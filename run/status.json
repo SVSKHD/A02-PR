@@ -1,5 +1,5 @@
 {
-  "ts": "2026-05-25T01:11:23.888431+00:00",
+  "ts": "2026-05-25T02:04:55.256073+00:00",
   "broker_date": "2026-05-25",
   "daily_pnl_realized": 0.0,
   "open_positions": 0,
@@ -10,7 +10,7 @@
   "kill_switch_locked": false,
   "paused": false,
   "mode": "live",
-  "lot_size": 0.52,
+  "lot_size": 0.55,
   "starting_balance": 51916.44,
   "broker_balance": 51916.44,
   "broker_equity": 51916.44,

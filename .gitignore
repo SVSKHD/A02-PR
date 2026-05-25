@@ -1,1 +1,45 @@
+# Secrets — NEVER commit
 .env
+.env.local
+.env.*.local
+*.secret
+
+# Bot runtime state
+run/
+*.state.json
+aureon_v2_state.json
+heartbeat
+commands.json
+status.json
+
+# Backtest/analysis outputs
+output/
+reports/
+strategy_output/
+research_data/
+data/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Monthly analysis outputs
+data/
+results/
+monthly_output/

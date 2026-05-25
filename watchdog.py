@@ -454,11 +454,10 @@ def main():
             bot_args.extend([flag, str(v)])
     bot_args += unknown
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    # Use the same logging setup as bot.py but with app_name='watchdog'
+    # so we get logs/watchdog.log alongside logs/aureon.log
+    from bot import setup_logging
+    setup_logging(level=args.log_level, log_dir="./logs", app_name="watchdog")
 
     Watchdog(bot_args, run_dir=args.run_dir).run()
 

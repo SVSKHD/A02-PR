@@ -72,13 +72,48 @@ class Config:
 # LOGGING
 # ============================================================================
 
-def setup_logging(level: str = "INFO"):
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+def setup_logging(level: str = "INFO", log_dir: str = "./logs",
+                  app_name: str = "aureon"):
+    """Set up logging to BOTH stdout and a daily-rotated file in log_dir.
+    
+    File naming: logs/aureon_YYYY-MM-DD.log (rotated daily at UTC midnight,
+    keeping 30 days of history). All log levels from app modules go in.
+    
+    Format includes timestamp, level, module name, and message. Caller can
+    grep for specific anchors, errors, or modules later.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper()))
+    # Clear any pre-existing handlers so basicConfig calls don't double-log
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
-    return logging.getLogger("AUREON")
+    
+    # Console handler (so terminal still shows everything)
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+    
+    # Daily-rotated file handler
+    from logging.handlers import TimedRotatingFileHandler
+    log_file = os.path.join(log_dir, f"{app_name}.log")
+    file_handler = TimedRotatingFileHandler(
+        log_file, when='midnight', interval=1, backupCount=30, utc=True,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(fmt)
+    file_handler.suffix = "%Y-%m-%d"  # so rotated files become aureon.log.2026-05-25
+    root.addHandler(file_handler)
+    
+    log = logging.getLogger("AUREON")
+    log.info(f"Logging to console + {log_file} (daily rotation, 30-day retention)")
+    return log
 
 
 log = logging.getLogger("AUREON")

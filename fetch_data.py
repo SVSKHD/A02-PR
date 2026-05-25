@@ -162,6 +162,10 @@ def fetch_m1(symbol: str = "XAUUSD",
 
 
 def main():
+    # Load .env if present
+    from env_loader import load_env
+    load_env()
+
     p = argparse.ArgumentParser(description="Fetch XAUUSD M1 historic bars from MT5")
     rng = p.add_mutually_exclusive_group(required=True)
     rng.add_argument("--days", type=int, help="rolling window in days from now")

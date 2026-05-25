@@ -160,6 +160,10 @@ def resolve_window(args) -> Tuple[datetime, datetime]:
 
 
 def main():
+    # Load .env if present
+    from env_loader import load_env
+    load_env()
+
     p = argparse.ArgumentParser(description="Multi-symbol multi-timeframe MT5 data fetcher",
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sym = p.add_mutually_exclusive_group(required=True)

@@ -296,6 +296,13 @@ def telemetry_from_env(component: str = "AUREON") -> Telemetry:
 # ============================================================================
 
 if __name__ == "__main__":
+    # Load .env if present (so this self-test works after setting up .env)
+    try:
+        from env_loader import load_env
+        load_env()
+    except ImportError:
+        pass
+
     logging.basicConfig(level=logging.DEBUG,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     t = telemetry_from_env("AUREON-TEST")

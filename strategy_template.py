@@ -260,6 +260,10 @@ def monthly_summary(trades: List[Dict]) -> pd.DataFrame:
 # ============================================================================
 
 def main():
+    # Load .env if present
+    from env_loader import load_env
+    load_env()
+
     p = argparse.ArgumentParser(description="Strategy research backtester")
     p.add_argument("--csv", required=True,
                    help="Path to OHLC CSV (from fetch_lab.py)")

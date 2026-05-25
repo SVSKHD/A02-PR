@@ -25,12 +25,16 @@ User=trader
 Group=trader
 WorkingDirectory=/home/trader/aureon_v2
 
-# Telegram credentials (replace with your real values)
-Environment="AUREON_TELEGRAM_TOKEN=PUT_YOUR_BOT_TOKEN_HERE"
-Environment="AUREON_TELEGRAM_CHAT=PUT_YOUR_CHAT_ID_HERE"
-Environment="AUREON_TELEGRAM_MIN_SEVERITY=INFO"
-Environment="AUREON_LOG_FILE=/var/log/aureon/aureon.log"
-Environment="AUREON_RUN_DIR=/home/trader/aureon_v2/run"
+# Telegram credentials and other config come from .env in WorkingDirectory.
+# This is the recommended approach — keeps secrets out of the unit file.
+# Make sure /home/trader/aureon_v2/.env exists and has chmod 600.
+
+# (If you prefer inline credentials instead of .env, uncomment these
+# and delete /home/trader/aureon_v2/.env — but .env is safer.)
+# Environment="AUREON_TELEGRAM_TOKEN=PUT_YOUR_BOT_TOKEN_HERE"
+# Environment="AUREON_TELEGRAM_CHAT=PUT_YOUR_CHAT_ID_HERE"
+# Environment="AUREON_TELEGRAM_MIN_SEVERITY=INFO"
+
 Environment="PYTHONUNBUFFERED=1"
 
 # Use PAPER mode for the first 2 weeks. Change to LIVE only after validation.

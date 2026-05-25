@@ -312,7 +312,14 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     # Header banner
-    sl_dollar   = 20.0 * 100 * args.lot
+    # Read SL/TP from the Config defaults (so banner reflects current strategy)
+    try:
+        from bot import Config as _Cfg
+        _cfg_for_banner = _Cfg()
+        actual_sl = _cfg_for_banner.sl_dist
+    except Exception:
+        actual_sl = 20.0
+    sl_dollar   = actual_sl * 100 * args.lot
     pct_balance = 100 * sl_dollar / args.balance
     kill_dollar = args.balance * args.daily_kill_pct
 

@@ -92,7 +92,12 @@ A self-running, supervised, real-money trading bot for XAUUSD (gold) on MetaTrad
 | `TELEGRAM_SETUP.md` | Step-by-step Telegram bot creation (BotFather → chat ID → env vars) + systemd unit file |
 | `AUTO_ANALYSIS.md` | Cron + systemd timer setup for daily auto-analysis |
 | `WHOLE_PACKAGE.md` | This file |
-| `requirements.txt` | Python dependencies |
+| `commands.md` | **NEW.** Every CLI, Telegram, and systemd command — reference card |
+| `.env.example` | **NEW.** Template for environment variables (Telegram token, chat ID, etc.). Copy to `.env`. |
+| `.gitignore` | **NEW.** Excludes secrets and runtime state from version control |
+| `aureon.service.example` | Production systemd unit template |
+| `env_loader.py` | **NEW.** Loads `.env` at startup (OS env vars take precedence) |
+| `requirements.txt` | Python dependencies (now includes python-dotenv) |
 
 ---
 

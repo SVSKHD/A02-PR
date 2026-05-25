@@ -122,12 +122,7 @@ sudo systemctl start aureon
 journalctl -u aureon -f
 ```
 
-## Configurationpython watchdog.py live \
-  \
-  \
-  \
-  --lot 0.5 \
-  --i-understand-the-risks
+## Configuration
 
 Defaults are encoded in `bot.py:Config`. Override via CLI flags:
 - `--lot 0.5` — lot size per leg

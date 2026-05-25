@@ -227,6 +227,10 @@ def run_analysis(days: int = 365,
 
 
 def main():
+    # Load .env if present
+    from env_loader import load_env
+    load_env()
+
     p = argparse.ArgumentParser(description="AUREON v2 daily auto-analysis")
     p.add_argument("--days", type=int, default=365,
                    help="Rolling window in days (default 365)")
