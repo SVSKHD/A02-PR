@@ -1,0 +1,43 @@
+{
+  "month": "2026-04-01",
+  "month_name": "April 2026",
+  "lot": 0.5,
+  "spread_used_dollars": 0.04,
+  "extra_slippage_dollars": 0.05,
+  "total_cost_per_trade": 0.09,
+  "spread_detection": {
+    "used": 0.04,
+    "median_points": 4.0,
+    "mean_points": 4.0,
+    "percentiles": {
+      "p10": 4.0,
+      "p25": 4.0,
+      "p50": 4.0,
+      "p75": 4.0,
+      "p90": 4.0,
+      "max": 177.0
+    },
+    "count": 27720,
+    "source": "auto-detected median from 27,720 bars in April 2026"
+  },
+  "starting_balance": 50000,
+  "daily_kill_pct": 0.03,
+  "trades": 80,
+  "wins": 75,
+  "sls": 5,
+  "tps": 2,
+  "gross_pips": 143.46,
+  "net_pips": 136.26,
+  "net_usd": 6813.0,
+  "days": 21,
+  "profitable": 17,
+  "losing": 4,
+  "best_day": 1843.0,
+  "worst_day": -796.5,
+  "win_rate": 93.75,
+  "avg_day": 324.43,
+  "avg_trade": 85.16,
+  "max_dd_usd": -796.5,
+  "max_dd_pct": -1.59,
+  "kill_switch_days": 0
+}

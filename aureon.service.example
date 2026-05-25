@@ -1,0 +1,70 @@
+# AUREON v2 — systemd unit file template
+#
+# Save as /etc/systemd/system/aureon.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now aureon.service
+#
+# View logs:    journalctl -u aureon -f
+# Restart:      sudo systemctl restart aureon
+# Stop:         sudo systemctl stop aureon
+# Status:       sudo systemctl status aureon
+#
+# NOTE: This service requires the MT5 terminal to be running on this machine
+# BEFORE the bot starts. On Linux that's via Wine — on a Windows VPS you'd
+# autostart the MT5 terminal via Task Scheduler instead and use NSSM / a
+# Windows Service Wrapper instead of this systemd unit.
+
+[Unit]
+Description=AUREON v2 trading bot (XAUUSD multi-anchor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/aureon_v2
+
+# Telegram credentials (replace with your real values)
+Environment="AUREON_TELEGRAM_TOKEN=PUT_YOUR_BOT_TOKEN_HERE"
+Environment="AUREON_TELEGRAM_CHAT=PUT_YOUR_CHAT_ID_HERE"
+Environment="AUREON_TELEGRAM_MIN_SEVERITY=INFO"
+Environment="AUREON_LOG_FILE=/var/log/aureon/aureon.log"
+Environment="AUREON_RUN_DIR=/home/trader/aureon_v2/run"
+Environment="PYTHONUNBUFFERED=1"
+
+# Use PAPER mode for the first 2 weeks. Change to LIVE only after validation.
+# PAPER:
+ExecStart=/usr/bin/python3 watchdog.py paper
+
+# LIVE (uncomment when ready, comment the paper line above):
+# ExecStart=/usr/bin/python3 watchdog.py live --i-understand-the-risks
+
+# Graceful shutdown: watchdog handles SIGTERM (flattens positions, saves state)
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# Auto-restart on crash (watchdog itself has internal backoff; this is the
+# outer safety net if even the watchdog process dies)
+Restart=on-failure
+RestartSec=30
+
+# Resource limits (gold bot is light)
+MemoryMax=512M
+CPUQuota=50%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/trader/aureon_v2 /var/log/aureon
+LockPersonality=true
+
+# Journal logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aureon
+
+[Install]
+WantedBy=multi-user.target

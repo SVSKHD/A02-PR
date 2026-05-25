@@ -1,0 +1,43 @@
+{
+  "month": "2026-01-01",
+  "month_name": "January 2026",
+  "lot": 0.5,
+  "spread_used_dollars": 0.04,
+  "extra_slippage_dollars": 0.05,
+  "total_cost_per_trade": 0.09,
+  "spread_detection": {
+    "used": 0.04,
+    "median_points": 4.0,
+    "mean_points": 4.0,
+    "percentiles": {
+      "p10": 4.0,
+      "p25": 4.0,
+      "p50": 4.0,
+      "p75": 4.0,
+      "p90": 4.0,
+      "max": 44.0
+    },
+    "count": 28810,
+    "source": "auto-detected median from 28,810 bars in January 2026"
+  },
+  "starting_balance": 50000,
+  "daily_kill_pct": 0.03,
+  "trades": 79,
+  "wins": 77,
+  "sls": 2,
+  "tps": 0,
+  "gross_pips": 94.45,
+  "net_pips": 87.34,
+  "net_usd": 4367.0,
+  "days": 22,
+  "profitable": 20,
+  "losing": 2,
+  "best_day": 625.5,
+  "worst_day": -861.0,
+  "win_rate": 97.47,
+  "avg_day": 198.5,
+  "avg_trade": 55.28,
+  "max_dd_usd": -1164.5,
+  "max_dd_pct": -2.33,
+  "kill_switch_days": 0
+}

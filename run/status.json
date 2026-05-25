@@ -1,0 +1,21 @@
+{
+  "ts": "2026-05-25T01:11:23.888431+00:00",
+  "broker_date": "2026-05-25",
+  "daily_pnl_realized": 0.0,
+  "open_positions": 0,
+  "pending_orders": 0,
+  "anchors_processed_today": [
+    "A1_02h_Asia"
+  ],
+  "kill_switch_locked": false,
+  "paused": false,
+  "mode": "live",
+  "lot_size": 0.52,
+  "starting_balance": 51916.44,
+  "broker_balance": 51916.44,
+  "broker_equity": 51916.44,
+  "broker_login": 5050361102,
+  "broker_server": "MetaQuotes-Demo",
+  "daily_loss_pct": 0.03,
+  "kill_threshold_usd": 1557.4932000000001
+}
