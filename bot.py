@@ -39,6 +39,7 @@ class Config:
     be_trigger:   float = 0.30            # unchanged: wait for $0.30 favorable before locking BE
     trail_gap:    float = 0.10            # was 0.30 — TIGHTER trail captures more of favorable excursion (+$5,727/yr)
     min_step:     float = 0.05            # was 0.10 — smaller min step needed for $0.10 trail gap to work in live
+    freeze_minutes: int = 0               # v2.3: N min after fill, hold initial $18 SL only (no BE/trail). 0 = OFF (legacy v2.2 behavior). 15 = recommended trend-capture mode.
 
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
     auto_lot: bool = True                # if True, override lot_size from live balance
@@ -180,7 +181,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             pos.closed = True
             return pos.outcome
 
-    # 2. UPDATE PEAK FAVORABLE
+    # 2. UPDATE PEAK FAVORABLE (always, even during freeze — used for reporting & post-freeze trail snap)
     if pos.side == 'BUY':
         if bar.high > pos.max_fav: pos.max_fav = bar.high
         fav = pos.max_fav - pos.entry_price
@@ -189,8 +190,19 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
         fav = pos.entry_price - pos.max_fav
     fav = max(fav, 0.0)
 
-    # 3-5. TRAIL UPDATE
-    if fav >= cfg.be_trigger:
+    # 3-5. TRAIL UPDATE — gated by freeze window
+    # v2.3 FREEZE: for cfg.freeze_minutes after fill, do NOT engage BE/trail.
+    # Initial $18 SL stays as the broker-side stop. When freeze expires, normal
+    # trail logic engages and will snap to (peak − trail_gap) automatically.
+    in_freeze = False
+    if cfg.freeze_minutes > 0 and pos.entry_time is not None:
+        try:
+            elapsed = (ts - pos.entry_time).total_seconds() / 60.0
+            in_freeze = elapsed < cfg.freeze_minutes
+        except Exception:
+            in_freeze = False  # bad timestamp → fall through to normal logic
+
+    if not in_freeze and fav >= cfg.be_trigger:
         if pos.side == 'BUY':
             candidate_sl = max(pos.entry_price, pos.max_fav - cfg.trail_gap)
             if candidate_sl > pos.current_sl + cfg.min_step:
@@ -555,6 +567,35 @@ class MT5Adapter:
             log.warning(f"get_account_info failed: {e}")
             return {}
 
+    def find_pending_by_price(self, symbol: str, side: str, price: float,
+                              lot: float, magic: int = 20260522,
+                              tolerance: float = 0.05):
+        """v2.3: Reconciliation helper — find an existing pending order matching the
+        spec we just tried to send. Used when order_send returned None / rc=-1, to
+        decide if the order actually got placed despite the missing ack.
+
+        Returns the matching order object (from mt5.orders_get) or None.
+        Matches on: symbol + side (BUY_STOP/SELL_STOP) + price within tolerance +
+        magic + volume within 0.005."""
+        mt5 = self.mt5
+        try:
+            orders = mt5.orders_get(symbol=symbol) or []
+        except Exception:
+            return None
+        want_type = mt5.ORDER_TYPE_BUY_STOP if side == 'BUY' else mt5.ORDER_TYPE_SELL_STOP
+        matches = []
+        for o in orders:
+            if int(o.type) != int(want_type): continue
+            if int(getattr(o, 'magic', 0)) != int(magic): continue
+            if abs(float(o.price_open) - float(price)) > tolerance: continue
+            if abs(float(o.volume_current) - float(lot)) > 0.005: continue
+            matches.append(o)
+        if not matches:
+            return None
+        # If multiple, return the most recently placed (highest ticket)
+        matches.sort(key=lambda o: int(o.ticket), reverse=True)
+        return matches[0]
+
     def place_stop_order(self, symbol: str, side: str, price: float,
                          lot: float, sl: float, tp: float,
                          comment: str = "AUREON_v2", dry_run: bool = False):
@@ -585,6 +626,40 @@ class MT5Adapter:
         rc = result.retcode if result else -1
         rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
         is_ok = (rc == 10009)  # TRADE_RETCODE_DONE
+
+        # v2.3 RECONCILIATION: order_send returned None (rc=-1) means we don't know
+        # if the order was actually placed. Query broker state to find out, then
+        # retry only if confirmed absent (cannot create duplicates).
+        if rc == -1:
+            import time as _time
+            _time.sleep(0.5)  # let broker settle
+            existing = self.find_pending_by_price(symbol, side, price, lot)
+            if existing is not None:
+                log.info(
+                    f"✅ Placed {side} stop @ {price} lot={lot}: rc=-1 but RECONCILED — "
+                    f"ticket {existing.ticket} found in broker state"
+                )
+                # Build a minimal SendResult-like shim so callers can read .retcode/.order
+                class _ReconciledResult:
+                    retcode = 10009
+                    order   = int(existing.ticket)
+                    deal    = 0
+                    comment = "RECONCILED_FROM_BROKER_STATE"
+                return _ReconciledResult()
+            # Truly not placed — safe to retry exactly once
+            log.warning(
+                f"⚠ {side} stop @ {price}: rc=-1 + no matching pending in broker state — retrying once"
+            )
+            result = mt5.order_send(req)
+            rc = result.retcode if result else -1
+            rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
+            is_ok = (rc == 10009)
+            if is_ok:
+                log.info(f"✅ Placed {side} stop @ {price} lot={lot} on RETRY: retcode={rc} ({rc_name})")
+                return result
+            log.error(f"❌ {side} stop @ {price} RETRY also failed: retcode={rc} ({rc_name})")
+            # fall through to standard rejection logging below
+
         # Log explicitly whether it actually went through, with the retcode meaning
         if is_ok:
             log.info(f"✅ Placed {side} stop @ {price} lot={lot}: retcode={rc} ({rc_name})")

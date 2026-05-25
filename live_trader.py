@@ -611,6 +611,7 @@ class LiveTrader:
                         'tp_level': rcv_tp,
                         'max_fav': float(fill_price),
                         'recovery': True,
+                        'fill_time': pd.Timestamp.now(tz='UTC').isoformat(),  # v2.3
                     }
                 self.tele.success(
                     f"✅ *{label} recovery {breakout_side} filled @ ${fill_price}*"
@@ -623,11 +624,16 @@ class LiveTrader:
             return
 
         # Out of catchable zone OR no breakout direction confirmed — skip cleanly
-        skip_reason = "no breakout confirmed"
-        if breakout_side is not None and slip > 15.0:
+        # v2.3: distinguish "order placement failed" (rc=-1 etc) from "genuine no-breakout"
+        both_no_response = (buy_rc in (None, -1)) and (sell_rc in (None, -1))
+        if both_no_response:
+            skip_reason = "ORDER PLACEMENT FAILED — broker returned no response on both sides"
+        elif breakout_side is not None and slip > 15.0:
             skip_reason = f"slip ${slip:.2f} > $15 (move exhausted, would chase top/bottom)"
         elif breakout_side is not None and slip < 0.5:
             skip_reason = f"slip ${slip:.2f} < $0.50 (price didn't actually break, broker quirk)"
+        else:
+            skip_reason = "no breakout confirmed"
         self.tele.error(
             f"❌ *{label} skipped — {skip_reason}*\n"
             f"BUY  stop @ ${buy_stop}: rc={_rcname(buy_res)}\n"
@@ -690,6 +696,15 @@ class LiveTrader:
                 self.shadow_pendings.pop(sibling, None)
                 # Promote to managed position
                 broker_p = next(p for p in broker_positions if int(p.ticket) == ticket)
+                # v2.3: capture broker's actual fill timestamp for freeze logic
+                # broker_p.time is Unix seconds (broker convention — use offset-aware decode)
+                try:
+                    fill_unix = int(broker_p.time)
+                    if self.adapter.tick_time_offset_hours:
+                        fill_unix -= self.adapter.tick_time_offset_hours * 3600
+                    fill_time_utc = pd.Timestamp(fill_unix, unit='s', tz='UTC')
+                except Exception:
+                    fill_time_utc = pd.Timestamp.now(tz='UTC')
                 self.shadow_positions[ticket] = {
                     'anchor_label': info['anchor_label'],
                     'side':         info['side'],
@@ -697,6 +712,7 @@ class LiveTrader:
                     'current_sl':   float(broker_p.sl),
                     'tp_level':     float(broker_p.tp),
                     'max_fav':      float(broker_p.price_open),
+                    'fill_time':    fill_time_utc.isoformat(),  # v2.3: persisted, restart-safe
                 }
 
         # Detect closures
@@ -768,11 +784,25 @@ class LiveTrader:
 
         for ticket, shadow in list(self.shadow_positions.items()):
             old_sl = shadow['current_sl']
+            # v2.3: pull stored fill_time so the freeze window is anchored to the
+            # actual broker fill timestamp (restart-safe). Fallback to bar_time only
+            # if state predates the patch (legacy positions opened before v2.3 deploy).
+            fill_time_iso = shadow.get('fill_time')
+            if fill_time_iso:
+                try:
+                    entry_time_for_pos = pd.Timestamp(fill_time_iso)
+                    if entry_time_for_pos.tzinfo is None:
+                        entry_time_for_pos = entry_time_for_pos.tz_localize('UTC')
+                except Exception:
+                    entry_time_for_pos = bar_time
+            else:
+                entry_time_for_pos = bar_time  # legacy fallback — freeze won't apply, normal trail
+
             pos = self._Position(
                 anchor_label=shadow['anchor_label'],
                 side=shadow['side'],
                 entry_price=shadow['entry_price'],
-                entry_time=bar_time,
+                entry_time=entry_time_for_pos,
                 current_sl=shadow['current_sl'],
                 tp_level=shadow['tp_level'],
                 max_fav=shadow['max_fav'],
