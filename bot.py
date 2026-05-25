@@ -35,14 +35,14 @@ class Config:
     trigger_dist: float = 5.00
     tp_dist:      float = 30.00           # was 20.00 — let winners run longer
     sl_dist:      float = 18.00           # was 20.00 — slightly tighter (saves $118 per SL)
-    lot_size:     float = 0.50            # was 0.49 — at $18 SL = $900 (1.80% of $50k, safely under 2% rule)
+    lot_size:     float = 0.54            # was 0.50 — max safe @ $50k (1.94% per trade, worst day -3.98% safely under 4% FP daily)
     be_trigger:   float = 0.30            # unchanged: wait for $0.30 favorable before locking BE
     trail_gap:    float = 0.10            # was 0.30 — TIGHTER trail captures more of favorable excursion (+$5,727/yr)
     min_step:     float = 0.05            # was 0.10 — smaller min step needed for $0.10 trail gap to work in live
 
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
     auto_lot: bool = True                # if True, override lot_size from live balance
-    lot_conservatism: float = 0.92       # was 1.0 — produces lot 0.50 at $50k (1.80% risk vs 2% rule limit)
+    lot_conservatism: float = 0.99       # was 0.92 — produces lot 0.54 at $50k (1.94% per trade, safe buffer to 4% daily rule)
     risk_pct_under_50k: float = 0.03     # Funding Pips: 3% per-trade on <$50k accounts
     risk_pct_over_50k:  float = 0.02     # Funding Pips: 2% per-trade on ≥$50k accounts
     slippage_buffer: float = 0.98        # keep lot's worst-case loss to this fraction of the rule cap
@@ -363,6 +363,41 @@ def summarize_backtest(df: pd.DataFrame, cfg: Config) -> Dict:
 # LIVE / PAPER MODES (MT5 integration)
 # ============================================================================
 
+# MT5 trade retcode names (from MetaTrader5 docs)
+_MT5_RETCODE_MAP = {
+    10004: "REQUOTE",
+    10006: "REJECT",
+    10007: "CANCEL",
+    10008: "PLACED",
+    10009: "DONE",                  # ← success
+    10010: "DONE_PARTIAL",
+    10011: "ERROR",
+    10012: "TIMEOUT",
+    10013: "INVALID",
+    10014: "INVALID_VOLUME",
+    10015: "INVALID_PRICE",         # ← stop price on wrong side of market
+    10016: "INVALID_STOPS",         # ← SL/TP on wrong side
+    10017: "TRADE_DISABLED",
+    10018: "MARKET_CLOSED",
+    10019: "NO_MONEY",
+    10020: "PRICE_CHANGED",
+    10021: "PRICE_OFF",
+    10022: "INVALID_EXPIRATION",
+    10023: "ORDER_CHANGED",
+    10024: "TOO_MANY_REQUESTS",
+    10025: "NO_CHANGES",
+    10026: "SERVER_DISABLES_AT",
+    10027: "CLIENT_DISABLES_AT",
+    10028: "LOCKED",
+    10029: "FROZEN",
+    10030: "INVALID_FILL",
+    10031: "CONNECTION",
+    10032: "ONLY_REAL",
+    10033: "LIMIT_ORDERS",
+    10034: "LIMIT_VOLUME",
+}
+
+
 class MT5Adapter:
     """
     Optional MT5 integration. Imports MetaTrader5 lazily so the backtest
@@ -371,6 +406,15 @@ class MT5Adapter:
     Connects to the ALREADY-RUNNING MT5 terminal on this machine (no creds
     passed). The terminal must be launched and logged into your broker
     account before starting the bot.
+
+    On startup, autodetects how this broker reports tick.time:
+      - "utc": broker sends real UTC Unix timestamps (most brokers)
+      - "broker_local": broker sends broker-local time encoded as Unix UTC
+        (some brokers, including a few MetaQuotes setups)
+
+    The detected convention is stored in self.tick_time_offset_hours (0 for
+    "utc", +3 for "broker_local" if broker is UTC+3). Use this offset to
+    decode any future tick.time and to encode times we send to copy_rates.
     """
     def __init__(self):
         import MetaTrader5 as mt5
@@ -388,20 +432,73 @@ class MT5Adapter:
             )
         log.info(f"Connected to MT5: account #{info.login} on {info.server}")
 
+        # Autodetect tick.time convention by comparing broker's claimed time
+        # to local UTC. Done ONCE at startup.
+        self.tick_time_offset_hours = self._detect_tick_time_offset()
+        log.info(
+            f"Detected broker tick.time convention: offset = "
+            f"{self.tick_time_offset_hours:+.0f}h "
+            f"({'real UTC' if self.tick_time_offset_hours == 0 else 'broker-local-as-UTC'})"
+        )
+
+    def _detect_tick_time_offset(self) -> float:
+        """Compare broker's reported tick time to our local UTC clock.
+        Returns the integer-hour offset that needs to be SUBTRACTED from
+        the broker's tick.time to convert it to real UTC. Returns 0 if
+        the broker is already using real UTC.
+
+        Falls back to 0 if no fresh tick is available."""
+        import time as _time
+        from datetime import datetime as _dt, timezone as _tz
+        # Try up to 3 times to get a fresh tick
+        for _ in range(3):
+            tick = self.mt5.symbol_info_tick("XAUUSD")
+            if tick is not None and tick.time > 0:
+                broker_unix = tick.time
+                now_unix = _dt.now(_tz.utc).timestamp()
+                diff_hours = (broker_unix - now_unix) / 3600.0
+                # Round to nearest hour
+                offset = round(diff_hours)
+                # Sanity: only accept offsets in [-12, +12] hours
+                if -12 <= offset <= 12:
+                    # If diff is < 5 minutes, broker is sending real UTC
+                    if abs(diff_hours) < (5/60):
+                        return 0
+                    return float(offset)
+            _time.sleep(0.5)
+        log.warning("Could not detect broker time offset — assuming real UTC (0h)")
+        return 0.0
+
     def shutdown(self):
         self.mt5.shutdown()
 
     def get_m5_close(self, symbol: str, utc_time: pd.Timestamp) -> Optional[float]:
-        bars = self.mt5.copy_rates_from(symbol, self.mt5.TIMEFRAME_M5, utc_time, 1)
-        if bars is None or len(bars) == 0: return None
-        return float(bars[0]['close'])
+        # Use copy_rates_range to specifically request the M5 bar ENDING at
+        # utc_time. Apply the autodetected offset so the time we send matches
+        # this broker's expected encoding.
+        m5_start = utc_time - pd.Timedelta(minutes=5)
+        broker_offset = pd.Timedelta(hours=self.tick_time_offset_hours)
+        m5_start_send = (m5_start + broker_offset).tz_localize(None).to_pydatetime()
+        m5_end_send   = (utc_time  + broker_offset).tz_localize(None).to_pydatetime()
+        bars = self.mt5.copy_rates_range(symbol, self.mt5.TIMEFRAME_M5,
+                                          m5_start_send, m5_end_send)
+        if bars is None or len(bars) == 0:
+            log.warning(f"get_m5_close: no bars in [{m5_start_send} → {m5_end_send}]")
+            return None
+        return float(bars[-1]['close'])
 
     def get_latest_m1(self, symbol: str, n: int = 1):
         return self.mt5.copy_rates_from_pos(symbol, self.mt5.TIMEFRAME_M1, 0, n)
 
     def server_time_utc(self) -> pd.Timestamp:
+        # tick.time is decoded using the convention we detected at startup.
+        # If broker sends real UTC: offset=0, no change.
+        # If broker sends broker-local-as-UTC: offset=+3 (UTC+3), subtract it.
         tick = self.mt5.symbol_info_tick("XAUUSD")
-        return pd.Timestamp(tick.time, unit='s', tz='UTC')
+        if tick is None:
+            raise RuntimeError("symbol_info_tick returned None — symbol not subscribed?")
+        broker_ts = pd.Timestamp(tick.time, unit='s', tz='UTC')
+        return broker_ts - pd.Timedelta(hours=self.tick_time_offset_hours)
 
     def get_account_info(self) -> dict:
         """Pull current account state from MT5. Returns {} on failure."""
@@ -449,7 +546,16 @@ class MT5Adapter:
             log.info(f"[PAPER] Would place {side} stop {symbol} @ {price} lot={lot} SL={sl} TP={tp}")
             return {'paper': True, 'request': req}
         result = mt5.order_send(req)
-        log.info(f"Placed {side} stop @ {price}: retcode={result.retcode}")
+        # Decode retcode for human-readable logging
+        rc = result.retcode if result else -1
+        rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
+        is_ok = (rc == 10009)  # TRADE_RETCODE_DONE
+        # Log explicitly whether it actually went through, with the retcode meaning
+        if is_ok:
+            log.info(f"✅ Placed {side} stop @ {price} lot={lot}: retcode={rc} ({rc_name})")
+        else:
+            err_detail = result.comment if result and hasattr(result, 'comment') else ''
+            log.error(f"❌ {side} stop @ {price} REJECTED: retcode={rc} ({rc_name}) {err_detail}")
         return result
 
     def modify_position_sl(self, ticket: int, new_sl: float,
@@ -498,6 +604,50 @@ class MT5Adapter:
             "comment": "AUREON_v2_close",
         }
         return mt5.order_send(req)
+
+    def place_market_order(self, symbol: str, side: str, lot: float,
+                           sl: float, tp: float, comment: str = "AUREON_v2_market",
+                           dry_run: bool = False):
+        """Place an IMMEDIATE market order. Used only for in-flight breakout
+        recovery: when pre-flight passed but broker rejected anyway because
+        price moved past the threshold during the millisecond order was in flight."""
+        mt5 = self.mt5
+        if dry_run:
+            log.info(f"[PAPER] Would place MARKET {side} {symbol} lot={lot} SL={sl} TP={tp}")
+            return {'paper': True, 'price': 0.0}
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            log.error("place_market_order: no tick available")
+            return None
+        if side == 'BUY':
+            order_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+        else:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": 50,
+            "magic": 20260522,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_DAY,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(req)
+        rc = result.retcode if result else -1
+        rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
+        if rc == 10009:
+            log.info(f"✅ MARKET {side} filled @ {price} lot={lot}: retcode={rc} ({rc_name})")
+        else:
+            err = result.comment if result and hasattr(result, 'comment') else ''
+            log.error(f"❌ MARKET {side} REJECTED: retcode={rc} ({rc_name}) {err}")
+        return result
 
 
 def run_live(cfg: Config, paper: bool = True):

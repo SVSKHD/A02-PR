@@ -45,6 +45,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from telemetry import telemetry_from_env, Severity
+from bot import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
 
@@ -85,6 +86,8 @@ class LiveTrader:
         self.status_path    = os.path.join(run_dir, "status.json")
         self.commands_path  = os.path.join(run_dir, "commands.json")
         self.daylog_path    = os.path.join(run_dir, "today_trades.csv")
+        self.price_log_dir  = os.path.join(run_dir, "price_log")  # daily-rotated CSVs
+        os.makedirs(self.price_log_dir, exist_ok=True)
 
         # Persistent state
         self.state_path = cfg.state_file
@@ -97,6 +100,9 @@ class LiveTrader:
         # Bar-close tracking
         self._last_managed_minute: Optional[pd.Timestamp] = None
         self._tick_counter = 0
+        # Hot polling window: for 30s after firing an anchor we tick at 0.2s
+        # to catch fills fast. After that, back to normal 1.0s cadence.
+        self._hot_poll_until: Optional[pd.Timestamp] = None
 
         # Pause flag (set via /pause command)
         self.paused = False
@@ -245,6 +251,44 @@ class LiveTrader:
         with open(self.heartbeat_path, "w") as f:
             f.write(datetime.now(timezone.utc).isoformat())
 
+    def _log_price(self, utc_now: pd.Timestamp):
+        """Write a per-tick row to today's price log. CSV per broker-date.
+        Captures: timestamp_utc, broker_time, bid, ask, mid, spread, last_m1_close.
+        At 1-sec polling, ~86k rows/day ≈ 5MB/day. Auto-rotates daily."""
+        if self.paper:
+            return  # no live tick data in paper mode
+        try:
+            tick = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+            if tick is None:
+                return
+            bid, ask = float(tick.bid), float(tick.ask)
+            spread_dollars = round(ask - bid, 4)
+            mid = round((bid + ask) / 2, 4)
+            broker_now = utc_now + pd.Timedelta(hours=self.cfg.broker_tz_offset_hours)
+            broker_date = broker_now.date()
+            # M1 close (last completed bar) — quick check, not critical
+            m1_close = ""
+            try:
+                m1_bars = self.adapter.get_latest_m1(self.cfg.symbol, 1)
+                if m1_bars is not None and len(m1_bars) > 0:
+                    m1_close = float(m1_bars[0]['close'])
+            except Exception:
+                pass
+
+            csv_path = os.path.join(self.price_log_dir, f"price_{broker_date}.csv")
+            need_header = not os.path.exists(csv_path)
+            with open(csv_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if need_header:
+                    w.writerow(["utc", "broker_time", "bid", "ask", "mid", "spread", "m1_close"])
+                w.writerow([
+                    utc_now.isoformat(timespec='seconds'),
+                    broker_now.isoformat(timespec='seconds'),
+                    bid, ask, mid, spread_dollars, m1_close,
+                ])
+        except Exception as e:
+            log.debug(f"price log write failed: {e}")
+
     def _write_status(self, broker_date: DateType):
         # Try to fetch live broker state (live mode only)
         broker_info = {}
@@ -349,27 +393,123 @@ class LiveTrader:
             self.tele.warn(f"⚠️ Could not fetch M5 close at {anchor_utc} — skipping {label}")
             return
 
+        # Get current market price BEFORE attempting any orders.
+        # We need this to detect gap-anchors that would produce invalid stops.
+        current_price = None
+        try:
+            tick = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+            if tick:
+                current_price = (tick.ask + tick.bid) / 2
+        except Exception as e:
+            log.warning(f"Could not read current tick for {label}: {e}")
+
+        # ADAPTIVE RE-ANCHOR ON GAP DAYS
+        # If the captured anchor is too far from current market, BOTH stops
+        # would be on the same side of price → one is mechanically invalid.
+        # Instead of skipping (passive), we re-anchor to current M5 close and
+        # trade the breakout from there with REDUCED RISK (half-lot, tight SL).
+        gap_mode = False
+        gap_lot = self.cfg.lot_size
+        gap_sl_dist = self.cfg.sl_dist
+        gap_tp_dist = self.cfg.tp_dist
+        if current_price is not None:
+            gap = abs(current_price - anchor_price)
+            if gap > self.cfg.trigger_dist + 0.5:  # 50¢ buffer past the trigger
+                # Try to use the most recent M5 close as the new anchor.
+                # We fetch the M5 bar just before NOW (not the scheduled anchor time).
+                try:
+                    now_utc = pd.Timestamp.now(tz='UTC')
+                    # Round DOWN to nearest 5 min boundary, then go one bar back
+                    minute = now_utc.minute - (now_utc.minute % 5)
+                    last_m5_end = now_utc.replace(minute=minute, second=0, microsecond=0)
+                    new_anchor = self.adapter.get_m5_close(self.cfg.symbol, last_m5_end)
+                    if new_anchor is None or abs(new_anchor - current_price) > self.cfg.trigger_dist:
+                        # Couldn't get fresh M5 OR fresh M5 also far from market
+                        # → use current price as anchor directly
+                        new_anchor = round(current_price, 2)
+                except Exception as e:
+                    log.warning(f"Re-anchor M5 fetch failed: {e}")
+                    new_anchor = round(current_price, 2)
+
+                gap_mode = True
+                gap_lot = round(self.cfg.lot_size / 2, 2)  # half-size
+                gap_sl_dist = 10.0    # tight SL: $10 instead of $18
+                gap_tp_dist = self.cfg.tp_dist  # keep normal TP
+                self.tele.warn(
+                    f"⚠️ *{label} GAP DETECTED*\n"
+                    f"Original anchor: `${anchor_price:.2f}`\n"
+                    f"Current market:  `${current_price:.2f}`\n"
+                    f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + 0.5:.2f} threshold)\n"
+                    f"→ Re-anchoring to current M5 close `${new_anchor:.2f}`\n"
+                    f"→ Half-lot `{gap_lot}` with tight SL `${gap_sl_dist:.0f}` "
+                    f"(reduced risk for gap-day breakout)"
+                )
+                anchor_price = new_anchor
+
         buy_stop  = round(anchor_price + self.cfg.trigger_dist, 2)
         sell_stop = round(anchor_price - self.cfg.trigger_dist, 2)
+        sl_buy    = round(buy_stop  - gap_sl_dist, 2)
+        sl_sell   = round(sell_stop + gap_sl_dist, 2)
+        tp_buy    = round(buy_stop  + gap_tp_dist, 2)
+        tp_sell   = round(sell_stop - gap_tp_dist, 2)
+
+        # FINAL SAFETY CHECK — after re-anchor, both stops should be on opposite
+        # sides of current price. If not, something is still wrong → skip.
+        if current_price is not None:
+            buy_invalid  = buy_stop  < current_price
+            sell_invalid = sell_stop > current_price
+            if buy_invalid or sell_invalid:
+                self.tele.error(
+                    f"❌ *{label} skipped after re-anchor*\n"
+                    f"Anchor ${anchor_price:.2f}, market ${current_price:.2f}\n"
+                    f"BUY stop ${buy_stop} {'INVALID (below market)' if buy_invalid else 'ok'}\n"
+                    f"SELL stop ${sell_stop} {'INVALID (above market)' if sell_invalid else 'ok'}\n"
+                    f"Refusing to place orders that would be rejected."
+                )
+                return
+
+        mode_tag = " [GAP MODE: half-lot, $10 SL]" if gap_mode else ""
         self.tele.info(
-            f"⚓ *{label}* anchor=${anchor_price:.2f}\n"
-            f"  BUY  stop @ ${buy_stop}  (SL ${buy_stop-self.cfg.sl_dist:.2f})\n"
-            f"  SELL stop @ ${sell_stop} (SL ${sell_stop+self.cfg.sl_dist:.2f})"
+            f"⚓ *{label}* anchor=${anchor_price:.2f}{mode_tag}\n"
+            f"  BUY  stop @ ${buy_stop}  (SL ${sl_buy}, TP ${tp_buy})\n"
+            f"  SELL stop @ ${sell_stop} (SL ${sl_sell}, TP ${tp_sell})\n"
+            f"  Lot: `{gap_lot}`"
         )
 
+        # PRE-FLIGHT VALIDATION — don't send orders that will be rejected.
+        # MT5 has no native OCO; these are two independent pending stops.
+        # A BUY_STOP must be ABOVE current ask; a SELL_STOP must be BELOW current bid.
+        # If our anchor + $5 trigger is on the wrong side of current market,
+        # the broker will return INVALID_PRICE. Better to detect locally and skip.
+        if current_price is not None:
+            buy_invalid  = buy_stop  <= current_price
+            sell_invalid = sell_stop >= current_price
+            if buy_invalid or sell_invalid:
+                self.tele.warn(
+                    f"⚠️ *{label} skipped — pre-flight rejected*\n"
+                    f"Anchor ${anchor_price:.2f}, market ${current_price:.2f}\n"
+                    f"BUY  stop ${buy_stop}: "
+                    f"{'❌ would be BELOW market (invalid)' if buy_invalid else '✅ ok'}\n"
+                    f"SELL stop ${sell_stop}: "
+                    f"{'❌ would be ABOVE market (invalid)' if sell_invalid else '✅ ok'}\n"
+                    f"Not sending. {label} marked processed."
+                )
+                return
+
         buy_res = self.adapter.place_stop_order(
-            self.cfg.symbol, 'BUY', buy_stop, self.cfg.lot_size,
-            sl=round(buy_stop - self.cfg.sl_dist, 2),
-            tp=round(buy_stop + self.cfg.tp_dist, 2),
-            comment=f"AUREONv2_{label}_BUY", dry_run=self.paper)
+            self.cfg.symbol, 'BUY', buy_stop, gap_lot,
+            sl=sl_buy, tp=tp_buy,
+            comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}",
+            dry_run=self.paper)
         sell_res = self.adapter.place_stop_order(
-            self.cfg.symbol, 'SELL', sell_stop, self.cfg.lot_size,
-            sl=round(sell_stop + self.cfg.sl_dist, 2),
-            tp=round(sell_stop - self.cfg.tp_dist, 2),
-            comment=f"AUREONv2_{label}_SELL", dry_run=self.paper)
+            self.cfg.symbol, 'SELL', sell_stop, gap_lot,
+            sl=sl_sell, tp=tp_sell,
+            comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}",
+            dry_run=self.paper)
 
         buy_ticket  = self._extract_ticket(buy_res,  f"paper_{label}_BUY")
         sell_ticket = self._extract_ticket(sell_res, f"paper_{label}_SELL")
+
         if buy_ticket is not None and sell_ticket is not None:
             self.shadow_pendings[buy_ticket] = {
                 'anchor_label': label, 'side': 'BUY',
@@ -381,14 +521,129 @@ class LiveTrader:
                 'sibling_ticket': buy_ticket,
                 'entry_price': sell_stop,
             }
-        else:
-            self.tele.error(f"❌ Failed to place pending orders for {label}")
+            # Mark a "hot polling" window — for the next 30 sec, _tick() runs
+            # at 0.2s cadence instead of 1s so we catch fills fast.
+            self._hot_poll_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=30)
+            return
+
+        # If we got here, pre-flight passed but the broker STILL rejected
+        # one or both (slippage between check and send, or other broker issue).
+        # Clean up: cancel anything that did place, log honestly, move on.
+        def _rcname(res):
+            rc = getattr(res, 'retcode', None) if res is not None else None
+            return f"{rc} ({_MT5_RETCODE_MAP.get(rc, '?')})" if rc else "no_response"
+
+        buy_rc  = getattr(buy_res,  'retcode', None) if buy_res  is not None else None
+        sell_rc = getattr(sell_res, 'retcode', None) if sell_res is not None else None
+
+        # Cancel any orphan FIRST before deciding recovery
+        for orphan in (buy_ticket, sell_ticket):
+            if orphan is not None and not str(orphan).startswith("paper_"):
+                try:
+                    self.adapter.cancel_order(orphan, dry_run=self.paper)
+                    self.tele.info(f"Cancelled orphan ticket {orphan}")
+                except Exception as e:
+                    self.tele.error(f"Failed to cancel orphan {orphan}: {e}")
+
+        # ----- CLEVER RECOVERY (narrow scope) -----
+        # When pre-flight passed but broker rejected with INVALID_PRICE on one
+        # side, it means price moved past our threshold WHILE the order was in
+        # flight (sub-second timing). This is a real breakout we just missed
+        # by milliseconds. Catchable if slip is small.
+        #
+        # Only activates when ALL of these are true:
+        #   1. One side rejected with INVALID_PRICE (10015)
+        #   2. The OTHER side either filled or also rejected (not a partial OK)
+        #   3. Re-read market confirms direction (price IS past the threshold)
+        #   4. Slip is in catchable zone: $0.50 to $15
+        #
+        # Outside that zone we skip cleanly. Gap mode at top of function handles
+        # huge anchor staleness; this handles the in-flight millisecond gap.
+        try:
+            tick = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+            recovery_price = (tick.ask + tick.bid) / 2 if tick else None
+        except Exception:
+            recovery_price = None
+
+        breakout_side = None
+        slip = 0.0
+        if recovery_price is not None:
+            if buy_rc == 10015 and recovery_price >= buy_stop:
+                breakout_side = 'BUY'
+                slip = recovery_price - buy_stop
+            elif sell_rc == 10015 and recovery_price <= sell_stop:
+                breakout_side = 'SELL'
+                slip = sell_stop - recovery_price
+
+        # Catchable zone check
+        if breakout_side is not None and 0.5 <= slip <= 15.0 and recovery_price is not None:
+            # Half the gap_lot (already half if in gap mode), tight $10 SL,
+            # normal $30 TP. Recovery trades tagged "_RCV" in MT5 comment.
+            rcv_lot = round(max(gap_lot / 2 if gap_mode else gap_lot * 0.5, 0.01), 2)
+            rcv_sl_dist = 10.0
+            if breakout_side == 'BUY':
+                rcv_sl = round(recovery_price - rcv_sl_dist, 2)
+                rcv_tp = round(recovery_price + gap_tp_dist, 2)
+            else:
+                rcv_sl = round(recovery_price + rcv_sl_dist, 2)
+                rcv_tp = round(recovery_price - gap_tp_dist, 2)
+
+            self.tele.warn(
+                f"🎯 *{label} IN-FLIGHT BREAKOUT — recovering {breakout_side}*\n"
+                f"Threshold ${buy_stop if breakout_side=='BUY' else sell_stop} was "
+                f"${slip:.2f} behind market ${recovery_price:.2f} (catchable zone).\n"
+                f"Market {breakout_side} • Lot `{rcv_lot}` • SL `${rcv_sl}` ($10 tight) • TP `${rcv_tp}`"
+            )
+            mkt_res = self.adapter.place_market_order(
+                self.cfg.symbol, breakout_side, rcv_lot,
+                sl=rcv_sl, tp=rcv_tp,
+                comment=f"AUREONv2_{label}_{breakout_side}_RCV",
+                dry_run=self.paper)
+            mkt_rc = getattr(mkt_res, 'retcode', None) if mkt_res is not None else None
+            if mkt_rc == 10009:
+                actual_ticket = getattr(mkt_res, 'order', None) or getattr(mkt_res, 'deal', None)
+                fill_price = getattr(mkt_res, 'price', recovery_price)
+                if actual_ticket:
+                    self.shadow_positions[int(actual_ticket)] = {
+                        'anchor_label': label, 'side': breakout_side,
+                        'entry_price': float(fill_price),
+                        'current_sl': rcv_sl,
+                        'tp_level': rcv_tp,
+                        'max_fav': float(fill_price),
+                        'recovery': True,
+                    }
+                self.tele.success(
+                    f"✅ *{label} recovery {breakout_side} filled @ ${fill_price}*"
+                )
+            else:
+                self.tele.error(
+                    f"❌ *{label} recovery market order also rejected*\n"
+                    f"retcode={mkt_rc} ({_MT5_RETCODE_MAP.get(mkt_rc, '?')})"
+                )
+            return
+
+        # Out of catchable zone OR no breakout direction confirmed — skip cleanly
+        skip_reason = "no breakout confirmed"
+        if breakout_side is not None and slip > 15.0:
+            skip_reason = f"slip ${slip:.2f} > $15 (move exhausted, would chase top/bottom)"
+        elif breakout_side is not None and slip < 0.5:
+            skip_reason = f"slip ${slip:.2f} < $0.50 (price didn't actually break, broker quirk)"
+        self.tele.error(
+            f"❌ *{label} skipped — {skip_reason}*\n"
+            f"BUY  stop @ ${buy_stop}: rc={_rcname(buy_res)}\n"
+            f"SELL stop @ ${sell_stop}: rc={_rcname(sell_res)}\n"
+            f"Current market: ${recovery_price if recovery_price else '?'}"
+        )
 
     @staticmethod
     def _extract_ticket(result, fallback: str):
         if result is None: return None
         if isinstance(result, dict) and result.get('paper'):
             return fallback
+        # Real MT5 result — only consider it a real ticket if retcode == DONE (10009)
+        retcode = getattr(result, 'retcode', None)
+        if retcode != 10009:
+            return None
         ticket = getattr(result, 'order', None)
         if ticket:
             return int(ticket)
@@ -646,12 +901,25 @@ class LiveTrader:
 
         try:
             while True:
+                tick_start = time.time()
+                utc_now = pd.Timestamp.now(tz='UTC')
                 try:
                     self._tick()
                 except Exception as e:
                     self.tele.error(f"Tick failed: {e}")
                     log.exception("Tick exception")
-                time.sleep(5)
+                # Per-second price snapshot for forensic log
+                try:
+                    self._log_price(utc_now)
+                except Exception as e:
+                    log.debug(f"price log error: {e}")
+                # Adaptive cadence: 0.2s during hot window (just after anchor
+                # fired and pendings are fresh), 1.0s otherwise.
+                in_hot = (self._hot_poll_until is not None
+                          and utc_now < self._hot_poll_until)
+                target_interval = 0.2 if in_hot else 1.0
+                elapsed = time.time() - tick_start
+                time.sleep(max(0.0, target_interval - elapsed))
         except KeyboardInterrupt:
             self.tele.warn("Manual interrupt received — flattening positions")
             self._flatten_all(reason="ManualInterrupt")
