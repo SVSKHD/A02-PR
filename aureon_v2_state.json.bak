@@ -4,8 +4,7 @@
   "processed_anchors_today": [
     "A1_02h_Asia",
     "A2_10h_London",
-    "A3_14h_Overlap",
-    "A4_17h_NYopen"
+    "A3_14h_Overlap"
   ],
   "kill_switch_locked": false,
   "shadow_positions_extended": {}
