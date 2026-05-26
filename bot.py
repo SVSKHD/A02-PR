@@ -39,7 +39,7 @@ class Config:
     be_trigger:   float = 0.30            # unchanged: wait for $0.30 favorable before locking BE
     trail_gap:    float = 0.10            # was 0.30 — TIGHTER trail captures more of favorable excursion (+$5,727/yr)
     min_step:     float = 0.05            # was 0.10 — smaller min step needed for $0.10 trail gap to work in live
-    freeze_minutes: int = 0               # v2.3: N min after fill, hold initial $18 SL only (no BE/trail). 0 = OFF (legacy v2.2 behavior). 15 = recommended trend-capture mode.
+    freeze_minutes: int = 15              # v2.5: ENABLED — trend-capture mode, matches backtest projections. 0 to disable for legacy v2.2 behavior.
 
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
     auto_lot: bool = True                # if True, override lot_size from live balance
@@ -211,6 +211,20 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             candidate_sl = min(pos.entry_price, pos.max_fav + cfg.trail_gap)
             if candidate_sl < pos.current_sl - cfg.min_step:
                 pos.current_sl = candidate_sl
+
+    # v2.3: $5 SECONDARY LOCK — once peak fav reaches $5, force SL to be at
+    # least $4 in profit from entry. Belt-and-suspenders on top of the trail.
+    # Guarantees: any trade that touches $5 fav exits with ≥$4 net per unit.
+    # At lot 0.55: minimum ~$220 net. At lot 0.28 (gap mode): minimum ~$112 net.
+    if not in_freeze and fav >= 5.00:
+        if pos.side == 'BUY':
+            floor_sl = pos.entry_price + 4.00
+            if floor_sl > pos.current_sl:
+                pos.current_sl = floor_sl
+        else:
+            floor_sl = pos.entry_price - 4.00
+            if floor_sl < pos.current_sl:
+                pos.current_sl = floor_sl
 
     # 6. TP CHECK
     if pos.side == 'BUY':
@@ -670,6 +684,10 @@ class MT5Adapter:
 
     def modify_position_sl(self, ticket: int, new_sl: float,
                            dry_run: bool = False):
+        """v2.5: rc=-1 reconciliation symmetric with place_stop_order.
+        If order_send returns None, query broker for actual position SL.
+        If broker already has the new SL, return success silently.
+        If broker still has old SL, retry once."""
         mt5 = self.mt5
         if dry_run:
             log.info(f"[PAPER] Would modify ticket {ticket} SL → {new_sl}")
@@ -679,7 +697,33 @@ class MT5Adapter:
             "position": ticket,
             "sl": new_sl,
         }
-        return mt5.order_send(req)
+        result = mt5.order_send(req)
+        rc = result.retcode if result else -1
+
+        # v2.5 reconciliation
+        if rc == -1:
+            import time as _time
+            _time.sleep(0.5)
+            positions = mt5.positions_get(ticket=ticket)
+            if positions:
+                actual_sl = positions[0].sl
+                if abs(actual_sl - new_sl) < 0.05:
+                    log.info(f"✅ Modify SL ticket={ticket} → ${new_sl}: rc=-1 but RECONCILED — broker SL matches")
+                    class _R: retcode = 10009; comment = "RECONCILED_SLTP"
+                    return _R()
+                else:
+                    log.warning(
+                        f"⚠ Modify SL ticket={ticket}: rc=-1, broker SL still ${actual_sl} (wanted ${new_sl}) — retrying"
+                    )
+                    result = mt5.order_send(req)
+                    rc = result.retcode if result else -1
+                    if rc == 10009:
+                        log.info(f"✅ Modify SL ticket={ticket} → ${new_sl} on RETRY: retcode=10009")
+                        return result
+                    log.error(f"❌ Modify SL ticket={ticket} RETRY also failed: retcode={rc}")
+            else:
+                log.warning(f"⚠ Modify SL ticket={ticket}: rc=-1 + position not found in broker state — position may have closed")
+        return result
 
     def cancel_order(self, ticket, dry_run: bool = False):
         """Cancel a pending order by ticket id."""
@@ -691,7 +735,20 @@ class MT5Adapter:
             "action": mt5.TRADE_ACTION_REMOVE,
             "order": int(ticket),
         }
-        return mt5.order_send(req)
+        result = mt5.order_send(req)
+        rc = result.retcode if result else -1
+        # v2.5: reconcile rc=-1 by checking if order still exists
+        if rc == -1:
+            import time as _time
+            _time.sleep(0.3)
+            orders = mt5.orders_get(ticket=int(ticket)) or []
+            if not orders:
+                log.info(f"✅ Cancel order {ticket}: rc=-1 but RECONCILED — order is gone")
+                class _R: retcode = 10009; comment = "RECONCILED_CANCEL"
+                return _R()
+            log.warning(f"⚠ Cancel order {ticket}: rc=-1 + order still exists — retrying")
+            result = mt5.order_send(req)
+        return result
 
     def close_position(self, ticket, dry_run: bool = False):
         mt5 = self.mt5

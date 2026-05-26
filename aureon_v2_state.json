@@ -1,8 +1,9 @@
 {
   "daily_pnl": 0.0,
-  "last_broker_date": "2026-05-25",
+  "last_broker_date": "2026-05-26",
   "processed_anchors_today": [
-    "A1_02h_Asia"
+    "A1_02h_Asia",
+    "A2_10h_London"
   ],
   "kill_switch_locked": false
 }

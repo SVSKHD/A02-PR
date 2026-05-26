@@ -89,6 +89,12 @@ class LiveTrader:
         self.price_log_dir  = os.path.join(run_dir, "price_log")  # daily-rotated CSVs
         os.makedirs(self.price_log_dir, exist_ok=True)
 
+        # v2.5: PID lock — prevent multiple bot instances running simultaneously
+        # against the same account. Multiple instances would share magic 20260522
+        # and conflict on shadow_position tracking + OCO cancels.
+        self.pid_lock_path = os.path.join(run_dir, "aureon.pid")
+        self._acquire_pid_lock()
+
         # Persistent state
         self.state_path = cfg.state_file
         self.state = self._load_state()
@@ -97,12 +103,18 @@ class LiveTrader:
         self.shadow_positions: Dict = {}
         self.shadow_pendings: Dict = {}
 
+        # v2.5: rehydrate shadow_positions max_fav/fill_time from persisted state
+        # so a mid-trade restart doesn't lose the $5 lock or freeze gate state.
+        self._pending_shadow_rehydrate = self.state.get('shadow_positions_extended', {})
+
         # Bar-close tracking
         self._last_managed_minute: Optional[pd.Timestamp] = None
         self._tick_counter = 0
         # Hot polling window: for 30s after firing an anchor we tick at 0.2s
         # to catch fills fast. After that, back to normal 1.0s cadence.
         self._hot_poll_until: Optional[pd.Timestamp] = None
+        # v2.5: deferred anchor placement (non-blocking 5s settle wait)
+        self._deferred_anchor: Optional[Dict] = None
 
         # Pause flag (set via /pause command)
         self.paused = False
@@ -128,28 +140,96 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def _load_state(self) -> Dict:
-        if os.path.exists(self.state_path):
-            try:
-                with open(self.state_path) as f:
-                    s = json.load(f)
-                log.info(f"Restored state from {self.state_path}")
-                return s
-            except Exception as e:
-                log.warning(f"Could not load state ({e}); starting fresh")
+        # v2.5: try main state, then .bak fallback, then fresh
+        for path, label in [(self.state_path, "main"),
+                            (self.state_path + ".bak", "backup")]:
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        s = json.load(f)
+                    log.info(f"Restored state from {label}: {path}")
+                    return s
+                except Exception as e:
+                    log.warning(f"State {label} corrupt ({e}); trying next source")
+        log.warning("No usable state file; starting fresh")
         return {
             'daily_pnl': 0.0,
             'last_broker_date': None,
             'processed_anchors_today': [],
             'kill_switch_locked': False,
+            'shadow_positions_extended': {},  # v2.5: persisted max_fav/fill_time per ticket
         }
 
     def _save_state(self):
         if self.paper:
             return
+        # v2.5: atomic write + rolling .bak backup
         tmp = self.state_path + '.tmp'
+        bak = self.state_path + '.bak'
+        # Mirror in-memory shadow lock state into the dict before writing
+        try:
+            self.state['shadow_positions_extended'] = {
+                str(ticket): {
+                    'max_fav':   shadow.get('max_fav'),
+                    'fill_time': shadow.get('fill_time'),
+                    'current_sl': shadow.get('current_sl'),
+                    'side':       shadow.get('side'),
+                    'entry_price': shadow.get('entry_price'),
+                    'anchor_label': shadow.get('anchor_label'),
+                }
+                for ticket, shadow in self.shadow_positions.items()
+            }
+        except Exception as e:
+            log.warning(f"Could not snapshot shadow_positions to state: {e}")
+        # Copy current main → .bak before overwriting
+        if os.path.exists(self.state_path):
+            try:
+                import shutil
+                shutil.copyfile(self.state_path, bak)
+            except Exception:
+                pass  # backup failure is not fatal
         with open(tmp, 'w') as f:
             json.dump(self.state, f, indent=2, default=str)
         os.replace(tmp, self.state_path)
+
+    def _acquire_pid_lock(self):
+        """v2.5: Refuse to start if another bot instance is already running."""
+        import psutil
+        if os.path.exists(self.pid_lock_path):
+            try:
+                with open(self.pid_lock_path) as f:
+                    other_pid = int(f.read().strip())
+                if psutil.pid_exists(other_pid):
+                    # Verify it's actually a python process running this bot
+                    try:
+                        p = psutil.Process(other_pid)
+                        cmdline = " ".join(p.cmdline()).lower()
+                        if "aureon" in cmdline or "live_trader" in cmdline or "bot.py" in cmdline:
+                            raise RuntimeError(
+                                f"Another AUREON bot is already running (PID {other_pid}). "
+                                f"Refusing to start a second instance — they would conflict on "
+                                f"magic number 20260522 and OCO sibling tracking. "
+                                f"Kill the other instance first: taskkill /F /PID {other_pid}"
+                            )
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass  # stale lock, safe to take it
+                # else: stale lock, fall through and take it
+            except (ValueError, OSError):
+                pass  # malformed lock, take it
+        with open(self.pid_lock_path, 'w') as f:
+            f.write(str(os.getpid()))
+        log.info(f"PID lock acquired: {self.pid_lock_path} = {os.getpid()}")
+
+    def _release_pid_lock(self):
+        try:
+            if os.path.exists(self.pid_lock_path):
+                with open(self.pid_lock_path) as f:
+                    locked_pid = int(f.read().strip())
+                if locked_pid == os.getpid():
+                    os.remove(self.pid_lock_path)
+                    log.info("PID lock released")
+        except Exception as e:
+            log.warning(f"Could not release PID lock: {e}")
 
     def _broker_date(self, utc_now: pd.Timestamp) -> DateType:
         return (utc_now + pd.Timedelta(hours=self.cfg.broker_tz_offset_hours)).date()
@@ -162,7 +242,7 @@ class LiveTrader:
         """
         Return the largest safe lot under Funding Pips per-trade risk rules.
         3% on accounts <$50k, 2% on ≥$50k. Apply slippage buffer + conservatism.
-        Rounds DOWN to broker's 0.01 lot precision so we never breach.
+        Rounds DOWN to broker's actual volume_step precision (v2.5: validated).
         """
         risk_pct = (self.cfg.risk_pct_over_50k if balance >= 50_000
                     else self.cfg.risk_pct_under_50k)
@@ -171,8 +251,24 @@ class LiveTrader:
         max_lot = max_loss / (self.cfg.sl_dist * 100)
         # Apply user conservatism multiplier
         effective_lot = max_lot * self.cfg.lot_conservatism
-        # Floor to 0.01 precision (round DOWN, never UP)
-        effective_lot = max(0.01, int(effective_lot * 100) / 100)
+
+        # v2.5: validate against broker's actual volume_step/min/max
+        try:
+            si = self.adapter.mt5.symbol_info(self.cfg.symbol)
+            if si is not None:
+                step = si.volume_step if si.volume_step > 0 else 0.01
+                vmin = si.volume_min if si.volume_min > 0 else 0.01
+                vmax = si.volume_max if si.volume_max > 0 else 100.0
+                # Floor to broker step
+                steps = int(effective_lot / step)
+                effective_lot = max(vmin, min(vmax, steps * step))
+                # Round to step decimal precision for cleanness
+                effective_lot = round(effective_lot, 2)
+            else:
+                effective_lot = max(0.01, int(effective_lot * 100) / 100)
+        except Exception as e:
+            log.warning(f"Lot validation against broker volume_step failed: {e}")
+            effective_lot = max(0.01, int(effective_lot * 100) / 100)
         return effective_lot
 
     def _refresh_from_broker(self, reason: str = "startup"):
@@ -388,20 +484,86 @@ class LiveTrader:
                 self._save_state()
 
     def _process_anchor(self, label: str, anchor_utc: pd.Timestamp):
+        # v2.5: account floor check — halt new entries if balance dropped too far
+        try:
+            ainfo = self.adapter.mt5.account_info()
+            if ainfo is not None:
+                floor = self.cfg.starting_balance * self.cfg.account_floor_pct
+                if ainfo.balance < floor:
+                    self.tele.warn(
+                        f"⛔ *{label} BLOCKED — account floor breached*\n"
+                        f"Balance: `${ainfo.balance:,.2f}`\n"
+                        f"Floor:   `${floor:,.2f}` ({self.cfg.account_floor_pct*100:.0f}% of starting)\n"
+                        f"No new entries until balance recovers."
+                    )
+                    return
+        except Exception as e:
+            log.warning(f"Account floor check failed: {e}")
+
         anchor_price = self.adapter.get_m5_close(self.cfg.symbol, anchor_utc)
         if anchor_price is None:
             self.tele.warn(f"⚠️ Could not fetch M5 close at {anchor_utc} — skipping {label}")
             return
 
-        # Get current market price BEFORE attempting any orders.
-        # We need this to detect gap-anchors that would produce invalid stops.
+        # v2.5: SCHEDULE deferred placement instead of blocking sleep.
+        # The bot tick loop will pick this up 5 seconds later and complete the
+        # placement. This keeps the bot responsive to fills/SL updates on EXISTING
+        # positions during the settle window.
+        defer_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=5)
+        self._deferred_anchor = {
+            'label': label,
+            'anchor_utc': anchor_utc,
+            'anchor_price': anchor_price,
+            'defer_until': defer_until,
+        }
+        log.info(
+            f"{label}: anchor captured @ ${anchor_price:.2f}, deferring placement to "
+            f"{defer_until.strftime('%H:%M:%S')} UTC (5s settle wait — non-blocking)"
+        )
+
+    def _complete_deferred_anchor(self):
+        """v2.5: Called from the tick loop. Completes a deferred anchor placement
+        after the 5-second settle window. Non-blocking — doesn't stop position management."""
+        if self._deferred_anchor is None:
+            return
+        if pd.Timestamp.now(tz='UTC') < self._deferred_anchor['defer_until']:
+            return  # still waiting
+
+        d = self._deferred_anchor
+        self._deferred_anchor = None  # consume
+
+        label = d['label']
+        anchor_price = d['anchor_price']
+        anchor_utc = d['anchor_utc']
+
+        # v2.5: tick freshness check — refuse to use stale market data
         current_price = None
         try:
             tick = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
-            if tick:
+            if tick is not None:
+                # tick.time is broker-time as unix; subtract broker offset to get UTC unix
+                broker_offset = self.adapter.tick_time_offset_hours * 3600
+                tick_utc_unix = tick.time - broker_offset
+                now_unix = pd.Timestamp.now(tz='UTC').timestamp()
+                tick_age_s = abs(now_unix - tick_utc_unix)
+                if tick_age_s > 60:
+                    self.tele.warn(
+                        f"⚠️ *{label} skipped — stale tick*\n"
+                        f"Tick age: {tick_age_s:.0f}s (> 60s threshold)\n"
+                        f"MT5 terminal may have lost connection. Skipping placement."
+                    )
+                    return
                 current_price = (tick.ask + tick.bid) / 2
         except Exception as e:
-            log.warning(f"Could not read current tick for {label}: {e}")
+            log.warning(f"Could not read fresh tick for {label}: {e}")
+            self.tele.warn(f"⚠️ {label}: tick read failed — skipping")
+            return
+
+        # === continue with original gap detection, pre-flight, and placement ===
+        self._place_orders_for_anchor(label, anchor_utc, anchor_price, current_price)
+
+    def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_price):
+        # All the original gap detection + pre-flight + placement logic.
 
         # ADAPTIVE RE-ANCHOR ON GAP DAYS
         # If the captured anchor is too far from current market, BOTH stops
@@ -414,7 +576,7 @@ class LiveTrader:
         gap_tp_dist = self.cfg.tp_dist
         if current_price is not None:
             gap = abs(current_price - anchor_price)
-            if gap > self.cfg.trigger_dist + 0.5:  # 50¢ buffer past the trigger
+            if gap > self.cfg.trigger_dist + 0.1:  # v2.3: was 0.5, now 0.1 — catches edge cases where market crept 10¢+ past trigger
                 # Try to use the most recent M5 close as the new anchor.
                 # We fetch the M5 bar just before NOW (not the scheduled anchor time).
                 try:
@@ -439,7 +601,7 @@ class LiveTrader:
                     f"⚠️ *{label} GAP DETECTED*\n"
                     f"Original anchor: `${anchor_price:.2f}`\n"
                     f"Current market:  `${current_price:.2f}`\n"
-                    f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + 0.5:.2f} threshold)\n"
+                    f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + 0.1:.2f} threshold)\n"
                     f"→ Re-anchoring to current M5 close `${new_anchor:.2f}`\n"
                     f"→ Half-lot `{gap_lot}` with tight SL `${gap_sl_dist:.0f}` "
                     f"(reduced risk for gap-day breakout)"
@@ -454,19 +616,35 @@ class LiveTrader:
         tp_sell   = round(sell_stop - gap_tp_dist, 2)
 
         # FINAL SAFETY CHECK — after re-anchor, both stops should be on opposite
-        # sides of current price. If not, something is still wrong → skip.
+        # sides of current price. If only ONE is invalid, place the valid side
+        # alone (v2.3 fix — was skipping both, leaving valid trades on the table).
+        skip_buy = False
+        skip_sell = False
         if current_price is not None:
             buy_invalid  = buy_stop  < current_price
             sell_invalid = sell_stop > current_price
-            if buy_invalid or sell_invalid:
+            if buy_invalid and sell_invalid:
                 self.tele.error(
-                    f"❌ *{label} skipped after re-anchor*\n"
+                    f"❌ *{label} skipped — BOTH sides invalid after re-anchor*\n"
                     f"Anchor ${anchor_price:.2f}, market ${current_price:.2f}\n"
-                    f"BUY stop ${buy_stop} {'INVALID (below market)' if buy_invalid else 'ok'}\n"
-                    f"SELL stop ${sell_stop} {'INVALID (above market)' if sell_invalid else 'ok'}\n"
+                    f"BUY ${buy_stop} below market, SELL ${sell_stop} above market.\n"
                     f"Refusing to place orders that would be rejected."
                 )
                 return
+            elif buy_invalid:
+                skip_buy = True
+                self.tele.warn(
+                    f"⚠️ *{label} — BUY invalid, placing SELL alone*\n"
+                    f"BUY ${buy_stop} would be below market ${current_price:.2f} (skip).\n"
+                    f"SELL ${sell_stop} valid — proceeding with one-sided entry."
+                )
+            elif sell_invalid:
+                skip_sell = True
+                self.tele.warn(
+                    f"⚠️ *{label} — SELL invalid, placing BUY alone*\n"
+                    f"SELL ${sell_stop} would be above market ${current_price:.2f} (skip).\n"
+                    f"BUY ${buy_stop} valid — proceeding with one-sided entry."
+                )
 
         mode_tag = " [GAP MODE: half-lot, $10 SL]" if gap_mode else ""
         self.tele.info(
@@ -477,52 +655,67 @@ class LiveTrader:
         )
 
         # PRE-FLIGHT VALIDATION — don't send orders that will be rejected.
-        # MT5 has no native OCO; these are two independent pending stops.
-        # A BUY_STOP must be ABOVE current ask; a SELL_STOP must be BELOW current bid.
-        # If our anchor + $5 trigger is on the wrong side of current market,
-        # the broker will return INVALID_PRICE. Better to detect locally and skip.
+        # v2.3: if only ONE side is invalid, place the valid side alone.
         if current_price is not None:
             buy_invalid  = buy_stop  <= current_price
             sell_invalid = sell_stop >= current_price
-            if buy_invalid or sell_invalid:
+            if buy_invalid and sell_invalid:
                 self.tele.warn(
-                    f"⚠️ *{label} skipped — pre-flight rejected*\n"
+                    f"⚠️ *{label} skipped — BOTH sides invalid in pre-flight*\n"
                     f"Anchor ${anchor_price:.2f}, market ${current_price:.2f}\n"
-                    f"BUY  stop ${buy_stop}: "
-                    f"{'❌ would be BELOW market (invalid)' if buy_invalid else '✅ ok'}\n"
-                    f"SELL stop ${sell_stop}: "
-                    f"{'❌ would be ABOVE market (invalid)' if sell_invalid else '✅ ok'}\n"
-                    f"Not sending. {label} marked processed."
+                    f"BUY ${buy_stop} ≤ market, SELL ${sell_stop} ≥ market. Not sending."
                 )
                 return
+            elif buy_invalid and not skip_buy:
+                skip_buy = True
+                self.tele.warn(
+                    f"⚠️ *{label} pre-flight — placing SELL alone*\n"
+                    f"BUY ${buy_stop} ≤ market ${current_price:.2f}; SELL ${sell_stop} valid."
+                )
+            elif sell_invalid and not skip_sell:
+                skip_sell = True
+                self.tele.warn(
+                    f"⚠️ *{label} pre-flight — placing BUY alone*\n"
+                    f"SELL ${sell_stop} ≥ market ${current_price:.2f}; BUY ${buy_stop} valid."
+                )
 
-        buy_res = self.adapter.place_stop_order(
-            self.cfg.symbol, 'BUY', buy_stop, gap_lot,
-            sl=sl_buy, tp=tp_buy,
-            comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}",
-            dry_run=self.paper)
-        sell_res = self.adapter.place_stop_order(
-            self.cfg.symbol, 'SELL', sell_stop, gap_lot,
-            sl=sl_sell, tp=tp_sell,
-            comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}",
-            dry_run=self.paper)
+        # v2.3: only place the sides that passed pre-flight
+        buy_res = None
+        sell_res = None
+        if not skip_buy:
+            buy_res = self.adapter.place_stop_order(
+                self.cfg.symbol, 'BUY', buy_stop, gap_lot,
+                sl=sl_buy, tp=tp_buy,
+                comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}",
+                dry_run=self.paper)
+        if not skip_sell:
+            sell_res = self.adapter.place_stop_order(
+                self.cfg.symbol, 'SELL', sell_stop, gap_lot,
+                sl=sl_sell, tp=tp_sell,
+                comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}",
+                dry_run=self.paper)
 
-        buy_ticket  = self._extract_ticket(buy_res,  f"paper_{label}_BUY")
-        sell_ticket = self._extract_ticket(sell_res, f"paper_{label}_SELL")
+        buy_ticket  = self._extract_ticket(buy_res,  f"paper_{label}_BUY")  if buy_res  is not None else None
+        sell_ticket = self._extract_ticket(sell_res, f"paper_{label}_SELL") if sell_res is not None else None
 
-        if buy_ticket is not None and sell_ticket is not None:
-            self.shadow_pendings[buy_ticket] = {
-                'anchor_label': label, 'side': 'BUY',
-                'sibling_ticket': sell_ticket,
-                'entry_price': buy_stop,
-            }
-            self.shadow_pendings[sell_ticket] = {
-                'anchor_label': label, 'side': 'SELL',
-                'sibling_ticket': buy_ticket,
-                'entry_price': sell_stop,
-            }
-            # Mark a "hot polling" window — for the next 30 sec, _tick() runs
-            # at 0.2s cadence instead of 1s so we catch fills fast.
+        # v2.3: success path includes single-side placement
+        buy_ok  = (buy_ticket  is not None) if not skip_buy  else True   # treat skipped-by-design as "no problem"
+        sell_ok = (sell_ticket is not None) if not skip_sell else True
+
+        if buy_ok and sell_ok:
+            if buy_ticket is not None:
+                self.shadow_pendings[buy_ticket] = {
+                    'anchor_label': label, 'side': 'BUY',
+                    'sibling_ticket': sell_ticket,  # None when SELL was skipped — fill handler tolerates None
+                    'entry_price': buy_stop,
+                }
+            if sell_ticket is not None:
+                self.shadow_pendings[sell_ticket] = {
+                    'anchor_label': label, 'side': 'SELL',
+                    'sibling_ticket': buy_ticket,  # None when BUY was skipped
+                    'entry_price': sell_stop,
+                }
+            # Hot polling window
             self._hot_poll_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=30)
             return
 
@@ -677,6 +870,34 @@ class LiveTrader:
         broker_pos_tickets  = {int(p.ticket) for p in broker_positions}
         broker_pend_tickets = {int(o.ticket) for o in broker_pendings}
 
+        # v2.5: REHYDRATE from persisted state for any broker position we don't
+        # already track in-memory. This handles bot restart mid-trade so we
+        # preserve max_fav (= $5 lock state) and fill_time (= freeze gate state).
+        if self._pending_shadow_rehydrate:
+            for broker_p in broker_positions:
+                tk = int(broker_p.ticket)
+                if tk in self.shadow_positions:
+                    continue
+                saved = self._pending_shadow_rehydrate.get(str(tk))
+                if saved:
+                    self.shadow_positions[tk] = {
+                        'anchor_label': saved.get('anchor_label', 'RECOVERED'),
+                        'side':         saved.get('side') or ('BUY' if broker_p.type == 0 else 'SELL'),
+                        'entry_price':  float(broker_p.price_open),
+                        'current_sl':   float(broker_p.sl),
+                        'tp_level':     float(broker_p.tp),
+                        # v2.5 critical: restore max_fav from persisted state, not entry price
+                        'max_fav':      float(saved.get('max_fav') or broker_p.price_open),
+                        'fill_time':    saved.get('fill_time') or pd.Timestamp.now(tz='UTC').isoformat(),
+                    }
+                    self.tele.info(
+                        f"♻️ Rehydrated position {tk} {saved.get('side','?')} "
+                        f"entry=${broker_p.price_open:.2f} max_fav=${float(saved.get('max_fav') or broker_p.price_open):.2f} "
+                        f"SL=${broker_p.sl:.2f} (lock state preserved)"
+                    )
+            # Clear the rehydration source after first reconcile
+            self._pending_shadow_rehydrate = {}
+
         # Detect fills (sibling cancel)
         for ticket, info in list(self.shadow_pendings.items()):
             if isinstance(ticket, str): continue
@@ -687,13 +908,14 @@ class LiveTrader:
                     f"🎯 FILL: *{info['anchor_label']}* {info['side']} "
                     f"@ ${info['entry_price']:.2f} (ticket {ticket})"
                 )
-                # Cancel sibling (OCO)
-                if sibling in broker_pend_tickets:
+                # Cancel sibling (OCO) — v2.3: sibling may be None if other side was skipped pre-flight
+                if sibling is not None and sibling in broker_pend_tickets:
                     try:
                         self.adapter.cancel_order(sibling)
                     except Exception as e:
                         self.tele.warn(f"Could not cancel sibling {sibling}: {e}")
-                self.shadow_pendings.pop(sibling, None)
+                if sibling is not None:
+                    self.shadow_pendings.pop(sibling, None)
                 # Promote to managed position
                 broker_p = next(p for p in broker_positions if int(p.ticket) == ticket)
                 # v2.3: capture broker's actual fill timestamp for freeze logic
@@ -830,20 +1052,71 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def _flatten_all(self, reason: str = "Manual"):
+        """v2.5: hardened EOD flatten — retries up to 3x on rc=-1, verifies via broker query.
+        Critical: if a position fails to close at EOD, it stays open OVERNIGHT
+        with bracket SL, and the bot loses tracking. Worth fighting for the close."""
         self.tele.warn(f"FLATTEN ({reason}) — closing {len(self.shadow_positions)} positions, "
                        f"cancelling {len(self.shadow_pendings)} pendings")
+
+        import time as _time
+
+        # Close positions with retry+verify
+        failed_closes = []
         for ticket in list(self.shadow_positions.keys()):
-            try:
-                self.adapter.close_position(ticket, dry_run=self.paper)
-            except Exception as e:
-                self.tele.error(f"Failed to close {ticket}: {e}")
+            closed = False
+            for attempt in range(3):
+                try:
+                    result = self.adapter.close_position(ticket, dry_run=self.paper)
+                    if self.paper:
+                        closed = True
+                        break
+                    # Verify by querying broker
+                    _time.sleep(0.3)
+                    still_open = self.adapter.mt5.positions_get(ticket=ticket)
+                    if not still_open:
+                        closed = True
+                        log.info(f"Position {ticket} verified closed (attempt {attempt+1})")
+                        break
+                    else:
+                        log.warning(f"Position {ticket} still open after close attempt {attempt+1} — retrying")
+                except Exception as e:
+                    log.warning(f"Close {ticket} attempt {attempt+1} raised: {e}")
+                _time.sleep(0.5)
+            if not closed:
+                failed_closes.append(ticket)
             self.shadow_positions.pop(ticket, None)
+
+        # Cancel pendings with retry+verify
+        failed_cancels = []
         for ticket in list(self.shadow_pendings.keys()):
-            try:
-                self.adapter.cancel_order(ticket, dry_run=self.paper)
-            except Exception as e:
-                self.tele.error(f"Failed to cancel {ticket}: {e}")
+            cancelled = False
+            for attempt in range(3):
+                try:
+                    self.adapter.cancel_order(ticket, dry_run=self.paper)
+                    if self.paper:
+                        cancelled = True
+                        break
+                    _time.sleep(0.2)
+                    still_pending = self.adapter.mt5.orders_get(ticket=int(ticket))
+                    if not still_pending:
+                        cancelled = True
+                        break
+                except Exception as e:
+                    log.warning(f"Cancel {ticket} attempt {attempt+1} raised: {e}")
+                _time.sleep(0.3)
+            if not cancelled:
+                failed_cancels.append(ticket)
             self.shadow_pendings.pop(ticket, None)
+
+        # Critical alert if anything failed to close — these are real money exposure
+        if failed_closes or failed_cancels:
+            self.tele.critical(
+                f"🚨 *FLATTEN INCOMPLETE — manual intervention needed*\n"
+                f"Failed to close {len(failed_closes)} positions: `{failed_closes}`\n"
+                f"Failed to cancel {len(failed_cancels)} pendings: `{failed_cancels}`\n"
+                f"These remain at broker with bracket SL but no bot tracking.\n"
+                f"Check MT5 terminal manually."
+            )
 
     def _send_daily_summary(self, day_str: str, pnl: float):
         emoji = "✅" if pnl > 0 else ("➖" if pnl == 0 else "📉")
@@ -953,7 +1226,22 @@ class LiveTrader:
         except KeyboardInterrupt:
             self.tele.warn("Manual interrupt received — flattening positions")
             self._flatten_all(reason="ManualInterrupt")
+        except Exception as e:
+            # v2.5: capture unexpected exceptions, alert, then exit cleanly
+            import traceback
+            tb = traceback.format_exc()
+            self.tele.critical(
+                f"🚨 *AUREON CRASHED — unhandled exception*\n"
+                f"`{type(e).__name__}: {e}`\n"
+                f"Watchdog will restart. Open positions stay protected by broker SL.\n"
+                f"Traceback in logs."
+            )
+            log.error(f"Unhandled exception in run loop:\n{tb}")
+            # Re-raise so watchdog can restart cleanly
+            raise
         finally:
+            # v2.5: always release PID lock so watchdog restart isn't blocked
+            self._release_pid_lock()
             self.tele.stop()
 
     def _tick(self):
@@ -1001,6 +1289,9 @@ class LiveTrader:
 
         # 7. Anchor due?
         self._process_anchor_if_due(broker_date, utc_now)
+
+        # 7b. v2.5: Complete any deferred anchor placement (5s settle window)
+        self._complete_deferred_anchor()
 
         # 8. M1 bar close → trails
         current_minute = utc_now.floor('1min')

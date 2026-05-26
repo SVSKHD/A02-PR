@@ -1,11 +1,12 @@
 {
-  "ts": "2026-05-25T02:04:55.256073+00:00",
-  "broker_date": "2026-05-25",
+  "ts": "2026-05-26T08:45:16.343918+00:00",
+  "broker_date": "2026-05-26",
   "daily_pnl_realized": 0.0,
   "open_positions": 0,
   "pending_orders": 0,
   "anchors_processed_today": [
-    "A1_02h_Asia"
+    "A1_02h_Asia",
+    "A2_10h_London"
   ],
   "kill_switch_locked": false,
   "paused": false,
