@@ -509,7 +509,10 @@ class LiveTrader:
         # The bot tick loop will pick this up 5 seconds later and complete the
         # placement. This keeps the bot responsive to fills/SL updates on EXISTING
         # positions during the settle window.
-        defer_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=5)
+        # v2.5.1: bumped 5s → 15s after observing A2 + A4 (session opens) still
+        # fail with 5s wait. NY/London open server load needs ~10-12s to settle.
+        # Cost: ~$1-3 of price slippage in fast markets. Benefit: ~$0 → working bot.
+        defer_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=15)
         self._deferred_anchor = {
             'label': label,
             'anchor_utc': anchor_utc,
@@ -518,7 +521,7 @@ class LiveTrader:
         }
         log.info(
             f"{label}: anchor captured @ ${anchor_price:.2f}, deferring placement to "
-            f"{defer_until.strftime('%H:%M:%S')} UTC (5s settle wait — non-blocking)"
+            f"{defer_until.strftime('%H:%M:%S')} UTC (15s settle wait — non-blocking)"
         )
 
     def _complete_deferred_anchor(self):
