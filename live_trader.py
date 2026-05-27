@@ -1,8 +1,22 @@
 """
-AUREON v2 — LiveTrader: production-ready live/paper trading loop.
+AUREON v2.5.2 — LiveTrader: production-ready live/paper trading loop.
 
 This module implements the runtime that was stubbed in bot.py's run_live().
 Imports cleanly into bot.py.
+
+v2.5.2 changes (2026-05-27, post-A2 failure analysis)
+----------------------------------------------------
+1. Per-anchor deferred wait — A2 (London) and A4 (NY) now wait 30s before
+   placement (was 15s globally). A1 and A3 remain at 15s.
+2. Retry-on-rc=-1 — if both pending stops return rc=-1 / no_response (the
+   May 27 A2 failure mode), placement is re-scheduled via the existing
+   deferred-anchor mechanism rather than being abandoned. Up to 2 retries
+   with 15s, then 30s backoff. Position management on existing trades
+   continues uninterrupted during the wait.
+
+Max total recovery window per anchor:
+   A1/A3:  15s defer + 15s retry-1 + 30s retry-2 = 60s
+   A2/A4:  30s defer + 15s retry-1 + 30s retry-2 = 75s
 
 Architecture
 ------------
@@ -64,6 +78,20 @@ class LiveTrader:
     STATUS_EVERY_TICKS    = 6         # write status.json every 30s
     COMMAND_POLL_EVERY    = 1         # poll commands every tick
 
+    # v2.5.2: per-anchor deferred wait (seconds). Session opens (A2 London,
+    # A4 NY) get more time for broker comm to stabilize past the volume spike.
+    DEFER_WAIT_BY_ANCHOR = {
+        'A1_02h_Asia':    15,
+        'A2_10h_London':  30,
+        'A3_14h_Overlap': 15,
+        'A4_17h_NY':      30,
+    }
+    DEFER_WAIT_DEFAULT = 15
+
+    # v2.5.2: retry on rc=-1 / no_response from broker
+    MAX_PLACEMENT_RETRIES = 2          # initial + 2 retries = 3 attempts total
+    RETRY_BACKOFF_BASE_SEC = 15        # delays: 15s, 30s
+
     def __init__(self, cfg, adapter, paper: bool = True):
         from bot import Position, anchor_datetime_utc, eod_datetime_utc  # late import
 
@@ -114,6 +142,7 @@ class LiveTrader:
         # to catch fills fast. After that, back to normal 1.0s cadence.
         self._hot_poll_until: Optional[pd.Timestamp] = None
         # v2.5: deferred anchor placement (non-blocking 5s settle wait)
+        # v2.5.2: now carries retry_count for rc=-1 recovery
         self._deferred_anchor: Optional[Dict] = None
 
         # Pause flag (set via /pause command)
@@ -127,7 +156,7 @@ class LiveTrader:
                      "outcome", "pnl_usd", "ticket"])
 
         self.tele.info(
-            f"LiveTrader initialized ({'PAPER' if paper else 'LIVE'}) — "
+            f"LiveTrader v2.5.2 initialized ({'PAPER' if paper else 'LIVE'}) — "
             f"4-anchor multi-session AUREON, lot {cfg.lot_size}"
         )
         self.tele.info(
@@ -411,6 +440,14 @@ class LiveTrader:
             "broker_server":  broker_info.get("server"),
             "daily_loss_pct": self.cfg.daily_loss_pct,
             "kill_threshold_usd": self.cfg.daily_loss_pct * self.cfg.starting_balance,
+            # v2.5.2: surface retry state in status for watchdog/dashboard visibility
+            "deferred_anchor": (
+                {
+                    'label': self._deferred_anchor['label'],
+                    'retry_count': self._deferred_anchor.get('retry_count', 0),
+                    'defer_until': str(self._deferred_anchor['defer_until']),
+                } if self._deferred_anchor else None
+            ),
         }
         tmp = self.status_path + ".tmp"
         with open(tmp, "w") as f:
@@ -505,28 +542,31 @@ class LiveTrader:
             self.tele.warn(f"⚠️ Could not fetch M5 close at {anchor_utc} — skipping {label}")
             return
 
-        # v2.5: SCHEDULE deferred placement instead of blocking sleep.
-        # The bot tick loop will pick this up 5 seconds later and complete the
-        # placement. This keeps the bot responsive to fills/SL updates on EXISTING
-        # positions during the settle window.
-        # v2.5.1: bumped 5s → 15s after observing A2 + A4 (session opens) still
-        # fail with 5s wait. NY/London open server load needs ~10-12s to settle.
-        # Cost: ~$1-3 of price slippage in fast markets. Benefit: ~$0 → working bot.
-        defer_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=15)
+        # v2.5.2: Per-anchor deferred wait. A2 (London open) and A4 (NY open) need
+        # longer than calm sessions for broker comm to stabilize past the volume spike.
+        # 2026-05-27 incident: A2 hit rc=-1 with 15s wait on both Pepperstone and
+        # MetaQuotes. Bumping A2/A4 to 30s + retry mechanism in _place_orders_for_anchor
+        # gives up to 75s total recovery window per anchor.
+        defer_seconds = self.DEFER_WAIT_BY_ANCHOR.get(label, self.DEFER_WAIT_DEFAULT)
+        defer_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=defer_seconds)
         self._deferred_anchor = {
             'label': label,
             'anchor_utc': anchor_utc,
             'anchor_price': anchor_price,
             'defer_until': defer_until,
+            'retry_count': 0,                # v2.5.2: retry counter for rc=-1 recovery
         }
         log.info(
             f"{label}: anchor captured @ ${anchor_price:.2f}, deferring placement to "
-            f"{defer_until.strftime('%H:%M:%S')} UTC (15s settle wait — non-blocking)"
+            f"{defer_until.strftime('%H:%M:%S')} UTC ({defer_seconds}s settle wait — non-blocking)"
         )
 
     def _complete_deferred_anchor(self):
         """v2.5: Called from the tick loop. Completes a deferred anchor placement
-        after the 5-second settle window. Non-blocking — doesn't stop position management."""
+        after the settle window. Non-blocking — doesn't stop position management.
+
+        v2.5.2: Plumbs retry_count through to placement so rc=-1 retries
+        re-enter via this same path without losing retry state."""
         if self._deferred_anchor is None:
             return
         if pd.Timestamp.now(tz='UTC') < self._deferred_anchor['defer_until']:
@@ -538,6 +578,7 @@ class LiveTrader:
         label = d['label']
         anchor_price = d['anchor_price']
         anchor_utc = d['anchor_utc']
+        retry_count = d.get('retry_count', 0)   # v2.5.2: pull retry counter
 
         # v2.5: tick freshness check — refuse to use stale market data
         current_price = None
@@ -562,11 +603,12 @@ class LiveTrader:
             self.tele.warn(f"⚠️ {label}: tick read failed — skipping")
             return
 
-        # === continue with original gap detection, pre-flight, and placement ===
-        self._place_orders_for_anchor(label, anchor_utc, anchor_price, current_price)
+        # v2.5.2: pass retry_count down for rc=-1 retry decision
+        self._place_orders_for_anchor(label, anchor_utc, anchor_price, current_price, retry_count)
 
-    def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_price):
+    def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_price, retry_count=0):
         # All the original gap detection + pre-flight + placement logic.
+        # v2.5.2: retry_count parameter added — used in the rc=-1 recovery block below.
 
         # ADAPTIVE RE-ANCHOR ON GAP DAYS
         # If the captured anchor is too far from current market, BOTH stops
@@ -600,8 +642,9 @@ class LiveTrader:
                 gap_lot = round(self.cfg.lot_size / 2, 2)  # half-size
                 gap_sl_dist = 10.0    # tight SL: $10 instead of $18
                 gap_tp_dist = self.cfg.tp_dist  # keep normal TP
+                retry_tag = f" (retry {retry_count})" if retry_count > 0 else ""    # v2.5.2
                 self.tele.warn(
-                    f"⚠️ *{label} GAP DETECTED*\n"
+                    f"⚠️ *{label} GAP DETECTED{retry_tag}*\n"
                     f"Original anchor: `${anchor_price:.2f}`\n"
                     f"Current market:  `${current_price:.2f}`\n"
                     f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + 0.1:.2f} threshold)\n"
@@ -650,8 +693,9 @@ class LiveTrader:
                 )
 
         mode_tag = " [GAP MODE: half-lot, $10 SL]" if gap_mode else ""
+        retry_tag = f" [RETRY {retry_count}]" if retry_count > 0 else ""     # v2.5.2
         self.tele.info(
-            f"⚓ *{label}* anchor=${anchor_price:.2f}{mode_tag}\n"
+            f"⚓ *{label}*{retry_tag} anchor=${anchor_price:.2f}{mode_tag}\n"
             f"  BUY  stop @ ${buy_stop}  (SL ${sl_buy}, TP ${tp_buy})\n"
             f"  SELL stop @ ${sell_stop} (SL ${sl_sell}, TP ${tp_sell})\n"
             f"  Lot: `{gap_lot}`"
@@ -683,19 +727,21 @@ class LiveTrader:
                 )
 
         # v2.3: only place the sides that passed pre-flight
+        # v2.5.2: append retry tag to comment for MT5 audit trail
+        retry_comment = f"_R{retry_count}" if retry_count > 0 else ""
         buy_res = None
         sell_res = None
         if not skip_buy:
             buy_res = self.adapter.place_stop_order(
                 self.cfg.symbol, 'BUY', buy_stop, gap_lot,
                 sl=sl_buy, tp=tp_buy,
-                comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}",
+                comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}{retry_comment}",
                 dry_run=self.paper)
         if not skip_sell:
             sell_res = self.adapter.place_stop_order(
                 self.cfg.symbol, 'SELL', sell_stop, gap_lot,
                 sl=sl_sell, tp=tp_sell,
-                comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}",
+                comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}{retry_comment}",
                 dry_run=self.paper)
 
         buy_ticket  = self._extract_ticket(buy_res,  f"paper_{label}_BUY")  if buy_res  is not None else None
@@ -720,6 +766,9 @@ class LiveTrader:
                 }
             # Hot polling window
             self._hot_poll_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=30)
+            # v2.5.2: surface retry success
+            if retry_count > 0:
+                self.tele.success(f"✅ *{label} placement succeeded on retry {retry_count}*")
             return
 
         # If we got here, pre-flight passed but the broker STILL rejected
@@ -741,7 +790,7 @@ class LiveTrader:
                 except Exception as e:
                     self.tele.error(f"Failed to cancel orphan {orphan}: {e}")
 
-        # ----- CLEVER RECOVERY (narrow scope) -----
+        # ----- IN-FLIGHT BREAKOUT RECOVERY (rc=10015 INVALID_PRICE only) -----
         # When pre-flight passed but broker rejected with INVALID_PRICE on one
         # side, it means price moved past our threshold WHILE the order was in
         # flight (sub-second timing). This is a real breakout we just missed
@@ -819,11 +868,38 @@ class LiveTrader:
                 )
             return
 
+        # ----- v2.5.2: rc=-1 / no_response RETRY -----
+        # If broker simply didn't respond (most likely VPS↔broker network spike
+        # at session open), re-schedule placement via the deferred-anchor
+        # mechanism instead of giving up. Tick loop continues managing existing
+        # positions during the wait. Backoff: 15s, 30s. Max 2 retries.
+        both_no_response_now = (buy_rc in (None, -1)) and (sell_rc in (None, -1))
+        if both_no_response_now and retry_count < self.MAX_PLACEMENT_RETRIES:
+            retry_delay = self.RETRY_BACKOFF_BASE_SEC * (1 + retry_count)  # 15s, then 30s
+            next_defer = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=retry_delay)
+            self._deferred_anchor = {
+                'label': label,
+                'anchor_utc': anchor_utc,
+                'anchor_price': anchor_price,    # use the *current* anchor
+                                                  # (already re-anchored if gap mode)
+                'defer_until': next_defer,
+                'retry_count': retry_count + 1,
+            }
+            self.tele.warn(
+                f"🔁 *{label} retry {retry_count + 1}/{self.MAX_PLACEMENT_RETRIES} scheduled*\n"
+                f"Both sides returned rc=-1 (broker/network comm failure).\n"
+                f"Re-attempting in `{retry_delay}s` at `{next_defer.strftime('%H:%M:%S')}` UTC.\n"
+                f"Position management on existing trades continues uninterrupted."
+            )
+            return  # tick loop will pick this up via _complete_deferred_anchor
+
         # Out of catchable zone OR no breakout direction confirmed — skip cleanly
         # v2.3: distinguish "order placement failed" (rc=-1 etc) from "genuine no-breakout"
+        # v2.5.2: append retry-exhausted suffix to skip message
         both_no_response = (buy_rc in (None, -1)) and (sell_rc in (None, -1))
         if both_no_response:
-            skip_reason = "ORDER PLACEMENT FAILED — broker returned no response on both sides"
+            retry_suffix = f" — gave up after {retry_count} retries" if retry_count > 0 else ""
+            skip_reason = f"ORDER PLACEMENT FAILED — broker returned no response on both sides{retry_suffix}"
         elif breakout_side is not None and slip > 15.0:
             skip_reason = f"slip ${slip:.2f} > $15 (move exhausted, would chase top/bottom)"
         elif breakout_side is not None and slip < 0.5:
@@ -1111,6 +1187,11 @@ class LiveTrader:
                 failed_cancels.append(ticket)
             self.shadow_pendings.pop(ticket, None)
 
+        # v2.5.2: if a deferred anchor was queued, drop it on flatten (consistent state)
+        if self._deferred_anchor is not None:
+            log.info(f"Flatten dropped deferred anchor: {self._deferred_anchor.get('label')}")
+            self._deferred_anchor = None
+
         # Critical alert if anything failed to close — these are real money exposure
         if failed_closes or failed_cancels:
             self.tele.critical(
@@ -1150,9 +1231,10 @@ class LiveTrader:
 
     def run(self):
         self.tele.success(
-            f"🚀 *AUREON v2 {'PAPER' if self.paper else 'LIVE'} starting*\n"
+            f"🚀 *AUREON v2.5.2 {'PAPER' if self.paper else 'LIVE'} starting*\n"
             f"Lot: `{self.cfg.lot_size}` (auto_lot={'on' if self.cfg.auto_lot else 'off'})\n"
-            f"Kill switch: `-{self.cfg.daily_loss_pct*100:.1f}%`"
+            f"Kill switch: `-{self.cfg.daily_loss_pct*100:.1f}%`\n"
+            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)"
         )
 
         # Broker time check.
@@ -1293,7 +1375,7 @@ class LiveTrader:
         # 7. Anchor due?
         self._process_anchor_if_due(broker_date, utc_now)
 
-        # 7b. v2.5: Complete any deferred anchor placement (5s settle window)
+        # 7b. v2.5: Complete any deferred anchor placement (settle window or retry)
         self._complete_deferred_anchor()
 
         # 8. M1 bar close → trails
