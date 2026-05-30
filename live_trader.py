@@ -1,8 +1,34 @@
 """
-AUREON v2.5.2 — LiveTrader: production-ready live/paper trading loop.
+AUREON v2.5.3 — LiveTrader: production-ready live/paper trading loop.
 
 This module implements the runtime that was stubbed in bot.py's run_live().
 Imports cleanly into bot.py.
+
+v2.5.3 changes (2026-05-27 evening, post-A4 failure analysis)
+-------------------------------------------------------------
+Root cause confirmed today: after long idle periods between anchors (the bot
+does only read-only mt5 calls in its tick loop), the MT5 Python SDK's *write*
+channel goes cold. order_send returns None instantly (rc=-1) while every read
+operation keeps working. Verified by elimination — diag scripts placed 10/10
+on the same VPS while the bot itself was hitting rc=-1 on every anchor.
+
+Fixes in this version:
+1. Trade channel WARMUP — before every anchor placement, send-and-cancel a
+   tiny pending order at $100 from market. This wakes the trade channel.
+2. AUTO-RECONNECT — if warmup ping fails, attempt mt5.shutdown() +
+   mt5.initialize() recovery. If that also fails, skip cleanly.
+3. mt5.last_error() CAPTURE in placement path. Each failed order_send leaves
+   a forensic trail in the telegram error message.
+4. PRESERVE gap_mode across retries — previously the retry re-evaluated gap
+   against fresh current_price (after re-anchor → zero gap → normal mode →
+   lot doubles and SL widens). Now gap state locks once resolved.
+5. FP_ZERO_MAX_LOT class constant — set to 0.27 before FP Zero deployment.
+6. MARKDOWN ESCAPE in startup banner — fixes the v2.5.2 Telegram 400 error
+   on `auto_lot` underscore parsing.
+7. ★ COMPREHENSIVE FAILURE DUMPS ★ — every failure path now emits a full
+   diagnostic via _dump_mt5_state() capturing terminal_info, account_info,
+   symbol_info, tick, and last_error in one structured block. If anything
+   fails tomorrow, the log says WHY in one place. No more guessing.
 
 v2.5.2 changes (2026-05-27, post-A2 failure analysis)
 ----------------------------------------------------
@@ -92,6 +118,19 @@ class LiveTrader:
     MAX_PLACEMENT_RETRIES = 2          # initial + 2 retries = 3 attempts total
     RETRY_BACKOFF_BASE_SEC = 15        # delays: 15s, 30s
 
+    # v2.5.3: Trade channel warmup constants. The send-and-cancel ping wakes
+    # the MT5 SDK's write channel which goes cold after hours of read-only
+    # tick activity. Ping is placed at $100 from market — far enough to NEVER
+    # accidentally fill on a $30/sec move.
+    WARMUP_LOT = 0.01
+    WARMUP_DISTANCE = 100.0    # $100 from market
+    WARMUP_MAGIC = 9999998     # distinct from main magic (20260522)
+    WARMUP_COMMENT = "WARMUP"
+
+    # v2.5.3: Hard lot cap for FP Zero 1% floating-loss compliance.
+    # None = disabled (Pepperstone demo). 0.27 caps $50k FP Zero at <$500 SL.
+    FP_ZERO_MAX_LOT = None     # set to 0.27 before FP Zero $50k buy
+
     def __init__(self, cfg, adapter, paper: bool = True):
         from bot import Position, anchor_datetime_utc, eod_datetime_utc  # late import
 
@@ -156,7 +195,7 @@ class LiveTrader:
                      "outcome", "pnl_usd", "ticket"])
 
         self.tele.info(
-            f"LiveTrader v2.5.2 initialized ({'PAPER' if paper else 'LIVE'}) — "
+            f"LiveTrader v2.5.3 initialized ({'PAPER' if paper else 'LIVE'}) — "
             f"4-anchor multi-session AUREON, lot {cfg.lot_size}"
         )
         self.tele.info(
@@ -186,6 +225,7 @@ class LiveTrader:
             'last_broker_date': None,
             'processed_anchors_today': [],
             'kill_switch_locked': False,
+            'day_start_equity': None,  # v2.5.4: today's opening equity — kill baseline
             'shadow_positions_extended': {},  # v2.5: persisted max_fav/fill_time per ticket
         }
 
@@ -298,6 +338,15 @@ class LiveTrader:
         except Exception as e:
             log.warning(f"Lot validation against broker volume_step failed: {e}")
             effective_lot = max(0.01, int(effective_lot * 100) / 100)
+
+        # v2.5.3: Hard lot cap for FP Zero 1% floating-loss compliance.
+        # No-op when FP_ZERO_MAX_LOT is None (Pepperstone demo testing).
+        if self.FP_ZERO_MAX_LOT is not None and effective_lot > self.FP_ZERO_MAX_LOT:
+            log.info(
+                f"Lot capped {effective_lot} → {self.FP_ZERO_MAX_LOT} "
+                f"(FP_ZERO_MAX_LOT compliance)"
+            )
+            effective_lot = self.FP_ZERO_MAX_LOT
         return effective_lot
 
     def _refresh_from_broker(self, reason: str = "startup"):
@@ -359,6 +408,18 @@ class LiveTrader:
             self.state['last_broker_date'] = str(broker_date)
             self.state['processed_anchors_today'] = []
             self.state['kill_switch_locked'] = False
+            # v2.5.4: re-baseline the daily kill switch to TODAY's opening equity.
+            # Prevents prior-day losses (and the start-of-day gap from a fixed
+            # starting_balance) from bleeding into today's daily-loss budget.
+            # This also matches how Funding Pips measures the daily-loss rule
+            # (from start-of-day equity, not the initial deposit).
+            day_start = self._live_equity()
+            self.state['day_start_equity'] = day_start if day_start is not None \
+                else self.cfg.starting_balance
+            log.info(
+                f"Daily kill baseline re-set to opening equity "
+                f"${self.state['day_start_equity']:,.2f} for {broker_date}"
+            )
             self._save_state()
             # Reset today's trade log
             with open(self.daylog_path, "w", newline="") as f:
@@ -439,7 +500,8 @@ class LiveTrader:
             "broker_login":   broker_info.get("login"),
             "broker_server":  broker_info.get("server"),
             "daily_loss_pct": self.cfg.daily_loss_pct,
-            "kill_threshold_usd": self.cfg.daily_loss_pct * self.cfg.starting_balance,
+            "kill_threshold_usd": self.cfg.daily_loss_pct * (
+                self.state.get('day_start_equity') or self.cfg.starting_balance),
             # v2.5.2: surface retry state in status for watchdog/dashboard visibility
             "deferred_anchor": (
                 {
@@ -492,18 +554,42 @@ class LiveTrader:
 
     def _check_kill_switch(self) -> bool:
         """
-        Daily kill switch — fires if losses exceed cfg.daily_loss_pct of starting balance.
-        In LIVE mode: uses live equity (includes unrealized P&L from open positions),
-                      which matches how Funding Pips actually measures the daily loss rule.
+        Daily kill switch — fires if losses exceed cfg.daily_loss_pct of the
+        DAY'S OPENING equity (v2.5.4). Previously measured from cfg.starting_balance,
+        a fixed baseline, which double-counted prior-day losses and the start-of-day
+        gap — that's what gated A2/A3/A4 off after A1's loss on 2026-05-28.
+        In LIVE mode: uses live equity (includes unrealized P&L), which matches how
+                      Funding Pips actually measures the daily loss rule.
         In PAPER mode: falls back to internal daily_pnl (realized only).
         """
-        threshold = self.cfg.daily_loss_pct * self.cfg.starting_balance
+        self._ensure_day_start_equity()
+        base = self.state.get('day_start_equity') or self.cfg.starting_balance
+        threshold = self.cfg.daily_loss_pct * base
         equity = self._live_equity()
         if equity is not None:
-            live_daily_loss = self.cfg.starting_balance - equity
+            live_daily_loss = base - equity
             return live_daily_loss >= threshold
         # Fallback (paper or MT5 query failure)
         return self.state['daily_pnl'] <= -threshold
+
+    def _ensure_day_start_equity(self):
+        """v2.5.4: lazily backfill today's opening equity if missing (e.g. the bot
+        is restarted mid-day before any new-broker-day reset has run). Reconstructs
+        opening equity = current balance - realized daily P&L, so the kill baseline
+        is correct immediately on restart instead of falling back to starting_balance."""
+        if self.state.get('day_start_equity') is not None:
+            return
+        base = self.cfg.starting_balance
+        try:
+            info = self.adapter.get_account_info() if self.adapter else None
+            if info and info.get('balance') is not None:
+                base = info['balance'] - self.state.get('daily_pnl', 0.0)
+        except Exception as e:
+            log.warning(f"_ensure_day_start_equity: account read failed ({e}); "
+                        f"using starting_balance ${base:,.2f}")
+        self.state['day_start_equity'] = base
+        self._save_state()
+        log.info(f"Daily kill baseline backfilled to opening equity ${base:,.2f}")
 
     def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
         if self.paused:
@@ -555,6 +641,11 @@ class LiveTrader:
             'anchor_price': anchor_price,
             'defer_until': defer_until,
             'retry_count': 0,                # v2.5.2: retry counter for rc=-1 recovery
+            # v2.5.3: gap-mode state preserved across retries (None on first attempt)
+            'gap_mode_locked':  False,
+            'gap_lot_override': None,
+            'gap_sl_override':  None,
+            'gap_re_anchor':    None,
         }
         log.info(
             f"{label}: anchor captured @ ${anchor_price:.2f}, deferring placement to "
@@ -579,6 +670,13 @@ class LiveTrader:
         anchor_price = d['anchor_price']
         anchor_utc = d['anchor_utc']
         retry_count = d.get('retry_count', 0)   # v2.5.2: pull retry counter
+        # v2.5.3: pull preserved gap-mode context
+        gap_mode_locked  = d.get('gap_mode_locked',  False)
+        gap_lot_override = d.get('gap_lot_override', None)
+        gap_sl_override  = d.get('gap_sl_override',  None)
+        gap_re_anchor    = d.get('gap_re_anchor',    None)
+        if gap_mode_locked and gap_re_anchor is not None:
+            anchor_price = gap_re_anchor
 
         # v2.5: tick freshness check — refuse to use stale market data
         current_price = None
@@ -591,6 +689,7 @@ class LiveTrader:
                 now_unix = pd.Timestamp.now(tz='UTC').timestamp()
                 tick_age_s = abs(now_unix - tick_utc_unix)
                 if tick_age_s > 60:
+                    self._dump_mt5_state(label, f"SKIP: tick stale ({tick_age_s:.0f}s old)")
                     self.tele.warn(
                         f"⚠️ *{label} skipped — stale tick*\n"
                         f"Tick age: {tick_age_s:.0f}s (> 60s threshold)\n"
@@ -598,61 +697,122 @@ class LiveTrader:
                     )
                     return
                 current_price = (tick.ask + tick.bid) / 2
+                # v2.5.4: ANCHOR ON CURRENT PRICE at the moment of placement.
+                # Replaces the M5-close anchor captured ~30s earlier in
+                # _process_anchor. Because placement uses anchor_price, both stops
+                # are now symmetric around live price -> gap mode self-disables
+                # (anchor-vs-current diff = 0). On rc=-1 retries this re-runs and
+                # re-fetches the tick, so retries re-anchor to fresh price too —
+                # fixing the 2026-05-27 A4 flaw (RETRY reused a dead anchor).
+                anchor_price = current_price
         except Exception as e:
             log.warning(f"Could not read fresh tick for {label}: {e}")
+            self._dump_mt5_state(label, f"SKIP: tick read raised {e}")
             self.tele.warn(f"⚠️ {label}: tick read failed — skipping")
             return
 
-        # v2.5.2: pass retry_count down for rc=-1 retry decision
-        self._place_orders_for_anchor(label, anchor_utc, anchor_price, current_price, retry_count)
+        # v2.5.4: HARD GUARANTEE of current-price anchoring. If the tick came back
+        # None (no exception, just unavailable), current_price is still None and
+        # anchor_price would otherwise be the stale M5 close. Refuse to place on it —
+        # skip cleanly instead of silently repeating the stale-anchor blunder.
+        if current_price is None:
+            self._dump_mt5_state(label, "SKIP: no live tick — refusing stale M5 anchor")
+            self.tele.warn(
+                f"⚠️ *{label} skipped — no live tick for current-price anchor*\n"
+                f"symbol_info_tick returned None. Refusing to place on the stale "
+                f"M5 anchor. Anchor lost this cycle (no blunder)."
+            )
+            log.warning(f"{label}: SKIP — current_price None, refusing stale anchor placement")
+            return
 
-    def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_price, retry_count=0):
+        # v2.5.3: WARM UP THE TRADE CHANNEL before real placement. If warmup
+        # fails AND reconnect also fails, skip cleanly with diagnostic dump.
+        if not self._warmup_trade_channel(label):
+            self._dump_mt5_state(label, "SKIP: warmup + reconnect both failed")
+            self.tele.error(
+                f"❌ *{label} skipped — trade channel could not be revived*\n"
+                f"Warmup ping returned None and mt5.shutdown()/initialize() also failed.\n"
+                f"This anchor is lost. See log for full mt5 state dump."
+            )
+            return
+
+        # v2.5.2/v2.5.3: pass retry_count and gap state through
+        self._place_orders_for_anchor(
+            label, anchor_utc, anchor_price, current_price, retry_count,
+            gap_mode_locked=gap_mode_locked,
+            gap_lot_override=gap_lot_override,
+            gap_sl_override=gap_sl_override,
+        )
+
+    def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_price,
+                                  retry_count=0,
+                                  gap_mode_locked=False,
+                                  gap_lot_override=None,
+                                  gap_sl_override=None):
         # All the original gap detection + pre-flight + placement logic.
         # v2.5.2: retry_count parameter added — used in the rc=-1 recovery block below.
+        # v2.5.3: gap_mode_locked + overrides — if a previous attempt resolved
+        #         gap mode, retries inherit verbatim instead of re-evaluating
+        #         (re-eval would fall to normal mode → 2× lot + wider SL).
 
-        # ADAPTIVE RE-ANCHOR ON GAP DAYS
-        # If the captured anchor is too far from current market, BOTH stops
-        # would be on the same side of price → one is mechanically invalid.
-        # Instead of skipping (passive), we re-anchor to current M5 close and
-        # trade the breakout from there with REDUCED RISK (half-lot, tight SL).
-        gap_mode = False
-        gap_lot = self.cfg.lot_size
-        gap_sl_dist = self.cfg.sl_dist
-        gap_tp_dist = self.cfg.tp_dist
-        if current_price is not None:
-            gap = abs(current_price - anchor_price)
-            if gap > self.cfg.trigger_dist + 0.1:  # v2.3: was 0.5, now 0.1 — catches edge cases where market crept 10¢+ past trigger
-                # Try to use the most recent M5 close as the new anchor.
-                # We fetch the M5 bar just before NOW (not the scheduled anchor time).
-                try:
-                    now_utc = pd.Timestamp.now(tz='UTC')
-                    # Round DOWN to nearest 5 min boundary, then go one bar back
-                    minute = now_utc.minute - (now_utc.minute % 5)
-                    last_m5_end = now_utc.replace(minute=minute, second=0, microsecond=0)
-                    new_anchor = self.adapter.get_m5_close(self.cfg.symbol, last_m5_end)
-                    if new_anchor is None or abs(new_anchor - current_price) > self.cfg.trigger_dist:
-                        # Couldn't get fresh M5 OR fresh M5 also far from market
-                        # → use current price as anchor directly
+        # v2.5.3: if gap mode was locked in a prior attempt, honor it
+        if gap_mode_locked:
+            gap_mode    = True
+            gap_lot     = gap_lot_override or round(self.cfg.lot_size / 2, 2)
+            gap_sl_dist = gap_sl_override  or 10.0
+            gap_tp_dist = self.cfg.tp_dist
+            log.info(
+                f"{label}: gap mode preserved across retry — "
+                f"lot={gap_lot}, SL=${gap_sl_dist}, anchor=${anchor_price:.2f}"
+            )
+            self.tele.info(
+                f"♻️ *{label} retry inheriting gap mode* — "
+                f"lot `{gap_lot}` SL `${gap_sl_dist}` (locked from initial)"
+            )
+        else:
+            # ADAPTIVE RE-ANCHOR ON GAP DAYS
+            # If the captured anchor is too far from current market, BOTH stops
+            # would be on the same side of price → one is mechanically invalid.
+            # Instead of skipping (passive), we re-anchor to current M5 close and
+            # trade the breakout from there with REDUCED RISK (half-lot, tight SL).
+            gap_mode = False
+            gap_lot = self.cfg.lot_size
+            gap_sl_dist = self.cfg.sl_dist
+            gap_tp_dist = self.cfg.tp_dist
+            if current_price is not None:
+                gap = abs(current_price - anchor_price)
+                if gap > self.cfg.trigger_dist + 0.1:  # v2.3: was 0.5, now 0.1 — catches edge cases where market crept 10¢+ past trigger
+                    # Try to use the most recent M5 close as the new anchor.
+                    # We fetch the M5 bar just before NOW (not the scheduled anchor time).
+                    try:
+                        now_utc = pd.Timestamp.now(tz='UTC')
+                        # Round DOWN to nearest 5 min boundary, then go one bar back
+                        minute = now_utc.minute - (now_utc.minute % 5)
+                        last_m5_end = now_utc.replace(minute=minute, second=0, microsecond=0)
+                        new_anchor = self.adapter.get_m5_close(self.cfg.symbol, last_m5_end)
+                        if new_anchor is None or abs(new_anchor - current_price) > self.cfg.trigger_dist:
+                            # Couldn't get fresh M5 OR fresh M5 also far from market
+                            # → use current price as anchor directly
+                            new_anchor = round(current_price, 2)
+                    except Exception as e:
+                        log.warning(f"Re-anchor M5 fetch failed: {e}")
                         new_anchor = round(current_price, 2)
-                except Exception as e:
-                    log.warning(f"Re-anchor M5 fetch failed: {e}")
-                    new_anchor = round(current_price, 2)
 
-                gap_mode = True
-                gap_lot = round(self.cfg.lot_size / 2, 2)  # half-size
-                gap_sl_dist = 10.0    # tight SL: $10 instead of $18
-                gap_tp_dist = self.cfg.tp_dist  # keep normal TP
-                retry_tag = f" (retry {retry_count})" if retry_count > 0 else ""    # v2.5.2
-                self.tele.warn(
-                    f"⚠️ *{label} GAP DETECTED{retry_tag}*\n"
-                    f"Original anchor: `${anchor_price:.2f}`\n"
-                    f"Current market:  `${current_price:.2f}`\n"
-                    f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + 0.1:.2f} threshold)\n"
-                    f"→ Re-anchoring to current M5 close `${new_anchor:.2f}`\n"
-                    f"→ Half-lot `{gap_lot}` with tight SL `${gap_sl_dist:.0f}` "
-                    f"(reduced risk for gap-day breakout)"
-                )
-                anchor_price = new_anchor
+                    gap_mode = True
+                    gap_lot = round(self.cfg.lot_size / 2, 2)  # half-size
+                    gap_sl_dist = 10.0    # tight SL: $10 instead of $18
+                    gap_tp_dist = self.cfg.tp_dist  # keep normal TP
+                    retry_tag = f" (retry {retry_count})" if retry_count > 0 else ""    # v2.5.2
+                    self.tele.warn(
+                        f"⚠️ *{label} GAP DETECTED{retry_tag}*\n"
+                        f"Original anchor: `${anchor_price:.2f}`\n"
+                        f"Current market:  `${current_price:.2f}`\n"
+                        f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + 0.1:.2f} threshold)\n"
+                        f"→ Re-anchoring to current M5 close `${new_anchor:.2f}`\n"
+                        f"→ Half-lot `{gap_lot}` with tight SL `${gap_sl_dist:.0f}` "
+                        f"(reduced risk for gap-day breakout)"
+                    )
+                    anchor_price = new_anchor
 
         buy_stop  = round(anchor_price + self.cfg.trigger_dist, 2)
         sell_stop = round(anchor_price - self.cfg.trigger_dist, 2)
@@ -728,21 +888,51 @@ class LiveTrader:
 
         # v2.3: only place the sides that passed pre-flight
         # v2.5.2: append retry tag to comment for MT5 audit trail
+        # v2.5.3: capture mt5.last_error() IMMEDIATELY after each call so we
+        #         have forensic data on every rc=-1 (adapter swallows it
+        #         internally during its built-in rc=-1 reconcile retry)
         retry_comment = f"_R{retry_count}" if retry_count > 0 else ""
         buy_res = None
         sell_res = None
+        buy_err = None
+        sell_err = None
         if not skip_buy:
             buy_res = self.adapter.place_stop_order(
                 self.cfg.symbol, 'BUY', buy_stop, gap_lot,
                 sl=sl_buy, tp=tp_buy,
                 comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}{retry_comment}",
                 dry_run=self.paper)
+            if not self.paper:
+                try:
+                    buy_err = self.adapter.mt5.last_error()
+                except Exception:
+                    buy_err = ('?', 'last_error read failed')
         if not skip_sell:
             sell_res = self.adapter.place_stop_order(
                 self.cfg.symbol, 'SELL', sell_stop, gap_lot,
                 sl=sl_sell, tp=tp_sell,
                 comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}{retry_comment}",
                 dry_run=self.paper)
+            if not self.paper:
+                try:
+                    sell_err = self.adapter.mt5.last_error()
+                except Exception:
+                    sell_err = ('?', 'last_error read failed')
+
+        # v2.5.3: surface mt5.last_error() in logs immediately when placement
+        # returns None (otherwise this info is lost forever)
+        if buy_res is None and not skip_buy:
+            log.error(
+                f"{label} BUY order_send returned None. mt5.last_error={buy_err}. "
+                f"Price=${buy_stop} SL=${sl_buy} TP=${tp_buy} lot={gap_lot} "
+                f"gap_mode={gap_mode}"
+            )
+        if sell_res is None and not skip_sell:
+            log.error(
+                f"{label} SELL order_send returned None. mt5.last_error={sell_err}. "
+                f"Price=${sell_stop} SL=${sl_sell} TP=${tp_sell} lot={gap_lot} "
+                f"gap_mode={gap_mode}"
+            )
 
         buy_ticket  = self._extract_ticket(buy_res,  f"paper_{label}_BUY")  if buy_res  is not None else None
         sell_ticket = self._extract_ticket(sell_res, f"paper_{label}_SELL") if sell_res is not None else None
@@ -873,8 +1063,17 @@ class LiveTrader:
         # at session open), re-schedule placement via the deferred-anchor
         # mechanism instead of giving up. Tick loop continues managing existing
         # positions during the wait. Backoff: 15s, 30s. Max 2 retries.
+        # v2.5.3: PRESERVE gap-mode state so retries don't fall back to normal
+        #         mode (and double the lot + widen the SL).
         both_no_response_now = (buy_rc in (None, -1)) and (sell_rc in (None, -1))
         if both_no_response_now and retry_count < self.MAX_PLACEMENT_RETRIES:
+            # v2.5.3: dump full mt5 state on rc=-1 — this is the diagnostic
+            # gold the user wants. If anything fails tomorrow, this log line
+            # tells us exactly why.
+            self._dump_mt5_state(
+                label,
+                f"rc=-1 RETRY scheduled (attempt {retry_count + 1}/{self.MAX_PLACEMENT_RETRIES})"
+            )
             retry_delay = self.RETRY_BACKOFF_BASE_SEC * (1 + retry_count)  # 15s, then 30s
             next_defer = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=retry_delay)
             self._deferred_anchor = {
@@ -884,34 +1083,353 @@ class LiveTrader:
                                                   # (already re-anchored if gap mode)
                 'defer_until': next_defer,
                 'retry_count': retry_count + 1,
+                # v2.5.3: lock gap state across retries
+                'gap_mode_locked':  gap_mode,
+                'gap_lot_override': gap_lot     if gap_mode else None,
+                'gap_sl_override':  gap_sl_dist if gap_mode else None,
+                'gap_re_anchor':    anchor_price if gap_mode else None,
             }
+            err_detail = ""
+            if not self.paper and (buy_err or sell_err):
+                err_detail = (f"\nBUY  mt5.last\\_error: `{buy_err}`"
+                              f"\nSELL mt5.last\\_error: `{sell_err}`")
             self.tele.warn(
                 f"🔁 *{label} retry {retry_count + 1}/{self.MAX_PLACEMENT_RETRIES} scheduled*\n"
                 f"Both sides returned rc=-1 (broker/network comm failure).\n"
                 f"Re-attempting in `{retry_delay}s` at `{next_defer.strftime('%H:%M:%S')}` UTC.\n"
                 f"Position management on existing trades continues uninterrupted."
+                + err_detail
             )
             return  # tick loop will pick this up via _complete_deferred_anchor
 
         # Out of catchable zone OR no breakout direction confirmed — skip cleanly
         # v2.3: distinguish "order placement failed" (rc=-1 etc) from "genuine no-breakout"
         # v2.5.2: append retry-exhausted suffix to skip message
+        # v2.5.3: dump full mt5 state on final skip so we have FULL forensics
         both_no_response = (buy_rc in (None, -1)) and (sell_rc in (None, -1))
         if both_no_response:
             retry_suffix = f" — gave up after {retry_count} retries" if retry_count > 0 else ""
             skip_reason = f"ORDER PLACEMENT FAILED — broker returned no response on both sides{retry_suffix}"
+            # v2.5.3: full diagnostic dump on final failure
+            self._dump_mt5_state(label, f"FINAL SKIP: {skip_reason}")
         elif breakout_side is not None and slip > 15.0:
             skip_reason = f"slip ${slip:.2f} > $15 (move exhausted, would chase top/bottom)"
         elif breakout_side is not None and slip < 0.5:
             skip_reason = f"slip ${slip:.2f} < $0.50 (price didn't actually break, broker quirk)"
         else:
             skip_reason = "no breakout confirmed"
+        err_detail_skip = ""
+        if not self.paper and (buy_err or sell_err):
+            err_detail_skip = (f"\nBUY  mt5.last\\_error: `{buy_err}`"
+                               f"\nSELL mt5.last\\_error: `{sell_err}`")
         self.tele.error(
             f"❌ *{label} skipped — {skip_reason}*\n"
             f"BUY  stop @ ${buy_stop}: rc={_rcname(buy_res)}\n"
             f"SELL stop @ ${sell_stop}: rc={_rcname(sell_res)}\n"
             f"Current market: ${recovery_price if recovery_price else '?'}"
+            + err_detail_skip
         )
+
+    # ------------------------------------------------------------------------
+    # v2.5.3: Trade channel warmup, MT5 reconnect, and DIAGNOSTIC DUMPS
+    # ------------------------------------------------------------------------
+
+    def _dump_mt5_state(self, label: str, context: str) -> None:
+        """v2.5.3: CLEAR FAILURE LOGGING. Captures the full MT5 state at the
+        moment of any failure into a single multi-line log entry. If anything
+        fails tomorrow, ONE log block has the complete story.
+
+        Always logs at ERROR level (visible in default log filter). Also
+        sends a compact telegram so failures are visible on the phone.
+
+        Captures: terminal_info, account_info, symbol_info trade params,
+        latest tick, and mt5.last_error(). Designed to never raise.
+        """
+        try:
+            if self.paper:
+                log.error(f"[{label}] {context} — PAPER mode, no MT5 state")
+                return
+
+            mt5 = self.adapter.mt5
+            lines = [
+                f"╔══ MT5 DIAGNOSTIC DUMP — {label} ══",
+                f"║ Context : {context}",
+                f"║ UTC time: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            ]
+
+            # 1. Terminal state
+            try:
+                ti = mt5.terminal_info()
+                if ti:
+                    lines.append(
+                        f"║ Terminal: connected={ti.connected}  "
+                        f"trade_allowed={ti.trade_allowed}  "
+                        f"dlls_allowed={ti.dlls_allowed}  "
+                        f"build={ti.build}  ping={ti.ping_last/1000:.0f}ms"
+                    )
+                else:
+                    lines.append("║ Terminal: terminal_info() returned None ⚠")
+            except Exception as e:
+                lines.append(f"║ Terminal: read raised {type(e).__name__}: {e}")
+
+            # 2. Account state — balance, equity, margin
+            try:
+                ai = mt5.account_info()
+                if ai:
+                    lines.append(
+                        f"║ Account : #{ai.login} on `{ai.server}`  "
+                        f"balance=${ai.balance:.2f}  equity=${ai.equity:.2f}  "
+                        f"margin=${ai.margin:.2f}  free=${ai.margin_free:.2f}  "
+                        f"trade_mode={ai.trade_mode}"
+                    )
+                else:
+                    lines.append("║ Account : account_info() returned None ⚠")
+            except Exception as e:
+                lines.append(f"║ Account : read raised {type(e).__name__}: {e}")
+
+            # 3. Symbol trading state — stops/freeze/filling/etc
+            try:
+                si = mt5.symbol_info(self.cfg.symbol)
+                if si:
+                    lines.append(
+                        f"║ Symbol  : {self.cfg.symbol}  "
+                        f"trade_mode={si.trade_mode} "
+                        f"(0=disabled,1=long_only,2=short_only,3=close_only,4=full)"
+                    )
+                    lines.append(
+                        f"║         : stops_level={si.trade_stops_level}pts "
+                        f"= ${si.trade_stops_level * si.point:.2f} | "
+                        f"freeze_level={si.trade_freeze_level}pts "
+                        f"= ${si.trade_freeze_level * si.point:.2f}"
+                    )
+                    lines.append(
+                        f"║         : volume_step={si.volume_step}  "
+                        f"vol_min={si.volume_min}  vol_max={si.volume_max}  "
+                        f"filling_mode={si.filling_mode} "
+                        f"(1=FOK,2=IOC,3=both,4=RETURN)"
+                    )
+                else:
+                    lines.append(f"║ Symbol  : symbol_info({self.cfg.symbol}) returned None ⚠")
+            except Exception as e:
+                lines.append(f"║ Symbol  : read raised {type(e).__name__}: {e}")
+
+            # 4. Latest tick — how old? mid-price?
+            try:
+                tk = mt5.symbol_info_tick(self.cfg.symbol)
+                if tk:
+                    broker_offset = self.adapter.tick_time_offset_hours * 3600
+                    tick_utc_unix = tk.time - broker_offset
+                    now_unix = pd.Timestamp.now(tz='UTC').timestamp()
+                    age = abs(now_unix - tick_utc_unix)
+                    lines.append(
+                        f"║ Tick    : bid=${tk.bid:.2f}  ask=${tk.ask:.2f}  "
+                        f"spread=${(tk.ask-tk.bid):.2f}  age={age:.1f}s  "
+                        f"volume={tk.volume}"
+                    )
+                else:
+                    lines.append("║ Tick    : symbol_info_tick() returned None ⚠")
+            except Exception as e:
+                lines.append(f"║ Tick    : read raised {type(e).__name__}: {e}")
+
+            # 5. THE BIG ONE — last_error
+            try:
+                err = mt5.last_error()
+                lines.append(f"║ last_err: {err}  ← THE ROOT CAUSE")
+            except Exception as e:
+                lines.append(f"║ last_err: read raised {type(e).__name__}: {e}")
+
+            # 6. Bot state context
+            try:
+                positions_now = len(mt5.positions_get(symbol=self.cfg.symbol) or [])
+                pendings_now  = len(mt5.orders_get(symbol=self.cfg.symbol) or [])
+                lines.append(
+                    f"║ Bot     : daily_pnl=${self.state.get('daily_pnl', 0):+.2f}  "
+                    f"positions={positions_now}  pendings={pendings_now}  "
+                    f"shadow_pos={len(self.shadow_positions)}  "
+                    f"shadow_pend={len(self.shadow_pendings)}"
+                )
+            except Exception as e:
+                lines.append(f"║ Bot     : state read raised {e}")
+
+            lines.append("╚════════════════════════════════════════")
+            dump = "\n".join(lines)
+            log.error(dump)
+        except Exception as outer:
+            # Diagnostic dump must NEVER raise — fall back to bare log
+            log.error(f"[{label}] {context} — dump raised: {outer}")
+
+    def _warmup_trade_channel(self, label: str) -> bool:
+        """v2.5.3: Send a tiny throwaway pending ($100 from market) to wake
+        the MT5 trade channel before real placement.
+
+        The tick loop hammers READ calls every second, but doesn't WRITE
+        between anchors. Hours of read-only activity → SDK's write path goes
+        cold → order_send returns None instantly (rc=-1). Confirmed root
+        cause for A2/A3/A4 failures on 2026-05-27.
+
+        Returns True if channel is healthy (or paper mode). False if both
+        the warmup ping AND mt5 reconnect failed.
+        """
+        if self.paper:
+            return True
+
+        try:
+            tick = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+            if tick is None:
+                log.warning(f"{label}: warmup — tick read returned None")
+                self._dump_mt5_state(label, "WARMUP: tick read returned None")
+                return self._attempt_mt5_reconnect(label)
+
+            ping_price = round(tick.ask + self.WARMUP_DISTANCE, 2)
+            ping_req = {
+                "action":       self.adapter.mt5.TRADE_ACTION_PENDING,
+                "symbol":       self.cfg.symbol,
+                "volume":       self.WARMUP_LOT,
+                "type":         self.adapter.mt5.ORDER_TYPE_BUY_STOP,
+                "price":        ping_price,
+                "sl":           round(ping_price - 20.0, 2),
+                "tp":           round(ping_price + 50.0, 2),
+                "deviation":    20,
+                "magic":        self.WARMUP_MAGIC,
+                "comment":      self.WARMUP_COMMENT,
+                "type_filling": self.adapter.mt5.ORDER_FILLING_IOC,
+                "type_time":    self.adapter.mt5.ORDER_TIME_DAY,  # matches bot's convention
+            }
+            ping_res = self.adapter.mt5.order_send(ping_req)
+            ping_err = self.adapter.mt5.last_error()
+
+            if ping_res is None:
+                log.warning(
+                    f"{label}: WARMUP PING returned None. last_error={ping_err}. "
+                    f"Attempting MT5 reconnect..."
+                )
+                self._dump_mt5_state(label, "WARMUP PING returned None — channel cold")
+                self.tele.warn(
+                    f"⚠️ *{label}: trade channel cold (warmup failed)*\n"
+                    f"last\\_error: `{ping_err}`\n"
+                    f"Cycling MT5 connection via shutdown+initialize..."
+                )
+                return self._attempt_mt5_reconnect(label)
+
+            if ping_res.retcode != 10009:
+                rc_name = _MT5_RETCODE_MAP.get(ping_res.retcode, f"UNKNOWN_{ping_res.retcode}")
+                log.warning(
+                    f"{label}: WARMUP PING rejected retcode={ping_res.retcode} ({rc_name}) "
+                    f"comment={ping_res.comment} last_error={ping_err}"
+                )
+                self._dump_mt5_state(
+                    label,
+                    f"WARMUP PING rejected rc={ping_res.retcode} ({rc_name})"
+                )
+                self.tele.warn(
+                    f"⚠️ *{label}: warmup ping rejected*\n"
+                    f"retcode `{ping_res.retcode}` ({rc_name}) — `{ping_res.comment}`\n"
+                    f"last\\_error: `{ping_err}`\n"
+                    f"Cycling MT5 connection..."
+                )
+                # Cancel partial ping if a ticket was issued
+                try:
+                    if ping_res.order:
+                        self.adapter.mt5.order_send({
+                            "action": self.adapter.mt5.TRADE_ACTION_REMOVE,
+                            "order": ping_res.order,
+                        })
+                except Exception:
+                    pass
+                return self._attempt_mt5_reconnect(label)
+
+            # Success — cancel the ping
+            try:
+                cancel_res = self.adapter.mt5.order_send({
+                    "action": self.adapter.mt5.TRADE_ACTION_REMOVE,
+                    "order":  ping_res.order,
+                })
+                if cancel_res is None or cancel_res.retcode != 10009:
+                    log.warning(
+                        f"{label}: warmup ping placed (ticket {ping_res.order}) "
+                        f"but cancel failed (rc={getattr(cancel_res,'retcode',None)}). "
+                        f"Ping is $100 from market — will not fill."
+                    )
+            except Exception as e:
+                log.warning(f"{label}: ping cancel raised: {e}")
+
+            log.info(
+                f"{label}: ✅ trade channel warmup OK (ping ticket {ping_res.order})"
+            )
+            return True
+
+        except Exception as e:
+            log.error(f"{label}: warmup raised {type(e).__name__}: {e}")
+            self._dump_mt5_state(label, f"WARMUP raised {type(e).__name__}: {e}")
+            self.tele.warn(f"⚠️ {label}: warmup raised exception — attempting reconnect")
+            return self._attempt_mt5_reconnect(label)
+
+    def _attempt_mt5_reconnect(self, label: str) -> bool:
+        """v2.5.3: Force-cycle the MT5 connection: shutdown + initialize + verify.
+
+        Called when warmup ping fails. Recovers a cold trade channel by tearing
+        down and re-establishing the SDK. Returns True if reconnect succeeded
+        and verified healthy state, False otherwise.
+
+        shadow_positions/shadow_pendings are unaffected — reconcile loop will
+        rebuild them from broker state on the next tick.
+        """
+        log.warning(f"{label}: cycling MT5 connection (shutdown + initialize)")
+        try:
+            self.adapter.mt5.shutdown()
+        except Exception as e:
+            log.warning(f"{label}: mt5.shutdown() raised: {e}")
+
+        # Tiny pause to let the OS release sockets cleanly
+        time.sleep(0.5)
+
+        try:
+            init_ok = self.adapter.mt5.initialize()
+            if not init_ok:
+                err = self.adapter.mt5.last_error()
+                self._dump_mt5_state(
+                    label, f"RECONNECT: mt5.initialize() returned False, last_error={err}"
+                )
+                self.tele.error(
+                    f"❌ *{label}: mt5.initialize() failed after shutdown*\n"
+                    f"last\\_error: `{err}`\n"
+                    f"Anchor will be skipped. Watchdog may need to restart bot."
+                )
+                return False
+        except Exception as e:
+            self._dump_mt5_state(label, f"RECONNECT: mt5.initialize() raised: {e}")
+            self.tele.error(f"❌ *{label}: mt5.initialize() raised:* `{e}`")
+            return False
+
+        # Verify reconnect actually worked
+        try:
+            ti = self.adapter.mt5.terminal_info()
+            ai = self.adapter.mt5.account_info()
+            if ti is None or not ti.connected or not ti.trade_allowed:
+                self._dump_mt5_state(label, "RECONNECT: post-reconnect terminal unhealthy")
+                self.tele.error(
+                    f"❌ *{label}: post-reconnect terminal unhealthy*\n"
+                    f"connected=`{getattr(ti,'connected',None)}`  "
+                    f"trade\\_allowed=`{getattr(ti,'trade_allowed',None)}`"
+                )
+                return False
+            if ai is None:
+                self._dump_mt5_state(label, "RECONNECT: account_info() is None after reconnect")
+                self.tele.error(f"❌ *{label}: post-reconnect account_info is None*")
+                return False
+            log.info(
+                f"{label}: ✅ MT5 reconnected — account #{ai.login} on {ai.server}, "
+                f"balance ${ai.balance:.2f}"
+            )
+            self.tele.warn(
+                f"♻️ *{label}: MT5 trade channel cycled (recovery)*\n"
+                f"Account `#{ai.login}` on `{ai.server}` — proceeding with placement."
+            )
+            return True
+        except Exception as e:
+            self._dump_mt5_state(label, f"RECONNECT: post-reconnect verify raised: {e}")
+            self.tele.error(f"❌ *{label}: post-reconnect verification raised:* `{e}`")
+            return False
 
     @staticmethod
     def _extract_ticket(result, fallback: str):
@@ -1230,11 +1748,19 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def run(self):
+        # v2.5.3: escape underscores so Telegram Markdown doesn't italicize
+        auto_lot_label = "auto\\_lot=on" if self.cfg.auto_lot else "auto\\_lot=off"
+        fp_cap_label = (f"\nFP\\_ZERO\\_MAX\\_LOT: `{self.FP_ZERO_MAX_LOT}` ⚠ CAP ACTIVE"
+                        if self.FP_ZERO_MAX_LOT is not None
+                        else "\nFP\\_ZERO\\_MAX\\_LOT: `None` (Pepperstone demo — no cap)")
         self.tele.success(
-            f"🚀 *AUREON v2.5.2 {'PAPER' if self.paper else 'LIVE'} starting*\n"
-            f"Lot: `{self.cfg.lot_size}` (auto_lot={'on' if self.cfg.auto_lot else 'off'})\n"
+            f"🚀 *AUREON v2.5.3 {'PAPER' if self.paper else 'LIVE'} starting*\n"
+            f"Lot: `{self.cfg.lot_size}` ({auto_lot_label})\n"
             f"Kill switch: `-{self.cfg.daily_loss_pct*100:.1f}%`\n"
-            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)"
+            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
+            f"Trade channel warmup: ON ($100 ping + mt5 reconnect on cold)\n"
+            f"Diagnostic dumps: ON (full MT5 state on any failure)"
+            + fp_cap_label
         )
 
         # Broker time check.
@@ -1348,10 +1874,19 @@ class LiveTrader:
 
         # 5. Kill switch?
         if self._check_kill_switch() and not self.state['kill_switch_locked']:
+            kill_base = self.state.get('day_start_equity') or self.cfg.starting_balance
+            kill_limit = self.cfg.daily_loss_pct * kill_base
+            # v2.5.4: persist to file log, not just Telegram, so any future gating
+            # of anchors is always reconstructable on disk.
+            log.warning(
+                f"KILL SWITCH TRIGGERED — daily_pnl=${self.state['daily_pnl']:.2f} "
+                f"limit=-${kill_limit:.0f} (base day_start_equity=${kill_base:,.2f}). "
+                f"Flattening; no new anchors today."
+            )
             self.tele.critical(
                 f"🚨 *KILL SWITCH TRIGGERED*\n"
                 f"Daily P&L: `${self.state['daily_pnl']:.2f}` "
-                f"(limit `${-self.cfg.daily_loss_pct * self.cfg.starting_balance:.0f}`)\n"
+                f"(limit `-${kill_limit:.0f}`, from day-open `${kill_base:,.0f}`)\n"
                 f"Flattening everything, no more trades today."
             )
             self._flatten_all(reason="KillSwitch")
@@ -1359,8 +1894,13 @@ class LiveTrader:
             self._save_state()
 
         if self.state['kill_switch_locked']:
-            # Still emit status periodically but don't open new trades
+            # v2.5.4: leave a periodic on-disk record of WHY anchors are gated,
+            # so a silent "no trades today" is never a mystery in the log again.
             if self._tick_counter % self.STATUS_EVERY_TICKS == 0:
+                log.warning(
+                    "Anchor processing GATED: kill switch locked for the day "
+                    f"(daily_pnl=${self.state['daily_pnl']:.2f}). Resets next broker day."
+                )
                 self._write_status(broker_date)
             return
 

@@ -37,8 +37,9 @@ class Config:
     sl_dist:      float = 18.00           # was 20.00 — slightly tighter (saves $118 per SL)
     lot_size:     float = 0.54            # was 0.50 — max safe @ $50k (1.94% per trade, worst day -3.98% safely under 4% FP daily)
     be_trigger:   float = 0.30            # unchanged: wait for $0.30 favorable before locking BE
-    trail_gap:    float = 0.10            # was 0.30 — TIGHTER trail captures more of favorable excursion (+$5,727/yr)
-    min_step:     float = 0.05            # was 0.10 — smaller min step needed for $0.10 trail gap to work in live
+    trail_gap:    float = 0.30            # v2.5.5: reverted 0.10->0.30. $0.10 was tighter than avg spread ($0.11);
+                                          # its backtest gain was a phantom (un-fillable on live ticks). 0.30 is executable.
+    min_step:     float = 0.10            # v2.5.5: back to 0.10 to match the 0.30 trail gap
     freeze_minutes: int = 15              # v2.5: ENABLED — trend-capture mode, matches backtest projections. 0 to disable for legacy v2.2 behavior.
 
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
@@ -191,7 +192,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     fav = max(fav, 0.0)
 
     # 3-5. TRAIL UPDATE — gated by freeze window
-    # v2.3 FREEZE: for cfg.freeze_minutes after fill, do NOT engage BE/trail.
+    # v2.3 FREEZE: for cfg.freeze_minutes after fill, do NOT engage BE-arm/trail.
     # Initial $18 SL stays as the broker-side stop. When freeze expires, normal
     # trail logic engages and will snap to (peak − trail_gap) automatically.
     in_freeze = False
@@ -201,6 +202,18 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             in_freeze = elapsed < cfg.freeze_minutes
         except Exception:
             in_freeze = False  # bad timestamp → fall through to normal logic
+
+    # v2.5.5 PATCH A — BASE LOCK: at +$3 favorable, force SL to break-even.
+    # Fires EVEN during freeze (safety valve for fast favorable spikes that
+    # reverse before the post-freeze trail can engage — e.g. Fri 29-May A3).
+    # This guarantees any trade that touches +$3 fav cannot become a loss.
+    if fav >= 3.00:
+        if pos.side == 'BUY':
+            if pos.entry_price > pos.current_sl:
+                pos.current_sl = pos.entry_price
+        else:
+            if pos.entry_price < pos.current_sl:
+                pos.current_sl = pos.entry_price
 
     if not in_freeze and fav >= cfg.be_trigger:
         if pos.side == 'BUY':
@@ -212,11 +225,10 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if candidate_sl < pos.current_sl - cfg.min_step:
                 pos.current_sl = candidate_sl
 
-    # v2.3: $5 SECONDARY LOCK — once peak fav reaches $5, force SL to be at
-    # least $4 in profit from entry. Belt-and-suspenders on top of the trail.
-    # Guarantees: any trade that touches $5 fav exits with ≥$4 net per unit.
-    # At lot 0.55: minimum ~$220 net. At lot 0.28 (gap mode): minimum ~$112 net.
-    if not in_freeze and fav >= 5.00:
+    # v2.5.5 PATCH A: $5 SECONDARY LOCK now fires EVEN during freeze (dropped the
+    # not-in_freeze gate). Once peak fav reaches $5, force SL to be at least $4 in
+    # profit from entry. Guarantees: any trade that touches $5 fav exits with ≥$4/unit.
+    if fav >= 5.00:
         if pos.side == 'BUY':
             floor_sl = pos.entry_price + 4.00
             if floor_sl > pos.current_sl:

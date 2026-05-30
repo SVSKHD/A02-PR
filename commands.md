@@ -606,7 +606,7 @@ sudo systemctl start aureon
 /stop                                        # graceful from phone
 rm -rf run/                                  # clear all state
 mkdir run
-python watchdog.py live --i-understand-the-risks
+python watchdog.py live --i-understand-the-risks --lot 0.55
 ```
 
 ### Recover from "bot exited cleanly but watchdog keeps restarting"

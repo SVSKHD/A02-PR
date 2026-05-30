@@ -354,6 +354,12 @@ class Watchdog:
                 time.sleep(5)
 
                 # 1. Crash detection
+                if self.bot_proc is None:
+                    # Defensive: shouldn't happen, but if restart logic ever leaves
+                    # bot_proc unset, respawn rather than crashing the watchdog itself.
+                    self.tele.warn("bot_proc unexpectedly None — respawning")
+                    self._spawn_bot()
+                    continue
                 if self.bot_proc.poll() is not None:
                     exit_code = self.bot_proc.returncode
                     runtime = time.time() - self.last_start_ts
@@ -400,6 +406,8 @@ class Watchdog:
                         f"Heartbeat stale ({hb_age:.0f}s old) — bot may be hung. "
                         f"Restarting.")
                     self._stop_bot()
+                    time.sleep(2)
+                    self._spawn_bot()
                     continue
 
                 # 3. Manual restart

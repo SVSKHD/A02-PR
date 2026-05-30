@@ -1,24 +1,20 @@
 {
-  "ts": "2026-05-26T16:10:33.623070+00:00",
-  "broker_date": "2026-05-26",
-  "daily_pnl_realized": 524.7,
+  "ts": "2026-05-30T10:12:42.751653+00:00",
+  "broker_date": "2026-05-30",
+  "daily_pnl_realized": 0.0,
   "open_positions": 0,
   "pending_orders": 0,
-  "anchors_processed_today": [
-    "A1_02h_Asia",
-    "A2_10h_London",
-    "A3_14h_Overlap",
-    "A4_17h_NYopen"
-  ],
+  "anchors_processed_today": [],
   "kill_switch_locked": false,
   "paused": false,
   "mode": "live",
-  "lot_size": 0.55,
-  "starting_balance": 51916.44,
-  "broker_balance": 52441.14,
-  "broker_equity": 52441.14,
-  "broker_login": 5050361102,
-  "broker_server": "MetaQuotes-Demo",
+  "lot_size": 0.8,
+  "starting_balance": 49579.39,
+  "broker_balance": 49579.39,
+  "broker_equity": 49579.39,
+  "broker_login": 61533831,
+  "broker_server": "Pepperstone-Demo",
   "daily_loss_pct": 0.03,
-  "kill_threshold_usd": 1557.4932000000001
+  "kill_threshold_usd": 1487.3817,
+  "deferred_anchor": null
 }

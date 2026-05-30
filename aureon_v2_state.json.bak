@@ -1,11 +1,11 @@
 {
-  "daily_pnl": 524.7,
-  "last_broker_date": "2026-05-26",
+  "daily_pnl": 353.92,
+  "last_broker_date": "2026-05-29",
   "processed_anchors_today": [
-    "A1_02h_Asia",
-    "A2_10h_London",
-    "A3_14h_Overlap"
+    "A3_14h_Overlap",
+    "A4_17h_NYopen"
   ],
   "kill_switch_locked": false,
-  "shadow_positions_extended": {}
+  "shadow_positions_extended": {},
+  "day_start_equity": 48290.25
 }
