@@ -594,11 +594,11 @@ class LiveTrader:
     def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
         if self.paused:
             return
-        for label, hour in self.cfg.anchors:
+        for label, hour, minute in self.cfg.anchors:
             if label in self.state['processed_anchors_today']:
                 continue
             anchor_utc = self._anchor_datetime_utc(
-                broker_date, hour, self.cfg.broker_tz_offset_hours)
+                broker_date, hour, self.cfg.broker_tz_offset_hours, minute)
             delta = (utc_now - anchor_utc).total_seconds()
             # Window: 0 to 120 seconds after the anchor minute
             if 0 <= delta < 120:
@@ -1576,9 +1576,88 @@ class LiveTrader:
                             shadow['entry_price'], close_price,
                             outcome, round(pnl_usd, 2), ticket,
                         ])
+                    # v2.5.6: rich journal row (one per fill) for strategy evaluation
+                    try:
+                        self._write_journal(shadow, close_deal, close_price, outcome, pnl_usd, ticket)
+                    except Exception as je:
+                        log.warning(f"journal write failed for {ticket}: {je}")
                     self._save_state()
             except Exception as e:
                 self.tele.warn(f"Could not fetch close deal for {ticket}: {e}")
+
+    # ------------------------------------------------------------------------
+    # v2.5.6: Trade journal — one rich row per fill, monthly CSV.
+    # The decisive column is modeled_trail_exit vs actual_exit: for trail exits
+    # it shows whether the live fill matched the backtest assumption (peak-0.30).
+    # That comparison is what validates (or kills) the backtest's edge.
+    # ------------------------------------------------------------------------
+    def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, ticket):
+        import os as _os
+        jdir = _os.path.join(self.run_dir, "journal")
+        _os.makedirs(jdir, exist_ok=True)
+        now_ist = pd.Timestamp.now(tz='Asia/Kolkata')
+        month = now_ist.strftime('%Y-%m')
+        jpath = _os.path.join(jdir, f"trades_{month}.csv")
+
+        side = shadow['side']
+        entry = float(shadow['entry_price'])
+        max_fav = float(shadow.get('max_fav', entry))
+        # favorable excursion in price terms
+        if side == 'BUY':
+            fav_dist = max_fav - entry
+            modeled_trail = entry + fav_dist - self.cfg.trail_gap  # peak - 0.30
+        else:
+            fav_dist = entry - max_fav
+            modeled_trail = entry - fav_dist + self.cfg.trail_gap
+        # refine outcome into the lock tiers when it was a 'Trail'-class exit
+        refined = outcome
+        if outcome == 'Trail':
+            if abs(fav_dist) < 3.0:
+                refined = 'SL_be'         # closed near BE before $3 lock
+            elif fav_dist < 5.0:
+                refined = 'SL_lock_3'     # $3 BE lock region
+            elif fav_dist < (self.cfg.trail_gap + 5.0):
+                refined = 'SL_lock_5'     # $5->+4 lock region
+            else:
+                refined = 'SL_trail'      # genuine trailing exit
+        # slippage of the actual fill vs the modeled trail level (only meaningful for trail exits)
+        trail_slip = ''
+        if refined in ('SL_trail', 'SL_lock_5', 'SL_lock_3', 'SL_be'):
+            trail_slip = round(close_price - modeled_trail, 3)
+
+        entry_time = shadow.get('entry_time')
+        entry_time_ist = (pd.Timestamp(entry_time).tz_convert('Asia/Kolkata').strftime('%H:%M:%S')
+                          if entry_time is not None else '')
+        row = [
+            now_ist.strftime('%Y-%m-%d'),                # date_ist
+            shadow.get('anchor_label', ''),              # anchor
+            shadow.get('anchor_price', ''),              # anchor_price
+            side,                                        # side
+            entry_time_ist,                              # entry_time_ist
+            round(entry, 3),                             # entry_price
+            shadow.get('lot', self.cfg.lot_size),        # lot
+            round(entry - self.cfg.sl_dist, 3) if side=='BUY' else round(entry + self.cfg.sl_dist, 3),  # initial_sl
+            round(entry + self.cfg.tp_dist, 3) if side=='BUY' else round(entry - self.cfg.tp_dist, 3),  # initial_tp
+            round(fav_dist, 3),                          # max_favorable ($ price)
+            now_ist.strftime('%H:%M:%S'),                # exit_time_ist
+            round(close_price, 3),                       # actual_exit_price
+            round(modeled_trail, 3),                     # modeled_trail_exit (peak-0.30)
+            trail_slip,                                  # actual - modeled (THE validation number)
+            refined,                                     # exit_reason
+            round(pnl_usd, 2),                           # realized_pnl_usd
+            ticket,                                      # ticket
+        ]
+        new_file = not _os.path.exists(jpath)
+        with open(jpath, "a", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(['date_ist','anchor','anchor_price','side','entry_time_ist',
+                            'entry_price','lot','initial_sl','initial_tp','max_favorable',
+                            'exit_time_ist','actual_exit_price','modeled_trail_exit',
+                            'trail_slip','exit_reason','realized_pnl_usd','ticket'])
+            w.writerow(row)
+        log.info(f"journal: {shadow.get('anchor_label')} {side} {refined} "
+                 f"pnl=${pnl_usd:+.2f} trail_slip={trail_slip}")
 
     # ------------------------------------------------------------------------
     # Trail management on M1 bar close
@@ -1821,9 +1900,38 @@ class LiveTrader:
         if not self.paper:
             self._refresh_from_broker(reason="startup")
 
+        # v2.5.6: sleep-gap detector. The bot CANNOT run while the OS is suspended
+        # (the process is frozen by the kernel). What we CAN do is notice on wake
+        # that a large gap occurred, alert, and force an immediate broker reconcile
+        # so we re-sync state before doing anything. _last_loop_wall is wall-clock
+        # time of the previous loop iteration; a gap far larger than the loop
+        # interval means the OS slept/locked.
+        self._last_loop_wall = time.time()
+        SLEEP_GAP_THRESHOLD = 60.0  # loop runs every 0.2-1.0s; >60s gap = suspension
+
         try:
             while True:
                 tick_start = time.time()
+                # --- sleep-gap detection ---
+                gap = tick_start - self._last_loop_wall
+                self._last_loop_wall = tick_start
+                if gap > SLEEP_GAP_THRESHOLD:
+                    mins = gap / 60.0
+                    log.warning(f"SLEEP GAP DETECTED: {gap:.0f}s ({mins:.1f} min) "
+                                f"since last loop — OS was likely suspended/locked.")
+                    try:
+                        self.tele.warn(
+                            f"⏰ *Bot was asleep* ~{mins:.0f} min "
+                            f"(OS suspended/locked). Forcing broker reconcile now — "
+                            f"CHECK any open trades, they were unmanaged during this gap.")
+                    except Exception:
+                        pass
+                    # force immediate re-sync with broker before normal processing
+                    try:
+                        self._reconcile_with_broker()
+                    except Exception as e:
+                        log.warning(f"post-wake reconcile failed: {e}")
+                # --- end sleep-gap detection ---
                 utc_now = pd.Timestamp.now(tz='UTC')
                 try:
                     self._tick()

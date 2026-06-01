@@ -49,12 +49,15 @@ class Config:
     risk_pct_over_50k:  float = 0.02     # Funding Pips: 2% per-trade on ≥$50k accounts
     slippage_buffer: float = 0.98        # keep lot's worst-case loss to this fraction of the rule cap
 
-    # Anchors — (label, broker_hour). Broker = UTC+3.
-    anchors: List[Tuple[str, int]] = field(default_factory=lambda: [
-        ("A1_02h_Asia",      2),
-        ("A2_10h_London",   10),
-        ("A3_14h_Overlap",  14),
-        ("A4_17h_NYopen",   17),
+    # Anchors — (label, broker_hour, broker_minute). Broker = UTC+3.
+    # v2.5.6: A3/A4 shifted 20 min EARLIER (13:40 / 16:40) so the position is
+    # opened and its freeze-lock established BEFORE the 10:00-ET news block,
+    # instead of entering into the news spike. A1/A2 unchanged (no US news).
+    anchors: List[Tuple[str, int, int]] = field(default_factory=lambda: [
+        ("A1_02h_Asia",      2,  0),
+        ("A2_10h_London",   10,  0),
+        ("A3_1340_Overlap", 13, 40),
+        ("A4_1640_NYopen",  16, 40),
     ])
     broker_tz_offset_hours: int = 3       # UTC+3
     eod_broker_hour: int = 23             # close all at 23:00 broker
@@ -268,9 +271,12 @@ def realize_pnl_usd(pos: Position, cfg: Config) -> float:
 # ============================================================================
 
 def anchor_datetime_utc(broker_date: DateType, broker_hour: int,
-                        broker_tz_offset_hours: int = 3) -> pd.Timestamp:
-    """Convert a broker-date + broker-hour to a UTC timestamp."""
-    ts = pd.Timestamp(broker_date) + pd.Timedelta(hours=broker_hour - broker_tz_offset_hours)
+                        broker_tz_offset_hours: int = 3,
+                        broker_minute: int = 0) -> pd.Timestamp:
+    """Convert a broker-date + broker-hour(+minute) to a UTC timestamp."""
+    ts = (pd.Timestamp(broker_date)
+          + pd.Timedelta(hours=broker_hour - broker_tz_offset_hours)
+          + pd.Timedelta(minutes=broker_minute))
     return ts.tz_localize('UTC')
 
 
@@ -315,10 +321,10 @@ def run_backtest(csv_path: str, start: str, end: str, cfg: Config) -> pd.DataFra
         daily_pnl = 0.0
         kill_triggered = False
 
-        for label, broker_hour in cfg.anchors:
+        for label, broker_hour, broker_minute in cfg.anchors:
             if kill_triggered: break
 
-            at = anchor_datetime_utc(broker_date, broker_hour, cfg.broker_tz_offset_hours)
+            at = anchor_datetime_utc(broker_date, broker_hour, cfg.broker_tz_offset_hours, broker_minute)
             if at >= eod_ts: continue
             anchor_price = m5_close_at(m5, at)
             if anchor_price is None: continue
