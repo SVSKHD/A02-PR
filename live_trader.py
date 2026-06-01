@@ -1627,6 +1627,7 @@ class LiveTrader:
                 max_fav=shadow['max_fav'],
                 lot=self.cfg.lot_size,
             )
+            old_max_fav = shadow.get('max_fav')
             update_position_on_bar(pos, bar_series, bar_time, self.cfg)
             shadow['current_sl'] = pos.current_sl
             shadow['max_fav']    = pos.max_fav
@@ -1643,6 +1644,13 @@ class LiveTrader:
                         self.adapter.modify_position_sl(ticket, round(pos.current_sl, 2))
                     except Exception as e:
                         self.tele.warn(f"Could not modify SL on {ticket}: {e}")
+            # v2.5.5: persist whenever SL moved OR max_fav advanced. Without this,
+            # max_fav/current_sl live only in RAM between saves; a Windows sleep or
+            # crash mid-trade would restore a STALE max_fav (often == entry) and the
+            # trail would "forget" the peak it had already reached. Saving here makes
+            # the trail restart-safe — the dominant cause of "trail doesn't work right".
+            if pos.current_sl != old_sl or pos.max_fav != old_max_fav:
+                self._save_state()
 
     # ------------------------------------------------------------------------
     # Bulk operations & summaries
