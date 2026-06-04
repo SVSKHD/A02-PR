@@ -56,7 +56,7 @@ class Config:
     anchors: List[Tuple[str, int, int]] = field(default_factory=lambda: [
         ("A1_02h_Asia",      2,  0),
         ("A2_10h_London",   10,  0),
-        ("A3_1340_Overlap", 13, 40),
+        ("A3_1340_Overlap", 13, 50),
         ("A4_1640_NYopen",  16, 40),
     ])
     broker_tz_offset_hours: int = 3       # UTC+3
@@ -520,6 +520,19 @@ class MT5Adapter:
             f"({'real UTC' if self.tick_time_offset_hours == 0 else 'broker-local-as-UTC'})"
         )
 
+        # v2.5.7: log broker's minimum legal stop distance + freeze level once.
+        try:
+            si = mt5.symbol_info("XAUUSD")
+            if si is not None:
+                log.info(
+                    f"Broker stop constraints: stops_level={si.trade_stops_level}pts "
+                    f"(=${si.trade_stops_level * si.point:.2f}) "
+                    f"freeze_level={si.trade_freeze_level}pts "
+                    f"(=${si.trade_freeze_level * si.point:.2f})"
+                )
+        except Exception as e:
+            log.warning(f"Could not read broker stop constraints: {e}")
+
     def _detect_tick_time_offset(self) -> float:
         """Compare broker's reported tick time to our local UTC clock.
         Returns the integer-hour offset that needs to be SUBTRACTED from
@@ -701,47 +714,59 @@ class MT5Adapter:
         return result
 
     def modify_position_sl(self, ticket: int, new_sl: float,
-                           dry_run: bool = False):
-        """v2.5: rc=-1 reconciliation symmetric with place_stop_order.
-        If order_send returns None, query broker for actual position SL.
-        If broker already has the new SL, return success silently.
-        If broker still has old SL, retry once."""
+                           dry_run: bool = False) -> bool:
+        """v2.5.7: verify-and-retry on ALL non-DONE retcodes (not just rc=-1).
+        Returns True only if the broker's actual SL matches new_sl afterward.
+        Returns False on any unrecoverable failure — caller must act on it."""
         mt5 = self.mt5
         if dry_run:
             log.info(f"[PAPER] Would modify ticket {ticket} SL → {new_sl}")
-            return {'paper': True}
-        req = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": ticket,
-            "sl": new_sl,
-        }
-        result = mt5.order_send(req)
-        rc = result.retcode if result else -1
+            return True
 
-        # v2.5 reconciliation
-        if rc == -1:
+        req = {"action": mt5.TRADE_ACTION_SLTP, "position": ticket, "sl": new_sl}
+
+        last_rc = None
+        last_actual = None
+        for attempt in range(3):
+            result = mt5.order_send(req)
+            rc = result.retcode if result else -1
+            rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
+            last_rc = f"{rc} ({rc_name})"
+
+            if rc == 10009:
+                log.info(f"✅ Modify SL ticket={ticket} → ${new_sl}: DONE (attempt {attempt+1})")
+                return True
+
+            # Any non-DONE rc (incl. -1, 10016 INVALID_STOPS, 10025 NO_CHANGES,
+            # 10027 FROZEN, 10018 MARKET_CLOSED). Read back broker SL to decide.
             import time as _time
-            _time.sleep(0.5)
+            _time.sleep(0.3)
             positions = mt5.positions_get(ticket=ticket)
-            if positions:
-                actual_sl = positions[0].sl
-                if abs(actual_sl - new_sl) < 0.05:
-                    log.info(f"✅ Modify SL ticket={ticket} → ${new_sl}: rc=-1 but RECONCILED — broker SL matches")
-                    class _R: retcode = 10009; comment = "RECONCILED_SLTP"
-                    return _R()
-                else:
-                    log.warning(
-                        f"⚠ Modify SL ticket={ticket}: rc=-1, broker SL still ${actual_sl} (wanted ${new_sl}) — retrying"
-                    )
-                    result = mt5.order_send(req)
-                    rc = result.retcode if result else -1
-                    if rc == 10009:
-                        log.info(f"✅ Modify SL ticket={ticket} → ${new_sl} on RETRY: retcode=10009")
-                        return result
-                    log.error(f"❌ Modify SL ticket={ticket} RETRY also failed: retcode={rc}")
-            else:
-                log.warning(f"⚠ Modify SL ticket={ticket}: rc=-1 + position not found in broker state — position may have closed")
-        return result
+            if not positions:
+                log.warning(
+                    f"⚠ Modify SL ticket={ticket}: rc={rc_name}, position not found "
+                    f"(may have closed). Stopping."
+                )
+                return False
+            last_actual = positions[0].sl
+            if abs(last_actual - new_sl) < 0.05:
+                log.info(
+                    f"✅ Modify SL ticket={ticket} → ${new_sl}: rc={rc_name} but "
+                    f"broker SL already matches — RECONCILED"
+                )
+                return True
+
+            log.warning(
+                f"⚠ Modify SL ticket={ticket} attempt {attempt+1}/3 FAILED: "
+                f"rc={rc_name}. Broker SL still ${last_actual} (wanted ${new_sl}). Retrying."
+            )
+
+        log.error(
+            f"❌ Modify SL ticket={ticket} → ${new_sl} FAILED after 3 attempts "
+            f"(last rc={last_rc}, broker SL=${last_actual}). SL NOT updated at broker — "
+            f"trade is running on its PREVIOUS stop. Will re-attempt next bar."
+        )
+        return False
 
     def cancel_order(self, ticket, dry_run: bool = False):
         """Cancel a pending order by ticket id."""

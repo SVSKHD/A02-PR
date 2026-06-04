@@ -5,7 +5,7 @@ Every command you'll use to operate the bot, grouped by context. Keep this on ha
 ---
 
 ## 🚀 Quick Reference Card
-
+## python 3.14 version.
 ```bash
 # DAILY OPERATION
 python watchdog.py live --i-understand-the-risks   # start trading

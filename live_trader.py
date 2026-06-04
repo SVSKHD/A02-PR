@@ -107,10 +107,10 @@ class LiveTrader:
     # v2.5.2: per-anchor deferred wait (seconds). Session opens (A2 London,
     # A4 NY) get more time for broker comm to stabilize past the volume spike.
     DEFER_WAIT_BY_ANCHOR = {
-        'A1_02h_Asia':    15,
-        'A2_10h_London':  30,
-        'A3_14h_Overlap': 15,
-        'A4_17h_NY':      30,
+        'A1_02h_Asia': 15,
+        'A2_10h_London': 30,
+        'A3_1340_Overlap': 15,
+        'A4_1640_NYopen': 30,
     }
     DEFER_WAIT_DEFAULT = 15
 
@@ -512,9 +512,12 @@ class LiveTrader:
             ),
         }
         tmp = self.status_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(status, f, indent=2, default=str)
-        os.replace(tmp, self.status_path)
+        try:
+            with open(tmp, "w") as f:
+                json.dump(status, f, indent=2, default=str)
+            os.replace(tmp, self.status_path)
+        except (PermissionError, OSError) as e:
+            log.debug(f"status.json write skipped (locked): {e}")
 
     def _consume_commands(self) -> List[Dict]:
         if not os.path.exists(self.commands_path):
@@ -1709,20 +1712,50 @@ class LiveTrader:
             old_max_fav = shadow.get('max_fav')
             update_position_on_bar(pos, bar_series, bar_time, self.cfg)
             shadow['current_sl'] = pos.current_sl
-            shadow['max_fav']    = pos.max_fav
+            shadow['max_fav'] = pos.max_fav
 
-            if pos.current_sl != old_sl:
-                # Log only — too noisy for Telegram
-                log.info(
-                    f"Trail advance ticket={ticket} side={shadow['side']} "
-                    f"SL ${old_sl:.2f} → ${pos.current_sl:.2f} "
-                    f"(max_fav=${pos.max_fav:.2f})"
-                )
-                if not self.paper:
+            if not self.paper:
+                # v2.5.7: read broker's ACTUAL sl and re-assert if it doesn't match
+                # the bot's intended sl — EVERY bar, not only on advance. A silently
+                # dropped/rejected modify (the A2 -990 bug) self-heals next bar
+                # instead of leaving the original stop live for hours.
+                intended = round(pos.current_sl, 2)
+                try:
+                    bp = self.adapter.mt5.positions_get(ticket=ticket)
+                    broker_sl = float(bp[0].sl) if bp else None
+                except Exception as e:
+                    broker_sl = None
+                    log.warning(f"Could not read broker SL for {ticket}: {e}")
+
+                needs_assert = (broker_sl is None) or (abs(broker_sl - intended) > 0.05)
+                if needs_assert:
+                    if pos.current_sl != old_sl:
+                        log.info(
+                            f"Trail advance ticket={ticket} side={shadow['side']} "
+                            f"SL ${old_sl:.2f} → ${intended:.2f} (max_fav=${pos.max_fav:.2f})"
+                        )
+                    else:
+                        log.warning(
+                            f"SL DRIFT ticket={ticket} side={shadow['side']}: broker "
+                            f"${broker_sl} != intended ${intended} — re-asserting"
+                        )
+                    ok = False
                     try:
-                        self.adapter.modify_position_sl(ticket, round(pos.current_sl, 2))
+                        ok = self.adapter.modify_position_sl(ticket, intended)
                     except Exception as e:
-                        self.tele.warn(f"Could not modify SL on {ticket}: {e}")
+                        log.warning(f"modify_position_sl raised for {ticket}: {e}")
+                    if not ok:
+                        self.tele.warn(
+                            f"⚠️ *SL modify FAILED* ticket={ticket} {shadow['side']}\n"
+                            f"Intended `${intended}`, broker still `${broker_sl}`.\n"
+                            f"Trade is on its PREVIOUS stop. Re-attempting next bar."
+                        )
+            else:
+                if pos.current_sl != old_sl:
+                    log.info(
+                        f"[PAPER] Trail advance ticket={ticket} SL ${old_sl:.2f} → "
+                        f"${pos.current_sl:.2f} (max_fav=${pos.max_fav:.2f})"
+                    )
             # v2.5.5: persist whenever SL moved OR max_fav advanced. Without this,
             # max_fav/current_sl live only in RAM between saves; a Windows sleep or
             # crash mid-trade would restore a STALE max_fav (often == entry) and the
