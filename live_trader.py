@@ -1720,6 +1720,38 @@ class LiveTrader:
                 # dropped/rejected modify (the A2 -990 bug) self-heals next bar
                 # instead of leaving the original stop live for hours.
                 intended = round(pos.current_sl, 2)
+
+                # v2.5.8: clamp SL to the broker's minimum LEGAL distance from market.
+                # This broker reports stops_level=0 but rejects stops within ~$0.20 of
+                # price (INVALID_STOPS / 10013); probe confirmed $0.30 is safely accepted.
+                # Pull the SL to the closest legal level rather than send an illegal value
+                # that gets rejected (which left the OLD stop live — the A2 -990 bug).
+                # NOTE: this only governs HOW CLOSE the stop may sit to market; the
+                # $3 BE and $5->+4 locks (in update_position_on_bar) still guarantee
+                # minimum locked profit regardless of this clamp.
+                MIN_SL_DIST = 0.00
+                try:
+                    ctk = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+                    csi = self.adapter.mt5.symbol_info(self.cfg.symbol)
+                    if ctk is not None:
+                        floor = MIN_SL_DIST
+                        if csi is not None and csi.trade_stops_level > 0:
+                            floor = max(floor, csi.trade_stops_level * csi.point)
+                        if shadow['side'] == 'BUY':
+                            max_legal = round(ctk.bid - floor, 2)
+                            if intended > max_legal:
+                                log.info(f"SL clamp ticket={ticket} BUY: ${intended} "
+                                         f"too close to bid ${ctk.bid:.2f} → ${max_legal}")
+                                intended = max_legal
+                        else:
+                            min_legal = round(ctk.ask + floor, 2)
+                            if intended < min_legal:
+                                log.info(f"SL clamp ticket={ticket} SELL: ${intended} "
+                                         f"too close to ask ${ctk.ask:.2f} → ${min_legal}")
+                                intended = min_legal
+                except Exception as e:
+                    log.warning(f"SL clamp check failed for {ticket}: {e}")
+
                 try:
                     bp = self.adapter.mt5.positions_get(ticket=ticket)
                     broker_sl = float(bp[0].sl) if bp else None

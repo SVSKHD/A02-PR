@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, date as DateType
 from typing import Optional, List, Dict, Tuple
 import pandas as pd
 
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -31,42 +32,46 @@ import pandas as pd
 class Config:
     # Strategy
     symbol: str = "XAUUSD"
-    contract_size: float = 100.0          # oz per 1.0 lot
+    contract_size: float = 100.0  # oz per 1.0 lot
     trigger_dist: float = 5.00
-    tp_dist:      float = 30.00           # was 20.00 — let winners run longer
-    sl_dist:      float = 18.00           # was 20.00 — slightly tighter (saves $118 per SL)
-    lot_size:     float = 0.54            # was 0.50 — max safe @ $50k (1.94% per trade, worst day -3.98% safely under 4% FP daily)
-    be_trigger:   float = 0.30            # unchanged: wait for $0.30 favorable before locking BE
-    trail_gap:    float = 0.30            # v2.5.5: reverted 0.10->0.30. $0.10 was tighter than avg spread ($0.11);
-                                          # its backtest gain was a phantom (un-fillable on live ticks). 0.30 is executable.
-    min_step:     float = 0.10            # v2.5.5: back to 0.10 to match the 0.30 trail gap
-    freeze_minutes: int = 15              # v2.5: ENABLED — trend-capture mode, matches backtest projections. 0 to disable for legacy v2.2 behavior.
+    tp_dist: float = 30.00  # was 20.00 — let winners run longer
+    sl_dist: float = 18.00  # was 20.00 — slightly tighter (saves $118 per SL)
+    lot_size: float = 0.54  # was 0.50 — max safe @ $50k (1.94% per trade, worst day -3.98% safely under 4% FP daily)
+    be_trigger: float = 2.50  # v2.6: was 0.30. Trail must NOT arm until +$2.5 favorable.
+    # The 0.30 arm let the trail chase price within seconds of fill,
+    # parking the SL near entry so the first pullback closed the trade
+    # at ~breakeven (the Jun-5 A2/A3/A4 losses). At +$2.5 the trade has
+    # proven direction before the SL starts following.
+    trail_gap: float = 1.50  # v2.6: was 0.30. Once armed, SL = peak - 1.50. Wide enough that
+    # normal gold noise (~$0.11 spread) doesn't clip a live runner.
+    min_step: float = 0.10  # v2.5.5: back to 0.10 to match the 0.30 trail gap
+    freeze_minutes: int = 15  # v2.5: ENABLED — trend-capture mode, matches backtest projections. 0 to disable for legacy v2.2 behavior.
 
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
-    auto_lot: bool = True                # if True, override lot_size from live balance
-    lot_conservatism: float = 0.99       # was 0.92 — produces lot 0.54 at $50k (1.94% per trade, safe buffer to 4% daily rule)
-    risk_pct_under_50k: float = 0.03     # Funding Pips: 3% per-trade on <$50k accounts
-    risk_pct_over_50k:  float = 0.02     # Funding Pips: 2% per-trade on ≥$50k accounts
-    slippage_buffer: float = 0.98        # keep lot's worst-case loss to this fraction of the rule cap
+    auto_lot: bool = True  # if True, override lot_size from live balance
+    lot_conservatism: float = 0.99  # was 0.92 — produces lot 0.54 at $50k (1.94% per trade, safe buffer to 4% daily rule)
+    risk_pct_under_50k: float = 0.03  # Funding Pips: 3% per-trade on <$50k accounts
+    risk_pct_over_50k: float = 0.02  # Funding Pips: 2% per-trade on ≥$50k accounts
+    slippage_buffer: float = 0.98  # keep lot's worst-case loss to this fraction of the rule cap
 
     # Anchors — (label, broker_hour, broker_minute). Broker = UTC+3.
     # v2.5.6: A3/A4 shifted 20 min EARLIER (13:40 / 16:40) so the position is
     # opened and its freeze-lock established BEFORE the 10:00-ET news block,
     # instead of entering into the news spike. A1/A2 unchanged (no US news).
     anchors: List[Tuple[str, int, int]] = field(default_factory=lambda: [
-        ("A1_02h_Asia",      2,  0),
-        ("A2_10h_London",   10,  0),
+        ("A1_02h_Asia", 6, 40),
+        ("A2_10h_London", 10, 0),
         ("A3_1340_Overlap", 13, 50),
-        ("A4_1640_NYopen",  16, 40),
+        ("A4_1640_NYopen", 16, 40),
     ])
-    broker_tz_offset_hours: int = 3       # UTC+3
-    eod_broker_hour: int = 23             # close all at 23:00 broker
+    broker_tz_offset_hours: int = 3  # UTC+3
+    eod_broker_hour: int = 23  # close all at 23:00 broker
 
     # Risk
     starting_balance: float = 50000.0
-    daily_loss_pct:   float = 0.03        # 3% kill switch (Funding Pips Zero has 5% trailing DD — 3% daily gives a 2% multi-day buffer)
-    weekly_loss_pct:  float = 0.08
-    account_floor_pct: float = 0.85       # halt new entries below this multiple of starting
+    daily_loss_pct: float = 0.03  # 3% kill switch (Funding Pips Zero has 5% trailing DD — 3% daily gives a 2% multi-day buffer)
+    weekly_loss_pct: float = 0.08
+    account_floor_pct: float = 0.85  # halt new entries below this multiple of starting
 
     # Operational
     log_level: str = "INFO"
@@ -80,31 +85,31 @@ class Config:
 def setup_logging(level: str = "INFO", log_dir: str = "./logs",
                   app_name: str = "aureon"):
     """Set up logging to BOTH stdout and a daily-rotated file in log_dir.
-    
+
     File naming: logs/aureon_YYYY-MM-DD.log (rotated daily at UTC midnight,
     keeping 30 days of history). All log levels from app modules go in.
-    
+
     Format includes timestamp, level, module name, and message. Caller can
     grep for specific anchors, errors, or modules later.
     """
     os.makedirs(log_dir, exist_ok=True)
-    
+
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper()))
     # Clear any pre-existing handlers so basicConfig calls don't double-log
     for h in list(root.handlers):
         root.removeHandler(h)
-    
+
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-    
+
     # Console handler (so terminal still shows everything)
     console = logging.StreamHandler()
     console.setFormatter(fmt)
     root.addHandler(console)
-    
+
     # Daily-rotated file handler
     from logging.handlers import TimedRotatingFileHandler
     log_file = os.path.join(log_dir, f"{app_name}.log")
@@ -115,7 +120,7 @@ def setup_logging(level: str = "INFO", log_dir: str = "./logs",
     file_handler.setFormatter(fmt)
     file_handler.suffix = "%Y-%m-%d"  # so rotated files become aureon.log.2026-05-25
     root.addHandler(file_handler)
-    
+
     log = logging.getLogger("AUREON")
     log.info(f"Logging to console + {log_file} (daily rotation, 30-day retention)")
     return log
@@ -132,7 +137,7 @@ log = logging.getLogger("AUREON")
 class Position:
     """A single open position (one leg from one anchor)."""
     anchor_label: str
-    side: str            # 'BUY' or 'SELL'
+    side: str  # 'BUY' or 'SELL'
     entry_price: float
     entry_time: pd.Timestamp
     current_sl: float
@@ -142,7 +147,7 @@ class Position:
     closed: bool = False
     exit_price: Optional[float] = None
     exit_time: Optional[pd.Timestamp] = None
-    outcome: Optional[str] = None        # 'SL', 'TP', 'Trail', 'EOD', 'KillSwitch'
+    outcome: Optional[str] = None  # 'SL', 'TP', 'Trail', 'EOD', 'KillSwitch'
 
     @property
     def pnl_dist(self) -> float:
@@ -155,6 +160,7 @@ class Position:
 
 def initial_sl(side: str, entry: float, cfg: Config) -> float:
     return entry - cfg.sl_dist if side == 'BUY' else entry + cfg.sl_dist
+
 
 def initial_tp(side: str, entry: float, cfg: Config) -> float:
     return entry + cfg.tp_dist if side == 'BUY' else entry - cfg.tp_dist
@@ -228,18 +234,11 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if candidate_sl < pos.current_sl - cfg.min_step:
                 pos.current_sl = candidate_sl
 
-    # v2.5.5 PATCH A: $5 SECONDARY LOCK now fires EVEN during freeze (dropped the
-    # not-in_freeze gate). Once peak fav reaches $5, force SL to be at least $4 in
-    # profit from entry. Guarantees: any trade that touches $5 fav exits with ≥$4/unit.
-    if fav >= 5.00:
-        if pos.side == 'BUY':
-            floor_sl = pos.entry_price + 4.00
-            if floor_sl > pos.current_sl:
-                pos.current_sl = floor_sl
-        else:
-            floor_sl = pos.entry_price - 4.00
-            if floor_sl < pos.current_sl:
-                pos.current_sl = floor_sl
+    # v2.6: $5 SECONDARY LOCK REMOVED. It pinned SL to entry+$4 above $5 fav, which is
+    # TIGHTER than the peak-1.50 trail and capped runners exactly where you want them to
+    # ride. The trail above already ratchets the SL up continuously and never down, so it
+    # serves as the moving profit floor. Design: arm at +$2.5, BE lock at +$3, then pure
+    # peak-1.50 trail all the way up.
 
     # 6. TP CHECK
     if pos.side == 'BUY':
@@ -303,11 +302,11 @@ def run_backtest(csv_path: str, start: str, end: str, cfg: Config) -> pd.DataFra
     log.info(f"Loading M1 from {csv_path}")
     m1 = pd.read_csv(csv_path)
     m1['time'] = pd.to_datetime(m1['time'], utc=True)
-    m1 = m1.set_index('time').sort_index()[['open','high','low','close']]
+    m1 = m1.set_index('time').sort_index()[['open', 'high', 'low', 'close']]
     log.info(f"Loaded {len(m1):,} M1 bars from {m1.index.min()} to {m1.index.max()}")
 
     m5 = m1.resample('5min', label='right', closed='right').agg(
-        {'open':'first','high':'max','low':'min','close':'last'}).dropna()
+        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
     log.info(f"Resampled to {len(m5):,} M5 bars")
 
     days = pd.date_range(start, end, freq='B')
@@ -329,7 +328,7 @@ def run_backtest(csv_path: str, start: str, end: str, cfg: Config) -> pd.DataFra
             anchor_price = m5_close_at(m5, at)
             if anchor_price is None: continue
 
-            buy_stop  = round(anchor_price + cfg.trigger_dist, 2)
+            buy_stop = round(anchor_price + cfg.trigger_dist, 2)
             sell_stop = round(anchor_price - cfg.trigger_dist, 2)
             window = m1.loc[at:eod_ts]
             if len(window) < 3: continue
@@ -338,33 +337,38 @@ def run_backtest(csv_path: str, start: str, end: str, cfg: Config) -> pd.DataFra
             side, fi = None, None
             for i, (ts, bar) in enumerate(window.iterrows()):
                 b_hit = bar.high >= buy_stop
-                s_hit = bar.low  <= sell_stop
+                s_hit = bar.low <= sell_stop
                 if b_hit and s_hit:
                     side = 'SELL' if bar.close >= bar.open else 'BUY'
-                    fi = i; break
+                    fi = i;
+                    break
                 elif b_hit:
-                    side = 'BUY'; fi = i; break
+                    side = 'BUY';
+                    fi = i;
+                    break
                 elif s_hit:
-                    side = 'SELL'; fi = i; break
+                    side = 'SELL';
+                    fi = i;
+                    break
 
             if side is None: continue
 
             entry_price = buy_stop if side == 'BUY' else sell_stop
-            entry_time  = window.index[fi]
+            entry_time = window.index[fi]
 
             pos = Position(
-                anchor_label = label,
-                side         = side,
-                entry_price  = entry_price,
-                entry_time   = entry_time,
-                current_sl   = initial_sl(side, entry_price, cfg),
-                tp_level     = initial_tp(side, entry_price, cfg),
-                max_fav      = entry_price,
-                lot          = cfg.lot_size,
+                anchor_label=label,
+                side=side,
+                entry_price=entry_price,
+                entry_time=entry_time,
+                current_sl=initial_sl(side, entry_price, cfg),
+                tp_level=initial_tp(side, entry_price, cfg),
+                max_fav=entry_price,
+                lot=cfg.lot_size,
             )
 
             # Walk forward from next bar
-            walk = window.iloc[fi+1:]
+            walk = window.iloc[fi + 1:]
             for ts, bar in walk.iterrows():
                 outcome = update_position_on_bar(pos, bar, ts, cfg)
                 if outcome:
@@ -422,19 +426,19 @@ def summarize_backtest(df: pd.DataFrame, cfg: Config) -> Dict:
     return {
         'fills': len(df),
         'total_pips': round(df['pnl_dist'].sum(), 2),
-        'total_usd':  round(df['pnl_usd'].sum(), 2),
-        'win_rate':   round(100 * (df['pnl_usd'] > 0).mean(), 2),
-        'max_dd':     round(dd, 2),
+        'total_usd': round(df['pnl_usd'].sum(), 2),
+        'win_rate': round(100 * (df['pnl_usd'] > 0).mean(), 2),
+        'max_dd': round(dd, 2),
         'max_dd_pct': round(100 * dd / cfg.starting_balance, 2),
-        'sl_count':   int((df['outcome']=='SL').sum()),
-        'tp_count':   int((df['outcome']=='TP').sum()),
-        'worst_day':  round(daily.min(), 2),
-        'best_day':   round(daily.max(), 2),
-        'kill_days':  int((daily <= -cfg.daily_loss_pct * cfg.starting_balance).sum()),
-        'months':     len(monthly),
-        'avg_per_month_usd':  round(monthly.mean(), 2),
+        'sl_count': int((df['outcome'] == 'SL').sum()),
+        'tp_count': int((df['outcome'] == 'TP').sum()),
+        'worst_day': round(daily.min(), 2),
+        'best_day': round(daily.max(), 2),
+        'kill_days': int((daily <= -cfg.daily_loss_pct * cfg.starting_balance).sum()),
+        'months': len(monthly),
+        'avg_per_month_usd': round(monthly.mean(), 2),
         'avg_per_month_pips': round(df['pnl_dist'].sum() / len(monthly), 2),
-        'monthly_pnl': {str(k): round(v,2) for k,v in monthly.items()},
+        'monthly_pnl': {str(k): round(v, 2) for k, v in monthly.items()},
     }
 
 
@@ -448,14 +452,14 @@ _MT5_RETCODE_MAP = {
     10006: "REJECT",
     10007: "CANCEL",
     10008: "PLACED",
-    10009: "DONE",                  # ← success
+    10009: "DONE",  # ← success
     10010: "DONE_PARTIAL",
     10011: "ERROR",
     10012: "TIMEOUT",
     10013: "INVALID",
     10014: "INVALID_VOLUME",
-    10015: "INVALID_PRICE",         # ← stop price on wrong side of market
-    10016: "INVALID_STOPS",         # ← SL/TP on wrong side
+    10015: "INVALID_PRICE",  # ← stop price on wrong side of market
+    10016: "INVALID_STOPS",  # ← SL/TP on wrong side
     10017: "TRADE_DISABLED",
     10018: "MARKET_CLOSED",
     10019: "NO_MONEY",
@@ -495,6 +499,7 @@ class MT5Adapter:
     "utc", +3 for "broker_local" if broker is UTC+3). Use this offset to
     decode any future tick.time and to encode times we send to copy_rates.
     """
+
     def __init__(self):
         import MetaTrader5 as mt5
         self.mt5 = mt5
@@ -520,46 +525,47 @@ class MT5Adapter:
             f"({'real UTC' if self.tick_time_offset_hours == 0 else 'broker-local-as-UTC'})"
         )
 
-        # v2.5.7: log broker's minimum legal stop distance + freeze level once.
-        try:
-            si = mt5.symbol_info("XAUUSD")
-            if si is not None:
-                log.info(
-                    f"Broker stop constraints: stops_level={si.trade_stops_level}pts "
-                    f"(=${si.trade_stops_level * si.point:.2f}) "
-                    f"freeze_level={si.trade_freeze_level}pts "
-                    f"(=${si.trade_freeze_level * si.point:.2f})"
-                )
-        except Exception as e:
-            log.warning(f"Could not read broker stop constraints: {e}")
-
-    def _detect_tick_time_offset(self) -> float:
-        """Compare broker's reported tick time to our local UTC clock.
-        Returns the integer-hour offset that needs to be SUBTRACTED from
-        the broker's tick.time to convert it to real UTC. Returns 0 if
-        the broker is already using real UTC.
-
-        Falls back to 0 if no fresh tick is available."""
+    def _detect_tick_time_offset(self, max_wait_s: float = 90.0):
+        """Detect broker tick.time offset from a LIVE feed. Returns int-hour
+        offset to SUBTRACT, or None if no live tick can be measured."""
         import time as _time
         from datetime import datetime as _dt, timezone as _tz
-        # Try up to 3 times to get a fresh tick
-        for _ in range(3):
-            tick = self.mt5.symbol_info_tick("XAUUSD")
-            if tick is not None and tick.time > 0:
-                broker_unix = tick.time
-                now_unix = _dt.now(_tz.utc).timestamp()
-                diff_hours = (broker_unix - now_unix) / 3600.0
-                # Round to nearest hour
-                offset = round(diff_hours)
-                # Sanity: only accept offsets in [-12, +12] hours
-                if -12 <= offset <= 12:
-                    # If diff is < 5 minutes, broker is sending real UTC
-                    if abs(diff_hours) < (5/60):
-                        return 0
+        FRESH_TOL_S = 15.0; ADVANCE_S = 4.0; POLL_S = 1.0
+        deadline = _time.monotonic() + max_wait_s
+        last_age = None
+        # A tick ~N whole-hours stale looks identical to an N-hour offset, so a
+        # single timestamp can't disambiguate. Require the feed to be LIVE:
+        # tick.time must advance with the wall clock between two reads.
+        while _time.monotonic() < deadline:
+            t1 = self.mt5.symbol_info_tick("XAUUSD"); w1 = _dt.now(_tz.utc).timestamp()
+            if t1 is None or t1.time <= 0:
+                _time.sleep(POLL_S); continue
+            _time.sleep(ADVANCE_S)
+            t2 = self.mt5.symbol_info_tick("XAUUSD"); w2 = _dt.now(_tz.utc).timestamp()
+            if t2 is None or t2.time <= 0:
+                _time.sleep(POLL_S); continue
+            wall = w2 - w1; adv = t2.time - t1.time
+            if adv < max(1.0, 0.5 * wall):
+                last_age = "feed not advancing"
+                log.warning(f"Offset detect: feed not live (adv {adv:.0f}s/{wall:.0f}s) — waiting")
+                _time.sleep(POLL_S); continue
+            diff = t2.time - w2; offset = round(diff / 3600.0)
+            if -12 <= offset <= 12:
+                remainder = abs(diff - offset * 3600.0); last_age = remainder
+                if remainder <= FRESH_TOL_S:
+                    log.info(f"Broker time offset detected: {offset:+d}h [live feed]")
                     return float(offset)
-            _time.sleep(0.5)
-        log.warning("Could not detect broker time offset — assuming real UTC (0h)")
-        return 0.0
+            _time.sleep(POLL_S)
+        log.error(f"Could not detect offset within {max_wait_s:.0f}s (last {last_age}). "
+                  f"Returning None — caller must NOT trade on a guessed offset.")
+        return None
+
+    def ensure_time_offset(self, max_wait_s: float = 90.0) -> bool:
+        off = self._detect_tick_time_offset(max_wait_s=max_wait_s)
+        if off is None:
+            return False
+        self.tick_time_offset_hours = off
+        return True
 
     def shutdown(self):
         self.mt5.shutdown()
@@ -571,9 +577,9 @@ class MT5Adapter:
         m5_start = utc_time - pd.Timedelta(minutes=5)
         broker_offset = pd.Timedelta(hours=self.tick_time_offset_hours)
         m5_start_send = (m5_start + broker_offset).tz_localize(None).to_pydatetime()
-        m5_end_send   = (utc_time  + broker_offset).tz_localize(None).to_pydatetime()
+        m5_end_send = (utc_time + broker_offset).tz_localize(None).to_pydatetime()
         bars = self.mt5.copy_rates_range(symbol, self.mt5.TIMEFRAME_M5,
-                                          m5_start_send, m5_end_send)
+                                         m5_start_send, m5_end_send)
         if bars is None or len(bars) == 0:
             log.warning(f"get_m5_close: no bars in [{m5_start_send} → {m5_end_send}]")
             return None
@@ -601,12 +607,12 @@ class MT5Adapter:
             return {
                 'login': int(info.login),
                 'balance': float(info.balance),
-                'equity':  float(info.equity),
-                'margin':  float(info.margin),
+                'equity': float(info.equity),
+                'margin': float(info.margin),
                 'margin_free': float(info.margin_free),
                 'currency': info.currency,
                 'leverage': int(info.leverage),
-                'server':   info.server,
+                'server': info.server,
             }
         except Exception as e:
             log.warning(f"get_account_info failed: {e}")
@@ -684,12 +690,14 @@ class MT5Adapter:
                     f"✅ Placed {side} stop @ {price} lot={lot}: rc=-1 but RECONCILED — "
                     f"ticket {existing.ticket} found in broker state"
                 )
+
                 # Build a minimal SendResult-like shim so callers can read .retcode/.order
                 class _ReconciledResult:
                     retcode = 10009
-                    order   = int(existing.ticket)
-                    deal    = 0
+                    order = int(existing.ticket)
+                    deal = 0
                     comment = "RECONCILED_FROM_BROKER_STATE"
+
                 return _ReconciledResult()
             # Truly not placed — safe to retry exactly once
             log.warning(
@@ -714,59 +722,51 @@ class MT5Adapter:
         return result
 
     def modify_position_sl(self, ticket: int, new_sl: float,
-                           dry_run: bool = False) -> bool:
-        """v2.5.7: verify-and-retry on ALL non-DONE retcodes (not just rc=-1).
-        Returns True only if the broker's actual SL matches new_sl afterward.
-        Returns False on any unrecoverable failure — caller must act on it."""
+                           dry_run: bool = False):
+        """v2.5: rc=-1 reconciliation symmetric with place_stop_order.
+        If order_send returns None, query broker for actual position SL.
+        If broker already has the new SL, return success silently.
+        If broker still has old SL, retry once."""
         mt5 = self.mt5
         if dry_run:
             log.info(f"[PAPER] Would modify ticket {ticket} SL → {new_sl}")
-            return True
+            return {'paper': True}
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "sl": new_sl,
+        }
+        result = mt5.order_send(req)
+        rc = result.retcode if result else -1
 
-        req = {"action": mt5.TRADE_ACTION_SLTP, "position": ticket, "sl": new_sl}
-
-        last_rc = None
-        last_actual = None
-        for attempt in range(3):
-            result = mt5.order_send(req)
-            rc = result.retcode if result else -1
-            rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
-            last_rc = f"{rc} ({rc_name})"
-
-            if rc == 10009:
-                log.info(f"✅ Modify SL ticket={ticket} → ${new_sl}: DONE (attempt {attempt+1})")
-                return True
-
-            # Any non-DONE rc (incl. -1, 10016 INVALID_STOPS, 10025 NO_CHANGES,
-            # 10027 FROZEN, 10018 MARKET_CLOSED). Read back broker SL to decide.
+        # v2.5 reconciliation
+        if rc == -1:
             import time as _time
-            _time.sleep(0.3)
+            _time.sleep(0.5)
             positions = mt5.positions_get(ticket=ticket)
-            if not positions:
+            if positions:
+                actual_sl = positions[0].sl
+                if abs(actual_sl - new_sl) < 0.05:
+                    log.info(f"✅ Modify SL ticket={ticket} → ${new_sl}: rc=-1 but RECONCILED — broker SL matches")
+
+                    class _R:
+                        retcode = 10009; comment = "RECONCILED_SLTP"
+
+                    return _R()
+                else:
+                    log.warning(
+                        f"⚠ Modify SL ticket={ticket}: rc=-1, broker SL still ${actual_sl} (wanted ${new_sl}) — retrying"
+                    )
+                    result = mt5.order_send(req)
+                    rc = result.retcode if result else -1
+                    if rc == 10009:
+                        log.info(f"✅ Modify SL ticket={ticket} → ${new_sl} on RETRY: retcode=10009")
+                        return result
+                    log.error(f"❌ Modify SL ticket={ticket} RETRY also failed: retcode={rc}")
+            else:
                 log.warning(
-                    f"⚠ Modify SL ticket={ticket}: rc={rc_name}, position not found "
-                    f"(may have closed). Stopping."
-                )
-                return False
-            last_actual = positions[0].sl
-            if abs(last_actual - new_sl) < 0.05:
-                log.info(
-                    f"✅ Modify SL ticket={ticket} → ${new_sl}: rc={rc_name} but "
-                    f"broker SL already matches — RECONCILED"
-                )
-                return True
-
-            log.warning(
-                f"⚠ Modify SL ticket={ticket} attempt {attempt+1}/3 FAILED: "
-                f"rc={rc_name}. Broker SL still ${last_actual} (wanted ${new_sl}). Retrying."
-            )
-
-        log.error(
-            f"❌ Modify SL ticket={ticket} → ${new_sl} FAILED after 3 attempts "
-            f"(last rc={last_rc}, broker SL=${last_actual}). SL NOT updated at broker — "
-            f"trade is running on its PREVIOUS stop. Will re-attempt next bar."
-        )
-        return False
+                    f"⚠ Modify SL ticket={ticket}: rc=-1 + position not found in broker state — position may have closed")
+        return result
 
     def cancel_order(self, ticket, dry_run: bool = False):
         """Cancel a pending order by ticket id."""
@@ -787,7 +787,9 @@ class MT5Adapter:
             orders = mt5.orders_get(ticket=int(ticket)) or []
             if not orders:
                 log.info(f"✅ Cancel order {ticket}: rc=-1 but RECONCILED — order is gone")
+
                 class _R: retcode = 10009; comment = "RECONCILED_CANCEL"
+
                 return _R()
             log.warning(f"⚠ Cancel order {ticket}: rc=-1 + order still exists — retrying")
             result = mt5.order_send(req)
@@ -889,7 +891,7 @@ def main():
     parser.add_argument('mode', choices=['backtest', 'paper', 'live'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
-    parser.add_argument('--end',   default='2026-12-31')
+    parser.add_argument('--end', default='2026-12-31')
     parser.add_argument('--output-dir', default='./output')
     parser.add_argument('--lot', type=float, default=None)
     parser.add_argument('--balance', type=float, default=None)
@@ -908,7 +910,8 @@ def main():
 
     if args.mode == 'backtest':
         if not args.csv:
-            log.error("Backtest mode requires --csv"); sys.exit(1)
+            log.error("Backtest mode requires --csv");
+            sys.exit(1)
         cfg.min_step = 0.0  # clean math in backtest
         os.makedirs(args.output_dir, exist_ok=True)
         df = run_backtest(args.csv, args.start, args.end, cfg)
@@ -916,7 +919,7 @@ def main():
             log.warning("No trades produced. Check CSV and date range.")
             return
         stats = summarize_backtest(df, cfg)
-        log.info(f"\n{'='*60}\nBACKTEST SUMMARY\n{'='*60}")
+        log.info(f"\n{'=' * 60}\nBACKTEST SUMMARY\n{'=' * 60}")
         for k, v in stats.items():
             if k == 'monthly_pnl': continue
             log.info(f"  {k:20s} = {v}")
@@ -925,7 +928,7 @@ def main():
             log.info(f"  {m}  ${p:>10,.2f}")
         # Save outputs
         trades_path = os.path.join(args.output_dir, 'trades.csv')
-        stats_path  = os.path.join(args.output_dir, 'stats.json')
+        stats_path = os.path.join(args.output_dir, 'stats.json')
         df.to_csv(trades_path, index=False)
         with open(stats_path, 'w') as f:
             json.dump(stats, f, indent=2)
