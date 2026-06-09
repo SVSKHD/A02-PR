@@ -46,9 +46,9 @@ class Config:
     # normal gold noise (~$0.11 spread) doesn't clip a live runner.
     min_step: float = 0.10  # v2.5.5: back to 0.10 to match the 0.30 trail gap
     freeze_minutes: int = 15  # v2.5: ENABLED — trend-capture mode, matches backtest projections. 0 to disable for legacy v2.2 behavior.
-
+    no_oco: bool = False  # True = keep sibling stop live after first fill; reversal fills it as 2nd independent position
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
-    auto_lot: bool = True  # if True, override lot_size from live balance
+    auto_lot: bool = False  # if True, override lot_size from live balance
     lot_conservatism: float = 0.99  # was 0.92 — produces lot 0.54 at $50k (1.94% per trade, safe buffer to 4% daily rule)
     risk_pct_under_50k: float = 0.03  # Funding Pips: 3% per-trade on <$50k accounts
     risk_pct_over_50k: float = 0.02  # Funding Pips: 2% per-trade on ≥$50k accounts
@@ -59,7 +59,7 @@ class Config:
     # opened and its freeze-lock established BEFORE the 10:00-ET news block,
     # instead of entering into the news spike. A1/A2 unchanged (no US news).
     anchors: List[Tuple[str, int, int]] = field(default_factory=lambda: [
-        ("A1_02h_Asia", 6, 40),
+        ("A1_02h_Asia", 2, 30),
         ("A2_10h_London", 10, 0),
         ("A3_1340_Overlap", 13, 50),
         ("A4_1640_NYopen", 16, 40),
@@ -895,6 +895,7 @@ def main():
     parser.add_argument('--output-dir', default='./output')
     parser.add_argument('--lot', type=float, default=None)
     parser.add_argument('--balance', type=float, default=None)
+    parser.add_argument('--no-oco', action='store_true', help="No-OCO: keep sibling live, reversal can 2nd-fill")
 
     parser.add_argument('--i-understand-the-risks', action='store_true',
                         help="Required for live mode")
@@ -905,6 +906,8 @@ def main():
     log = setup_logging(args.log_level)
 
     cfg = Config()
+    if args.no_oco: cfg.no_oco = True
+
     if args.lot is not None: cfg.lot_size = args.lot
     if args.balance is not None: cfg.starting_balance = args.balance
 

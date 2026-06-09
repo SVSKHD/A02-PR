@@ -1509,13 +1509,19 @@ class LiveTrader:
                     f"@ ${info['entry_price']:.2f} (ticket {ticket})"
                 )
                 # Cancel sibling (OCO) — v2.3: sibling may be None if other side was skipped pre-flight
-                if sibling is not None and sibling in broker_pend_tickets:
-                    try:
-                        self.adapter.cancel_order(sibling)
-                    except Exception as e:
-                        self.tele.warn(f"Could not cancel sibling {sibling}: {e}")
-                if sibling is not None:
-                    self.shadow_pendings.pop(sibling, None)
+                # OCO vs No-OCO sibling handling
+                if not getattr(self.cfg, 'no_oco', False):
+                    if sibling is not None and sibling in broker_pend_tickets:
+                        try:
+                            self.adapter.cancel_order(sibling)
+                        except Exception as e:
+                            self.tele.warn(f"Could not cancel sibling {sibling}: {e}")
+                    if sibling is not None:
+                        self.shadow_pendings.pop(sibling, None)
+                else:
+                    if sibling is not None and sibling in self.shadow_pendings:
+                        self.shadow_pendings[sibling]['sibling_ticket'] = None
+                        self.tele.info(f"No-OCO: sibling {sibling} left live (reversal can fill it)")
                 # Promote to managed position
                 broker_p = next(p for p in broker_positions if int(p.ticket) == ticket)
                 # v2.3: capture broker's actual fill timestamp for freeze logic

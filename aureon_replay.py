@@ -77,7 +77,7 @@ CACHE_DIR = "bt_cache"
 
 # Anchors: (label, broker_hour, broker_minute)
 ANCHORS = [
-    ("A1_02h_Asia",      2,  0),
+    ("A1_02h_Asia",      6, 40),   # changed to match today's live test time
     ("A2_10h_London",   10,  0),
     ("A3_1340_Overlap", 13, 50),
     ("A4_1640_NYopen",  16, 40),
@@ -97,6 +97,7 @@ class Rules:
     min_step:       float = 0.10
     spread:         float = 0.0        # $ spread estimate; bar-extreme peak is haircut by this so the trail rides the EXECUTABLE side, not mid. 0 = old behaviour.
     no_oco:         bool  = False       # False = OCO (sibling cancelled on first fill). True = both stops stay live; sibling can fill as a 2nd independent trade.
+    reverse_at:     float = 0.0          # STOP-AND-REVERSE: if >0, OCO fill that goes this many $ underwater (from fill price) is CLOSED and an opposite leg opened at that price, then trailed normally. ONE flip max per anchor. 0 = off. Mutually exclusive with no_oco.
     checkpoints: list = field(default_factory=lambda: [])  # [(peak, locked_profit)]
     eod_broker_hour: int = 23
 
@@ -185,14 +186,19 @@ def ticks_to_m1(ticks):
 # SINGLE-TRADE MANAGEMENT  (mirrors the bot)
 # ---------------------------------------------------------------------------
 
-def manage_trade(side, entry, fill_time, m1_bars, ticks_after, rules, eod):
+def manage_trade(side, entry, fill_time, m1_bars, ticks_after, rules, eod, allow_reverse=False):
     """
     m1_bars: list of (ts,o,h,l,c) AFTER fill, ascending, up to EOD.
     ticks_after: list of (ts,bid,ask) AFTER fill, ascending, up to EOD (for stop touch).
-    Returns (exit_price, exit_reason, exit_time, peak_fav).
+    Returns (exit_price, exit_reason, exit_time, peak_fav, timeline).
 
     Trail decisions happen on M1 close (like _manage_trails_on_bar_close).
     Stop touches are checked on ticks between bar closes (like the broker stop).
+
+    allow_reverse: if True and rules.reverse_at>0, a leg that goes reverse_at $
+    underwater (from fill) BEFORE going favorable is closed early with reason
+    'REVERSE' at the -reverse_at price, so the caller can open the opposite leg.
+    The reversed leg itself is managed with allow_reverse=False (one flip max).
     """
     sl = entry - rules.sl_dist if side == 'BUY' else entry + rules.sl_dist
     tp = entry + rules.tp_dist if side == 'BUY' else entry - rules.tp_dist
@@ -223,6 +229,15 @@ def manage_trade(side, entry, fill_time, m1_bars, ticks_after, rules, eod):
                 is_init = sl >= entry + rules.sl_dist - 0.01
             reason = 'SL_initial' if is_init else ('SL_be' if abs(sl-entry) < 0.05 else 'SL_trail')
             return done(sl, reason, ts)
+        # STOP-AND-REVERSE trigger: if enabled, and this leg has gone reverse_at $
+        # underwater while never having armed (peak still below be_trigger), close
+        # here and signal a flip. Guard on peak<be_trigger so a trade that already
+        # ran favorable and is now pulling back is handled by the trail, not flipped.
+        if allow_reverse and rules.reverse_at > 0 and peak < rules.be_trigger:
+            adverse = (entry - bid) if side == 'BUY' else (ask - entry)
+            if adverse >= rules.reverse_at:
+                rev_price = entry - rules.reverse_at if side == 'BUY' else entry + rules.reverse_at
+                return done(rev_price, 'REVERSE', ts)
         # TP touch
         if (side == 'BUY' and ask >= tp) or (side == 'SELL' and bid <= tp):
             return done(tp, 'TP', ts)
@@ -335,26 +350,44 @@ def run_day(d: DateType, m1_day, ticks_day, rules, verbose=False):
                     legs.append(('SELL', sib_stop, ts)); break
 
         # ---- MANAGE EACH LEG ----
-        for leg_i, (side, entry, fill_time) in enumerate(legs):
+        # legs is a queue; the SAR flip can append one opposite leg dynamically.
+        leg_i = 0
+        queue = list(legs)
+        while leg_i < len(queue):
+            side, entry, fill_time = queue[leg_i]
             m1_after = [b for b in m1_day if b[0] >= fill_time]
             ticks_after = [t for t in ticks_day if t[0] >= fill_time]
+            # allow_reverse only on the FIRST leg of an OCO anchor, and only if the
+            # reverse feature is on (and No-OCO is off — they're mutually exclusive).
+            allow_rev = (rules.reverse_at > 0 and not rules.no_oco and leg_i == 0)
             exit_price, reason, exit_time, peak, timeline = manage_trade(
-                side, entry, fill_time, m1_after, ticks_after, rules, eod)
+                side, entry, fill_time, m1_after, ticks_after, rules, eod,
+                allow_reverse=allow_rev)
             pnl = ((exit_price - entry) if side == 'BUY' else (entry - exit_price)) * rules.contract_size * rules.lot
-            leg_tag = label if leg_i == 0 else f"{label}*"   # * marks the No-OCO 2nd leg
-            # convert timeline (price-fav) to USD samples for the intraday curve
+            if leg_i == 0:
+                leg_tag = label
+            elif reason == 'REVERSE' or (queue[leg_i-1][0] != side and rules.reverse_at > 0 and not rules.no_oco):
+                leg_tag = f"{label}~"   # ~ marks the stop-and-reverse flipped leg
+            else:
+                leg_tag = f"{label}*"   # * marks the No-OCO 2nd leg
             usd_samples = [(ts, fav * rules.contract_size * rules.lot) for ts, fav in timeline]
             results.append({
                 'date': str(d), 'anchor': leg_tag, 'side': side, 'entry': round(entry,2),
                 'fill_time': fill_time.strftime('%H:%M:%S'), 'exit': round(exit_price,2),
                 'exit_time': exit_time.strftime('%H:%M:%S'), 'reason': reason,
                 'peak': round(peak,2), 'pnl': round(pnl,2),
-                'samples': usd_samples,   # (ts, running unrealized USD) for intraday equity
+                'samples': usd_samples,
             })
             if verbose:
-                tag = " (2nd leg)" if leg_i else ""
+                tag = " (REVERSE flip)" if leg_tag.endswith('~') else (" (2nd leg)" if leg_i else "")
                 print(f"  {leg_tag} {side} entry {entry:.2f} @ {fill_time:%H:%M}{tag} "
                       f"peak +${peak:.2f} -> exit {exit_price:.2f} ({reason}) @ {exit_time:%H:%M}  ${pnl:+.2f}")
+            # If this leg ended on a REVERSE signal, open ONE opposite leg at the
+            # reverse price and queue it (managed with allow_reverse=False → one flip max).
+            if reason == 'REVERSE':
+                flip_side = 'SELL' if side == 'BUY' else 'BUY'
+                queue.append((flip_side, exit_price, exit_time))
+            leg_i += 1
     return results
 
 
@@ -462,6 +495,11 @@ def main():
     ap.add_argument('--no-oco', action='store_true',
                     help="Disable OCO: keep both stops live; the sibling can fill as a "
                          "2nd independent trade (marked anchor*). Doubles worst-case exposure.")
+    ap.add_argument('--reverse-at', type=float, default=0.0,
+                    help="STOP-AND-REVERSE: $ adverse move (from fill) that triggers a flip. "
+                         "OCO leg that goes this far underwater (before arming) is closed and an "
+                         "opposite leg opened at that price, trailed normally. ONE flip max per "
+                         "anchor (flipped leg marked anchor~). 0 = off. Ignored if --no-oco set.")
     ap.add_argument('--compare', action='store_true',
                     help="Run BOTH OCO and No-OCO over the same data and print a side-by-side "
                          "summary incl. intraday-equity drawdown. Suppresses the per-trade table.")
@@ -473,7 +511,7 @@ def main():
 
     rules = Rules(trail_gap=args.trail_gap, be_trigger=args.trail_arm, be_lock=args.be_lock,
                   freeze_minutes=args.freeze, tp_dist=args.tp, lot=args.lot, spread=args.spread,
-                  no_oco=args.no_oco)
+                  no_oco=args.no_oco, reverse_at=args.reverse_at)
     if args.checkpoints.strip():
         rules.checkpoints = [(float(a), float(b)) for a,b in (p.split(':') for p in args.checkpoints.split(','))]
 
@@ -483,7 +521,8 @@ def main():
     print(f"\nAUREON MONTH BACKTEST  {start} .. {end}")
     print(f"RULES  arm=+${rules.be_trigger}  BE=+${rules.be_lock}  gap=${rules.trail_gap}  "
           f"freeze={rules.freeze_minutes}m  SL=${rules.sl_dist}  TP=${rules.tp_dist}  lot={rules.lot}  "
-          f"spread=${rules.spread}  ckpt={rules.checkpoints or 'off'}")
+          f"spread=${rules.spread}  ckpt={rules.checkpoints or 'off'}  "
+          f"reverse_at={('$'+str(rules.reverse_at)) if rules.reverse_at>0 else 'off'}")
     print(f"       bot-faithful: trail on M1 close, stop on tick, EOD flatten 23:00 broker")
     print(f"       OCO: {'OFF — both stops live, sibling can 2nd-fill (marked *)' if rules.no_oco else 'ON — first fill cancels sibling'}\n")
 
