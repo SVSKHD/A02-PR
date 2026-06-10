@@ -222,10 +222,15 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             in_freeze = False  # bad timestamp → fall through to normal logic
 
     # v2.5.5 PATCH A — BASE LOCK: at +$3 favorable, force SL to break-even.
-    # Fires EVEN during freeze (safety valve for fast favorable spikes that
-    # reverse before the post-freeze trail can engage — e.g. Fri 29-May A3).
-    # This guarantees any trade that touches +$3 fav cannot become a loss.
-    if fav >= 3.00:
+    # v2.7 CHANGE: now gated to AFTER the freeze window. The validated tick-grid
+    # engine (+$26.7k @45m) has NO BE-lock during the hold -- its numbers already
+    # price in the cost of +$3 winners reversing to -$18. Firing it during the
+    # hold makes live diverge from the backtest, and live evidence (Jun-10 test
+    # anchor: SELL scratched $0.00 at 3.1m via BE-bounce while the market kept
+    # falling toward TP) shows it scratches exactly the riders the hold exists
+    # to protect. Post-freeze it is mostly redundant with the arm-1.5/gap-1.0
+    # trail but kept as a cheap floor.
+    if fav >= 3.00 and not in_freeze:
         if pos.side == 'BUY':
             if pos.entry_price > pos.current_sl:
                 pos.current_sl = pos.entry_price
