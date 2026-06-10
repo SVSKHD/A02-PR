@@ -1570,11 +1570,38 @@ class LiveTrader:
                             outcome = 'SL'
                         else:
                             outcome = 'Trail'
+                    # v2.7: hold-duration audit -- permanent detector for the freeze bug.
+                    # fill_time is TRUE UTC; close_deal.time is broker epoch seconds, so
+                    # subtract the offset to compare in the same (UTC) clock.
+                    hold_min = None
+                    try:
+                        _ft = shadow.get('fill_time')
+                        if _ft:
+                            _off = getattr(self.adapter, 'tick_time_offset_hours', 0) or 0
+                            _close_utc = pd.Timestamp(int(close_deal.time) - _off * 3600,
+                                                      unit='s', tz='UTC')
+                            hold_min = (_close_utc - pd.Timestamp(_ft)).total_seconds() / 60.0
+                    except Exception:
+                        hold_min = None
+                    hold_txt = f"  |  held `{hold_min:.1f}m`" if hold_min is not None else ""
+                    # Freeze-breach alarm: a Trail-class exit before the freeze window
+                    # elapsed should be impossible. Exits AT entry (+/- $0.40) are the
+                    # +$3 BASE LOCK firing, which IS allowed during freeze -- excluded.
+                    if (hold_min is not None and outcome == 'Trail'
+                            and self.cfg.freeze_minutes > 0
+                            and hold_min < self.cfg.freeze_minutes - 0.5
+                            and abs(close_price - float(shadow['entry_price'])) > 0.40):
+                        self.tele.warn(
+                            f"🚨 *FREEZE BREACH* {shadow['anchor_label']} "
+                            f"{shadow['side']}: Trail exit after only {hold_min:.1f}m "
+                            f"(< freeze {self.cfg.freeze_minutes}m). Trail gate is "
+                            f"engaging early -- investigate before next anchor."
+                        )
                     sev = Severity.SUCCESS if pnl_usd > 0 else Severity.WARN
                     self.tele.send(
                         f"📤 CLOSE: *{shadow['anchor_label']}* {shadow['side']} "
                         f"`{outcome}` @ ${close_price:.2f}\n"
-                        f"P&L: `${pnl_usd:+.2f}`  |  Daily total: `${self.state['daily_pnl']:+.2f}`",
+                        f"P&L: `${pnl_usd:+.2f}`  |  Daily total: `${self.state['daily_pnl']:+.2f}`{hold_txt}",
                         sev
                     )
                     # Append to today's trade log
@@ -1700,10 +1727,22 @@ class LiveTrader:
                     entry_time_for_pos = pd.Timestamp(fill_time_iso)
                     if entry_time_for_pos.tzinfo is None:
                         entry_time_for_pos = entry_time_for_pos.tz_localize('UTC')
+                    # v2.7 FIX (CRITICAL): fill_time is stored in TRUE UTC (the broker
+                    # offset is subtracted at capture), but bar_time is broker-clock-
+                    # LABELED-as-UTC (MT5 convention, no offset applied). Comparing them
+                    # inflated elapsed by +offset hours (+3h), so the freeze window was
+                    # ALWAYS already expired and the trail engaged from bar one on every
+                    # position (the $63-on-a-$1,500-move exits). Shift fill_time back
+                    # into the broker-clock convention so both sides use the same clock.
+                    _off = getattr(self.adapter, 'tick_time_offset_hours', 0) or 0
+                    entry_time_for_pos = entry_time_for_pos + pd.Timedelta(hours=_off)
                 except Exception:
-                    entry_time_for_pos = bar_time
+                    entry_time_for_pos = None  # unknown fill time -> no freeze, normal trail
             else:
-                entry_time_for_pos = bar_time  # legacy fallback — freeze won't apply, normal trail
+                # v2.7 FIX: None = no freeze (bot.py gates on `entry_time is not None`).
+                # The old `= bar_time` fallback made elapsed ~= 0 on EVERY bar, freezing
+                # the trail FOREVER -- the opposite of the original comment's intent.
+                entry_time_for_pos = None
 
             pos = self._Position(
                 anchor_label=shadow['anchor_label'],

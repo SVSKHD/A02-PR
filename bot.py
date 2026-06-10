@@ -36,17 +36,26 @@ class Config:
     trigger_dist: float = 5.00
     tp_dist: float = 30.00  # was 20.00 — let winners run longer
     sl_dist: float = 18.00  # was 20.00 — slightly tighter (saves $118 per SL)
-    lot_size: float = 0.54  # was 0.50 — max safe @ $50k (1.94% per trade, worst day -3.98% safely under 4% FP daily)
-    be_trigger: float = 2.50  # v2.6: was 0.30. Trail must NOT arm until +$2.5 favorable.
+    lot_size: float = 0.35  # v2.7: pinned to the backtested lot. Two full SLs = -$1,260,
+    # which survives the 3% daily kill switch (~$1,490 @ $49.6k). At 0.50+, two SLs
+    # (-$1,800+) trip the switch and end the day early.
+    be_trigger: float = 1.50  # v2.7: was 2.50. Tick grid (29 days, +$0.20 spread stress):
+    # arm 1.5 marginally better at every freeze level once the hold rule works.
     # The 0.30 arm let the trail chase price within seconds of fill,
     # parking the SL near entry so the first pullback closed the trade
     # at ~breakeven (the Jun-5 A2/A3/A4 losses). At +$2.5 the trade has
     # proven direction before the SL starts following.
-    trail_gap: float = 1.50  # v2.6: was 0.30. Once armed, SL = peak - 1.50. Wide enough that
-    # normal gold noise (~$0.11 spread) doesn't clip a live runner.
+    trail_gap: float = 1.00  # v2.7: was 1.50. With the 45m hold doing the noise-survival
+    # job, a tighter post-hold trail keeps more of the move (gap 1.0 best at every
+    # freeze level in the grid). The hold protects the runner; the gap banks it.
     min_step: float = 0.10  # v2.5.5: back to 0.10 to match the 0.30 trail gap
-    freeze_minutes: int = 15  # v2.5: ENABLED — trend-capture mode, matches backtest projections. 0 to disable for legacy v2.2 behavior.
-    no_oco: bool = False  # True = keep sibling stop live after first fill; reversal fills it as 2nd independent position
+    freeze_minutes: int = 45  # v2.7: was 15 (and functionally DEAD until the v2.7 timezone
+    # fix in live_trader._manage_trails_on_bar_close -- see comment there). 45m = risk-
+    # adjusted sweet spot of the tick grid: +$26.7k vs +$23.0k @30m, same maxDD (-$2,520),
+    # mid-plateau (30/45/60 all similar -- not a lucky number). During the hold only the
+    # $18 SL, $30 TP and +$3 BASE LOCK may close a trade.
+    no_oco: bool = True  # v2.7 default ON: grid shows nooco > oco by ~2x at every freeze
+    # level (2nd legs net +$6k standalone). --no-oco launch flag no longer required.
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
     auto_lot: bool = False  # if True, override lot_size from live balance
     lot_conservatism: float = 0.99  # was 0.92 — produces lot 0.54 at $50k (1.94% per trade, safe buffer to 4% daily rule)
