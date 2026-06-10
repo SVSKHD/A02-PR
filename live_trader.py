@@ -1,5 +1,5 @@
 """
-AUREON v2.5.3 — LiveTrader: production-ready live/paper trading loop.
+AUREON LiveTrader — production live/paper trading loop. Version: version.py.
 
 This module implements the runtime that was stubbed in bot.py's run_live().
 Imports cleanly into bot.py.
@@ -83,6 +83,10 @@ from datetime import date as DateType, timedelta, datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+try:
+    from version import __version__ as AUREON_VERSION
+except ImportError:
+    AUREON_VERSION = '2.9.2'  # fallback if version.py missing
 
 from telemetry import telemetry_from_env, Severity
 from bot import _MT5_RETCODE_MAP
@@ -241,6 +245,7 @@ class LiveTrader:
                 str(ticket): {
                     'max_fav':   shadow.get('max_fav'),
                     'fill_time': shadow.get('fill_time'),
+                    'role':      shadow.get('role', 'normal'),
                     'current_sl': shadow.get('current_sl'),
                     'side':       shadow.get('side'),
                     'entry_price': shadow.get('entry_price'),
@@ -1489,6 +1494,7 @@ class LiveTrader:
                         # v2.5 critical: restore max_fav from persisted state, not entry price
                         'max_fav':      float(saved.get('max_fav') or broker_p.price_open),
                         'fill_time':    saved.get('fill_time') or pd.Timestamp.now(tz='UTC').isoformat(),
+                        'role':         saved.get('role', 'normal'),  # v2.9
                     }
                     self.tele.info(
                         f"♻️ Rehydrated position {tk} {saved.get('side','?')} "
@@ -1521,7 +1527,10 @@ class LiveTrader:
                 else:
                     if sibling is not None and sibling in self.shadow_pendings:
                         self.shadow_pendings[sibling]['sibling_ticket'] = None
-                        self.tele.info(f"No-OCO: sibling {sibling} left live (reversal can fill it)")
+                        # v2.9: the sibling, if it ever fills, is a RESCUE leg --
+                        # it only fills after price traveled $10 against this leg.
+                        self.shadow_pendings[sibling]['rescue_on_fill'] = True
+                        self.tele.info(f"No-OCO: sibling {sibling} left live (reversal can fill it; will run as RESCUE)")
                 # Promote to managed position
                 broker_p = next(p for p in broker_positions if int(p.ticket) == ticket)
                 # v2.3: capture broker's actual fill timestamp for freeze logic
@@ -1541,7 +1550,11 @@ class LiveTrader:
                     'tp_level':     float(broker_p.tp),
                     'max_fav':      float(broker_p.price_open),
                     'fill_time':    fill_time_utc.isoformat(),  # v2.3: persisted, restart-safe
+                    'role':         'rescue' if info.get('rescue_on_fill') else 'normal',  # v2.9
                 }
+                if info.get('rescue_on_fill'):
+                    self.tele.info(f"\U0001F691 RESCUE leg active (ticket {ticket}): no early locks, "
+                                   f"free to run until +$10 covers the twin's loss.")
 
         # Detect closures
         for ticket in list(self.shadow_positions):
@@ -1755,6 +1768,7 @@ class LiveTrader:
                 tp_level=shadow['tp_level'],
                 max_fav=shadow['max_fav'],
                 lot=self.cfg.lot_size,
+                role=shadow.get('role', 'normal'),  # v2.9 role-aware ladder
             )
             old_max_fav = shadow.get('max_fav')
             update_position_on_bar(pos, bar_series, bar_time, self.cfg)
@@ -1982,12 +1996,13 @@ class LiveTrader:
                         if self.FP_ZERO_MAX_LOT is not None
                         else "\nFP\\_ZERO\\_MAX\\_LOT: `None` (Pepperstone demo — no cap)")
         self.tele.success(
-            f"🚀 *AUREON v2.5.3 {'PAPER' if self.paper else 'LIVE'} starting*\n"
+            f"🚀 *AUREON v{AUREON_VERSION} {'PAPER' if self.paper else 'LIVE'} starting*\n"
             f"Lot: `{self.cfg.lot_size}` ({auto_lot_label})\n"
             f"Kill switch: `-{self.cfg.daily_loss_pct*100:.1f}%`\n"
-            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
-            f"Trade channel warmup: ON ($100 ping + mt5 reconnect on cold)\n"
-            f"Diagnostic dumps: ON (full MT5 state on any failure)"
+            f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
+            f"Ladder: `2.5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
+            f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
+            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)"
             + fp_cap_label
         )
 

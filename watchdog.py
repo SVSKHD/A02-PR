@@ -44,6 +44,10 @@ import logging
 import os
 import signal
 import subprocess
+try:
+    from version import __version__ as AUREON_VERSION
+except ImportError:
+    AUREON_VERSION = '?'
 import sys
 import threading
 import time
@@ -435,7 +439,7 @@ def main():
     from env_loader import load_env
     load_env()
 
-    p = argparse.ArgumentParser(description="AUREON v2 watchdog supervisor")
+    p = argparse.ArgumentParser(description=f"AUREON v{AUREON_VERSION} watchdog supervisor")
     p.add_argument("mode", choices=["backtest", "paper", "live"],
                    help="Forwarded to bot.py as the first arg")
     p.add_argument("--run-dir", default="./run",

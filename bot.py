@@ -157,6 +157,7 @@ class Position:
     tp_level: float
     max_fav: float
     lot: float
+    role: str = 'normal'  # v2.9: 'normal' (1st leg) | 'rescue' (No-OCO 2nd leg)
     closed: bool = False
     exit_price: Optional[float] = None
     exit_time: Optional[pd.Timestamp] = None
@@ -225,22 +226,39 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
         except Exception:
             in_freeze = False  # bad timestamp → fall through to normal logic
 
-    # v2.5.5 PATCH A — BASE LOCK: at +$3 favorable, force SL to break-even.
-    # v2.7 CHANGE: now gated to AFTER the freeze window. The validated tick-grid
-    # engine (+$26.7k @45m) has NO BE-lock during the hold -- its numbers already
-    # price in the cost of +$3 winners reversing to -$18. Firing it during the
-    # hold makes live diverge from the backtest, and live evidence (Jun-10 test
-    # anchor: SELL scratched $0.00 at 3.1m via BE-bounce while the market kept
-    # falling toward TP) shows it scratches exactly the riders the hold exists
-    # to protect. Post-freeze it is mostly redundant with the arm-1.5/gap-1.0
-    # trail but kept as a cheap floor.
-    if fav >= 3.00 and not in_freeze:
+    # v2.9 ROLE-AWARE PROFIT LADDER -- fires EVEN during the hold. The hold
+    # blocks the noise-chasing trail, NOT profit protection. One-way ratchet:
+    # locks can only raise the floor, never loosen a stop.
+    #
+    # NORMAL leg (1st fill -- job: catch the breakout, bank profits):
+    #   fav >= $10  -> SL locked at peak - $2 (floor +$8)
+    #   fav >= $6   -> SL locked at entry +/- $4
+    #   fav >= $2.5 -> SL locked at breakeven (v2.9.2: was $3)
+    # RESCUE leg (No-OCO 2nd fill -- by construction it only fills after price
+    # traveled $10 against its twin; its job is to COVER the twin's loss, so it
+    # must stay free to run. Early BE-locks scratch it at $0 exactly when the
+    # crash it exists for is happening -- the Jun-10 A3 lesson):
+    #   fav >= $10 -> SL locked at entry +/- $8   (loss covered; start protecting)
+    #   no smaller tiers.
+    def _ratchet(level):
         if pos.side == 'BUY':
-            if pos.entry_price > pos.current_sl:
-                pos.current_sl = pos.entry_price
+            if level > pos.current_sl:
+                pos.current_sl = level
         else:
-            if pos.entry_price < pos.current_sl:
-                pos.current_sl = pos.entry_price
+            if level < pos.current_sl:
+                pos.current_sl = level
+    _sgn = 1.0 if pos.side == 'BUY' else -1.0
+    if fav >= 10.00:
+        # v2.9.1: above +$10 the lock FOLLOWS the peak at $2 distance (ratchet),
+        # floor +$8. Captures most of a hold-period spike (peak +$12.8 -> lock
+        # +$10.8 = +$540 @0.5) instead of a flat +$8, while $2 of room keeps
+        # ordinary noise from tagging it. fav here is peak favorable (max_fav).
+        _ratchet(pos.entry_price + _sgn * max(8.00, fav - 2.00))
+    elif pos.role != 'rescue':
+        if fav >= 6.00:
+            _ratchet(pos.entry_price + _sgn * 4.00)
+        elif fav >= 2.50:
+            _ratchet(pos.entry_price)
 
     if not in_freeze and fav >= cfg.be_trigger:
         if pos.side == 'BUY':
