@@ -1570,6 +1570,8 @@ class LiveTrader:
                             outcome = 'SL'
                         else:
                             outcome = 'Trail'
+                    if shadow.get('tstop'):
+                        outcome = 'TSTOP'
                     # v2.7: hold-duration audit -- permanent detector for the freeze bug.
                     # fill_time is TRUE UTC; close_deal.time is broker epoch seconds, so
                     # subtract the offset to compare in the same (UTC) clock.
@@ -1758,6 +1760,35 @@ class LiveTrader:
             update_position_on_bar(pos, bar_series, bar_time, self.cfg)
             shadow['current_sl'] = pos.current_sl
             shadow['max_fav'] = pos.max_fav
+
+            # v2.7.1 TSTOP -- loser time-stop (grid-validated). At hold expiry, a leg
+            # whose best favorable excursion never reached +$tstop_fav is a trapped
+            # fake-out; close at market (~ -$5..-$12) instead of riding to the full SL.
+            # One-shot by construction: max_fav is monotonic, so once fav >= threshold
+            # at expiry this can never fire later.
+            if (getattr(self.cfg, 'tstop_fav', 0.0) > 0
+                    and self.cfg.freeze_minutes > 0
+                    and entry_time_for_pos is not None):
+                try:
+                    _elapsed = (bar_time - entry_time_for_pos).total_seconds() / 60.0
+                except Exception:
+                    _elapsed = None
+                if _elapsed is not None and _elapsed >= self.cfg.freeze_minutes:
+                    _fav = (pos.max_fav - pos.entry_price) if shadow['side'] == 'BUY' \
+                        else (pos.entry_price - pos.max_fav)
+                    if _fav < self.cfg.tstop_fav:
+                        self.tele.warn(
+                            f"\u23f1 TSTOP: {shadow['anchor_label']} {shadow['side']} "
+                            f"never reached +${self.cfg.tstop_fav:.2f} fav in "
+                            f"{self.cfg.freeze_minutes}m (peak +${max(_fav, 0):.2f}) -- "
+                            f"closing at market instead of riding to SL."
+                        )
+                        shadow['tstop'] = True
+                        try:
+                            self.adapter.close_position(ticket, dry_run=self.paper)
+                        except Exception as e:
+                            log.warning(f"TSTOP close failed for {ticket}: {e}")
+                        continue
 
             if not self.paper:
                 # v2.5.7: read broker's ACTUAL sl and re-assert if it doesn't match

@@ -56,6 +56,10 @@ class Config:
     # $18 SL, $30 TP and +$3 BASE LOCK may close a trade.
     no_oco: bool = True  # v2.7 default ON: grid shows nooco > oco by ~2x at every freeze
     # level (2nd legs net +$6k standalone). --no-oco launch flag no longer required.
+    tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
+    # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
+    # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all
+    # 72 combos. fav<$2 or <$3 tested WORSE -- only truly dead legs get cut. 0 disables.
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
     auto_lot: bool = False  # if True, override lot_size from live balance
     lot_conservatism: float = 0.99  # was 0.92 — produces lot 0.54 at $50k (1.94% per trade, safe buffer to 4% daily rule)
