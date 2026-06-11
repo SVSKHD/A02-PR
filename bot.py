@@ -56,6 +56,16 @@ class Config:
     # $18 SL, $30 TP and +$3 BASE LOCK may close a trade.
     no_oco: bool = True  # v2.7 default ON: grid shows nooco > oco by ~2x at every freeze
     # level (2nd legs net +$6k standalone). --no-oco launch flag no longer required.
+    rescue_boost_enabled: bool = True  # v2.9.5 Hithesh's SL-RESCUE BOOST: when the
+    # sibling fills as RESCUE (= first leg is -$10), open extra market trades in
+    # the rescue direction so the remaining $8 to the first leg's SL is covered:
+    # 2 x 0.35 x $8 = +$560 at the moment the trapped leg stops out. Each boost
+    # carries a TIGHT $6 SL so the whipsaw day costs -$420 extra (vs -$1,260
+    # with full $18 SLs -- which would breach the daily kill switch in ONE
+    # anchor; measured Jun-11 A3). Boosts run as rescue legs: no small locks,
+    # $10 tier, post-hold trail, TSTOP at 45m.
+    rescue_boost_count: int = 2
+    rescue_boost_sl: float = 6.0
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all
@@ -72,12 +82,12 @@ class Config:
     # opened and its freeze-lock established BEFORE the 10:00-ET news block,
     # instead of entering into the news spike. A1/A2 unchanged (no US news).
     anchors: List[Tuple[str, int, int]] = field(default_factory=lambda: [
-        # v2.9.3: A1 + A2 DISABLED. Honest 29-day tick replay: A1 -$5,634,
-        # A2 -$1,496 vs A3 +$735, A4 +$336. Worse: their losses trip the daily
-        # kill switch and LOCK OUT A3/A4 (Jun-10 morning). Re-enable only if
-        # multi-regime data (April+) shows otherwise.
-        # ("A1_02h_Asia", 2, 30),
-        # ("A2_10h_London", 10, 0),
+        # v2.9.4: ALL anchors re-enabled for LIVE forward evaluation (user
+        # decision: backtest evidence set aside; only forward demo performance
+        # counts). Each anchor is judged on its own live record after 2 demo
+        # weeks -- persistent losers get cut based on the journal, not sims.
+        ("A1_02h_Asia", 2, 30),
+        ("A2_10h_London", 10, 0),
         ("A3_1340_Overlap", 13, 50),
         ("A4_1640_NYopen", 16, 40),
     ])

@@ -1555,6 +1555,53 @@ class LiveTrader:
                 if info.get('rescue_on_fill'):
                     self.tele.info(f"\U0001F691 RESCUE leg active (ticket {ticket}): no early locks, "
                                    f"free to run until +$10 covers the twin's loss.")
+                    # v2.9.5 SL-RESCUE BOOST (Hithesh): at this exact moment the
+                    # first leg is -$10; open extra trades in the rescue
+                    # direction with a tight $6 SL each, so the remaining $8 to
+                    # the first leg's SL is harvested (~+$560 @ 2x0.35).
+                    if getattr(self.cfg, 'rescue_boost_enabled', False):
+                        b_side = info['side']
+                        b_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
+                        b_sld = float(getattr(self.cfg, 'rescue_boost_sl', 6.0))
+                        b_ep = float(info['entry_price'])
+                        sgn = 1.0 if b_side == 'BUY' else -1.0
+                        b_sl = round(b_ep - sgn * b_sld, 2)
+                        b_tp = round(b_ep + sgn * self.cfg.tp_dist, 2)
+                        self.tele.warn(
+                            f"\u26A1 SL-RESCUE BOOST: opening {b_n}x{self.cfg.lot_size} "
+                            f"{b_side} @ market | SL ${b_sl} (tight ${b_sld:.0f}) | TP ${b_tp}\n"
+                            f"Goal: +${b_n * 8 * self.cfg.lot_size * 100:.0f} covers the twin "
+                            f"if its SL hits; capped -${b_n * b_sld * self.cfg.lot_size * 100:.0f} on whipsaw."
+                        )
+                        for bi in range(b_n):
+                            try:
+                                b_res = self.adapter.place_market_order(
+                                    self.cfg.symbol, b_side, self.cfg.lot_size,
+                                    sl=b_sl, tp=b_tp,
+                                    comment=f"AUREONv2_{info['anchor_label']}_{b_side}_BOOST{bi+1}",
+                                    dry_run=self.paper)
+                            except Exception as e:
+                                log.warning(f"BOOST{bi+1} order error: {e}")
+                                continue
+                            b_rc = getattr(b_res, 'retcode', None) if b_res is not None else None
+                            if b_rc == 10009:
+                                b_tk = getattr(b_res, 'order', None) or getattr(b_res, 'deal', None)
+                                b_fp = float(getattr(b_res, 'price', b_ep) or b_ep)
+                                if b_tk:
+                                    self.shadow_positions[int(b_tk)] = {
+                                        'anchor_label': info['anchor_label'],
+                                        'side':         b_side,
+                                        'entry_price':  b_fp,
+                                        'current_sl':   b_sl,
+                                        'tp_level':     b_tp,
+                                        'max_fav':      b_fp,
+                                        'fill_time':    pd.Timestamp.now(tz='UTC').isoformat(),
+                                        'role':         'rescue',
+                                        'boost':        True,
+                                    }
+                                self.tele.success(f"\u26A1 BOOST{bi+1} {b_side} filled @ ${b_fp}")
+                            else:
+                                self.tele.error(f"\u274C BOOST{bi+1} rejected rc={b_rc}")
 
         # Detect closures
         for ticket in list(self.shadow_positions):

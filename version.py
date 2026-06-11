@@ -18,9 +18,14 @@ History (one line per behavioral change):
          never more than $2 behind the peak)
   2.9.3  A1/A2 anchors disabled -- honest replay shows them net -$7.1k/29d
          and their losses kill-switch-block A3/A4 (the only green anchors)
+  2.9.4  all 4 anchors re-enabled for live forward trial on demo; verdict
+         per anchor from the live journal after 2 weeks (backtest set aside)
+  2.9.5  SL-RESCUE BOOST (Hithesh): on rescue fill, +2 market trades in the
+         rescue direction, tight $6 SL each -- covers the twins remaining
+         $8-to-SL on crash days (~+$560), capped -$420 on whipsaw days
 """
 
-__version__ = "2.9.3"
+__version__ = "2.9.5"
 CODENAME = "Astra Hawk"
 
 
