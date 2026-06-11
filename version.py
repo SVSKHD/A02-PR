@@ -23,9 +23,11 @@ History (one line per behavioral change):
   2.9.5  SL-RESCUE BOOST (Hithesh): on rescue fill, +2 market trades in the
          rescue direction, tight $6 SL each -- covers the twins remaining
          $8-to-SL on crash days (~+$560), capped -$420 on whipsaw days
+  2.9.6  trail arm 1.50 -> 2.50: sub-$2.5 peaks keep full SL post-hold
+         (kills the $0 scratch-at-entry exits; Jun-11 A3 lesson)
 """
 
-__version__ = "2.9.5"
+__version__ = "2.9.6"
 CODENAME = "Astra Hawk"
 
 

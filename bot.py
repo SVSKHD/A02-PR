@@ -39,7 +39,10 @@ class Config:
     lot_size: float = 0.35  # v2.7: pinned to the backtested lot. Two full SLs = -$1,260,
     # which survives the 3% daily kill switch (~$1,490 @ $49.6k). At 0.50+, two SLs
     # (-$1,800+) trip the switch and end the day early.
-    be_trigger: float = 1.50  # v2.7: was 2.50. Tick grid (29 days, +$0.20 spread stress):
+    be_trigger: float = 2.50  # v2.9.6 trail ARM (was 1.50). Jun-11 A3: a +$2.00-peak
+    # sell got its post-hold stop snapped to peak-2 = its own ENTRY and scratched $0
+    # minutes before its move came. Arm 2.50 means: peaks under +$2.50 get NO trail --
+    # full SL stays, trade keeps waiting. Cost: dead-chop days pay -$630 instead of -$25.
     # arm 1.5 marginally better at every freeze level once the hold rule works.
     # The 0.30 arm let the trail chase price within seconds of fill,
     # parking the SL near entry so the first pullback closed the trade
