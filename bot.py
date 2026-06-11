@@ -48,7 +48,9 @@ class Config:
     # parking the SL near entry so the first pullback closed the trade
     # at ~breakeven (the Jun-5 A2/A3/A4 losses). At +$2.5 the trade has
     # proven direction before the SL starts following.
-    trail_gap: float = 1.00  # v2.7: was 1.50. With the 45m hold doing the noise-survival
+    trail_gap: float = 2.00  # v2.9.7: was 1.00 (manual edit from v2.9.2 was never
+    # applied -- caught live via the Jun-11 A4 banner). One rule everywhere: in
+    # profit, never more than $2 behind the peak (matches the ladder's peak-2).
     # job, a tighter post-hold trail keeps more of the move (gap 1.0 best at every
     # freeze level in the grid). The hold protects the runner; the gap banks it.
     min_step: float = 0.10  # v2.5.5: back to 0.10 to match the 0.30 trail gap

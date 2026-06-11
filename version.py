@@ -25,9 +25,11 @@ History (one line per behavioral change):
          $8-to-SL on crash days (~+$560), capped -$420 on whipsaw days
   2.9.6  trail arm 1.50 -> 2.50: sub-$2.5 peaks keep full SL post-hold
          (kills the $0 scratch-at-entry exits; Jun-11 A3 lesson)
+  2.9.7  trail gap actually set 1.00 -> 2.00 (v2.9.2 manual edit was never
+         applied; caught via the live banner config receipt on Jun-11 A4)
 """
 
-__version__ = "2.9.6"
+__version__ = "2.9.7"
 CODENAME = "Astra Hawk"
 
 
