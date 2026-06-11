@@ -16,9 +16,11 @@ History (one line per behavioral change):
   2.9.1  top tier follows peak - $2 (floor +$8)
   2.9.2  BE tier 3.00 -> 2.50; trail gap 1.00 -> 2.00 (one rule: in profit,
          never more than $2 behind the peak)
+  2.9.3  A1/A2 anchors disabled -- honest replay shows them net -$7.1k/29d
+         and their losses kill-switch-block A3/A4 (the only green anchors)
 """
 
-__version__ = "2.9.2"
+__version__ = "2.9.3"
 CODENAME = "Astra Hawk"
 
 

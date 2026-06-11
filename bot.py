@@ -72,8 +72,12 @@ class Config:
     # opened and its freeze-lock established BEFORE the 10:00-ET news block,
     # instead of entering into the news spike. A1/A2 unchanged (no US news).
     anchors: List[Tuple[str, int, int]] = field(default_factory=lambda: [
-        ("A1_02h_Asia", 2, 30),
-        ("A2_10h_London", 10, 0),
+        # v2.9.3: A1 + A2 DISABLED. Honest 29-day tick replay: A1 -$5,634,
+        # A2 -$1,496 vs A3 +$735, A4 +$336. Worse: their losses trip the daily
+        # kill switch and LOCK OUT A3/A4 (Jun-10 morning). Re-enable only if
+        # multi-regime data (April+) shows otherwise.
+        # ("A1_02h_Asia", 2, 30),
+        # ("A2_10h_London", 10, 0),
         ("A3_1340_Overlap", 13, 50),
         ("A4_1640_NYopen", 16, 40),
     ])
