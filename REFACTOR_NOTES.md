@@ -128,10 +128,71 @@ change). No circular imports: mixins import only stdlib + `mt5_adapter`/`strateg
 
 ## Suspicious findings (NOTED, NOT FIXED — per rule #1)
 
-_(populated during extraction — see end of file)_
+Found while moving code byte-identically. **None were changed.** All are
+pre-existing in 2.9.8 and frozen for this refactor.
 
----
+1. **`_write_journal` reads keys the shadow dict never sets.** `shadow.get('entry_time')`,
+   `shadow.get('anchor_price', '')` and `shadow.get('lot', ...)` are used to fill the
+   journal's `entry_time_ist`, `anchor_price` and `lot` columns, but the shadow-position
+   dicts only ever store `fill_time`, `anchor_label`, (no `lot`). Net effect in live:
+   the journal's `entry_time_ist` and `anchor_price` columns are always blank and `lot`
+   always falls back to `cfg.lot_size`. The CSV *schema* (19 columns) is unchanged; only
+   those cell values are empty. Consequence for the new Firebase records: `open_time` /
+   `held_min` derive from `entry_time_ist`, so they will be `null` for real trades until
+   this is fixed upstream. (Left as-is — behavior frozen.)
+2. **`_compute_safe_lot` hardcodes contract size 100** (`max_loss / (sl_dist * 100)`)
+   instead of `cfg.contract_size`. Harmless while XAUUSD stays at 100 oz/lot; a different
+   instrument would mis-size. The inline comment already acknowledges the assumption.
+3. **Leaked secret (handled in Step 0):** `envtext.txt` contained a live
+   `AUREON_TELEGRAM_TOKEN` and chat id. Removed from the tree; **rotate that bot token**
+   regardless, since it is in git history on `master`.
+4. **`firebase_journal.py` did not exist** (see *Deviations*). The new fail-safe module
+   is the author's, not a pre-validated drop-in.
 
 ## Validation gate outputs
 
-_(populated after the build — see end of file)_
+All six gates run on this branch (MetaTrader5 stubbed for import on non-Windows; on the
+VPS the real package is installed):
+
+```
+GATE 1  py_compile — config, strategy, mt5_adapter, state, risk, anchors, fills,
+        trails, journal, bot, live_trader, firebase_journal, version, telemetry,
+        env_loader, watchdog ......................................... COMPILE ALL OK
+GATE 2  import live_trader, bot, anchors, fills, trails, risk, journal, state,
+        mt5_adapter, strategy, config, firebase_journal .............. IMPORT ALL OK
+GATE 3  paper-mode startup (fake adapter, closed market):
+          banner shows "AUREON v3.0.0" .............................. PASS
+          module receipt present .................................... PASS
+          receipt = config, strategy, mt5_adapter, anchors, fills,
+            trails, risk, journal, state, firebase_journal,
+            telemetry, version, live_trader ......................... PASS
+          idles cleanly on closed market ("Market closed ...") ...... PASS
+GATE 4  byte-identical proof vs master (git diff of moved hunks):
+          update_position_on_bar (bot.py -> strategy.py) ............ BYTE-IDENTICAL
+          _reconcile_with_broker (-> fills.py) ...................... BYTE-IDENTICAL
+            exit-classifier block ................................... BYTE-IDENTICAL
+            SL-RESCUE BOOST block ................................... BYTE-IDENTICAL
+          _manage_trails_on_bar_close (-> trails.py) FULL ........... BYTE-IDENTICAL
+            STOP-THROUGH block ...................................... BYTE-IDENTICAL
+GATE 5  state.json rehydration:
+          existing aureon_v2_state.json loads, all keys intact ...... OK
+          save/load round-trip preserves exact persisted key names:
+            shadow_positions_extended{anchor_label,current_sl,
+              entry_price,fill_time,max_fav,role,side} .............. OK
+            shadow_pendings_extended{anchor_label,entry_price,
+              rescue_on_fill,sibling_ticket,side} .................. OK
+GATE 6  CRLF check on all refactor source ........................... ALL CRLF OK
+```
+
+**Extra behavior-frozen proof (not a required gate):** ran the *identical* backtest on
+`master` (monolith) and on this branch over 2026-04-29..2026-05-31; both produced
+**54 trades / $2,493.40 P&L** with byte-identical `trades.csv` and `stats.json`. The
+strategy split is provably behavior-preserving end to end.
+
+**Firebase wiring proof:** `make_trade_record` builds the full per-trade record
+(ticket, sibling_ticket, role, side, lot, entry/exit price, open/close ISO, held_min,
+exit_reason, slip, max_favorable, nohold_trail_exit, pnl); `save_daily_journal` and
+`weekly_reconcile` return cleanly (no-op with a warning) when no credentials are present
+— proving the fail-safe contract: Firebase never blocks trading or the flatten.
+
+**Rollback:** `master` retains the untouched 2.9.8 monoliths.
