@@ -3,14 +3,24 @@
 .env.local
 .env.*.local
 *.secret
+firebase_key.json
+firebase_key*.json
+envtext.txt
 
 # Bot runtime state
 run/
 *.state.json
+state.json*
 aureon_v2_state.json
+aureon_v2_state.json.bak
+*.bak
 heartbeat
 commands.json
 status.json
+
+# Journal CSVs (live trade journal — VPS only)
+trades_*.csv
+today_trades.csv
 
 # Backtest/analysis outputs
 output/

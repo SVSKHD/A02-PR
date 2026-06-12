@@ -38,9 +38,16 @@ History (one line per behavioral change):
          shows last_error, 10030 retries FOK (Jun-11 silent-boost mystery);
          (5) journal-only no-hold trail counterfactual per leg -- decides
          hold-vs-no-hold from live data
+  3.0.0  STRUCTURAL refactor only -- trading behavior IDENTICAL to 2.9.8.
+         The live_trader/bot monoliths are split into focused modules
+         (config, strategy, mt5_adapter, anchors, fills, trails, risk,
+         journal, state); LiveTrader methods are moved byte-identical into
+         mixins. NEW: Firebase EOD journal + weekly reconcile (fail-safe,
+         never blocks trading); startup banner prints a module receipt so
+         deployment drift is visible in Telegram. No logic edits.
 """
 
-__version__ = "2.9.8"
+__version__ = "3.0.0"
 CODENAME = "Astra Hawk"
 
 
