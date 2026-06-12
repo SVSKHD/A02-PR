@@ -177,6 +177,8 @@ class LiveTrader:
         # v2.5: rehydrate shadow_positions max_fav/fill_time from persisted state
         # so a mid-trade restart doesn't lose the $5 lock or freeze gate state.
         self._pending_shadow_rehydrate = self.state.get('shadow_positions_extended', {})
+        # v2.9.8: pendings rehydrate source (rescue flag survives restarts)
+        self._pending_pendings_rehydrate = self.state.get('shadow_pendings_extended', {})
 
         # Bar-close tracking
         self._last_managed_minute: Optional[pd.Timestamp] = None
@@ -255,6 +257,22 @@ class LiveTrader:
             }
         except Exception as e:
             log.warning(f"Could not snapshot shadow_positions to state: {e}")
+        # v2.9.8: persist PENDINGS too -- a restart between placement and fill
+        # previously orphaned them (fills undetected / rescue flag lost).
+        try:
+            self.state['shadow_pendings_extended'] = {
+                str(tk): {
+                    'anchor_label':   p.get('anchor_label'),
+                    'side':           p.get('side'),
+                    'sibling_ticket': p.get('sibling_ticket'),
+                    'entry_price':    p.get('entry_price'),
+                    'rescue_on_fill': bool(p.get('rescue_on_fill', False)),
+                }
+                for tk, p in self.shadow_pendings.items()
+                if not isinstance(tk, str)
+            }
+        except Exception as e:
+            log.warning(f"Could not snapshot shadow_pendings to state: {e}")
         # Copy current main → .bak before overwriting
         if os.path.exists(self.state_path):
             try:
@@ -1504,6 +1522,27 @@ class LiveTrader:
             # Clear the rehydration source after first reconcile
             self._pending_shadow_rehydrate = {}
 
+        # v2.9.8: rehydrate PENDING stop orders (restart-safe rescue flag)
+        _pend_saved = getattr(self, '_pending_pendings_rehydrate', None)
+        if _pend_saved:
+            for broker_o in broker_pendings:
+                tk = int(broker_o.ticket)
+                if tk in self.shadow_pendings:
+                    continue
+                saved = _pend_saved.get(str(tk))
+                if saved:
+                    self.shadow_pendings[tk] = {
+                        'anchor_label':   saved.get('anchor_label', 'RECOVERED'),
+                        'side':           saved.get('side') or ('BUY' if broker_o.type in (2, 4) else 'SELL'),
+                        'sibling_ticket': saved.get('sibling_ticket'),
+                        'entry_price':    float(saved.get('entry_price') or broker_o.price_open),
+                        'rescue_on_fill': bool(saved.get('rescue_on_fill', False)),
+                    }
+                    self.tele.info(
+                        f"♻️ Rehydrated pending {tk} {saved.get('side','?')} "
+                        f"(rescue_on_fill={bool(saved.get('rescue_on_fill', False))})")
+            self._pending_pendings_rehydrate = {}
+
         # Detect fills (sibling cancel)
         for ticket, info in list(self.shadow_pendings.items()):
             if isinstance(ticket, str): continue
@@ -1542,6 +1581,23 @@ class LiveTrader:
                     fill_time_utc = pd.Timestamp(fill_unix, unit='s', tz='UTC')
                 except Exception:
                     fill_time_utc = pd.Timestamp.now(tz='UTC')
+                # v2.9.8 STRUCTURAL RESCUE (Jun-12 A1: rescue flag chain silently
+                # failed -> 2nd leg ran as 'normal', no boosts fired). In No-OCO a
+                # fill for an anchor that ALREADY has an open non-boost position is
+                # BY CONSTRUCTION the rescue leg: it can only fill after price
+                # traveled the full stop spread against its twin. The flag is now a
+                # hint; the structure is the truth.
+                is_rescue = bool(info.get('rescue_on_fill'))
+                if not is_rescue and getattr(self.cfg, 'no_oco', False):
+                    is_rescue = any(
+                        sp.get('anchor_label') == info['anchor_label']
+                        and not sp.get('boost')
+                        for sp in self.shadow_positions.values())
+                    if is_rescue:
+                        self.tele.warn(
+                            f"⚠️ rescue flag was MISSING for {info['anchor_label']} "
+                            f"{info['side']} -- recovered structurally (2nd fill of a "
+                            f"live anchor). Check log for flag-loss cause.")
                 self.shadow_positions[ticket] = {
                     'anchor_label': info['anchor_label'],
                     'side':         info['side'],
@@ -1550,9 +1606,9 @@ class LiveTrader:
                     'tp_level':     float(broker_p.tp),
                     'max_fav':      float(broker_p.price_open),
                     'fill_time':    fill_time_utc.isoformat(),  # v2.3: persisted, restart-safe
-                    'role':         'rescue' if info.get('rescue_on_fill') else 'normal',  # v2.9
+                    'role':         'rescue' if is_rescue else 'normal',  # v2.9 / v2.9.8 structural
                 }
-                if info.get('rescue_on_fill'):
+                if is_rescue:
                     self.tele.info(f"\U0001F691 RESCUE leg active (ticket {ticket}): no early locks, "
                                    f"free to run until +$10 covers the twin's loss.")
                     # v2.9.5 SL-RESCUE BOOST (Hithesh): at this exact moment the
@@ -1581,7 +1637,11 @@ class LiveTrader:
                                     comment=f"AUREONv2_{info['anchor_label']}_{b_side}_BOOST{bi+1}",
                                     dry_run=self.paper)
                             except Exception as e:
-                                log.warning(f"BOOST{bi+1} order error: {e}")
+                                log.warning(f"BOOST{bi+1} order error: {e!r}")
+                                # v2.9.8: Jun-11 A4 mystery -- exceptions here were
+                                # log-only, so Telegram showed the announce and then
+                                # NOTHING. Every boost now reports fate to Telegram.
+                                self.tele.error(f"❌ BOOST{bi+1} EXCEPTION: {e!r} -- order NOT placed")
                                 continue
                             b_rc = getattr(b_res, 'retcode', None) if b_res is not None else None
                             if b_rc == 10009:
@@ -1601,7 +1661,13 @@ class LiveTrader:
                                     }
                                 self.tele.success(f"\u26A1 BOOST{bi+1} {b_side} filled @ ${b_fp}")
                             else:
-                                self.tele.error(f"\u274C BOOST{bi+1} rejected rc={b_rc}")
+                                _le = ''
+                                if b_res is None:  # v2.9.8: surface WHY
+                                    try:
+                                        _le = f" last_error={self.adapter.mt5.last_error()}"
+                                    except Exception:
+                                        pass
+                                self.tele.error(f"\u274C BOOST{bi+1} rejected rc={b_rc}{_le}")
 
         # Detect closures
         for ticket in list(self.shadow_positions):
@@ -1615,21 +1681,34 @@ class LiveTrader:
                     pnl_usd = float(close_deal.profit) + float(close_deal.swap) + float(close_deal.commission)
                     self.state['daily_pnl'] += pnl_usd
                     close_price = float(close_deal.price)
-                    # Determine outcome label
-                    if shadow['side'] == 'BUY':
-                        if abs(close_price - (shadow['entry_price'] + self.cfg.tp_dist)) < 0.05:
-                            outcome = 'TP'
-                        elif close_price <= shadow['entry_price'] - self.cfg.sl_dist + 0.05:
-                            outcome = 'SL'
-                        else:
-                            outcome = 'Trail'
+                    # v2.9.8 EXIT CLASSIFIER: name the RULE that fired by comparing
+                    # the close to the bot's own intended stop (current_sl), instead
+                    # of guessing from distance-to-entry. Jun-12 A1 lesson: a +$10
+                    # LADDER tier exit was labeled 'Trail' (false FREEZE BREACH) and
+                    # a BE exit that slipped $2.20 masqueraded as a loss-making trail.
+                    _sgn = 1.0 if shadow['side'] == 'BUY' else -1.0
+                    _entry = float(shadow['entry_price'])
+                    _cur_sl = shadow.get('current_sl')
+                    slip_txt = ''
+                    if abs(close_price - (_entry + _sgn * self.cfg.tp_dist)) < 0.05:
+                        outcome = 'TP'
+                    elif _sgn * (close_price - (_entry - _sgn * self.cfg.sl_dist)) <= 0.05:
+                        outcome = 'SL'
                     else:
-                        if abs(close_price - (shadow['entry_price'] - self.cfg.tp_dist)) < 0.05:
-                            outcome = 'TP'
-                        elif close_price >= shadow['entry_price'] + self.cfg.sl_dist - 0.05:
-                            outcome = 'SL'
-                        else:
+                        _locked = _sgn * (float(_cur_sl) - _entry) if _cur_sl is not None else None
+                        if _locked is None:
                             outcome = 'Trail'
+                        elif abs(_locked) <= 0.10:
+                            outcome = 'BE'        # ladder tier 1 (+2.5 -> entry)
+                        elif abs(_locked - 4.00) <= 0.10:
+                            outcome = 'LOCK4'     # ladder tier 2 (+6 -> +4)
+                        elif _locked >= 7.90:
+                            outcome = 'TIER'      # ladder tier 3 (+10 -> peak-2, floor +8)
+                        else:
+                            outcome = 'Trail'     # genuine post-hold trail level
+                        if _cur_sl is not None and abs(close_price - float(_cur_sl)) > 0.30:
+                            slip_txt = (f" (slip {_sgn * (close_price - float(_cur_sl)):+.2f}"
+                                        f" vs stop ${float(_cur_sl):.2f})")
                     if shadow.get('tstop'):
                         outcome = 'TSTOP'
                     # v2.7: hold-duration audit -- permanent detector for the freeze bug.
@@ -1660,10 +1739,17 @@ class LiveTrader:
                             f"engaging early -- investigate before next anchor."
                         )
                     sev = Severity.SUCCESS if pnl_usd > 0 else Severity.WARN
+                    # v2.9.8 SHADOW NO-HOLD verdict line (journal feeds the
+                    # hold-vs-no-hold decision; computed in trail loop)
+                    nh_txt = ''
+                    _nh = shadow.get('nh_exit')
+                    if _nh is not None:
+                        _nh_pnl = _sgn * (float(_nh) - _entry) * self.cfg.lot_size * 100
+                        nh_txt = f"\nno-hold trail would have exited @ ${float(_nh):.2f} (`${_nh_pnl:+.2f}`)"
                     self.tele.send(
                         f"📤 CLOSE: *{shadow['anchor_label']}* {shadow['side']} "
-                        f"`{outcome}` @ ${close_price:.2f}\n"
-                        f"P&L: `${pnl_usd:+.2f}`  |  Daily total: `${self.state['daily_pnl']:+.2f}`{hold_txt}",
+                        f"`{outcome}`{slip_txt} @ ${close_price:.2f}\n"
+                        f"P&L: `${pnl_usd:+.2f}`  |  Daily total: `${self.state['daily_pnl']:+.2f}`{hold_txt}{nh_txt}",
                         sev
                     )
                     # Append to today's trade log
@@ -1708,6 +1794,8 @@ class LiveTrader:
             fav_dist = entry - max_fav
             modeled_trail = entry - fav_dist + self.cfg.trail_gap
         # refine outcome into the lock tiers when it was a 'Trail'-class exit
+        # (v2.9.8: classifier already names BE/LOCK4/TIER; this only refines
+        # legacy 'Trail' labels)
         refined = outcome
         if outcome == 'Trail':
             if abs(fav_dist) < 3.0:
@@ -1744,6 +1832,8 @@ class LiveTrader:
             refined,                                     # exit_reason
             round(pnl_usd, 2),                           # realized_pnl_usd
             ticket,                                      # ticket
+            shadow.get('nh_exit', ''),                   # v2.9.8 no-hold trail exit
+            shadow.get('role', 'normal'),                # v2.9.8 role
         ]
         new_file = not _os.path.exists(jpath)
         with open(jpath, "a", newline="") as f:
@@ -1752,7 +1842,8 @@ class LiveTrader:
                 w.writerow(['date_ist','anchor','anchor_price','side','entry_time_ist',
                             'entry_price','lot','initial_sl','initial_tp','max_favorable',
                             'exit_time_ist','actual_exit_price','modeled_trail_exit',
-                            'trail_slip','exit_reason','realized_pnl_usd','ticket'])
+                            'trail_slip','exit_reason','realized_pnl_usd','ticket',
+                            'nohold_trail_exit','role'])
             w.writerow(row)
         log.info(f"journal: {shadow.get('anchor_label')} {side} {refined} "
                  f"pnl=${pnl_usd:+.2f} trail_slip={trail_slip}")
@@ -1822,6 +1913,27 @@ class LiveTrader:
             shadow['current_sl'] = pos.current_sl
             shadow['max_fav'] = pos.max_fav
 
+            # v2.9.8 SHADOW NO-HOLD LOG (journal-only, zero behavior change):
+            # where would a trail with NO 45m hold (arm $2.50, gap $2.00, from
+            # fill) have exited this leg? Hithesh's hold-vs-no-hold question
+            # gets answered from live data instead of a one-day sample.
+            if 'nh_exit' not in shadow:
+                _e = float(shadow['entry_price'])
+                _s = 1.0 if shadow['side'] == 'BUY' else -1.0
+                _pk = float(shadow.get('nh_peak', _e))
+                _hi = float(bar_series['high']); _lo = float(bar_series['low'])
+                _pk = max(_pk, _hi) if _s > 0 else min(_pk, _lo)
+                shadow['nh_peak'] = _pk
+                if _s * (_pk - _e) >= self.cfg.be_trigger:
+                    if _s > 0:
+                        _stop = max(_e, _pk - self.cfg.trail_gap)
+                        if _lo <= _stop:
+                            shadow['nh_exit'] = round(_stop, 2)
+                    else:
+                        _stop = min(_e, _pk + self.cfg.trail_gap)
+                        if _hi >= _stop:
+                            shadow['nh_exit'] = round(_stop, 2)
+
             # v2.7.1 TSTOP -- loser time-stop (grid-validated). At hold expiry, a leg
             # whose best favorable excursion never reached +$tstop_fav is a trapped
             # fake-out; close at market (~ -$5..-$12) instead of riding to the full SL.
@@ -1874,18 +1986,30 @@ class LiveTrader:
                         floor = MIN_SL_DIST
                         if csi is not None and csi.trade_stops_level > 0:
                             floor = max(floor, csi.trade_stops_level * csi.point)
+                        # v2.9.8 STOP-THROUGH: if the intended (ladder) stop is
+                        # already at/through market, the level was breached intrabar.
+                        # Pinning SL to bid/ask (old clamp) is rejection-prone and
+                        # fills at noise (Jun-12 A1 BUY: BE pinned -> -$2.20 'Trail').
+                        # Close at market and name the rule; one-way ratchet means
+                        # this is always the honest outcome.
+                        _through = False
                         if shadow['side'] == 'BUY':
                             max_legal = round(ctk.bid - floor, 2)
-                            if intended > max_legal:
-                                log.info(f"SL clamp ticket={ticket} BUY: ${intended} "
-                                         f"too close to bid ${ctk.bid:.2f} → ${max_legal}")
-                                intended = max_legal
+                            _through = intended > max_legal
                         else:
                             min_legal = round(ctk.ask + floor, 2)
-                            if intended < min_legal:
-                                log.info(f"SL clamp ticket={ticket} SELL: ${intended} "
-                                         f"too close to ask ${ctk.ask:.2f} → ${min_legal}")
-                                intended = min_legal
+                            _through = intended < min_legal
+                        if _through:
+                            self.tele.warn(
+                                f"⚡ STOP-THROUGH: {shadow['anchor_label']} "
+                                f"{shadow['side']} intended stop ${intended:.2f} is "
+                                f"through market (bid ${ctk.bid:.2f}/ask ${ctk.ask:.2f}) "
+                                f"-- closing at market.")
+                            try:
+                                self.adapter.close_position(ticket, dry_run=self.paper)
+                            except Exception as e:
+                                log.warning(f"stop-through close failed {ticket}: {e}")
+                            continue
                 except Exception as e:
                     log.warning(f"SL clamp check failed for {ticket}: {e}")
 
@@ -2049,7 +2173,8 @@ class LiveTrader:
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
             f"Ladder: `2.5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
-            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)"
+            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
+            f"v2.9.8: `rescue=structural` | `stop-through=mkt close` | `exit-classifier v2` | `boost-diag` | `no-hold shadow log`"
             + fp_cap_label
         )
 

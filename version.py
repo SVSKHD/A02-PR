@@ -27,9 +27,20 @@ History (one line per behavioral change):
          (kills the $0 scratch-at-entry exits; Jun-11 A3 lesson)
   2.9.7  trail gap actually set 1.00 -> 2.00 (v2.9.2 manual edit was never
          applied; caught via the live banner config receipt on Jun-11 A4)
+  2.9.8  Jun-12 A1 forensics: (1) RESCUE now detected STRUCTURALLY (2nd fill
+         of a live anchor), flag is only a hint -- flag-loss no longer kills
+         the fleet; pendings + rescue flag persisted/rehydrated across
+         restarts; (2) STOP-THROUGH: ladder stop breached intrabar -> close
+         at market (old clamp pinned SL to bid: the BUY -$2.20 'Trail');
+         (3) exit classifier names the rule (BE/LOCK4/TIER/Trail/SL/TP +
+         slip) from the bot's own current_sl -- kills false FREEZE BREACH on
+         ladder exits; (4) boost orders: exceptions Telegram-visible, rc=None
+         shows last_error, 10030 retries FOK (Jun-11 silent-boost mystery);
+         (5) journal-only no-hold trail counterfactual per leg -- decides
+         hold-vs-no-hold from live data
 """
 
-__version__ = "2.9.7"
+__version__ = "2.9.8"
 CODENAME = "Astra Hawk"
 
 

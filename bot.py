@@ -906,13 +906,31 @@ class MT5Adapter:
             "type_time": mt5.ORDER_TIME_DAY,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-        result = mt5.order_send(req)
+        try:
+            result = mt5.order_send(req)
+        except Exception as e:  # v2.9.8: a raise here was SILENT in the boost path
+            log.error(f"place_market_order order_send raised: {e!r}")
+            return None
         rc = result.retcode if result else -1
+        if rc == 10030:  # v2.9.8 INVALID_FILL: retry once with FOK
+            log.warning("MARKET order rc=10030 (filling mode) with IOC -- retrying FOK")
+            req["type_filling"] = mt5.ORDER_FILLING_FOK
+            try:
+                result = mt5.order_send(req)
+            except Exception as e:
+                log.error(f"place_market_order FOK retry raised: {e!r}")
+                return None
+            rc = result.retcode if result else -1
         rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
         if rc == 10009:
             log.info(f"✅ MARKET {side} filled @ {price} lot={lot}: retcode={rc} ({rc_name})")
         else:
             err = result.comment if result and hasattr(result, 'comment') else ''
+            if result is None:  # v2.9.8: capture WHY when broker gave no response
+                try:
+                    err = f"last_error={mt5.last_error()}"
+                except Exception:
+                    pass
             log.error(f"❌ MARKET {side} REJECTED: retcode={rc} ({rc_name}) {err}")
         return result
 
