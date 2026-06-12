@@ -1,0 +1,9 @@
+# AUREON A08 (MCX port) — requirements
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+python-dotenv>=1.0
+# Broker (LIVE only; PAPER/SIM runs without it)
+dhanhq>=2.0
+# Firebase (EOD daily doc); optional until you wire the EOD write
+firebase-admin>=6.0
