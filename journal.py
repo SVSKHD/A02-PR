@@ -138,9 +138,13 @@ def _firebase_save_daily(self, broker_date):
     Never raises -- a Firebase failure must not touch the EOD path."""
     try:
         import firebase_journal
-        now_ist = pd.Timestamp.now(tz='Asia/Kolkata')
-        day_str = now_ist.strftime('%Y-%m-%d')
-        jpath = os.path.join(self._journal_dir(), f"trades_{now_ist.strftime('%Y-%m')}.csv")
+        # Key the export off the BROKER trading date passed in by the EOD logic --
+        # NOT the IST wall clock. EOD fires at broker 23:00 = ~01:30 IST, so
+        # now_ist would be the NEXT day and the date_ist filter would miss the
+        # whole broker day. Anchor closes are intraday, so a trade's journal
+        # date_ist equals the broker calendar date; match on that.
+        day_str = str(broker_date)
+        jpath = os.path.join(self._journal_dir(), f"trades_{day_str[:7]}.csv")
         if not os.path.exists(jpath):
             log.info(f"firebase EOD: no journal CSV for {day_str}; nothing to save")
             return

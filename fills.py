@@ -145,11 +145,19 @@ def _reconcile_with_broker(self):
             _flag_hint = bool(info.get('rescue_on_fill'))
             is_rescue = False
             if getattr(self.cfg, 'no_oco', False):
+                # The twin must be open in BROKER-confirmed state, not merely
+                # tracked in shadow_positions: the "Detect closures" cleanup runs
+                # LATER in this same reconcile cycle, so a twin that just closed at
+                # the broker can still linger in shadow_positions and falsely read
+                # as open (firing phantom boosts -- the exact failure this guard
+                # prevents). broker_pos_tickets (built above) is the truth.
                 _sib = info.get('sibling_ticket')
-                _twin_open = (_sib is not None and _sib in self.shadow_positions) or any(
-                    sp.get('anchor_label') == info['anchor_label']
+                _twin_open = (_sib is not None and _sib in self.shadow_positions
+                              and _sib in broker_pos_tickets) or any(
+                    tk in broker_pos_tickets
+                    and sp.get('anchor_label') == info['anchor_label']
                     and not sp.get('boost')
-                    for sp in self.shadow_positions.values())
+                    for tk, sp in self.shadow_positions.items())
                 is_rescue = _twin_open
                 if _twin_open and not _flag_hint:
                     self.tele.warn(

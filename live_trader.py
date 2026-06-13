@@ -470,9 +470,19 @@ class LiveTrader:
             except Exception as e:
                 log.warning(f"state save before weekend sleep failed: {e}")
             market_open = False
+            # Sleep the 5-min market re-check in short chunks, touching the
+            # heartbeat each chunk. The watchdog restarts a bot whose heartbeat
+            # is older than HEARTBEAT_STALE_SECONDS (180s in watchdog.py); a single
+            # 300s sleep would let it go stale and trigger a weekend-long restart
+            # loop, so touch every 30s while only re-probing the market every 5 min.
+            HB_EVERY_S = 30
+            RECHECK_EVERY_S = 300
             while not market_open:
-                self._touch_heartbeat()  # keep alive so the watchdog doesn't kill us
-                time.sleep(300)  # 5 minutes
+                slept = 0
+                while slept < RECHECK_EVERY_S:
+                    self._touch_heartbeat()  # keep alive so the watchdog doesn't kill us
+                    time.sleep(HB_EVERY_S)
+                    slept += HB_EVERY_S
                 try:
                     server_utc = self.adapter.server_time_utc()
                     now_utc = pd.Timestamp.now(tz='UTC')

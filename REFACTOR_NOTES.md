@@ -243,3 +243,52 @@ EXTRA   weekend sleep/wake simulated: entry-once, heartbeat kept,
 ## 8. Rollback
 The pre-PR 2.9.8 files remain on `master` untouched. If Monday looks wrong,
 redeploy those to `C:\A02-PR\`.
+
+---
+
+## 9. CodeAnt AI review findings (2026-06-13) — disposition
+
+CodeAnt left 9 substantive findings. Each was validated against `master` (2.9.8)
+to establish provenance, because **Rule #1** governs: code moved byte-identically
+from 2.9.8 must NOT be changed in this split PR — pre-existing issues are documented
+here, not fixed. Findings in *new* code (commits 1/3/4) are in scope.
+
+### Fixed (in new code added by this PR)
+
+| # | File | Finding | Fix |
+|---|------|---------|-----|
+| 1 | live_trader.py `wait_until_market_open` (commit 4) | Weekend sleep touched the heartbeat once per **300s**, but `watchdog.py` restarts a bot whose heartbeat is >`HEARTBEAT_STALE_SECONDS` (**180s**) old → weekend-long restart loop. **VALID.** | Sleep the 5-min re-check in **30s chunks**, touching the heartbeat each chunk (max age 30s ≪ 180s). Market still re-probed every 5 min. |
+| 3 | journal.py `_firebase_save_daily` (commit 3) | Daily export keyed off `now_ist` (IST wall clock). EOD fires at broker 23:00 = ~01:30 IST, so it filtered for the **next** IST day and saved ~0 trades. **VALID.** | Key the export off the **`broker_date`** passed in (and match `date_ist` on it); anchor closes are intraday so `date_ist` == broker calendar date. |
+| 8 | fills.py `_reconcile_with_broker` rescue guard (commit 1) | Twin-open test read `self.shadow_positions`, which still contains a twin that closed at the broker until the closure-cleanup loop runs **later in the same reconcile** → a same-cycle close+sibling-fill could fire phantom boosts. **VALID** (narrow window; the live Jun-12 bug was an hour-later fill, already handled). | Require the twin to be **broker-confirmed open** (`_sib in broker_pos_tickets`, built earlier in the same function) — strengthens the exact guard commit 1 adds. |
+
+### NOT fixed — pre-existing 2.9.8 behavior, byte-identical (Rule #1 → documented, awaiting maintainer decision)
+
+| # | File | Finding | Severity | Provenance |
+|---|------|---------|----------|------------|
+| 2 | state.py `_acquire_pid_lock` | Non-atomic PID lock (TOCTOU): two near-simultaneous starts can both pass the existence check and write the lock → duplicate instances. Fix = `O_CREAT|O_EXCL` / OS file lock. | Critical | byte-identical to `master` live_trader.py 287–313 |
+| 4 | mt5_adapter.py `__init__` | `_detect_tick_time_offset()` returns `None` when no live feed (e.g. **closed market**); the startup log formats it with `:+.0f` → `TypeError`, crashing adapter init. **Blocks weekend cold-start** (see §10). | Critical | byte-identical to `master` bot.py 558–624 |
+| 5 | trails.py `_manage_trails_on_bar_close` | `modify_position_sl()` returns an MT5 result object (truthy) on both success and rejection; `if not ok:` never fires on a broker rejection → SL drift goes unwarned. | Critical | byte-identical to `master` (trail manager proven identical, §3) |
+| 6 | utils.py `m5_close_at` | Returns `near[0]` (earliest within ±5min), not the **nearest** bar — can pick the wrong anchor close on M5 gaps (backtest only). | Major | byte-identical to `master` bot.py 342–349 |
+| 7 | mt5_adapter.py | Time-offset detection + `server_time_utc` hardcode `"XAUUSD"` instead of `cfg.symbol`; breaks if run on another instrument or XAUUSD unsubscribed. (Bot only trades XAUUSD today.) | Major | byte-identical to `master` adapter |
+| 9 | backtest.py `run_backtest` | `walk.iloc[-1]` with an empty `walk` (fill on the last bar of the window) → `IndexError` aborts the backtest. | Critical | byte-identical to `master` bot.py (walk.iloc[-1] at master:432) |
+
+These six are real but predate this PR; fixing them changes 2.9.8 behavior and is out
+of scope for a behavior-frozen split. Recommend a **follow-up hardening PR**. The
+maintainer was asked (PR thread) whether to pull any forward into this PR.
+
+## 10. ⚠ Deploy-blocking interaction (finding #4 × commit 4)
+
+Finding #4 (adapter init crashes when the offset can't be detected on a closed
+market) **directly conflicts with the commit-4 weekend deploy plan**: `MT5Adapter()`
+is constructed in `run_live` *before* `LiveTrader.run()` reaches the market-closed
+wait, so a weekend `python bot.py paper` / live arming (DEPLOY_RUNBOOK Steps 4–5)
+would crash at adapter init — never reaching the self-sleep. 2.9.8 has the same
+limitation (it was presumably always started while the market was open).
+
+Options for the maintainer (asked on the PR):
+- **(a)** Fix #4 now: on `None`, log a warning instead of crashing and default the
+  offset so startup proceeds into the weekend wait; commit 4 already forces a fresh
+  `ensure_time_offset()` on Monday wake *before* any trading. Enables weekend deploy.
+- **(b)** Leave #4 as pre-existing and **start the bot when the market is open**
+  (Sunday 22:00 UTC pre-open or Monday), not over the closed weekend — adjust the
+  runbook accordingly.
