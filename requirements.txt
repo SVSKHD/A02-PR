@@ -3,3 +3,4 @@ numpy>=1.24
 requests>=2.31
 python-dotenv>=1.0
 MetaTrader5>=5.0.45 ; sys_platform == "win32"
+firebase-admin>=6.0  # EOD/weekly trade journal (Firestore); optional off-VPS

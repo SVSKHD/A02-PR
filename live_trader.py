@@ -463,6 +463,10 @@ class LiveTrader:
                     f"First anchor of week is 02:00 broker (Mon Asia)."
                 )
                 market_open = False
+                # v3.0.0 commit 3: closed-market (Sunday) startup -- backfill any
+                # day the EOD Firebase write missed, from the monthly trades CSVs.
+                # Fail-safe: a Firebase error never blocks startup.
+                self._firebase_weekly_reconcile()
                 # Sleep loop: wait for market to reopen
                 while not market_open:
                     time.sleep(300)  # 5 minutes
@@ -617,6 +621,13 @@ class LiveTrader:
         if self._eod_reached(broker_date, utc_now):
             if self.shadow_positions or self.shadow_pendings:
                 self._flatten_all(reason="EOD")
+            # v3.0.0 commit 3: Firebase EOD journal -- ONCE per broker day, after
+            # the book is flat and the day's P&L is final (never during anchor
+            # capture). Guarded so it fires once and never blocks the EOD path.
+            if self.state.get('firebase_eod_date') != str(broker_date):
+                self._firebase_save_daily(broker_date)
+                self.state['firebase_eod_date'] = str(broker_date)
+                self._save_state()
             if self._tick_counter % self.STATUS_EVERY_TICKS == 0:
                 self._write_status(broker_date)
             return
@@ -693,9 +704,12 @@ LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close
 LiveTrader._write_journal           = _journal_mod._write_journal
 LiveTrader._send_daily_summary      = _journal_mod._send_daily_summary
 LiveTrader._send_today_summary      = _journal_mod._send_today_summary
+LiveTrader._journal_dir             = _journal_mod._journal_dir
+LiveTrader._firebase_save_daily     = _journal_mod._firebase_save_daily
+LiveTrader._firebase_weekly_reconcile = _journal_mod._firebase_weekly_reconcile
 
 # Module receipt printed in the startup banner (rule #6: deployment drift
 # is visible in Telegram).
 LOADED_MODULES = ['utils', 'config', 'strategy', 'mt5_adapter', 'backtest',
                   'state', 'risk', 'anchors', 'fills', 'trails', 'journal',
-                  'live_trader', 'bot']
+                  'live_trader', 'bot', 'firebase_journal']

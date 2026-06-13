@@ -119,3 +119,73 @@ def _send_today_summary(self):
     day_str = self.state.get("last_broker_date", "?")
     pnl = self.state.get("daily_pnl", 0.0)
     self._send_daily_summary(day_str, pnl)
+
+
+# ============================================================================
+# v3.0.0 commit 3 — Firebase EOD journal wiring.
+# firebase_journal.py is internally fail-safe; we double-guard at every call
+# site so a Firebase error can NEVER block trading, the EOD flatten, or startup.
+# ============================================================================
+
+def _journal_dir(self):
+    return os.path.join(self.run_dir, "journal")
+
+
+def _firebase_save_daily(self, broker_date):
+    """ONE Firestore write per trading day, after the EOD flatten when the day's
+    P&L is final. Builds one record per closed trade from today's journal CSV via
+    make_trade_record/build_anchor, then a single save_daily_journal() call.
+    Never raises -- a Firebase failure must not touch the EOD path."""
+    try:
+        import firebase_journal
+        now_ist = pd.Timestamp.now(tz='Asia/Kolkata')
+        day_str = now_ist.strftime('%Y-%m-%d')
+        jpath = os.path.join(self._journal_dir(), f"trades_{now_ist.strftime('%Y-%m')}.csv")
+        if not os.path.exists(jpath):
+            log.info(f"firebase EOD: no journal CSV for {day_str}; nothing to save")
+            return
+        rows = []
+        with open(jpath, newline="") as f:
+            for r in csv.DictReader(f):
+                if r.get('date_ist') == day_str:
+                    rows.append(r)
+        if not rows:
+            log.info(f"firebase EOD: 0 trades for {day_str}; skipping daily journal")
+            return
+        grouped = {}
+        total = 0.0
+        for r in rows:
+            rec = firebase_journal.make_trade_record(
+                ticket=r.get('ticket'), side=r.get('side'), lot=r.get('lot'),
+                entry_price=r.get('entry_price'), exit_price=r.get('actual_exit_price'),
+                pnl=r.get('realized_pnl_usd'), role=r.get('role'),
+                open_time=r.get('entry_time_ist'), close_time=r.get('exit_time_ist'),
+                exit_reason=r.get('exit_reason'), slip=r.get('trail_slip'),
+                max_favorable=r.get('max_favorable'),
+                nohold_trail_exit=r.get('nohold_trail_exit'), anchor=r.get('anchor'))
+            try:
+                total += float(r.get('realized_pnl_usd') or 0.0)
+            except (TypeError, ValueError):
+                pass
+            label = r.get('anchor') or '?'
+            grouped.setdefault(label, {'price': r.get('anchor_price'), 'trades': []})
+            grouped[label]['trades'].append(rec)
+        anchors = [firebase_journal.build_anchor(label, g['price'], g['trades'])
+                   for label, g in grouped.items()]
+        firebase_journal.save_daily_journal(
+            day_str, anchors=anchors, total_pnl=round(total, 2),
+            meta={'source': 'eod', 'broker_date': str(broker_date)})
+    except Exception as e:
+        log.warning(f"firebase EOD journal skipped (non-fatal): {e!r}")
+
+
+def _firebase_weekly_reconcile(self):
+    """On closed-market (Sunday) startup, backfill any day the EOD write missed
+    by reconciling the monthly trades CSVs against Firestore. Never raises."""
+    try:
+        import firebase_journal
+        n = firebase_journal.weekly_reconcile(self._journal_dir())
+        if n:
+            self.tele.info(f"📒 Firebase weekly reconcile backfilled {n} day(s).")
+    except Exception as e:
+        log.warning(f"firebase weekly reconcile skipped (non-fatal): {e!r}")
