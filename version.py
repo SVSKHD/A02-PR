@@ -38,9 +38,20 @@ History (one line per behavioral change):
          shows last_error, 10030 retries FOK (Jun-11 silent-boost mystery);
          (5) journal-only no-hold trail counterfactual per leg -- decides
          hold-vs-no-hold from live data
+  2.9.9  FIX A stale rescue flag: a 2nd fill is a genuine RESCUE only if its
+         twin is STILL OPEN at the moment of the 2nd fill (Jun-12 A4: SELL
+         banked +$477 and closed, BUY filled an hour later, inherited the
+         stale rescue_on_fill flag and fired 2 boosts with no twin to rescue;
+         A2 same setup fired nothing -> nondeterministic). Twin-open is tested
+         structurally (sibling_ticket or any non-boost open leg of the anchor);
+         a stale flag with a closed twin runs as a normal breakout leg, no
+         boosts. FIX B boost diagnostics: every exit of the boost path now
+         self-reports (attempting / exception / result=None+last_error /
+         rejected rc+name+comment / filled price+ticket) -- the 0-for-6 silent
+         boosts get a full trace on the next live event (no param change)
 """
 
-__version__ = "2.9.8"
+__version__ = "2.9.9"
 CODENAME = "Astra Hawk"
 
 

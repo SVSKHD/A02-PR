@@ -1587,17 +1587,37 @@ class LiveTrader:
                 # BY CONSTRUCTION the rescue leg: it can only fill after price
                 # traveled the full stop spread against its twin. The flag is now a
                 # hint; the structure is the truth.
-                is_rescue = bool(info.get('rescue_on_fill'))
-                if not is_rescue and getattr(self.cfg, 'no_oco', False):
-                    is_rescue = any(
+                # v3.0.0 Fix A (stale rescue flag): a 2nd fill is a genuine
+                # RESCUE only if its twin is STILL OPEN at this moment. The
+                # rescue_on_fill flag is set when the FIRST leg fills (below)
+                # and was never re-checked against the twin later closing --
+                # Jun-12 A4: the SELL banked +$477 and closed; an hour later
+                # the BUY filled, inherited the stale flag, was tagged RESCUE
+                # and fired 2 boosts with no trapped twin to rescue (A2, the
+                # identical setup, fired nothing -> nondeterministic). Re-validate
+                # structurally: prefer the explicit sibling_ticket, else any
+                # non-boost open position of this anchor. shadow_positions holds
+                # only OPEN positions (closed ones are popped below), so
+                # membership IS the "twin still open" test.
+                _flag_hint = bool(info.get('rescue_on_fill'))
+                is_rescue = False
+                if getattr(self.cfg, 'no_oco', False):
+                    _sib = info.get('sibling_ticket')
+                    _twin_open = (_sib is not None and _sib in self.shadow_positions) or any(
                         sp.get('anchor_label') == info['anchor_label']
                         and not sp.get('boost')
                         for sp in self.shadow_positions.values())
-                    if is_rescue:
+                    is_rescue = _twin_open
+                    if _twin_open and not _flag_hint:
                         self.tele.warn(
                             f"⚠️ rescue flag was MISSING for {info['anchor_label']} "
-                            f"{info['side']} -- recovered structurally (2nd fill of a "
-                            f"live anchor). Check log for flag-loss cause.")
+                            f"{info['side']} -- recovered structurally (twin still "
+                            f"open). Check log for flag-loss cause.")
+                    elif _flag_hint and not _twin_open:
+                        self.tele.warn(
+                            f"ℹ️ stale rescue flag IGNORED for {info['anchor_label']} "
+                            f"{info['side']} -- twin already closed; running as a "
+                            f"normal breakout leg (no boosts).")
                 self.shadow_positions[ticket] = {
                     'anchor_label': info['anchor_label'],
                     'side':         info['side'],
@@ -1630,6 +1650,16 @@ class LiveTrader:
                             f"if its SL hits; capped -${b_n * b_sld * self.cfg.lot_size * 100:.0f} on whipsaw."
                         )
                         for bi in range(b_n):
+                            # v3.0.0 Fix B (boost-fill diagnostics): boosts are
+                            # 0-for-6 lifetime -- announced (⚡) but NO success/
+                            # reject follow-up ever appears and no boost shows in
+                            # the broker; the failure bypasses all current logging.
+                            # We do NOT yet know the cause, so instrument EVERY
+                            # possible exit of this path: no boost is announced
+                            # without a subsequent Telegram line naming its fate.
+                            self.tele.info(
+                                f"… attempting BOOST{bi+1} {b_side} {self.cfg.lot_size} "
+                                f"@ market | SL ${b_sl} TP ${b_tp}")
                             try:
                                 b_res = self.adapter.place_market_order(
                                     self.cfg.symbol, b_side, self.cfg.lot_size,
@@ -1643,7 +1673,20 @@ class LiveTrader:
                                 # NOTHING. Every boost now reports fate to Telegram.
                                 self.tele.error(f"❌ BOOST{bi+1} EXCEPTION: {e!r} -- order NOT placed")
                                 continue
-                            b_rc = getattr(b_res, 'retcode', None) if b_res is not None else None
+                            if b_res is None:
+                                # v3.0.0: broker returned no result object at all --
+                                # surface mt5.last_error() so the next event tells us why.
+                                _le = ''
+                                try:
+                                    _le = f" last_error={self.adapter.mt5.last_error()}"
+                                except Exception:
+                                    pass
+                                self.tele.error(
+                                    f"❌ BOOST{bi+1} result=None -- order NOT placed{_le}")
+                                continue
+                            b_rc = getattr(b_res, 'retcode', None)
+                            b_rc_name = _MT5_RETCODE_MAP.get(b_rc, f"UNKNOWN_{b_rc}")
+                            b_cmt = getattr(b_res, 'comment', '') or ''
                             if b_rc == 10009:
                                 b_tk = getattr(b_res, 'order', None) or getattr(b_res, 'deal', None)
                                 b_fp = float(getattr(b_res, 'price', b_ep) or b_ep)
@@ -1659,15 +1702,14 @@ class LiveTrader:
                                         'role':         'rescue',
                                         'boost':        True,
                                     }
-                                self.tele.success(f"\u26A1 BOOST{bi+1} {b_side} filled @ ${b_fp}")
+                                self.tele.success(
+                                    f"\u2705\u26A1 BOOST{bi+1} {b_side} FILLED @ ${b_fp} "
+                                    f"(ticket {b_tk}) rc={b_rc} ({b_rc_name})")
                             else:
-                                _le = ''
-                                if b_res is None:  # v2.9.8: surface WHY
-                                    try:
-                                        _le = f" last_error={self.adapter.mt5.last_error()}"
-                                    except Exception:
-                                        pass
-                                self.tele.error(f"\u274C BOOST{bi+1} rejected rc={b_rc}{_le}")
+                                # v3.0.0: non-success retcode -- name it + show comment
+                                self.tele.error(
+                                    f"\u274C BOOST{bi+1} rejected rc={b_rc} ({b_rc_name}) "
+                                    f"comment={b_cmt!r}")
 
         # Detect closures
         for ticket in list(self.shadow_positions):

@@ -906,6 +906,11 @@ class MT5Adapter:
             "type_time": mt5.ORDER_TIME_DAY,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
+        # v3.0.0 Fix B: announce the attempt before order_send so the log has a
+        # line at EVERY exit of this path (the boost path was 0-for-6 with no
+        # trace at all). Telegram visibility for boosts is layered on by the
+        # live_trader boost loop, which wraps this call.
+        log.info(f"… attempting MARKET {side} {symbol} lot={lot} @ {price} SL={sl} TP={tp} ({comment})")
         try:
             result = mt5.order_send(req)
         except Exception as e:  # v2.9.8: a raise here was SILENT in the boost path
@@ -923,7 +928,8 @@ class MT5Adapter:
             rc = result.retcode if result else -1
         rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
         if rc == 10009:
-            log.info(f"✅ MARKET {side} filled @ {price} lot={lot}: retcode={rc} ({rc_name})")
+            tk = getattr(result, 'order', None) or getattr(result, 'deal', None)
+            log.info(f"✅ MARKET {side} filled @ {price} lot={lot} ticket={tk}: retcode={rc} ({rc_name})")
         else:
             err = result.comment if result and hasattr(result, 'comment') else ''
             if result is None:  # v2.9.8: capture WHY when broker gave no response
