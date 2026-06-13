@@ -49,9 +49,22 @@ History (one line per behavioral change):
          self-reports (attempting / exception / result=None+last_error /
          rejected rc+name+comment / filled price+ticket) -- the 0-for-6 silent
          boosts get a full trace on the next live event (no param change)
+  3.0.0  STRUCTURAL SPLIT (behavior-frozen): live_trader.py (~2.4k) and bot.py
+         (~1k) broken into 13 modules -- utils, config, strategy (pure Position
+         + update_position_on_bar), mt5_adapter (sole MetaTrader5 importer),
+         backtest, state, risk, anchors, fills, trails, journal -- plus the slim
+         LiveTrader orchestrator and a CLI/backtest-only bot.py (run_live moved
+         to live_trader). Moved code is byte-identical (proof in REFACTOR_NOTES);
+         methods are bound onto LiveTrader so every call site, state.json key,
+         Telegram string and 19-col journal schema are unchanged. Startup banner
+         prints a MODULE RECEIPT (rule #6). Firebase EOD journal wired in
+         (journal.py, fail-safe). Weekend self-sleep + Monday auto-resume:
+         wait_until_market_open() factored from startup into the main loop, so
+         the process deep-sleeps over the weekend and wakes itself Monday (offset
+         re-detect on wake, heartbeat kept alive, state saved before sleeping).
 """
 
-__version__ = "2.9.9"
+__version__ = "3.0.0"
 CODENAME = "Astra Hawk"
 
 
