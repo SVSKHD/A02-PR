@@ -421,6 +421,91 @@ class LiveTrader:
         return utc_now >= eod
 
     # ------------------------------------------------------------------------
+    # v3.0.0 commit 4: weekend self-sleep + Monday auto-resume
+    # ------------------------------------------------------------------------
+
+    def _market_closed_now(self) -> bool:
+        """Cheap probe: True if the broker's last tick is >1h old (weekend or a
+        holiday). False on any error -- never blocks trading on a probe failure."""
+        try:
+            server_utc = self.adapter.server_time_utc()
+            age = (pd.Timestamp.now(tz='UTC') - server_utc).total_seconds()
+            return age > 3600
+        except Exception as e:
+            log.warning(f"market-closed probe failed: {e}")
+            return False
+
+    def wait_until_market_open(self, reason: str = "startup") -> bool:
+        """Reusable market-closed deep-sleep. The tick-age>3600s -> 300s sleep
+        loop -> resume-when-fresh(<60s) logic is the original startup block,
+        factored out so BOTH startup AND the main loop enter the SAME wait --
+        the process now stays alive across the weekend and wakes itself Monday.
+
+        Returns True when the market is open (or the probe failed -> proceed),
+        False only on the clock-drift abort (caller decides whether to exit).
+        On weekend ENTRY: announce once + save state. During sleep: keep the
+        heartbeat alive (watchdog must not kill a sleeping bot) and re-check
+        every 5 min. On WAKE: force a broker time-offset re-detect BEFORE any
+        data call (Jun-8 cold-start fix) and announce the offset + resume."""
+        try:
+            server_utc = self.adapter.server_time_utc()
+            now_utc = pd.Timestamp.now(tz='UTC')
+            tick_age_sec = (now_utc - server_utc).total_seconds()
+        except Exception as e:
+            self.tele.warn(f"Could not verify broker time ({reason}): {e}")
+            return True  # don't block; proceed as if open (original on-error path)
+
+        if tick_age_sec > 3600:
+            hours = tick_age_sec / 3600
+            # ONE Telegram line on ENTERING weekend sleep (announce-once: the
+            # while-loop below blocks here until Monday, so this never repeats).
+            self.tele.info(
+                f"💤 Weekend — market closed, sleeping, will auto-resume Monday. "
+                f"Next anchor A1 02:00 broker. "
+                f"(last tick {hours:.1f}h old; entered via {reason})")
+            # Persist state before the long sleep so a mid-weekend VPS reboot
+            # rehydrates cleanly and the relaunched process re-enters this wait.
+            try:
+                self._save_state()
+            except Exception as e:
+                log.warning(f"state save before weekend sleep failed: {e}")
+            market_open = False
+            while not market_open:
+                self._touch_heartbeat()  # keep alive so the watchdog doesn't kill us
+                time.sleep(300)  # 5 minutes
+                try:
+                    server_utc = self.adapter.server_time_utc()
+                    now_utc = pd.Timestamp.now(tz='UTC')
+                    tick_age_sec = (now_utc - server_utc).total_seconds()
+                    if tick_age_sec < 60:
+                        market_open = True
+                except Exception as e:
+                    log.warning(f"Market-open check failed: {e}")
+            # WAKE: re-detect the broker time offset BEFORE any get_m5_close
+            # (Jun-8 cold-start: a 0h misdetect made A1 miss). Announce it so a
+            # misdetect is visible immediately in Telegram on Monday wake.
+            try:
+                ok = self.adapter.ensure_time_offset()
+                off = getattr(self.adapter, 'tick_time_offset_hours', None)
+                self.tele.success(
+                    f"📈 Market open — resuming. Week starting. "
+                    f"Broker time offset re-detected: +{off}h "
+                    f"({'ok' if ok else 'DETECT FAILED — check before A1'}).")
+            except Exception as e:
+                self.tele.warn(f"offset re-detect on wake failed: {e}")
+                self.tele.success("📈 Market open — resuming. Week starting.")
+            return True
+        elif abs(tick_age_sec) > 120:
+            # Market open but clock disagrees with broker → config problem
+            self.tele.critical(
+                f"❌ Broker server time drifts >2min from local UTC "
+                f"(broker tick {server_utc} vs local {now_utc}). ABORTING. "
+                f"Fix the OS clock (sync NTP) and restart.")
+            return False
+        # else: tick recent and within tolerance → market is open
+        return True
+
+    # ------------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------------
 
@@ -448,50 +533,14 @@ class LiveTrader:
         # stale during weekends/holidays. We must distinguish two cases:
         #   - tick is very old (>1h)  → market is closed; sleep until market opens
         #   - tick is recent (<1h) but disagrees with OS clock by >2min → real problem
-        market_open = True
-        try:
-            server_utc = self.adapter.server_time_utc()
-            now_utc = pd.Timestamp.now(tz='UTC')
-            tick_age_sec = (now_utc - server_utc).total_seconds()
-            if tick_age_sec > 3600:
-                # Last tick is more than an hour old — market is closed.
-                # SLEEP and re-check every 5 minutes instead of exiting.
-                hours = tick_age_sec / 3600
-                self.tele.info(
-                    f"📅 Market closed (last tick {hours:.1f}h old). "
-                    f"Bot will sleep and re-check every 5 min until market opens. "
-                    f"First anchor of week is 02:00 broker (Mon Asia)."
-                )
-                market_open = False
-                # v3.0.0 commit 3: closed-market (Sunday) startup -- backfill any
-                # day the EOD Firebase write missed, from the monthly trades CSVs.
-                # Fail-safe: a Firebase error never blocks startup.
-                self._firebase_weekly_reconcile()
-                # Sleep loop: wait for market to reopen
-                while not market_open:
-                    time.sleep(300)  # 5 minutes
-                    try:
-                        server_utc = self.adapter.server_time_utc()
-                        now_utc = pd.Timestamp.now(tz='UTC')
-                        tick_age_sec = (now_utc - server_utc).total_seconds()
-                        if tick_age_sec < 60:
-                            self.tele.success(
-                                f"📈 Market open detected — broker tick is fresh "
-                                f"({tick_age_sec:.0f}s old). Starting trader loop."
-                            )
-                            market_open = True
-                    except Exception as e:
-                        log.warning(f"Market-open check failed: {e}")
-            elif abs(tick_age_sec) > 120:
-                # Market is open but clock disagrees with broker → config problem
-                self.tele.critical(
-                    f"❌ Broker server time drifts >2min from local UTC "
-                    f"(broker tick {server_utc} vs local {now_utc}). ABORTING. "
-                    f"Fix the OS clock (sync NTP) and restart.")
-                return
-            # else: tick recent and within tolerance → all good
-        except Exception as e:
-            self.tele.warn(f"Could not verify broker time: {e}")
+        # v3.0.0 commit 4: the startup market-closed wait is now wait_until_market_open(),
+        # shared with the main loop so weekends are handled wherever first seen.
+        # commit 3: on a closed-market (Sunday) STARTUP only, backfill any EOD
+        # Firebase write the week missed, before entering the sleep.
+        if self._market_closed_now():
+            self._firebase_weekly_reconcile()
+        if self.wait_until_market_open(reason="startup") is False:
+            return  # clock-drift abort (original behavior)
 
         # Initial balance + lot autodetect (live mode only)
         if not self.paper:
@@ -570,6 +619,13 @@ class LiveTrader:
 
     def _tick(self):
         self._tick_counter += 1
+        # v3.0.0 commit 4: weekend/holiday self-sleep. If the market has closed
+        # while we were running (Friday EOD onward), enter the SAME deep-sleep
+        # used at startup and only return Monday when ticks are fresh again.
+        # _reset_if_new_day (below) then fires on the Monday tick via broker_date.
+        if self._market_closed_now():
+            self.wait_until_market_open(reason="weekend")
+            return
         utc_now = pd.Timestamp.now(tz='UTC')
         broker_date = self._broker_date(utc_now)
 
