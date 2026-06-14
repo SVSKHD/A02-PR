@@ -192,6 +192,8 @@ class Watchdog:
     # ------------------------------------------------------------------------
 
     def _format_status(self, status: dict) -> str:
+        if status.get("sleeping"):
+            return self._format_sleeping_status(status)
         kill = "🔴 *LOCKED*" if status.get("kill_switch_locked") else "🟢 OK"
         anchors = status.get("anchors_processed_today", [])
         hb_age = self._heartbeat_age()
@@ -225,6 +227,42 @@ class Watchdog:
         ]
         return "\n".join(lines)
 
+    def _format_sleeping_status(self, status: dict) -> str:
+        """💤 weekend/holiday reply: last trading day per-anchor P&L +
+        week to date, from the stats the bot embedded in status.json while
+        asleep. Fully fail-safe -- a missing/empty stats block still returns
+        the sleeping header rather than erroring."""
+        def money(v):
+            try:
+                return f"${float(v):+.2f}"
+            except (TypeError, ValueError):
+                return "$?"
+        next_anchor = status.get("next_anchor", "A1 02:00 broker")
+        lines = ["💤 AUREON — sleeping (market closed, auto-resume Monday)",
+                 f"Next anchor: {next_anchor}"]
+        ws = status.get("weekend_stats") or {}
+        last_day = ws.get("last_day") or {}
+        week = ws.get("week") or {}
+        if not last_day:
+            lines += ["", "📊 Stats unavailable (no trades journal yet)."]
+            return "\n".join(lines)
+        anchors = last_day.get("anchors") or {}
+        anchor_str = " · ".join(f"{a} {money(anchors[a])}" for a in sorted(anchors))
+        lines += ["",
+                  f"📊 Last trading day ({last_day.get('date', '?')}):",
+                  f"  {anchor_str or '(no anchors)'}",
+                  f"  Day total: {money(last_day.get('total', 0))}"]
+        days = week.get("days") or []
+        lines += ["", f"📈 Week to date ({week.get('n', len(days))} days):"]
+        for entry in days:
+            try:
+                d, tot = entry
+            except (ValueError, TypeError):
+                continue
+            lines.append(f"  {d}: {money(tot)}")
+        lines.append(f"  Week total: {money(week.get('total', 0))}")
+        return "\n".join(lines)
+
     def _format_today_summary(self) -> str:
         if not os.path.exists(self.daylog_path):
             return "No trades yet today."
@@ -256,7 +294,10 @@ class Watchdog:
             self.tele.info(HELP_TEXT)
         elif cmd == "status":
             status = self._read_status()
-            if status:
+            if status and status.get("sleeping"):
+                # weekend/holiday deep-sleep: the payload IS the sleep summary
+                self.tele.info(self._format_status(status))
+            elif status:
                 self.tele.info(f"📊 *AUREON Status*\n{self._format_status(status)}")
             else:
                 self.tele.warn("No status available — bot may still be starting")

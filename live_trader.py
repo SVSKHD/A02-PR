@@ -340,7 +340,7 @@ class LiveTrader:
         except Exception as e:
             log.debug(f"price log write failed: {e}")
 
-    def _write_status(self, broker_date: DateType):
+    def _write_status(self, broker_date: DateType, sleeping: bool = False):
         # Try to fetch live broker state (live mode only)
         broker_info = {}
         if not self.paper:
@@ -376,6 +376,22 @@ class LiveTrader:
                 } if self._deferred_anchor else None
             ),
         }
+        # v3.0.0 follow-up: keep `status` answerable during the weekend
+        # deep-sleep and carry last-day + week-to-date stats so the Telegram
+        # reply is useful precisely when the human checks in on a closed
+        # market. Fail-safe: any error here leaves the normal status intact.
+        status["sleeping"] = sleeping
+        if sleeping:
+            status["next_anchor"] = "A1 02:00 broker"
+            try:
+                import journal as _jmod
+                today = pd.Timestamp.now(tz='Asia/Kolkata').strftime('%Y-%m-%d')
+                jpath = os.path.join(self._journal_dir(), f"trades_{today[:7]}.csv")
+                last_day, week = _jmod.summarize_recent(jpath, today)
+                status["weekend_stats"] = {"last_day": last_day, "week": week}
+            except Exception as e:
+                status["weekend_stats"] = None
+                log.debug(f"weekend stats skipped (non-fatal): {e!r}")
         tmp = self.status_path + ".tmp"
         try:
             with open(tmp, "w") as f:
@@ -470,6 +486,11 @@ class LiveTrader:
             except Exception as e:
                 log.warning(f"state save before weekend sleep failed: {e}")
             market_open = False
+            # Keep `status` answerable while we sleep: the watchdog reads
+            # status.json, and on a Sunday cold-start nothing has written it
+            # yet (the startup wait runs before the main loop's first
+            # _write_status), so `status` would return "No status available".
+            sleep_bdate = self.state.get("last_broker_date", "")
             # Sleep the 5-min market re-check in short chunks, touching the
             # heartbeat each chunk. The watchdog restarts a bot whose heartbeat
             # is older than HEARTBEAT_STALE_SECONDS (180s in watchdog.py); a single
@@ -481,6 +502,7 @@ class LiveTrader:
                 slept = 0
                 while slept < RECHECK_EVERY_S:
                     self._touch_heartbeat()  # keep alive so the watchdog doesn't kill us
+                    self._write_status(sleep_bdate, sleeping=True)  # `status` stays fresh while asleep
                     time.sleep(HB_EVERY_S)
                     slept += HB_EVERY_S
                 try:

@@ -22,6 +22,98 @@ from mt5_adapter import _MT5_RETCODE_MAP
 log = logging.getLogger("AUREON")
 
 
+# ============================================================================
+# Weekend-status stats (v3.0.0 follow-up). PURE READ of the local trades
+# journal CSV -- no side effects, no AUREON-runtime imports. Used by the
+# weekend `status` reply and reusable by a future standalone `stats` command
+# or the frontend later.
+# ============================================================================
+
+def summarize_recent(csv_path, today=None):
+    """Return (last_day, week) realized-P&L summaries from a trades journal CSV.
+
+    last_day = {} when there is no data, else
+        {'date': 'YYYY-MM-DD',
+         'anchors': {'A1': pnl, 'A2': pnl, ...},   # sum realized_pnl_usd / anchor
+         'total': float}
+    week = {} when there is no data, else
+        {'days': [('YYYY-MM-DD', day_total), ...],  # chronological
+         'total': float, 'n': int}
+
+    "Last trading day" = the most recent date_ist present in the CSV. "Week to
+    date" = the trading days present in the Mon-Fri week containing `today` (a
+    'YYYY-MM-DD' str/date; default = the last trading day). All numbers come
+    from the realized_pnl_usd column. If `csv_path` is named trades_<YYYY-MM>.csv
+    a sibling previous-month file (same dir) is merged in, so a Mon-Fri week that
+    straddles a month boundary is still complete. Pure read; a malformed row is
+    skipped rather than raised, so the caller always gets whatever parsed.
+    """
+    def _parse_day(s):
+        try:
+            return datetime.strptime(str(s)[:10], '%Y-%m-%d').date()
+        except (TypeError, ValueError):
+            return None
+
+    # Candidate files: the given CSV + (if monthly-named) the prior month, so a
+    # week spanning month-end is whole even though trades live in monthly files.
+    paths = [csv_path]
+    base = os.path.basename(csv_path)
+    if base.startswith('trades_') and base.endswith('.csv'):
+        ym = base[len('trades_'):-len('.csv')]
+        try:
+            y, m = int(ym[:4]), int(ym[5:7])
+            pm = (y - 1, 12) if m == 1 else (y, m - 1)
+            paths.append(os.path.join(os.path.dirname(csv_path),
+                                      f"trades_{pm[0]:04d}-{pm[1]:02d}.csv"))
+        except (ValueError, IndexError):
+            pass
+
+    per_anchor = {}   # date -> {anchor -> pnl}
+    per_day = {}      # date -> total pnl
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            with open(p, newline="") as f:
+                for r in csv.DictReader(f):
+                    d = _parse_day(r.get('date_ist'))
+                    if d is None:
+                        continue
+                    try:
+                        pnl = float(r.get('realized_pnl_usd') or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    label = (r.get('anchor') or '?').strip() or '?'
+                    bucket = per_anchor.setdefault(d, {})
+                    bucket[label] = round(bucket.get(label, 0.0) + pnl, 2)
+                    per_day[d] = round(per_day.get(d, 0.0) + pnl, 2)
+        except (OSError, csv.Error):
+            continue
+
+    if not per_day:
+        return {}, {}
+
+    last = max(per_day)
+    last_day = {
+        'date': last.isoformat(),
+        'anchors': dict(per_anchor.get(last, {})),
+        'total': round(per_day[last], 2),
+    }
+
+    # Week = Mon-Fri of the week containing `today` (else the last trading day);
+    # weekend/holiday days map onto the same Mon-Fri window as that week's trades.
+    anchor_day = _parse_day(today) or last
+    monday = anchor_day - timedelta(days=anchor_day.weekday())
+    friday = monday + timedelta(days=4)
+    wdays = sorted(d for d in per_day if monday <= d <= friday)
+    week = {
+        'days': [(d.isoformat(), round(per_day[d], 2)) for d in wdays],
+        'total': round(sum(per_day[d] for d in wdays), 2),
+        'n': len(wdays),
+    }
+    return last_day, week
+
+
 def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, ticket):
     import os as _os
     jdir = _os.path.join(self.run_dir, "journal")

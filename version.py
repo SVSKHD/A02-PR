@@ -62,6 +62,11 @@ History (one line per behavioral change):
          wait_until_market_open() factored from startup into the main loop, so
          the process deep-sleeps over the weekend and wakes itself Monday (offset
          re-detect on wake, heartbeat kept alive, state saved before sleeping).
+         Weekend `status` (follow-up): status.json is now refreshed inside the
+         weekend sleep loop, and the sleep-state reply carries last-trading-day
+         per-anchor P&L + week-to-date totals read from the local
+         trades_<YYYY-MM>.csv (journal.summarize_recent, fail-safe -> "stats
+         unavailable"). No trading-behavior change; version held at 3.0.0.
 """
 
 __version__ = "3.0.0"
