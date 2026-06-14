@@ -727,7 +727,7 @@ def run_live(cfg, paper: bool = True):
     Delegates to LiveTrader for the full event loop.
     """
     from mt5_adapter import MT5Adapter  # late import: only the live path needs MT5
-    adapter = MT5Adapter()
+    adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'))  # hardening #7: probe the configured symbol
     try:
         trader = LiveTrader(cfg, adapter, paper=paper)
         trader.run()

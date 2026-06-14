@@ -202,9 +202,16 @@ def _manage_trails_on_bar_close(self):
                         f"SL DRIFT ticket={ticket} side={shadow['side']}: broker "
                         f"${broker_sl} != intended ${intended} — re-asserting"
                     )
+                # Hardening #5: modify_position_sl returns the MT5 result object
+                # (truthy) on BOTH success and broker rejection -- treating it as
+                # a boolean masked failed re-asserts. Confirm retcode == 10009
+                # (DONE); otherwise the SL really didn't move and we must warn.
                 ok = False
                 try:
-                    ok = self.adapter.modify_position_sl(ticket, intended)
+                    _res = self.adapter.modify_position_sl(ticket, intended)
+                    ok = (_res is not None and (
+                        getattr(_res, 'retcode', None) == 10009
+                        or (isinstance(_res, dict) and _res.get('paper'))))
                 except Exception as e:
                     log.warning(f"modify_position_sl raised for {ticket}: {e}")
                 if not ok:

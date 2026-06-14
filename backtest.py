@@ -90,9 +90,14 @@ def run_backtest(csv_path: str, start: str, end: str, cfg: Config) -> pd.DataFra
                 if outcome:
                     break
             if not pos.closed:
-                last = walk.iloc[-1]
-                pos.exit_price = float(last.close)
-                pos.exit_time = walk.index[-1]
+                # Hardening #9: walk is empty when the fill lands on the LAST bar
+                # of the window (fi+1 == len(window)); walk.iloc[-1] would raise
+                # IndexError and abort the whole backtest. Fall back to the entry
+                # bar (window.iloc[fi]) for the EOD close in that case.
+                close_bar = walk.iloc[-1] if len(walk) else window.iloc[fi]
+                close_ts = walk.index[-1] if len(walk) else window.index[fi]
+                pos.exit_price = float(close_bar.close)
+                pos.exit_time = close_ts
                 pos.outcome = 'EOD'
                 pos.closed = True
 
