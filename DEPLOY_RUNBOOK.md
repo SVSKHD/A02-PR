@@ -55,7 +55,16 @@ pip install -r requirements.txt
 `firebase-admin>=6.0` is the only new package. If the VPS has no outbound network,
 skip it — the journal degrades fail-safe and trading is unaffected.
 
-## Step 4 — Paper smoke test on the closed market (GATE)
+> ✅ **Prefer starting when the market is open.** `MT5Adapter` detects the broker
+> time offset from a LIVE tick feed at init. With the hardening PR's #4 guard a
+> closed-market start no longer crashes (it warns, sleeps, and re-detects the
+> offset on Monday wake before any trade) — but a start at/after **Sunday ~22:00
+> UTC pre-open** is cleanest: the offset detects immediately as **+3h** and you
+> see it in the banner. (On plain v3.0.0 *without* the hardening PR, a
+> closed-market start WILL crash at adapter init — there, you MUST start when the
+> market is open.)
+
+## Step 4 — Paper smoke test (GATE) — run at/after Sunday pre-open
 ```
 cd C:\A02-PR
 python bot.py paper
@@ -63,20 +72,20 @@ python bot.py paper
 Confirm in Telegram:
 1. The banner prints **`v3.0.0`** and the **`Modules (14): …`** receipt exactly as in
    `PRE_DEPLOY_CHECK.md §5`. Wrong version or a short module list ⇒ deploy didn't land.
-2. Since the market is closed, it then posts the weekend line
-   **`💤 Weekend — market closed, sleeping, will auto-resume Monday. …`** and goes quiet.
-3. No tracebacks in the console/log.
+2. The broker time offset logs as **`+3h`** (not `+0h`) — the live feed is detected.
+3. No tracebacks in the console/log. (If you must verify earlier while the market is
+   dead, expect an adapter-init error — that's #4; just retry once ticks are live.)
 Then stop it (`Ctrl-C` / `/stop`). Paper mode places no orders.
 
-## Step 5 — Arm for Monday (live)
+## Step 5 — Arm for Monday (live) — at/after Sunday pre-open
 Start the watchdog in live mode exactly as you do today:
 ```
 cd C:\A02-PR
 python watchdog.py live --i-understand-the-risks
 ```
-It spawns `bot.py live`. Expect the v3.0.0 banner, then the `💤 Weekend` sleep line.
-The process stays alive all weekend and **auto-resumes Monday** at the first fresh
-tick — no manual restart. Leave it running.
+It spawns `bot.py live`. Expect the v3.0.0 banner and the `+3h` offset. If launched
+while the market is briefly between sessions, the process self-sleeps and
+**auto-resumes** at the first fresh tick — no manual restart. Leave it running.
 
 ## Step 6 — Rollback (if anything looks wrong, any time)
 1. Stop the watchdog/bot.

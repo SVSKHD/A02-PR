@@ -90,4 +90,8 @@ def m5_close_at(m5: pd.DataFrame, target_utc: pd.Timestamp) -> Optional[float]:
     near = m5.index[(m5.index >= target_utc - pd.Timedelta(minutes=5)) &
                     (m5.index <= target_utc + pd.Timedelta(minutes=5))]
     if len(near) == 0: return None
-    return float(m5.loc[near[0], 'close'])
+    # Hardening #6: return the close of the bar NEAREST to target_utc, not the
+    # earliest in the window (near[0]) -- when bars straddle target on both
+    # sides the earliest can be further away and pick the wrong anchor close.
+    nearest = min(near, key=lambda ix: abs(ix - target_utc))
+    return float(m5.loc[nearest, 'close'])

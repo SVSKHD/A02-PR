@@ -96,32 +96,57 @@ def _save_state(self):
 
 
 def _acquire_pid_lock(self):
-    """v2.5: Refuse to start if another bot instance is already running."""
+    """v2.5: Refuse to start if another bot instance is already running.
+
+    Hardening #2: acquire the lock ATOMICALLY with O_CREAT|O_EXCL so two
+    near-simultaneous starts can never both win (the old exists()-then-write
+    was a TOCTOU hole -- both could pass the check and both write). On EEXIST we
+    inspect the holder: a LIVE AUREON process means refuse; a stale/foreign lock
+    is removed and the create retried once.
+    """
     import psutil
-    if os.path.exists(self.pid_lock_path):
+
+    def _holder_is_live_aureon() -> bool:
         try:
             with open(self.pid_lock_path) as f:
                 other_pid = int(f.read().strip())
-            if psutil.pid_exists(other_pid):
-                # Verify it's actually a python process running this bot
-                try:
-                    p = psutil.Process(other_pid)
-                    cmdline = " ".join(p.cmdline()).lower()
-                    if "aureon" in cmdline or "live_trader" in cmdline or "bot.py" in cmdline:
-                        raise RuntimeError(
-                            f"Another AUREON bot is already running (PID {other_pid}). "
-                            f"Refusing to start a second instance — they would conflict on "
-                            f"magic number 20260522 and OCO sibling tracking. "
-                            f"Kill the other instance first: taskkill /F /PID {other_pid}"
-                        )
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass  # stale lock, safe to take it
-            # else: stale lock, fall through and take it
         except (ValueError, OSError):
-            pass  # malformed lock, take it
-    with open(self.pid_lock_path, 'w') as f:
-        f.write(str(os.getpid()))
-    log.info(f"PID lock acquired: {self.pid_lock_path} = {os.getpid()}")
+            return False  # malformed -> stale
+        if not psutil.pid_exists(other_pid):
+            return False
+        try:
+            cmdline = " ".join(psutil.Process(other_pid).cmdline()).lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False  # can't confirm -> treat as stale, safe to take
+        if "aureon" in cmdline or "live_trader" in cmdline or "bot.py" in cmdline:
+            raise RuntimeError(
+                f"Another AUREON bot is already running (PID {other_pid}). "
+                f"Refusing to start a second instance — they would conflict on "
+                f"magic number 20260522 and OCO sibling tracking. "
+                f"Kill the other instance first: taskkill /F /PID {other_pid}"
+            )
+        return False  # live but not an AUREON bot -> foreign/stale lock
+
+    for _attempt in (1, 2):
+        try:
+            fd = os.open(self.pid_lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _holder_is_live_aureon():  # raises if a live AUREON bot holds it
+                return
+            try:
+                os.remove(self.pid_lock_path)  # stale/foreign -> clear and retry
+            except OSError:
+                pass
+            continue
+        else:
+            with os.fdopen(fd, 'w') as f:
+                f.write(str(os.getpid()))
+            log.info(f"PID lock acquired: {self.pid_lock_path} = {os.getpid()}")
+            return
+    raise RuntimeError(
+        f"Could not acquire PID lock {self.pid_lock_path} after retrying — "
+        f"another instance is racing to start. Aborting to stay single-instance."
+    )
 
 
 def _release_pid_lock(self):

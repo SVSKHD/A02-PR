@@ -66,9 +66,13 @@ class MT5Adapter:
     decode any future tick.time and to encode times we send to copy_rates.
     """
 
-    def __init__(self):
+    def __init__(self, symbol: str = "XAUUSD"):
         import MetaTrader5 as mt5
         self.mt5 = mt5
+        # Hardening #7: time-offset detection + server_time read use the
+        # configured trading symbol (still defaults to XAUUSD for every existing
+        # caller -- test_place/validate_25 construct MT5Adapter() with no args).
+        self.symbol = symbol
         if not mt5.initialize():
             raise RuntimeError(
                 f"MT5 init failed: {mt5.last_error()}. "
@@ -84,12 +88,26 @@ class MT5Adapter:
 
         # Autodetect tick.time convention by comparing broker's claimed time
         # to local UTC. Done ONCE at startup.
+        # Autodetect tick.time convention by comparing broker's claimed time
+        # to local UTC. Done ONCE at startup.
         self.tick_time_offset_hours = self._detect_tick_time_offset()
-        log.info(
-            f"Detected broker tick.time convention: offset = "
-            f"{self.tick_time_offset_hours:+.0f}h "
-            f"({'real UTC' if self.tick_time_offset_hours == 0 else 'broker-local-as-UTC'})"
-        )
+        # Hardening #4: detection returns None when there is no LIVE feed (e.g. a
+        # CLOSED market on weekend cold-start). Do NOT crash formatting None --
+        # log a warning and proceed; the weekend self-sleep forces a fresh
+        # ensure_time_offset() on Monday wake BEFORE any trading, and
+        # server_time_utc treats None as 0 for the coarse market-closed probe.
+        if self.tick_time_offset_hours is None:
+            log.warning(
+                "Broker tick.time offset NOT detected at startup (no live feed -- "
+                "market likely closed). Proceeding; will re-detect on market open "
+                "before any trade. Market-open probes treat the offset as 0 meanwhile."
+            )
+        else:
+            log.info(
+                f"Detected broker tick.time convention: offset = "
+                f"{self.tick_time_offset_hours:+.0f}h "
+                f"({'real UTC' if self.tick_time_offset_hours == 0 else 'broker-local-as-UTC'})"
+            )
 
     def _detect_tick_time_offset(self, max_wait_s: float = 90.0):
         """Detect broker tick.time offset from a LIVE feed. Returns int-hour
@@ -103,11 +121,11 @@ class MT5Adapter:
         # single timestamp can't disambiguate. Require the feed to be LIVE:
         # tick.time must advance with the wall clock between two reads.
         while _time.monotonic() < deadline:
-            t1 = self.mt5.symbol_info_tick("XAUUSD"); w1 = _dt.now(_tz.utc).timestamp()
+            t1 = self.mt5.symbol_info_tick(self.symbol); w1 = _dt.now(_tz.utc).timestamp()
             if t1 is None or t1.time <= 0:
                 _time.sleep(POLL_S); continue
             _time.sleep(ADVANCE_S)
-            t2 = self.mt5.symbol_info_tick("XAUUSD"); w2 = _dt.now(_tz.utc).timestamp()
+            t2 = self.mt5.symbol_info_tick(self.symbol); w2 = _dt.now(_tz.utc).timestamp()
             if t2 is None or t2.time <= 0:
                 _time.sleep(POLL_S); continue
             wall = w2 - w1; adv = t2.time - t1.time
@@ -158,11 +176,14 @@ class MT5Adapter:
         # tick.time is decoded using the convention we detected at startup.
         # If broker sends real UTC: offset=0, no change.
         # If broker sends broker-local-as-UTC: offset=+3 (UTC+3), subtract it.
-        tick = self.mt5.symbol_info_tick("XAUUSD")
+        tick = self.mt5.symbol_info_tick(self.symbol)
         if tick is None:
             raise RuntimeError("symbol_info_tick returned None — symbol not subscribed?")
         broker_ts = pd.Timestamp(tick.time, unit='s', tz='UTC')
-        return broker_ts - pd.Timedelta(hours=self.tick_time_offset_hours)
+        # Hardening #4: offset may be None pre-detection (closed-market cold-start);
+        # treat as 0 for the coarse staleness math. The real offset is set by
+        # ensure_time_offset() on market open before any trade decision.
+        return broker_ts - pd.Timedelta(hours=self.tick_time_offset_hours or 0)
 
     def get_account_info(self) -> dict:
         """Pull current account state from MT5. Returns {} on failure."""
