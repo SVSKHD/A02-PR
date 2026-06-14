@@ -69,3 +69,17 @@ If Monday goes wrong **live** (bad fills, wrong exits, crash loop), follow
 `DEPLOY_RUNBOOK.md §6` immediately — restore the 2.9.8 backup zip and relaunch.
 Rolling back the deploy and keeping the PR open are independent: fix on the branch,
 re-deploy when green.
+
+## Addendum — weekend `status` stats (separate PR: `claude/weekend-status-stats`)
+
+A follow-up PR (independent of the 5 criteria above) makes the `status` command
+answer during weekend/holiday deep-sleep. To validate over a weekend/holiday:
+- Send `status` while the bot is in the `💤 Weekend …` sleep. It must reply with
+  the 💤 sleeping layout (NOT `No status available`): last trading day per-anchor
+  P&L, day total, and week-to-date per-day totals + week total — read from the
+  local `run/journal/trades_<YYYY-MM>.csv` (no Firebase dependency).
+- `run/status.json` must keep refreshing while asleep (mtime advances ~every 30s)
+  and carry `"sleeping": true` plus a `weekend_stats` block.
+- If `trades_<month>.csv` is missing/empty/malformed, the reply still shows the
+  💤 header + "Stats unavailable" — it must never error.
+Version stays 3.0.0 (a history line was added). No trading-behavior change.
