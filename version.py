@@ -67,6 +67,16 @@ History (one line per behavioral change):
          per-anchor P&L + week-to-date totals read from the local
          trades_<YYYY-MM>.csv (journal.summarize_recent, fail-safe -> "stats
          unavailable"). No trading-behavior change; version held at 3.0.0.
+         Monday-wake + A1 hardening (defense in depth, no strategy change): the
+         broker offset is VALIDATED on wake/startup against
+         cfg.EXPECTED_BROKER_OFFSET_HOURS and A1 is BLOCKED (loud alert) if it
+         mismatches after retries -- eliminates the Jun-8 silent miss (0h
+         misdetect -> wrong M5 window -> no bars -> no trade, silently). Anchors
+         refuse to place on an unvalidated offset; the M5 anchor fetch retries and
+         a no-bars result is alerted, never swallowed; A1's resting stops are
+         confirmed at the broker (missing leg re-placed once, else INCOMPLETE
+         alert); a WAKE FAILSAFE alarm fires if still asleep past the expected
+         weekly open; a "Ready" receipt posts on every startup/wake. 3.0.0 held.
 """
 
 __version__ = "3.0.0"

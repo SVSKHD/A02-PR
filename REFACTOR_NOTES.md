@@ -292,3 +292,37 @@ Options for the maintainer (asked on the PR):
 - **(b)** Leave #4 as pre-existing and **start the bot when the market is open**
   (Sunday 22:00 UTC pre-open or Monday), not over the closed weekend — adjust the
   runbook accordingly.
+
+## Monday-wake + A1 hardening (eliminate the Jun-8 silent-miss)
+
+Defense in depth around the wake → A1 path. **No strategy change**; version held
+at 3.0.0. All guards are additive and gated to LIVE mode — paper/backtest run
+unguarded so the frozen behavior and the byte-identical backtest are unaffected.
+
+ELIMINATES (now impossible to occur *silently*):
+- The Jun-8 silent miss: a 0h offset misdetect → `get_m5_close` queried the wrong
+  M5 window → "no bars" → A1 placed nothing, silently. **Guard 1** validates the
+  offset on wake against `cfg.EXPECTED_BROKER_OFFSET_HOURS` (+3h) and BLOCKS A1
+  with a loud ⚠️ critical on mismatch. **Guard 2** refuses to place on an
+  unvalidated offset and retries the M5 fetch, alerting on a final no-bars instead
+  of swallowing it.
+- Silent A1 placement failure: **Guard 3** confirms A1's resting BUY+SELL stops
+  exist at the broker after a "successful" send, re-places a confirmed-missing leg
+  once (only after two consecutive broker reads both miss it — avoids duplicating
+  on a transient empty read), else fires a ⚠️ `placement INCOMPLETE` alert.
+
+Does NOT prevent (outside code's reach) — but now ALERTS, not silent:
+- VPS down at 02:00, OS reboot, broker-feed outage, power loss. **Guard 4** fires a
+  repeating ⚠️ `WAKE FAILSAFE` alarm if the bot is still asleep past the
+  expected weekly open (gold/FX ~Sun 22:00 UTC) + grace, until it wakes or the
+  human intervenes. Recovery = watchdog relaunch + A2 fallback.
+
+**Guard 5** posts a one-line `🔧 Ready: offset {x}h {validated/UNVALIDATED}
+· next anchor … · state rehydrated {ok/fail}` on every startup/wake.
+
+Honest residual risk: Guard 3's one-shot re-placement reads broker order state to
+decide; a broker reporting an order list inconsistent with reality for >2s could in
+principle cause a duplicate (mitigated by the two-read rule) or a missed re-place.
+This is the first LIVE run of v3.0.0 — the guards make failures LOUD and
+recoverable, the achievable form of certainty; Monday's run is still the validation
+event.

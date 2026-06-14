@@ -12,12 +12,18 @@ actually happened.
 
 ## The 5 merge criteria (all must be TRUE)
 
-### 1 — Monday wake (commit 4 + cold-start fix)
+### 1 — Monday wake (commit 4 + cold-start fix + wake/A1 hardening)
 - Bot **auto-resumed** from weekend sleep (no manual restart).
-- Posted **`📈 Market open — resuming. Week starting. Broker time offset re-detected: +3h …`**.
-- Offset is **+3h, NOT 0h** (the Jun-8 A1-miss bug). A `+0h` / `DETECT FAILED` ⇒ FAIL.
-- **A1 placed at 02:00 broker** by the normal anchor path.
-- Evidence: the resume Telegram line + the A1 placement/fill lines.
+- Posted **`📈 Market open — resuming. Week starting.`**.
+- Posted **`✅ Monday wake: broker offset confirmed +3h`** (the new Guard-1
+  validation) and a **`🔧 Ready: offset 3h validated · next anchor …`** receipt.
+- Offset is **+3h, NOT 0h** (the Jun-8 A1-miss bug). A `+0h` mismatch now BLOCKS
+  A1 with a ⚠️ `offset detect FAILED on wake` critical ⇒ that is the guard
+  working, but A1 will NOT have placed — investigate the offset before retrying.
+- **A1 placed at 02:00 broker** by the normal anchor path, and its resting BUY+SELL
+  stops were **confirmed at the broker** (no ⚠️ `placement INCOMPLETE`).
+- Evidence: the resume + `✅ offset confirmed` + `🔧 Ready` lines + the
+  A1 placement/fill lines.
 
 ### 2 — No regression vs 2.9.8 (commit 2 behavior-frozen)
 - Every anchor's legs show the **correct exit labels** (BE / LOCK4 / TIER / Trail /
