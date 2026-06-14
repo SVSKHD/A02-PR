@@ -38,9 +38,33 @@ History (one line per behavioral change):
          shows last_error, 10030 retries FOK (Jun-11 silent-boost mystery);
          (5) journal-only no-hold trail counterfactual per leg -- decides
          hold-vs-no-hold from live data
+  2.9.9  FIX A stale rescue flag: a 2nd fill is a genuine RESCUE only if its
+         twin is STILL OPEN at the moment of the 2nd fill (Jun-12 A4: SELL
+         banked +$477 and closed, BUY filled an hour later, inherited the
+         stale rescue_on_fill flag and fired 2 boosts with no twin to rescue;
+         A2 same setup fired nothing -> nondeterministic). Twin-open is tested
+         structurally (sibling_ticket or any non-boost open leg of the anchor);
+         a stale flag with a closed twin runs as a normal breakout leg, no
+         boosts. FIX B boost diagnostics: every exit of the boost path now
+         self-reports (attempting / exception / result=None+last_error /
+         rejected rc+name+comment / filled price+ticket) -- the 0-for-6 silent
+         boosts get a full trace on the next live event (no param change)
+  3.0.0  STRUCTURAL SPLIT (behavior-frozen): live_trader.py (~2.4k) and bot.py
+         (~1k) broken into 13 modules -- utils, config, strategy (pure Position
+         + update_position_on_bar), mt5_adapter (sole MetaTrader5 importer),
+         backtest, state, risk, anchors, fills, trails, journal -- plus the slim
+         LiveTrader orchestrator and a CLI/backtest-only bot.py (run_live moved
+         to live_trader). Moved code is byte-identical (proof in REFACTOR_NOTES);
+         methods are bound onto LiveTrader so every call site, state.json key,
+         Telegram string and 19-col journal schema are unchanged. Startup banner
+         prints a MODULE RECEIPT (rule #6). Firebase EOD journal wired in
+         (journal.py, fail-safe). Weekend self-sleep + Monday auto-resume:
+         wait_until_market_open() factored from startup into the main loop, so
+         the process deep-sleeps over the weekend and wakes itself Monday (offset
+         re-detect on wake, heartbeat kept alive, state saved before sleeping).
 """
 
-__version__ = "2.9.8"
+__version__ = "3.0.0"
 CODENAME = "Astra Hawk"
 
 

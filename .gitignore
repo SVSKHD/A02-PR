@@ -3,14 +3,25 @@
 .env.local
 .env.*.local
 *.secret
+# Firebase service-account key (lives at C:\A02-PR\firebase_key.json on the VPS)
+firebase_key.json
+*firebase*key*.json
 
 # Bot runtime state
 run/
 *.state.json
+state.json
+state.json.*
 aureon_v2_state.json
+aureon_v2_state.json.bak
+*.bak
 heartbeat
 commands.json
 status.json
+
+# Journal CSVs (one rich row per fill, monthly)
+trades_*.csv
+today_trades.csv
 
 # Backtest/analysis outputs
 output/
