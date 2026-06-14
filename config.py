@@ -72,6 +72,10 @@ class Config:
         ("A4_1640_NYopen", 16, 40),
     ])
     broker_tz_offset_hours: int = 3  # UTC+3
+    # Monday-wake hardening: the broker offset the bot MUST measure on wake before
+    # it will place any anchor. Pepperstone = UTC+3. A mismatch (e.g. the Jun-8
+    # 0h misdetect) blocks A1 loudly instead of querying the wrong M5 window.
+    EXPECTED_BROKER_OFFSET_HOURS: int = 3
     eod_broker_hour: int = 23  # close all at 23:00 broker
 
     # Risk

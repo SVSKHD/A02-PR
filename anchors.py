@@ -54,9 +54,43 @@ def _process_anchor(self, label: str, anchor_utc: pd.Timestamp):
     except Exception as e:
         log.warning(f"Account floor check failed: {e}")
 
-    anchor_price = self.adapter.get_m5_close(self.cfg.symbol, anchor_utc)
+    # Guard 2 (Monday-wake hardening): never place on an UNVALIDATED broker time
+    # offset. A wrong offset queries the wrong M5 window -> "no bars" -> the Jun-8
+    # silent A1 miss. Block + alert instead of querying blind (live only; paper/
+    # backtest run unguarded). The same offset feeds every anchor, so gating all
+    # of them fails CLOSED if the wake validation never passed.
+    if not self.paper and not getattr(self, "offset_validated", False):
+        self.tele.warn(
+            f"⚠️ *{label} skipped — offset not validated*\n"
+            f"Broker time offset has not passed wake validation; refusing to "
+            f"place on an unvalidated offset (Jun-8 silent-miss guard)."
+        )
+        log.warning(f"{label}: SKIP — offset_validated is False")
+        return
+
+    # Guard 2: retry the anchor M5 fetch before giving up, and NEVER swallow a
+    # no-bars result silently (the literal Jun-8 symptom). Loud alert on final
+    # failure so a no-bars anchor can never pass unnoticed.
+    _fetch_retries = getattr(self, "ANCHOR_FETCH_RETRIES", 3)
+    anchor_price = None
+    for _attempt in range(1, _fetch_retries + 1):
+        anchor_price = self.adapter.get_m5_close(self.cfg.symbol, anchor_utc)
+        if anchor_price is not None:
+            break
+        log.warning(
+            f"{label}: get_m5_close returned no bars "
+            f"(attempt {_attempt}/{_fetch_retries}) at {anchor_utc}")
+        if _attempt < _fetch_retries:
+            time.sleep(getattr(self, "ANCHOR_FETCH_RETRY_WAIT_S", 2))
     if anchor_price is None:
-        self.tele.warn(f"⚠️ Could not fetch M5 close at {anchor_utc} — skipping {label}")
+        self.tele.warn(
+            f"⚠️ *{label} anchor fetch returned no bars — investigate*\n"
+            f"get_m5_close found no M5 bar ending {anchor_utc} after "
+            f"{_fetch_retries} attempts "
+            f"(offset {getattr(self.adapter, 'tick_time_offset_hours', None)}h). "
+            f"NOT placing — no silent miss."
+        )
+        log.warning(f"⚠️ {label}: anchor fetch returned no bars after retries — skipping")
         return
 
     # v2.5.2: Per-anchor deferred wait. A2 (London open) and A4 (NY open) need
@@ -390,6 +424,14 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         # v2.5.2: surface retry success
         if retry_count > 0:
             self.tele.success(f"✅ *{label} placement succeeded on retry {retry_count}*")
+        # Guard 3 (Monday-wake hardening): confirm A1's resting stops actually
+        # exist at the broker. A "successful" send that left no resting order is a
+        # silent A1 no-show; re-place the missing leg once, else alert loudly.
+        if not self.paper and label.startswith("A1"):
+            self._confirm_a1_placement(
+                label, gap_lot,
+                None if skip_buy  else (buy_stop,  sl_buy,  tp_buy,  buy_ticket),
+                None if skip_sell else (sell_stop, sl_sell, tp_sell, sell_ticket))
         return
 
     # If we got here, pre-flight passed but the broker STILL rejected
@@ -560,6 +602,71 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         f"Current market: ${recovery_price if recovery_price else '?'}"
         + err_detail_skip
     )
+
+def _confirm_a1_placement(self, label, lot, buy_leg, sell_leg):
+    """Guard 3: assert A1's resting stop orders exist at the broker after a
+    "successful" placement; re-place a confirmed-missing leg ONCE, else fire a
+    loud INCOMPLETE alert. buy_leg/sell_leg are (price, sl, tp, ticket) or None
+    (skipped by design). Live only. Never raises (a guard must not break the
+    loop). Re-placement triggers only on TWO consecutive broker reads that both
+    miss the leg, to avoid duplicating an order on a transient empty read."""
+    try:
+        def _present_once(side, price, ticket):
+            try:
+                orders = self.adapter.mt5.orders_get(symbol=self.cfg.symbol) or []
+            except Exception as e:
+                log.warning(f"{label}: orders_get raised during A1 confirm: {e}")
+                return None
+            want = (self.adapter.mt5.ORDER_TYPE_BUY_STOP if side == "BUY"
+                    else self.adapter.mt5.ORDER_TYPE_SELL_STOP)
+            for o in orders:
+                if ticket is not None and getattr(o, "ticket", None) == ticket:
+                    return True
+                if (getattr(o, "type", None) == want and
+                        abs(getattr(o, "price_open", 0.0) - price) <= 0.05):
+                    return True
+            return False
+
+        def _present(side, price, ticket):
+            r1 = _present_once(side, price, ticket)
+            if r1 is None or r1:
+                return True            # unknown or present -> never re-place
+            time.sleep(1)
+            r2 = _present_once(side, price, ticket)
+            return (r2 is None) or bool(r2)  # absent only on two confirmed misses
+
+        legs = []
+        if buy_leg is not None:
+            legs.append(("BUY",) + tuple(buy_leg))
+        if sell_leg is not None:
+            legs.append(("SELL",) + tuple(sell_leg))
+
+        for side, price, sl, tp, ticket in legs:
+            if _present(side, price, ticket):
+                continue
+            self.tele.warn(
+                f"⚠️ *{label} {side} stop missing at broker — re-placing once*\n"
+                f"Sent OK but no resting {side} stop @ ${price} found.")
+            res = self.adapter.place_stop_order(
+                self.cfg.symbol, side, price, lot, sl=sl, tp=tp,
+                comment=f"AUREONv2_{label}_{side}_CONFIRM", dry_run=self.paper)
+            new_ticket = self._extract_ticket(res, f"paper_{label}_{side}")
+            time.sleep(1)
+            if new_ticket is not None and _present(side, price, new_ticket):
+                self.shadow_pendings[int(new_ticket)] = {
+                    "anchor_label": label, "side": side,
+                    "sibling_ticket": None, "entry_price": price,
+                }
+                self.tele.success(
+                    f"✅ *{label} {side} stop re-placed and confirmed* (ticket {new_ticket})")
+            else:
+                self.tele.warn(
+                    f"⚠️ *{label} placement INCOMPLETE — {side} leg missing*\n"
+                    f"{side} stop @ ${price} not present at broker after re-place "
+                    f"(rc={getattr(res, 'retcode', None)}). Manual check needed.")
+    except Exception as e:
+        log.warning(f"{label}: A1 placement confirm raised (non-fatal): {e}")
+
 
 # ------------------------------------------------------------------------
 # v2.5.3: Trade channel warmup, MT5 reconnect, and DIAGNOSTIC DUMPS

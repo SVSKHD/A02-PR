@@ -135,6 +135,14 @@ class LiveTrader:
     # None = disabled (Pepperstone demo). 0.27 caps $50k FP Zero at <$500 SL.
     FP_ZERO_MAX_LOT = None     # set to 0.27 before FP Zero $50k buy
 
+    # Monday-wake + A1 hardening (eliminate the Jun-8 silent-miss)
+    OFFSET_VALIDATE_RETRIES   = 10     # wake offset detect attempts
+    OFFSET_VALIDATE_WAIT_S    = 30     # spacing between offset detect attempts
+    ANCHOR_FETCH_RETRIES      = 3      # get_m5_close attempts before giving up
+    ANCHOR_FETCH_RETRY_WAIT_S = 2
+    WAKE_FAILSAFE_GRACE_MIN   = 15     # alert if still asleep this long past open
+    WAKE_FAILSAFE_REPEAT_S    = 300    # re-alert cadence while still asleep
+
     def __init__(self, cfg, adapter, paper: bool = True):
         from strategy import Position  # late import
         from utils import anchor_datetime_utc, eod_datetime_utc  # late import
@@ -193,6 +201,11 @@ class LiveTrader:
 
         # Pause flag (set via /pause command)
         self.paused = False
+
+        # Monday-wake hardening: no anchor places until the broker time offset is
+        # measured fresh on wake and matches cfg.EXPECTED_BROKER_OFFSET_HOURS.
+        # Stays False until _validate_offset_on_wake() confirms it (live mode).
+        self.offset_validated = False
 
         # Today's trade log header
         if not os.path.exists(self.daylog_path):
@@ -451,6 +464,89 @@ class LiveTrader:
             log.warning(f"market-closed probe failed: {e}")
             return False
 
+    def _validate_offset_on_wake(self, reason: str = "wake") -> bool:
+        """Guard 1 (core fix): on wake/startup, force a fresh broker time-offset
+        detect and ASSERT it equals cfg.EXPECTED_BROKER_OFFSET_HOURS before any
+        anchor logic. The Jun-8 silent A1 miss was a 0h misdetect -> wrong M5
+        window -> no bars -> no trade, silently. Here a mismatch is LOUD and A1
+        is BLOCKED (placing on a wrong offset is worse than not placing).
+
+        Sets self.offset_validated and returns it. Heartbeat is kept alive
+        between attempts so the watchdog never kills the bot mid-validation.
+        Paper/backtest are never blocked (offset still detected for data)."""
+        expected = int(getattr(self.cfg, "EXPECTED_BROKER_OFFSET_HOURS",
+                               self.cfg.broker_tz_offset_hours))
+        if self.paper:
+            try:
+                self.adapter.ensure_time_offset()
+            except Exception as e:
+                log.warning(f"paper offset detect (non-blocking) failed: {e}")
+            self.offset_validated = True
+            return True
+        off = None
+        for attempt in range(1, self.OFFSET_VALIDATE_RETRIES + 1):
+            try:
+                ok = self.adapter.ensure_time_offset()
+                off = getattr(self.adapter, "tick_time_offset_hours", None)
+            except Exception as e:
+                ok = False
+                log.warning(f"offset detect attempt {attempt} raised: {e}")
+            if ok and off is not None and int(off) == expected:
+                self.offset_validated = True
+                self.tele.success(
+                    f"✅ Monday wake: broker offset confirmed +{int(off)}h "
+                    f"(attempt {attempt}/{self.OFFSET_VALIDATE_RETRIES}, {reason}).")
+                return True
+            log.warning(
+                f"offset validate attempt {attempt}/{self.OFFSET_VALIDATE_RETRIES}: "
+                f"got {off}h, expected {expected}h (ok={ok})")
+            if attempt < self.OFFSET_VALIDATE_RETRIES:
+                self._touch_heartbeat()
+                time.sleep(self.OFFSET_VALIDATE_WAIT_S)
+        self.offset_validated = False
+        self.tele.critical(
+            f"⚠️ offset detect FAILED on wake: got {off}h expected "
+            f"{expected}h - A1 BLOCKED, manual check needed. Bot stays up and "
+            f"will keep alerting; no anchor will place until the offset validates.")
+        return False
+
+    def _post_readiness(self, reason: str = "startup") -> None:
+        """Guard 5: one-line Telegram readiness receipt so the human can see at a
+        glance the bot is correctly armed for A1. Never raises."""
+        try:
+            off = getattr(self.adapter, "tick_time_offset_hours", None)
+            tag = "validated" if self.offset_validated else "UNVALIDATED"
+            try:
+                a = self.cfg.anchors[0]
+                next_anchor = f"{a[0]} {a[1]:02d}:{a[2]:02d}"
+            except Exception:
+                next_anchor = "A1 02:00"
+            state_ok = "ok" if isinstance(self.state, dict) and self.state else "fail"
+            self.tele.info(
+                f"🔧 Ready: offset {off}h {tag} · next anchor "
+                f"{next_anchor} broker · state rehydrated {state_ok} ({reason})")
+        except Exception as e:
+            log.warning(f"readiness line failed (non-fatal): {e}")
+
+    def _expected_market_open_utc(self, now_utc):
+        """Guard 4 helper: the most recent expected weekly market-open instant
+        (gold/FX reopen ~Sunday 22:00 UTC = broker Mon 01:00, UTC+3) IF we are
+        inside the Mon-Fri trading window, else None (a legitimately-closed
+        weekend, where staying asleep is correct and must NOT alarm)."""
+        try:
+            OPEN_WD, OPEN_HOUR = 6, 22  # Sunday=6 (Mon=0), 22:00 UTC
+            days_since = (now_utc.weekday() - OPEN_WD) % 7
+            candidate = (now_utc.normalize()
+                         - pd.Timedelta(days=days_since)
+                         + pd.Timedelta(hours=OPEN_HOUR))
+            if candidate > now_utc:
+                candidate -= pd.Timedelta(days=7)
+            if (now_utc - candidate) > pd.Timedelta(days=5):  # past Fri ~21:00 close
+                return None
+            return candidate
+        except Exception:
+            return None
+
     def wait_until_market_open(self, reason: str = "startup") -> bool:
         """Reusable market-closed deep-sleep. The tick-age>3600s -> 300s sleep
         loop -> resume-when-fresh(<60s) logic is the original startup block,
@@ -498,6 +594,7 @@ class LiveTrader:
             # loop, so touch every 30s while only re-probing the market every 5 min.
             HB_EVERY_S = 30
             RECHECK_EVERY_S = 300
+            wake_failsafe_last = None   # Guard 4: throttle the repeated alarm
             while not market_open:
                 slept = 0
                 while slept < RECHECK_EVERY_S:
@@ -513,19 +610,32 @@ class LiveTrader:
                         market_open = True
                 except Exception as e:
                     log.warning(f"Market-open check failed: {e}")
+                # Guard 4 - failsafe wake alarm: if the market SHOULD be open
+                # (past the weekly open instant + grace) but we are still asleep,
+                # a wake failure (VPS down, feed/broker outage) must be LOUD, not
+                # silent. Re-alert every WAKE_FAILSAFE_REPEAT_S until we wake.
+                if not market_open:
+                    nowu = pd.Timestamp.now(tz="UTC")
+                    exp_open = self._expected_market_open_utc(nowu)
+                    if (exp_open is not None and
+                            nowu >= exp_open + pd.Timedelta(minutes=self.WAKE_FAILSAFE_GRACE_MIN)):
+                        if (wake_failsafe_last is None or
+                                (nowu - wake_failsafe_last).total_seconds() >= self.WAKE_FAILSAFE_REPEAT_S):
+                            late_min = (nowu - exp_open).total_seconds() / 60.0
+                            self.tele.critical(
+                                f"⚠️ WAKE FAILSAFE: market should be open "
+                                f"(expected ~{exp_open.strftime('%a %H:%M')} UTC, "
+                                f"{late_min:.0f}min ago) but bot still asleep - manual "
+                                f"check (VPS/feed/broker). A1 at risk.")
+                            wake_failsafe_last = nowu
             # WAKE: re-detect the broker time offset BEFORE any get_m5_close
             # (Jun-8 cold-start: a 0h misdetect made A1 miss). Announce it so a
             # misdetect is visible immediately in Telegram on Monday wake.
-            try:
-                ok = self.adapter.ensure_time_offset()
-                off = getattr(self.adapter, 'tick_time_offset_hours', None)
-                self.tele.success(
-                    f"📈 Market open — resuming. Week starting. "
-                    f"Broker time offset re-detected: +{off}h "
-                    f"({'ok' if ok else 'DETECT FAILED — check before A1'}).")
-            except Exception as e:
-                self.tele.warn(f"offset re-detect on wake failed: {e}")
-                self.tele.success("📈 Market open — resuming. Week starting.")
+            self.tele.success("📈 Market open — resuming. Week starting.")
+            # Guard 1: validate the broker offset BEFORE any anchor logic runs on
+            # the resumed loop; Guard 5: post the readiness receipt.
+            self._validate_offset_on_wake(reason=f"wake/{reason}")
+            self._post_readiness(reason=f"wake/{reason}")
             return True
         elif abs(tick_age_sec) > 120:
             # Market open but clock disagrees with broker → config problem
@@ -534,7 +644,11 @@ class LiveTrader:
                 f"(broker tick {server_utc} vs local {now_utc}). ABORTING. "
                 f"Fix the OS clock (sync NTP) and restart.")
             return False
-        # else: tick recent and within tolerance → market is open
+        # else: tick recent and within tolerance → market is open.
+        # Guard 1/5: a market-open startup never entered the wake branch above,
+        # so validate the offset and post readiness here before the loop trades.
+        self._validate_offset_on_wake(reason=reason)
+        self._post_readiness(reason=reason)
         return True
 
     # ------------------------------------------------------------------------
@@ -786,6 +900,7 @@ LiveTrader._place_orders_for_anchor = _anchors_mod._place_orders_for_anchor
 LiveTrader._dump_mt5_state          = _anchors_mod._dump_mt5_state
 LiveTrader._warmup_trade_channel    = _anchors_mod._warmup_trade_channel
 LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
+LiveTrader._confirm_a1_placement    = _anchors_mod._confirm_a1_placement
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)
 LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close
