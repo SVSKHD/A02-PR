@@ -92,6 +92,12 @@ History (one line per behavioral change):
          expected AND be within STALE_TOL_S of utc+expected) -> confirms +3h when
          the feed is quiet, yet still REJECTS a wrong offset (Jun-8 0h stays
          blocked). Belt-and-suspenders with the Monday A1 shift above. 3.0.0 held.
+         Fix 1 (2026-06-15 missed-anchor incident): stale-tick RETRY at placement.
+         A 76s tick (16s over threshold) skipped two anchors today incl. a clean
+         ~$25 gold move. Placement now polls for a fresh tick (stale_retry_poll_s)
+         up to stale_retry_window_s before skipping, nudging/reconnecting the feed
+         mid-window; kill switch / pause / EOD abort the wait. Skips only if stale
+         the whole window. No anchor-timing change. 3.0.0 held.
 """
 
 __version__ = "3.0.0"

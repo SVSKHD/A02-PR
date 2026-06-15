@@ -356,3 +356,67 @@ Why it is safe:
   = None` forces live-only detection for a different broker. Tier 2 feeds the SAME
   `offset_validated` flag, so the block-on-mismatch / failsafe / readiness guards are
   all retained. Supersedes the Monday-A1-time shift (that override becomes unnecessary).
+
+## 2026-06-15 missed-anchor incident + Fix 1 (stale-tick retry at placement)
+
+Today the offset detector worked (`offset 3.0h validated`), but the bot still
+MISSED two anchors: at placement the latest tick was ~76s old (16s over the 60s
+threshold) — a momentary MT5/broker stutter — and the code SKIPPED the whole
+anchor. One of the misses was a clean ~$25 one-way gold drop (4332→4303) that the
+A2/A3 straddles are designed to catch — a large missed TIER win.
+
+**Fix 1 — retry instead of skip.** When the tick is stale at placement,
+`_await_fresh_tick_for_placement` polls every `stale_retry_poll_s` (5s) for up to
+`stale_retry_window_s` (90s); the straddle places the instant a fresh tick
+(age ≤ `stale_tick_threshold_s`, 60s) appears (`placed after {x}s stale-tick
+wait`). It nudges the feed each poll and calls `_attempt_mt5_reconnect` once
+mid-window; kill switch / pause / EOD abort the wait (priority); heartbeat is kept
+alive so the watchdog can't kill the bot mid-wait. It skips ONLY if the tick stays
+stale the whole window (`skipped — stale tick after 90s of retries`). Same for all
+anchors A1–A4. **Tradeoff:** the wait blocks the main tick loop (no position
+management) for up to ~90s on a stale anchor; bounded and rare (anchors fire ≤4×/day,
+and only on a blip).
+
+**⚠️ DISCREPANCY for the human — anchor reference price.** The spec for Fix 1 says
+the straddle must be placed off the captured ANCHOR price (the scheduled-time M5
+close) and "MUST NOT be recomputed during retries … not the live price." But the
+DEPLOYED code (v2.5.4) anchors on the CURRENT price at the moment of placement for
+**every** placement (stale-retry or not) — it overwrites the captured M5-close
+anchor with `current_price`. Fix 1 preserved that deployed behavior (it does not
+silently change the straddle-anchoring strategy): the retry waits for a fresh tick,
+then places off that fresh tick's price exactly as a normal placement would. If you
+want the spec's fixed-anchor-price (straddle off the scheduled M5 close), that is a
+separate strategy change to v2.5.4 — tell me and I'll do it; it is NOT in this commit.
+
+### Fixes 2-4 status (2026-06-15 consolidated pass) — confirmations, no code change
+
+- **Fix 2 — tiered offset detector: CONFIRMED PRESENT** (mt5_adapter
+  `_detect_tick_time_offset`: Tier 1 live-feed -> Tier 2 `_detect_offset_stale_consistency`
+  vs `EXPECTED_BROKER_OFFSET_HOURS=3`). Validated LIVE today (`offset 3.0h validated`).
+  Tier 2 accepts +3h within `STALE_TOL_S`, rejects any non-3h round (Jun-8 0h stays
+  blocked). **NOT present:** the spec's `test_config.py` / `AUREON_TEST_*` env toggles
+  and the "TEST MODE ACTIVE" banner -- that cold-wake test-scope feature has never been
+  built in this repo. It is underspecified (which toggles, what each simulates), so it
+  is left for the human to spec rather than built speculatively on the eve of live
+  trading. Say the word and I will design + add it.
+- **Fix 3 — boost diagnostics: CONFIRMED PRESENT** (fills.py: `... attempting BOOST`,
+  exception repr, `result None` + `mt5.last_error()`, `BOOST rejected rc=(name) comment`,
+  success price+ticket; mt5_adapter keeps the 10030->FOK retry). No silent path; no
+  order-param change (diagnose from the next live fleet event; still 0-for-6 lifetime).
+- **Fix 4 — twin-open rescue guard: CONFIRMED PRESENT** (fills.py STRUCTURAL RESCUE:
+  a 2nd fill is RESCUE only if its twin is STILL OPEN at that moment -- prefer the
+  explicit `sibling_ticket`, else any non-boost open leg; a closed-twin 2nd fill runs
+  `normal`, no boosts). Prevents the Jun-12 phantom boosts.
+
+### Anchor-timing discrepancy for the human — A1 02:30 vs 03:00 (REPORT ONLY)
+
+Today's readiness line showed **A1 03:00 broker**, diverging from the intended
+unchanged **02:30**. Cause: `Config.anchors[0]` is still `("A1_02h_Asia", 2, 30)`, but
+the Monday-A1 override (`cfg.monday_a1_override = (3, 0)`, from the #8 work merged into
+this stack) shifts A1 to **03:00 on Mondays only**. Both are "true": Tue-Fri A1 = 02:30,
+Monday A1 = 03:00. No silent change made. Decide:
+- KEEP the Monday 03:00 shift (cold-start cushion), OR
+- set `monday_a1_override = None` to restore pure 02:30 every day -- now that the
+  stale-tick retry (Fix 1) + the Tier-2 offset detector make a quiet-Monday 02:30
+  placement robust, the shift may be unnecessary.
+A2/A3/A4 unchanged regardless.
