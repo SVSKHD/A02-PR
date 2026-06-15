@@ -77,6 +77,13 @@ History (one line per behavioral change):
          confirmed at the broker (missing leg re-placed once, else INCOMPLETE
          alert); a WAKE FAILSAFE alarm fires if still asleep past the expected
          weekly open; a "Ready" receipt posts on every startup/wake. 3.0.0 held.
+         Monday-only A1 shift (cold-start cushion, no strategy change): on Mondays
+         A1 fires at 03:00 broker (05:30 IST) instead of 02:30 -- ~3h after the
+         week's open, by which point the offset is settled and M5 history exists,
+         so the Monday cold-start "no bars" miss can't happen. Tue-Fri A1 and
+         A2/A3/A4 unchanged; label "A1_02h_Asia" stable; cfg.monday_a1_override
+         (default (3,0), None disables). Complements the wake guards, not a
+         replacement. 3.0.0 held.
 """
 
 __version__ = "3.0.0"

@@ -1,6 +1,6 @@
 """AUREON — Config dataclass (split from bot.py, v3.0.0). Byte-identical."""
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -71,6 +71,13 @@ class Config:
         ("A3_1340_Overlap", 13, 50),
         ("A4_1640_NYopen", 16, 40),
     ])
+    # Monday cold-start cushion. Forex opens Mon 00:00 broker; A1 at 02:30 is only
+    # 2.5h after week-open, when the Monday offset re-detect + still-thin M5 history
+    # can make get_m5_close land on an empty/forming window -> "no bars" -> a silent
+    # A1 miss. On MONDAYS ONLY, fire A1 ~3h after open instead. (broker_hour,
+    # broker_minute); None disables the shift (pure 02:30 every day). A2/A3/A4 and
+    # A1 on Tue-Fri are unaffected; the A1 label is unchanged.
+    monday_a1_override: Optional[Tuple[int, int]] = (3, 0)
     broker_tz_offset_hours: int = 3  # UTC+3
     # Monday-wake hardening: the broker offset the bot MUST measure on wake before
     # it will place any anchor. Pepperstone = UTC+3. A mismatch (e.g. the Jun-8
