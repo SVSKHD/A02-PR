@@ -98,6 +98,11 @@ History (one line per behavioral change):
          up to stale_retry_window_s before skipping, nudging/reconnecting the feed
          mid-window; kill switch / pause / EOD abort the wait. Skips only if stale
          the whole window. No anchor-timing change. 3.0.0 held.
+         Auto-deploy (INFRA, default OFF, AUTODEPLOY_ENABLED): the watchdog polls
+         master, pulls + validates new code off-tree (py_compile + import), and
+         restarts the bot ONLY when the book is flat or at EOD (never mid-trade);
+         ff-only merge keeps git-ignored .env/state/firebase_key/logs intact. The
+         bot now publishes flat/eod_done in status.json for the gate. 3.0.0 held.
 """
 
 __version__ = "3.0.0"

@@ -389,6 +389,17 @@ class LiveTrader:
                 } if self._deferred_anchor else None
             ),
         }
+        # Auto-deploy safe-restart signals (INFRA): the watchdog reads these to
+        # know when it can restart the bot WITHOUT touching an open trade. flat =
+        # no open positions, no pending straddle, no anchor pending placement.
+        flat = (len(self.shadow_positions) == 0 and len(self.shadow_pendings) == 0
+                and self._deferred_anchor is None)
+        status["flat"] = flat
+        try:
+            status["eod_done"] = bool(
+                flat and self._eod_reached(broker_date, pd.Timestamp.now(tz="UTC")))
+        except Exception:
+            status["eod_done"] = False
         # v3.0.0 follow-up: keep `status` answerable during the weekend
         # deep-sleep and carry last-day + week-to-date stats so the Telegram
         # reply is useful precisely when the human checks in on a closed
