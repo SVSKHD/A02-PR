@@ -20,7 +20,9 @@ actually happened.
 - Offset is **+3h, NOT 0h** (the Jun-8 A1-miss bug). A `+0h` mismatch now BLOCKS
   A1 with a ⚠️ `offset detect FAILED on wake` critical ⇒ that is the guard
   working, but A1 will NOT have placed — investigate the offset before retrying.
-- **A1 placed at 02:00 broker** by the normal anchor path, and its resting BUY+SELL
+- **A1 placed at 03:00 broker (05:30 AM IST) on Monday** — the Monday-only cold-start
+  shift (`cfg.monday_a1_override`); Tue-Fri A1 stays 02:30 — by the normal anchor
+  path, and its resting BUY+SELL
   stops were **confirmed at the broker** (no ⚠️ `placement INCOMPLETE`).
 - Evidence: the resume + `✅ offset confirmed` + `🔧 Ready` lines + the
   A1 placement/fill lines.
