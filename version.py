@@ -84,6 +84,14 @@ History (one line per behavioral change):
          A2/A3/A4 unchanged; label "A1_02h_Asia" stable; cfg.monday_a1_override
          (default (3,0), None disables). Complements the wake guards, not a
          replacement. 3.0.0 held.
+         Offset detect: stale-tick consistency fallback for the quiet Monday wake
+         (no schedule change to the detector's contract). The live-feed detector
+         needs ADVANCING ticks, which gold lacks pre-session Monday -> every quiet
+         wake timed out -> A1 blocked. New Tier 2 validates a single stale tick
+         against the constant cfg.EXPECTED_BROKER_OFFSET_HOURS (must round to
+         expected AND be within STALE_TOL_S of utc+expected) -> confirms +3h when
+         the feed is quiet, yet still REJECTS a wrong offset (Jun-8 0h stays
+         blocked). Belt-and-suspenders with the Monday A1 shift above. 3.0.0 held.
 """
 
 __version__ = "3.0.0"
