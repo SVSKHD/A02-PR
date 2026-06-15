@@ -66,13 +66,22 @@ class MT5Adapter:
     decode any future tick.time and to encode times we send to copy_rates.
     """
 
-    def __init__(self, symbol: str = "XAUUSD"):
+    # Tiered offset detection (quiet-Monday-wake fix)
+    LIVE_DETECT_BUDGET_S = 20.0   # Tier 1 advancing-feed budget (was effectively 90)
+    STALE_TOL_S          = 600.0  # Tier 2: accept a tick within ~10min of utc+offset
+
+    def __init__(self, symbol: str = "XAUUSD", expected_offset_hours=None):
         import MetaTrader5 as mt5
         self.mt5 = mt5
         # Hardening #7: time-offset detection + server_time read use the
         # configured trading symbol (still defaults to XAUUSD for every existing
         # caller -- test_place/validate_25 construct MT5Adapter() with no args).
         self.symbol = symbol
+        # Tier-2 offset consistency check: the broker offset is a CONSTANT, so a
+        # quiet pre-session tick can be VALIDATED against it (not guessed). None
+        # disables Tier 2 (live-feed detection only); run_live passes
+        # cfg.EXPECTED_BROKER_OFFSET_HOURS.
+        self.expected_offset_hours = expected_offset_hours
         if not mt5.initialize():
             raise RuntimeError(
                 f"MT5 init failed: {mt5.last_error()}. "
@@ -110,8 +119,23 @@ class MT5Adapter:
             )
 
     def _detect_tick_time_offset(self, max_wait_s: float = 90.0):
-        """Detect broker tick.time offset from a LIVE feed. Returns int-hour
-        offset to SUBTRACT, or None if no live tick can be measured."""
+        """Detect the broker tick.time offset (hours to SUBTRACT), or None if it
+        cannot be established safely. Tiered:
+          Tier 1 (preferred) measures from a LIVE advancing feed (short budget).
+          Tier 2 (quiet-wake) validates a single stale tick against the configured
+            constant offset when the feed is not advancing (the Monday pre-session
+            case where gold ticks are near-dead and Tier 1 can never succeed).
+        Returns None when neither tier can confirm an offset -- the caller must
+        NOT trade on a guessed offset (the wake-validation guard then blocks)."""
+        live = self._detect_offset_live(min(max_wait_s, self.LIVE_DETECT_BUDGET_S))
+        if live is not None:
+            return live
+        return self._detect_offset_stale_consistency()
+
+    def _detect_offset_live(self, max_wait_s: float):
+        """Tier 1: offset from a LIVE feed -- tick.time must ADVANCE with the wall
+        clock between two reads (the original method). Best when liquid; returns
+        None on a quiet / non-advancing feed so the caller falls through to Tier 2."""
         import time as _time
         from datetime import datetime as _dt, timezone as _tz
         FRESH_TOL_S = 15.0; ADVANCE_S = 4.0; POLL_S = 1.0
@@ -140,8 +164,40 @@ class MT5Adapter:
                     log.info(f"Broker time offset detected: {offset:+d}h [live feed]")
                     return float(offset)
             _time.sleep(POLL_S)
-        log.error(f"Could not detect offset within {max_wait_s:.0f}s (last {last_age}). "
-                  f"Returning None — caller must NOT trade on a guessed offset.")
+        log.warning(f"Tier 1 (live-feed) offset detect timed out in {max_wait_s:.0f}s "
+                    f"(last {last_age}); trying stale-tick consistency.")
+        return None
+
+    def _detect_offset_stale_consistency(self):
+        """Tier 2 -- the quiet-wake path. A single tick timestamp is ambiguous on
+        its own, but the broker offset is a CONSTANT, so ACCEPT a stale tick only
+        if it is CONSISTENT with the configured EXPECTED_BROKER_OFFSET_HOURS: it
+        must round to the expected offset AND sit within STALE_TOL_S of
+        utc+expected. This confirms the verified constant; it can NEVER
+        rubber-stamp a wrong offset -- a 0h broker reads ~3h off expected and is
+        REJECTED, so the Jun-8 case stays blocked. Returns float(expected) or None."""
+        from datetime import datetime as _dt, timezone as _tz
+        expected = self.expected_offset_hours
+        if expected is None:
+            log.warning("offset Tier 2 skipped: no EXPECTED_BROKER_OFFSET configured "
+                        "(live-only mode); returning None.")
+            return None
+        expected = int(expected)
+        tick = self.mt5.symbol_info_tick(self.symbol)
+        if tick is None or getattr(tick, "time", 0) <= 0:
+            log.error("offset Tier 2: no usable tick (None/time<=0) — returning None (block).")
+            return None
+        now = _dt.now(_tz.utc).timestamp()
+        diff = tick.time - now
+        offset = round(diff / 3600.0)
+        remainder = abs(diff - expected * 3600.0)
+        if offset == expected and remainder <= self.STALE_TOL_S:
+            log.info(f"offset confirmed +{expected}h via stale-tick consistency "
+                     f"(feed quiet; tick {remainder:.0f}s from utc+{expected}h).")
+            return float(expected)
+        log.error(f"offset Tier 2 REJECT: tick implies {offset}h (diff {diff:.0f}s, "
+                  f"remainder {remainder:.0f}s vs tol {self.STALE_TOL_S:.0f}s) != expected "
+                  f"+{expected}h — returning None (block). [the Jun-8 0h case lands here]")
         return None
 
     def ensure_time_offset(self, max_wait_s: float = 90.0) -> bool:

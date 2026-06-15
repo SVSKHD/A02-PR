@@ -77,6 +77,14 @@ History (one line per behavioral change):
          confirmed at the broker (missing leg re-placed once, else INCOMPLETE
          alert); a WAKE FAILSAFE alarm fires if still asleep past the expected
          weekly open; a "Ready" receipt posts on every startup/wake. 3.0.0 held.
+         Offset detect: stale-tick consistency fallback for the quiet Monday wake
+         (no schedule change). The live-feed detector needs ADVANCING ticks, which
+         gold lacks pre-session Monday -> every quiet wake timed out -> A1 blocked.
+         New Tier 2 validates a single stale tick against the constant
+         cfg.EXPECTED_BROKER_OFFSET_HOURS (must round to expected AND be within
+         STALE_TOL_S of utc+expected) -> confirms +3h when the feed is quiet, yet
+         still REJECTS a wrong offset (Jun-8 0h stays blocked). All anchor timings
+         unchanged (A1 02:30 every day). 3.0.0 held.
 """
 
 __version__ = "3.0.0"
