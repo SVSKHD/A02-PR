@@ -23,8 +23,9 @@ actually happened.
 - Offset confirmed by EITHER path: a live-feed detect (`[live feed]`) OR, on a
   quiet pre-session wake, the new **`offset confirmed +3h via stale-tick
   consistency (feed quiet)`** (Tier 2). Either is a pass; both end in `+3h`.
-- **A1 placed at its normal 02:30 broker time** (no schedule change) by the normal
-  anchor path, and its resting BUY+SELL
+- **A1 placed at 03:00 broker (05:30 AM IST) on Monday** — the Monday-only cold-start
+  shift (`cfg.monday_a1_override`); Tue-Fri A1 stays 02:30 — by the normal anchor
+  path, and its resting BUY+SELL
   stops were **confirmed at the broker** (no ⚠️ `placement INCOMPLETE`).
 - Evidence: the resume + `✅ offset confirmed` + `🔧 Ready` lines + the
   A1 placement/fill lines.
