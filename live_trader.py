@@ -905,6 +905,7 @@ LiveTrader._warmup_trade_channel    = _anchors_mod._warmup_trade_channel
 LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
 LiveTrader._confirm_a1_placement    = _anchors_mod._confirm_a1_placement
 LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
+LiveTrader._await_fresh_tick_for_placement = _anchors_mod._await_fresh_tick_for_placement
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)
 LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close

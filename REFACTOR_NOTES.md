@@ -356,3 +356,34 @@ Why it is safe:
   = None` forces live-only detection for a different broker. Tier 2 feeds the SAME
   `offset_validated` flag, so the block-on-mismatch / failsafe / readiness guards are
   all retained. Supersedes the Monday-A1-time shift (that override becomes unnecessary).
+
+## 2026-06-15 missed-anchor incident + Fix 1 (stale-tick retry at placement)
+
+Today the offset detector worked (`offset 3.0h validated`), but the bot still
+MISSED two anchors: at placement the latest tick was ~76s old (16s over the 60s
+threshold) — a momentary MT5/broker stutter — and the code SKIPPED the whole
+anchor. One of the misses was a clean ~$25 one-way gold drop (4332→4303) that the
+A2/A3 straddles are designed to catch — a large missed TIER win.
+
+**Fix 1 — retry instead of skip.** When the tick is stale at placement,
+`_await_fresh_tick_for_placement` polls every `stale_retry_poll_s` (5s) for up to
+`stale_retry_window_s` (90s); the straddle places the instant a fresh tick
+(age ≤ `stale_tick_threshold_s`, 60s) appears (`placed after {x}s stale-tick
+wait`). It nudges the feed each poll and calls `_attempt_mt5_reconnect` once
+mid-window; kill switch / pause / EOD abort the wait (priority); heartbeat is kept
+alive so the watchdog can't kill the bot mid-wait. It skips ONLY if the tick stays
+stale the whole window (`skipped — stale tick after 90s of retries`). Same for all
+anchors A1–A4. **Tradeoff:** the wait blocks the main tick loop (no position
+management) for up to ~90s on a stale anchor; bounded and rare (anchors fire ≤4×/day,
+and only on a blip).
+
+**⚠️ DISCREPANCY for the human — anchor reference price.** The spec for Fix 1 says
+the straddle must be placed off the captured ANCHOR price (the scheduled-time M5
+close) and "MUST NOT be recomputed during retries … not the live price." But the
+DEPLOYED code (v2.5.4) anchors on the CURRENT price at the moment of placement for
+**every** placement (stale-retry or not) — it overwrites the captured M5-close
+anchor with `current_price`. Fix 1 preserved that deployed behavior (it does not
+silently change the straddle-anchoring strategy): the retry waits for a fresh tick,
+then places off that fresh tick's price exactly as a normal placement would. If you
+want the spec's fixed-anchor-price (straddle off the scheduled M5 close), that is a
+separate strategy change to v2.5.4 — tell me and I'll do it; it is NOT in this commit.

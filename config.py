@@ -90,6 +90,13 @@ class Config:
     daily_loss_pct: float = 0.03  # 3% kill switch (Funding Pips Zero has 5% trailing DD — 3% daily gives a 2% multi-day buffer)
     weekly_loss_pct: float = 0.08
     account_floor_pct: float = 0.85  # halt new entries below this multiple of starting
+    # Fix 1 (2026-06-15 missed-anchor incident): stale-tick RETRY at placement
+    # instead of an immediate skip. A tick older than the threshold triggers a
+    # poll loop (every poll_s, up to window_s) for a fresh tick before giving up
+    # -- a transient MT5/broker blip must not cost a whole anchor.
+    stale_tick_threshold_s: float = 60.0   # tick age that counts as 'stale'
+    stale_retry_window_s: float = 90.0     # NEW: total poll window before skip
+    stale_retry_poll_s: float = 5.0        # NEW: poll cadence within the window
 
     # Operational
     log_level: str = "INFO"
