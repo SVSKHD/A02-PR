@@ -518,7 +518,9 @@ class LiveTrader:
             tag = "validated" if self.offset_validated else "UNVALIDATED"
             try:
                 a = self.cfg.anchors[0]
-                next_anchor = f"{a[0]} {a[1]:02d}:{a[2]:02d}"
+                bdate = self._broker_date(pd.Timestamp.now(tz="UTC"))
+                rh, rm = self._resolved_anchor_hm(a[0], bdate, a[1], a[2])
+                next_anchor = f"{a[0]} {rh:02d}:{rm:02d}"
             except Exception:
                 next_anchor = "A1 02:00"
             state_ok = "ok" if isinstance(self.state, dict) and self.state else "fail"
@@ -863,7 +865,8 @@ def run_live(cfg, paper: bool = True):
     Delegates to LiveTrader for the full event loop.
     """
     from mt5_adapter import MT5Adapter  # late import: only the live path needs MT5
-    adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'))  # hardening #7: probe the configured symbol
+    adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'),  # hardening #7: probe the configured symbol
+                         expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))  # Tier-2 consistency
     try:
         trader = LiveTrader(cfg, adapter, paper=paper)
         trader.run()
@@ -901,6 +904,7 @@ LiveTrader._dump_mt5_state          = _anchors_mod._dump_mt5_state
 LiveTrader._warmup_trade_channel    = _anchors_mod._warmup_trade_channel
 LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
 LiveTrader._confirm_a1_placement    = _anchors_mod._confirm_a1_placement
+LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)
 LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close

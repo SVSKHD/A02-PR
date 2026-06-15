@@ -22,14 +22,29 @@ from mt5_adapter import _MT5_RETCODE_MAP
 log = logging.getLogger("AUREON")
 
 
+def _resolved_anchor_hm(self, label, broker_date, hour, minute):
+    """Resolve an anchor's (broker_hour, broker_minute), applying the Monday-only
+    A1 cold-start cushion. Forex opens Mon 00:00 broker; A1 at 02:30 is only 2.5h
+    after week-open (Monday offset re-detect + thin M5 history -> 'no bars' risk),
+    so on Mondays A1 fires ~3h after open instead. Uses the BROKER date's weekday
+    so the Monday test is correct relative to A1's own broker day. Other anchors,
+    and A1 on Tue-Fri, are unchanged; cfg.monday_a1_override=None disables it. The
+    A1 label is NOT changed (journal/Firebase/aggregation keys stay stable)."""
+    ovr = getattr(self.cfg, 'monday_a1_override', None)
+    if ovr is not None and label.startswith('A1') and broker_date.weekday() == 0:
+        return int(ovr[0]), int(ovr[1])
+    return hour, minute
+
 def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
     if self.paused:
         return
     for label, hour, minute in self.cfg.anchors:
         if label in self.state['processed_anchors_today']:
             continue
+        # Monday-only A1 shift (cold-start cushion) resolved off the broker date.
+        r_hour, r_minute = self._resolved_anchor_hm(label, broker_date, hour, minute)
         anchor_utc = self._anchor_datetime_utc(
-            broker_date, hour, self.cfg.broker_tz_offset_hours, minute)
+            broker_date, r_hour, self.cfg.broker_tz_offset_hours, r_minute)
         delta = (utc_now - anchor_utc).total_seconds()
         # Window: 0 to 120 seconds after the anchor minute
         if 0 <= delta < 120:

@@ -326,3 +326,33 @@ principle cause a duplicate (mitigated by the two-read rule) or a missed re-plac
 This is the first LIVE run of v3.0.0 — the guards make failures LOUD and
 recoverable, the achievable form of certainty; Monday's run is still the validation
 event.
+
+## Offset detect: stale-tick consistency for the quiet Monday wake (no schedule change)
+
+Mon 2026-06-15 proved the wake guards worked (A1 BLOCKED + CRITICAL, not silently
+missed) but exposed the TRUE root cause: `_detect_tick_time_offset` requires an
+ADVANCING tick feed (two reads 4s apart), and gold is near-dead pre-session at the
+Monday wake — `feed not live (adv 0s/4s)` for 20 min, all validate attempts failed,
+A1 blocked. The detector simply cannot measure a quiet feed.
+
+Fix is ENTIRELY in the detector (no anchor timing change — A1 stays 02:30 every
+day): a tiered `_detect_tick_time_offset`:
+- **Tier 1** — the original live-feed measurement, now on a short ~20s budget so a
+  quiet feed falls through fast.
+- **Tier 2** — validate a single stale tick against the CONSTANT
+  `cfg.EXPECTED_BROKER_OFFSET_HOURS` (+3h): accept only if the tick rounds to the
+  expected offset AND sits within `STALE_TOL_S` (~10 min) of `utc+expected`.
+
+Why it is safe:
+- **Jun-8 (0h on a +3h broker):** the tick reads ~3h off expected → Tier 2 rounds
+  to 0 ≠ 3 (and remainder ≫ tol) → REJECT → still blocked. Bug stays fixed.
+- **Quiet Monday wake (tick present, ≈ utc+3h, feed not advancing):** Tier 2
+  confirms +3h → A1 places at 02:30. This is the fix.
+- **No data (tick None / time≤0):** None → block → alert. Correct.
+- The whole-hour ambiguity ("could +3h actually be a 3h-stale 0h feed?") is bounded
+  by `STALE_TOL_S`: a tick within ~10 min of `utc+3h` cannot also be `utc+0h` (that
+  is 3h stale, far outside tolerance). Tier 2 cannot rubber-stamp a 0h broker as +3h.
+- The expected offset is config, not hardcoded in logic; `EXPECTED_BROKER_OFFSET_HOURS
+  = None` forces live-only detection for a different broker. Tier 2 feeds the SAME
+  `offset_validated` flag, so the block-on-mismatch / failsafe / readiness guards are
+  all retained. Supersedes the Monday-A1-time shift (that override becomes unnecessary).
