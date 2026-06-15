@@ -215,7 +215,7 @@ class LiveTrader:
                      "outcome", "pnl_usd", "ticket"])
 
         self.tele.info(
-            f"LiveTrader v2.5.3 initialized ({'PAPER' if paper else 'LIVE'}) — "
+            f"LiveTrader v{AUREON_VERSION} initialized ({'PAPER' if paper else 'LIVE'}) — "
             f"4-anchor multi-session AUREON, lot {cfg.lot_size}"
         )
         self.tele.info(

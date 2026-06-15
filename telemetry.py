@@ -266,6 +266,17 @@ class Telemetry:
             }, timeout=10)
             if r.status_code != 200:
                 self._log.warning(f"Telegram returned {r.status_code}: {r.text[:200]}")
+                # A Markdown parse failure must never DROP a message (an unescaped
+                # _/*/backtick in an interpolated value). Retry once as PLAIN text.
+                if r.status_code == 400 and "parse" in r.text.lower():
+                    try:
+                        requests.post(url, json={
+                            "chat_id": self.telegram.chat_id,
+                            "text": body,
+                            "disable_web_page_preview": True,
+                        }, timeout=10)
+                    except Exception as e2:
+                        self._log.warning(f"Telegram plain-text retry failed: {e2}")
         except Exception as e:
             self._log.warning(f"Telegram send failed: {e}")
 
@@ -273,6 +284,16 @@ class Telemetry:
 # ============================================================================
 # Factory from environment
 # ============================================================================
+
+def md_escape(s):
+    """Escape Telegram (legacy) Markdown specials in an INTERPOLATED value so a
+    dynamic _ / * / ` / [ cannot open an entity that never closes (the boost
+    can't-parse-entities 400). Escape values, not whole pre-formatted messages."""
+    s = str(s)
+    for ch in ("_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
 
 def telemetry_from_env(component: str = "AUREON") -> Telemetry:
     """

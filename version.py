@@ -103,9 +103,17 @@ History (one line per behavioral change):
          restarts the bot ONLY when the book is flat or at EOD (never mid-trade);
          ff-only merge keeps git-ignored .env/state/firebase_key/logs intact. The
          bot now publishes flat/eod_done in status.json for the gate. 3.0.0 held.
+  3.0.1  FIX the 0-for-7 boost root cause: MetaTrader5 silently rejects an order
+         `comment` longer than 31 chars with (-2, 'Invalid "comment" argument')
+         (Jun-15 A3: AUREONv2_A3_1340_Overlap_SELL_BOOST1 = 34). All order comments
+         now route through mt5_comment() (hard <=31) and use a compact scheme
+         (AUR_A3_S_B1, AUR_A3_BUY). Boost Telegram messages escape dynamic values
+         (md_escape) + a plain-text failover so a Markdown 400 never drops a message;
+         the LiveTrader init banner reads version.__version__ (was a stale hardcoded
+         2.5.3). Unblocks the crash-branch boost upside.
 """
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 CODENAME = "Astra Hawk"
 
 

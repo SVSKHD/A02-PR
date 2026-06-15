@@ -47,6 +47,15 @@ _MT5_RETCODE_MAP = {
 
 
 
+def mt5_comment(s):
+    """MetaTrader5 silently rejects an order `comment` longer than 31 chars with
+    (-2, \'Invalid "comment" argument\') -- the 0-for-7 boost root cause (Jun-15
+    A3: `AUREONv2_A3_1340_Overlap_SELL_BOOST1` = 34 chars). HARD-TRUNCATE every
+    order comment to <= 31 here; routed through place_stop_order / place_market_order
+    so no order type can ever recur this bug."""
+    return (str(s) if s is not None else "")[:31]
+
+
 class MT5Adapter:
     """
     Optional MT5 integration. Imports MetaTrader5 lazily so the backtest
@@ -293,6 +302,7 @@ class MT5Adapter:
     def place_stop_order(self, symbol: str, side: str, price: float,
                          lot: float, sl: float, tp: float,
                          comment: str = "AUREON_v2", dry_run: bool = False):
+        comment = mt5_comment(comment)  # MT5 rejects comments > 31 chars (boost root cause)
         mt5 = self.mt5
         if side == 'BUY':
             order_type = mt5.ORDER_TYPE_BUY_STOP
@@ -466,6 +476,7 @@ class MT5Adapter:
         """Place an IMMEDIATE market order. Used only for in-flight breakout
         recovery: when pre-flight passed but broker rejected anyway because
         price moved past the threshold during the millisecond order was in flight."""
+        comment = mt5_comment(comment)  # MT5 rejects comments > 31 chars (boost root cause)
         mt5 = self.mt5
         if dry_run:
             log.info(f"[PAPER] Would place MARKET {side} {symbol} lot={lot} SL={sl} TP={tp}")

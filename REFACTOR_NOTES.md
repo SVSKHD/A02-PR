@@ -420,3 +420,32 @@ Monday A1 = 03:00. No silent change made. Decide:
   stale-tick retry (Fix 1) + the Tier-2 offset detector make a quiet-Monday 02:30
   placement robust, the shift may be unnecessary.
 A2/A3/A4 unchanged regardless.
+
+## 2026-06-15 A3 — boost 0-for-7 ROOT CAUSE found + fixed (v3.0.1)
+
+The boost-diag instrumentation finally captured it live:
+`retcode=-1 last_error=(-2, 'Invalid "comment" argument')`. The order `comment`
+`AUREONv2_A3_1340_Overlap_SELL_BOOST1` is **34 chars**; MetaTrader5 silently rejects
+any order comment longer than **31 chars**. The straddle legs fill because
+`AUREONv2_A3_1340_Overlap_BUY` is 28 (just under); the boosts append `_BOOST1/2` and
+tip over. Never a margin/fill/filling-mode issue -- purely a too-long comment. That
+is the entire 0-for-7 lifetime.
+
+Fix (v3.0.1):
+- `mt5_comment(s)` (mt5_adapter) hard-truncates every comment to <=31, applied inside
+  `place_stop_order` and `place_market_order` so EVERY order type is covered
+  (belt-and-braces); the warmup ping routes through it too.
+- Compact scheme: `AUR_<A1..A4>_<BUY/SELL>` straddles (`AUR_A3_BUY`),
+  `AUR_<Ax>_<B/S>_B<n>` boosts (`AUR_A3_S_B1`), `_RCV`/`_CFM` for recovery/confirm.
+  Nothing downstream parses the old long format (reconcile matches by TICKET), so the
+  rename is safe.
+- Telegram entity fix: boost messages interpolated `b_rc_name` (e.g. `UNKNOWN_-1`) and
+  the broker comment raw -> an unescaped `_` opened a Markdown entity that never closed
+  (`400 can't parse entities`). Dynamic values now go through `md_escape`, and
+  `_send_telegram` retries once as PLAIN text on a parse-400 so a message is never lost.
+- Truthful banner: the `LiveTrader v2.5.3 initialized` line was a stale hardcoded
+  literal; it now reads `version.__version__`.
+
+Note: today's A3 was a GENUINE rescue (twin open at -$630 SL) -- the twin-open guard
+worked correctly; only the boost placement failed, now fixed. The next genuine rescue
+should show boosts placing with `rc=10009`.

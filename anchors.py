@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from telemetry import telemetry_from_env, Severity
-from mt5_adapter import _MT5_RETCODE_MAP
+from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
 
 log = logging.getLogger("AUREON")
 
@@ -443,7 +443,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         buy_res = self.adapter.place_stop_order(
             self.cfg.symbol, 'BUY', buy_stop, gap_lot,
             sl=sl_buy, tp=tp_buy,
-            comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}{retry_comment}",
+            comment=f"AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}",
             dry_run=self.paper)
         if not self.paper:
             try:
@@ -454,7 +454,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         sell_res = self.adapter.place_stop_order(
             self.cfg.symbol, 'SELL', sell_stop, gap_lot,
             sl=sl_sell, tp=tp_sell,
-            comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}{retry_comment}",
+            comment=f"AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}",
             dry_run=self.paper)
         if not self.paper:
             try:
@@ -583,7 +583,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         mkt_res = self.adapter.place_market_order(
             self.cfg.symbol, breakout_side, rcv_lot,
             sl=rcv_sl, tp=rcv_tp,
-            comment=f"AUREONv2_{label}_{breakout_side}_RCV",
+            comment=f"AUR_{label[:2]}_{breakout_side[0]}_RCV",
             dry_run=self.paper)
         mkt_rc = getattr(mkt_res, 'retcode', None) if mkt_res is not None else None
         if mkt_rc == 10009:
@@ -727,7 +727,7 @@ def _confirm_a1_placement(self, label, lot, buy_leg, sell_leg):
                 f"Sent OK but no resting {side} stop @ ${price} found.")
             res = self.adapter.place_stop_order(
                 self.cfg.symbol, side, price, lot, sl=sl, tp=tp,
-                comment=f"AUREONv2_{label}_{side}_CONFIRM", dry_run=self.paper)
+                comment=f"AUR_{label[:2]}_{side[0]}_CFM", dry_run=self.paper)
             new_ticket = self._extract_ticket(res, f"paper_{label}_{side}")
             time.sleep(1)
             if new_ticket is not None and _present(side, price, new_ticket):
@@ -907,7 +907,7 @@ def _warmup_trade_channel(self, label: str) -> bool:
             "tp":           round(ping_price + 50.0, 2),
             "deviation":    20,
             "magic":        self.WARMUP_MAGIC,
-            "comment":      self.WARMUP_COMMENT,
+            "comment":      mt5_comment(self.WARMUP_COMMENT),
             "type_filling": self.adapter.mt5.ORDER_FILLING_IOC,
             "type_time":    self.adapter.mt5.ORDER_TIME_DAY,  # matches bot's convention
         }

@@ -48,6 +48,10 @@ actually happened.
   `✅⚡ … FILLED` / `❌ … rejected rc=…` Telegram lines.
 - Note: if **no** 2nd-leg fill happens Monday, this criterion is **N/A-pass** (the
   guard simply never triggers) — but the boost diagnostics remain available.
+- **Boost comment root cause FIXED (v3.0.1):** MT5 silently rejected order comments
+  > 31 chars `(-2, 'Invalid "comment" argument')` — the 0-for-7 boost cause (Jun-15
+  A3). Comments are now compact (`AUR_A3_S_B1`) + hard-truncated to <=31. The NEXT
+  genuine rescue must show boosts placing with **`rc=10009`** (FILLED), not `rc=-1`.
 
 ### 4 — Firebase (commit 3)
 - Monday EOD writes **exactly one** `aureon_forex/{2026-06-15}` document
