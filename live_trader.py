@@ -215,7 +215,7 @@ class LiveTrader:
                      "outcome", "pnl_usd", "ticket"])
 
         self.tele.info(
-            f"LiveTrader v2.5.3 initialized ({'PAPER' if paper else 'LIVE'}) — "
+            f"LiveTrader v{AUREON_VERSION} initialized ({'PAPER' if paper else 'LIVE'}) — "
             f"4-anchor multi-session AUREON, lot {cfg.lot_size}"
         )
         self.tele.info(
@@ -389,6 +389,17 @@ class LiveTrader:
                 } if self._deferred_anchor else None
             ),
         }
+        # Auto-deploy safe-restart signals (INFRA): the watchdog reads these to
+        # know when it can restart the bot WITHOUT touching an open trade. flat =
+        # no open positions, no pending straddle, no anchor pending placement.
+        flat = (len(self.shadow_positions) == 0 and len(self.shadow_pendings) == 0
+                and self._deferred_anchor is None)
+        status["flat"] = flat
+        try:
+            status["eod_done"] = bool(
+                flat and self._eod_reached(broker_date, pd.Timestamp.now(tz="UTC")))
+        except Exception:
+            status["eod_done"] = False
         # v3.0.0 follow-up: keep `status` answerable during the weekend
         # deep-sleep and carry last-day + week-to-date stats so the Telegram
         # reply is useful precisely when the human checks in on a closed
@@ -905,6 +916,7 @@ LiveTrader._warmup_trade_channel    = _anchors_mod._warmup_trade_channel
 LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
 LiveTrader._confirm_a1_placement    = _anchors_mod._confirm_a1_placement
 LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
+LiveTrader._await_fresh_tick_for_placement = _anchors_mod._await_fresh_tick_for_placement
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)
 LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close

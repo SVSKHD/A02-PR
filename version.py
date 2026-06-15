@@ -92,9 +92,28 @@ History (one line per behavioral change):
          expected AND be within STALE_TOL_S of utc+expected) -> confirms +3h when
          the feed is quiet, yet still REJECTS a wrong offset (Jun-8 0h stays
          blocked). Belt-and-suspenders with the Monday A1 shift above. 3.0.0 held.
+         Fix 1 (2026-06-15 missed-anchor incident): stale-tick RETRY at placement.
+         A 76s tick (16s over threshold) skipped two anchors today incl. a clean
+         ~$25 gold move. Placement now polls for a fresh tick (stale_retry_poll_s)
+         up to stale_retry_window_s before skipping, nudging/reconnecting the feed
+         mid-window; kill switch / pause / EOD abort the wait. Skips only if stale
+         the whole window. No anchor-timing change. 3.0.0 held.
+         Auto-deploy (INFRA, default OFF, AUTODEPLOY_ENABLED): the watchdog polls
+         master, pulls + validates new code off-tree (py_compile + import), and
+         restarts the bot ONLY when the book is flat or at EOD (never mid-trade);
+         ff-only merge keeps git-ignored .env/state/firebase_key/logs intact. The
+         bot now publishes flat/eod_done in status.json for the gate. 3.0.0 held.
+  3.0.1  FIX the 0-for-7 boost root cause: MetaTrader5 silently rejects an order
+         `comment` longer than 31 chars with (-2, 'Invalid "comment" argument')
+         (Jun-15 A3: AUREONv2_A3_1340_Overlap_SELL_BOOST1 = 34). All order comments
+         now route through mt5_comment() (hard <=31) and use a compact scheme
+         (AUR_A3_S_B1, AUR_A3_BUY). Boost Telegram messages escape dynamic values
+         (md_escape) + a plain-text failover so a Markdown 400 never drops a message;
+         the LiveTrader init banner reads version.__version__ (was a stale hardcoded
+         2.5.3). Unblocks the crash-branch boost upside.
 """
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 CODENAME = "Astra Hawk"
 
 

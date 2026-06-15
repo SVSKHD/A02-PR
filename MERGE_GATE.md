@@ -48,6 +48,10 @@ actually happened.
   `✅⚡ … FILLED` / `❌ … rejected rc=…` Telegram lines.
 - Note: if **no** 2nd-leg fill happens Monday, this criterion is **N/A-pass** (the
   guard simply never triggers) — but the boost diagnostics remain available.
+- **Boost comment root cause FIXED (v3.0.1):** MT5 silently rejected order comments
+  > 31 chars `(-2, 'Invalid "comment" argument')` — the 0-for-7 boost cause (Jun-15
+  A3). Comments are now compact (`AUR_A3_S_B1`) + hard-truncated to <=31. The NEXT
+  genuine rescue must show boosts placing with **`rc=10009`** (FILLED), not `rc=-1`.
 
 ### 4 — Firebase (commit 3)
 - Monday EOD writes **exactly one** `aureon_forex/{2026-06-15}` document
@@ -94,3 +98,16 @@ answer during weekend/holiday deep-sleep. To validate over a weekend/holiday:
 - If `trades_<month>.csv` is missing/empty/malformed, the reply still shows the
   💤 header + "Stats unavailable" — it must never error.
 Version stays 3.0.0 (a history line was added). No trading-behavior change.
+
+## Addendum — auto-deploy on merge to master (INFRA, default OFF)
+
+With `AUTODEPLOY_ENABLED=1` in `.env`, you can merge a PR to `master` remotely
+(even while away) and the VPS bot self-deploys SAFELY: the watchdog polls master
+every `AUTODEPLOY_POLL_MIN` min, pulls + validates the new code off-tree
+(py_compile + import), then restarts the bot ONLY when the book is flat OR at EOD
+(never mid-trade). A broken merge fails validation and is NOT applied (bot keeps
+running old code, with a warning). ff-only merge leaves git-ignored
+`.env`/`state.json`/`firebase_key.json`/logs untouched. Every transition posts a
+Telegram line (detected -> pulled+validated/failed -> waiting for flat/EOD ->
+applied+restarted/merge-failed). Default OFF so it never surprise-deploys during
+manual testing; enable it via `.env` when ready.

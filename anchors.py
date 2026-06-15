@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from telemetry import telemetry_from_env, Severity
-from mt5_adapter import _MT5_RETCODE_MAP
+from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
 
 log = logging.getLogger("AUREON")
 
@@ -132,6 +132,73 @@ def _process_anchor(self, label: str, anchor_utc: pd.Timestamp):
         f"{defer_until.strftime('%H:%M:%S')} UTC ({defer_seconds}s settle wait — non-blocking)"
     )
 
+def _await_fresh_tick_for_placement(self, label):
+    """Fix 1 (2026-06-15 missed-anchor incident): at placement, a tick older than
+    cfg.stale_tick_threshold_s is usually a transient MT5/broker blip, not a
+    reason to lose the whole anchor (a 76s tick skipped two anchors and a clean
+    ~$25 gold move today). Poll every stale_retry_poll_s for up to
+    stale_retry_window_s and return (tick, current_price, waited_s) as soon as a
+    fresh tick appears; return None if it stays stale the whole window, or a kill
+    switch / pause / EOD intervenes (those take priority). The retry only confirms
+    the feed is live enough to place -- the anchor price is taken at placement by
+    the caller (deployed v2.5.4 current-price anchoring; see REFACTOR_NOTES for the
+    spec's fixed-anchor-price request vs the deployed behavior). Heartbeat is kept
+    alive throughout so the watchdog never kills the bot mid-wait. ONE Telegram
+    line on entry, not per poll."""
+    thr    = getattr(self.cfg, 'stale_tick_threshold_s', 60.0)
+    window = getattr(self.cfg, 'stale_retry_window_s', 90.0)
+    poll   = getattr(self.cfg, 'stale_retry_poll_s', 5.0)
+
+    def _read():
+        tk = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+        if tk is None:
+            return None, None
+        off = (self.adapter.tick_time_offset_hours or 0) * 3600
+        age = abs(pd.Timestamp.now(tz='UTC').timestamp() - (tk.time - off))
+        return tk, age
+
+    tk, age = _read()
+    if tk is not None and age is not None and age <= thr:
+        return tk, (tk.ask + tk.bid) / 2, 0.0   # already fresh -> no wait
+
+    self.tele.warn(
+        f"⏳ *{label} waiting for fresh tick* — last tick "
+        f"{('%.0fs old' % age) if age is not None else 'unavailable'} "
+        f"(> {thr:.0f}s). Polling up to {window:.0f}s before skipping; anchor "
+        f"held, placing late off the same anchor is correct."
+    )
+    start = time.monotonic()
+    reconnected = False
+    while (time.monotonic() - start) < window:
+        self._touch_heartbeat()  # this loop blocks the tick loop -- stay alive
+        # Priority: kill switch / pause / EOD abort the wait immediately.
+        if self.state.get('kill_switch_locked', False) or self.paused:
+            log.warning(f"{label}: stale-tick wait aborted (kill_switch/paused).")
+            return None
+        try:
+            now_utc = pd.Timestamp.now(tz='UTC')
+            if self._eod_reached(self._broker_date(now_utc), now_utc):
+                log.warning(f"{label}: stale-tick wait aborted (EOD reached).")
+                return None
+        except Exception:
+            pass
+        # Mid-window, cycle the connection once in case the terminal truly dropped.
+        if not reconnected and (time.monotonic() - start) >= (window / 2.0):
+            reconnected = True
+            try:
+                self._attempt_mt5_reconnect(label)
+            except Exception as e:
+                log.warning(f"{label}: mid-wait reconnect raised: {e}")
+        time.sleep(poll)
+        tk, age = _read()
+        if tk is not None and age is not None and age <= thr:
+            waited = time.monotonic() - start
+            log.info(f"{label}: fresh tick after {waited:.0f}s stale-tick wait (age {age:.0f}s).")
+            self.tele.success(
+                f"✅ *{label} placed after {waited:.0f}s stale-tick wait* — feed live again.")
+            return tk, (tk.ask + tk.bid) / 2, waited
+    return None
+
 def _complete_deferred_anchor(self):
     """v2.5: Called from the tick loop. Completes a deferred anchor placement
     after the settle window. Non-blocking — doesn't stop position management.
@@ -158,33 +225,29 @@ def _complete_deferred_anchor(self):
     if gap_mode_locked and gap_re_anchor is not None:
         anchor_price = gap_re_anchor
 
-    # v2.5: tick freshness check — refuse to use stale market data
+    # v2.5: tick freshness check — refuse to use stale market data.
+    # Fix 1 (2026-06-15): a transient stale tick (e.g. a 76s blip) must NOT cost
+    # the whole anchor. Poll for a fresh tick up to stale_retry_window_s and place
+    # as soon as the feed is live again; skip ONLY if it stays stale the whole
+    # window. Anchor price is still taken at placement (v2.5.4 current-price
+    # anchoring, unchanged) -- see REFACTOR_NOTES for the spec's fixed-anchor-price
+    # request vs the deployed behavior.
     current_price = None
     try:
-        tick = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
-        if tick is not None:
-            # tick.time is broker-time as unix; subtract broker offset to get UTC unix
-            broker_offset = self.adapter.tick_time_offset_hours * 3600
-            tick_utc_unix = tick.time - broker_offset
-            now_unix = pd.Timestamp.now(tz='UTC').timestamp()
-            tick_age_s = abs(now_unix - tick_utc_unix)
-            if tick_age_s > 60:
-                self._dump_mt5_state(label, f"SKIP: tick stale ({tick_age_s:.0f}s old)")
-                self.tele.warn(
-                    f"⚠️ *{label} skipped — stale tick*\n"
-                    f"Tick age: {tick_age_s:.0f}s (> 60s threshold)\n"
-                    f"MT5 terminal may have lost connection. Skipping placement."
-                )
-                return
-            current_price = (tick.ask + tick.bid) / 2
-            # v2.5.4: ANCHOR ON CURRENT PRICE at the moment of placement.
-            # Replaces the M5-close anchor captured ~30s earlier in
-            # _process_anchor. Because placement uses anchor_price, both stops
-            # are now symmetric around live price -> gap mode self-disables
-            # (anchor-vs-current diff = 0). On rc=-1 retries this re-runs and
-            # re-fetches the tick, so retries re-anchor to fresh price too —
-            # fixing the 2026-05-27 A4 flaw (RETRY reused a dead anchor).
-            anchor_price = current_price
+        fresh = self._await_fresh_tick_for_placement(label)
+        if fresh is None:
+            window = getattr(self.cfg, 'stale_retry_window_s', 90.0)
+            thr = getattr(self.cfg, 'stale_tick_threshold_s', 60.0)
+            self._dump_mt5_state(label, f"SKIP: tick stale through {window:.0f}s retry window")
+            self.tele.warn(
+                f"⚠️ *{label} skipped — stale tick* after {window:.0f}s of retries\n"
+                f"Tick stayed older than {thr:.0f}s the whole window "
+                f"(MT5/broker connection). Anchor lost this cycle."
+            )
+            return
+        tick, current_price, _waited = fresh
+        # v2.5.4: ANCHOR ON CURRENT PRICE at the moment of placement (unchanged).
+        anchor_price = current_price
     except Exception as e:
         log.warning(f"Could not read fresh tick for {label}: {e}")
         self._dump_mt5_state(label, f"SKIP: tick read raised {e}")
@@ -380,7 +443,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         buy_res = self.adapter.place_stop_order(
             self.cfg.symbol, 'BUY', buy_stop, gap_lot,
             sl=sl_buy, tp=tp_buy,
-            comment=f"AUREONv2_{label}_BUY{'_GAP' if gap_mode else ''}{retry_comment}",
+            comment=f"AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}",
             dry_run=self.paper)
         if not self.paper:
             try:
@@ -391,7 +454,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         sell_res = self.adapter.place_stop_order(
             self.cfg.symbol, 'SELL', sell_stop, gap_lot,
             sl=sl_sell, tp=tp_sell,
-            comment=f"AUREONv2_{label}_SELL{'_GAP' if gap_mode else ''}{retry_comment}",
+            comment=f"AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}",
             dry_run=self.paper)
         if not self.paper:
             try:
@@ -520,7 +583,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         mkt_res = self.adapter.place_market_order(
             self.cfg.symbol, breakout_side, rcv_lot,
             sl=rcv_sl, tp=rcv_tp,
-            comment=f"AUREONv2_{label}_{breakout_side}_RCV",
+            comment=f"AUR_{label[:2]}_{breakout_side[0]}_RCV",
             dry_run=self.paper)
         mkt_rc = getattr(mkt_res, 'retcode', None) if mkt_res is not None else None
         if mkt_rc == 10009:
@@ -664,7 +727,7 @@ def _confirm_a1_placement(self, label, lot, buy_leg, sell_leg):
                 f"Sent OK but no resting {side} stop @ ${price} found.")
             res = self.adapter.place_stop_order(
                 self.cfg.symbol, side, price, lot, sl=sl, tp=tp,
-                comment=f"AUREONv2_{label}_{side}_CONFIRM", dry_run=self.paper)
+                comment=f"AUR_{label[:2]}_{side[0]}_CFM", dry_run=self.paper)
             new_ticket = self._extract_ticket(res, f"paper_{label}_{side}")
             time.sleep(1)
             if new_ticket is not None and _present(side, price, new_ticket):
@@ -844,7 +907,7 @@ def _warmup_trade_channel(self, label: str) -> bool:
             "tp":           round(ping_price + 50.0, 2),
             "deviation":    20,
             "magic":        self.WARMUP_MAGIC,
-            "comment":      self.WARMUP_COMMENT,
+            "comment":      mt5_comment(self.WARMUP_COMMENT),
             "type_filling": self.adapter.mt5.ORDER_FILLING_IOC,
             "type_time":    self.adapter.mt5.ORDER_TIME_DAY,  # matches bot's convention
         }

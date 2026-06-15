@@ -113,6 +113,19 @@ class Watchdog:
         self.tg_chat  = os.environ.get("AUREON_TELEGRAM_CHAT",  "").strip()
         self.tg_enabled = bool(self.tg_token and self.tg_chat)
 
+        # Auto-deploy (INFRA, default OFF). When ON, poll master, pull+validate,
+        # and restart the bot ONLY when the book is flat / at EOD (never mid-trade).
+        self.autodeploy_enabled = os.environ.get("AUTODEPLOY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+        try:
+            self.autodeploy_poll_min = float(os.environ.get("AUTODEPLOY_POLL_MIN", "5"))
+        except ValueError:
+            self.autodeploy_poll_min = 5.0
+        self.deployed_sha_path = os.path.join(run_dir, "deployed_sha.txt")
+        self.update_pending = None          # validated sha awaiting a safe apply window
+        self._autodeploy_failed_sha = None  # sha that failed validation/merge (don't re-alert/re-pull)
+        self._last_autodeploy_poll = 0.0
+        self.deployed_sha = self._git_head_sha()
+
         # Clean stale heartbeat from previous crash
         if os.path.exists(self.heartbeat_path):
             os.remove(self.heartbeat_path)
@@ -149,6 +162,134 @@ class Watchdog:
             except subprocess.TimeoutExpired:
                 pass
         self.bot_proc = None
+
+    # ------------------------------------------------------------------------
+    # Auto-deploy (INFRA): pull master always; restart only when flat or at EOD
+    # ------------------------------------------------------------------------
+
+    def _run(self, argv, cwd=None, timeout=180):
+        """Run a subprocess; return (rc, combined_output). Never raises."""
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, cwd=cwd, timeout=timeout)
+            return r.returncode, (r.stdout + r.stderr).strip()
+        except Exception as e:
+            return 1, f"{argv[0]} raised: {e!r}"
+
+    def _git(self, *args, timeout=120):
+        return self._run(["git", *args], timeout=timeout)
+
+    def _git_head_sha(self):
+        rc, out = self._git("rev-parse", "HEAD")
+        return out.split()[0] if rc == 0 and out else None
+
+    def _remote_master_sha(self):
+        # Read remote master HEAD WITHOUT modifying the working tree.
+        rc, out = self._git("ls-remote", "origin", "refs/heads/master")
+        if rc != 0 or not out:
+            return None
+        return out.split()[0]  # "<sha>\trefs/heads/master"
+
+    def _autodeploy_validate(self, sha):
+        """Validate the fetched sha in an ISOLATED git worktree BEFORE applying:
+        py_compile all .py + an import smoke. A broken merge must never take down
+        the live bot. Returns (ok, detail). Never raises."""
+        import glob as _glob, tempfile as _tf, shutil as _sh
+        wt = _tf.mkdtemp(prefix="aureon_stage_")
+        try:
+            rc, out = self._git("worktree", "add", "--detach", wt, sha)
+            if rc != 0:
+                return False, f"worktree add failed: {out[:200]}"
+            pyfiles = _glob.glob(os.path.join(wt, "*.py"))
+            rc, out = self._run([sys.executable, "-m", "py_compile", *pyfiles])
+            if rc != 0:
+                return False, f"py_compile failed: {out[:300]}"
+            mods = ("bot live_trader watchdog config strategy mt5_adapter backtest "
+                    "state risk anchors fills trails journal utils firebase_journal "
+                    "telemetry env_loader version").split()
+            rc, out = self._run([sys.executable, "-c", "import " + ", ".join(mods)], cwd=wt)
+            if rc != 0:
+                return False, f"import test failed: {out[:300]}"
+            return True, "py_compile + import OK"
+        finally:
+            self._git("worktree", "remove", "--force", wt)
+            try:
+                _sh.rmtree(wt, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _autodeploy_apply(self, sha):
+        """Apply a validated pending update at a safe window: graceful-stop the
+        bot, ff-only merge origin/master into the live dir (NEVER reset --hard
+        with the book open; ff-only leaves git-ignored .env / state.json /
+        firebase_key.json / logs untouched), record the sha, relaunch. Returns
+        (ok, detail)."""
+        self._stop_bot()
+        rc, out = self._git("merge", "--ff-only", "origin/master")
+        if rc != 0:
+            # Do NOT force. Relaunch the CURRENT code so the bot is never left down.
+            self.tele.warn(
+                f"⚠️ auto-deploy: ff-only merge failed, manual intervention needed.\n"
+                f"`{out[:300]}`\nRelaunching CURRENT code; update NOT applied.")
+            self._spawn_bot()
+            return False, "ff-only merge failed"
+        new_sha = self._git_head_sha() or sha
+        try:
+            with open(self.deployed_sha_path, "w") as f:
+                f.write(new_sha + "\n")
+        except Exception:
+            pass
+        self.deployed_sha = new_sha
+        self._spawn_bot()
+        self.tele.success(
+            f"✅ auto-deploy: applied master `{new_sha[:10]}`, bot restarted on "
+            f"v{AUREON_VERSION} (banner/module receipt confirms what is running).")
+        return True, "applied"
+
+    def _autodeploy_check(self):
+        """Poll master, validate off-tree, and apply only when the book is FLAT
+        or EOD is done (whichever first). Pull/validate are always safe; RESTART
+        is gated. Default OFF (AUTODEPLOY_ENABLED). Never raises."""
+        if not self.autodeploy_enabled:
+            return
+        try:
+            # Apply gate first: while an update is pending, apply as soon as safe.
+            if self.update_pending:
+                st = self._read_status() or {}
+                if st.get("flat") is True or st.get("eod_done") is True:
+                    why = "flat" if st.get("flat") else "EOD"
+                    self.tele.info(f"📦 auto-deploy: book {why} — applying pending master "
+                                   f"`{self.update_pending[:10]}`.")
+                    ok, _ = self._autodeploy_apply(self.update_pending)
+                    if not ok:
+                        self._autodeploy_failed_sha = self.update_pending
+                    self.update_pending = None
+                return  # while pending, do nothing else
+
+            now = time.time()
+            if (now - self._last_autodeploy_poll) < self.autodeploy_poll_min * 60:
+                return
+            self._last_autodeploy_poll = now
+            remote = self._remote_master_sha()
+            if not remote or remote == self.deployed_sha or remote == self._autodeploy_failed_sha:
+                return
+            rc, out = self._git("fetch", "origin", "master")
+            if rc != 0:
+                self.tele.warn(f"⚠️ auto-deploy: git fetch failed: `{out[:200]}`")
+                return
+            ok, detail = self._autodeploy_validate(remote)
+            if not ok:
+                self._autodeploy_failed_sha = remote
+                self.tele.warn(
+                    f"⚠️ auto-deploy: new master `{remote[:10]}` FAILED validation, "
+                    f"NOT applied, staying on `{(self.deployed_sha or '?')[:10]}`.\n"
+                    f"`{detail[:200]}`")
+                return
+            self.update_pending = remote
+            self.tele.info(
+                f"📥 auto-deploy: master `{remote[:10]}` pulled + validated — "
+                f"will apply at next flat/EOD window.")
+        except Exception as e:
+            logging.warning(f"auto-deploy check raised (non-fatal): {e}")
 
     # ------------------------------------------------------------------------
     # Heartbeat & status
@@ -374,6 +515,8 @@ class Watchdog:
             f"Bot args: `{' '.join(self.bot_args)}`\n"
             f"Run dir: `{self.run_dir}`\n"
             f"Telegram polling: `{'on' if self.tg_enabled else 'off'}`\n"
+            f"Auto-deploy: `{'ON' if self.autodeploy_enabled else 'off'}`"
+            f"{f' (poll {self.autodeploy_poll_min:.0f}m)' if self.autodeploy_enabled else ''}\n"
             f"Send `/help` to see commands."
         )
 
@@ -463,6 +606,10 @@ class Watchdog:
                     self._spawn_bot()
                     self.consecutive_crashes = 0
                     continue
+
+                # 4. Auto-deploy (INFRA, default OFF): pull master always; restart
+                #    only when the book is flat or EOD done. Never mid-trade.
+                self._autodeploy_check()
 
         finally:
             self.tele.warn("Watchdog shutting down — stopping bot")

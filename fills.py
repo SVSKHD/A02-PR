@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from telemetry import telemetry_from_env, Severity
+from telemetry import telemetry_from_env, Severity, md_escape
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
@@ -215,21 +215,21 @@ def _reconcile_with_broker(self):
                             b_res = self.adapter.place_market_order(
                                 self.cfg.symbol, b_side, self.cfg.lot_size,
                                 sl=b_sl, tp=b_tp,
-                                comment=f"AUREONv2_{info['anchor_label']}_{b_side}_BOOST{bi+1}",
+                                comment=f"AUR_{info['anchor_label'][:2]}_{b_side[0]}_B{bi+1}",
                                 dry_run=self.paper)
                         except Exception as e:
                             log.warning(f"BOOST{bi+1} order error: {e!r}")
                             # v2.9.8: Jun-11 A4 mystery -- exceptions here were
                             # log-only, so Telegram showed the announce and then
                             # NOTHING. Every boost now reports fate to Telegram.
-                            self.tele.error(f"❌ BOOST{bi+1} EXCEPTION: {e!r} -- order NOT placed")
+                            self.tele.error(f"❌ BOOST{bi+1} EXCEPTION: {md_escape(repr(e))} -- order NOT placed")
                             continue
                         if b_res is None:
                             # v3.0.0: broker returned no result object at all --
                             # surface mt5.last_error() so the next event tells us why.
                             _le = ''
                             try:
-                                _le = f" last_error={self.adapter.mt5.last_error()}"
+                                _le = f" last_error={md_escape(self.adapter.mt5.last_error())}"
                             except Exception:
                                 pass
                             self.tele.error(
@@ -259,8 +259,8 @@ def _reconcile_with_broker(self):
                         else:
                             # v3.0.0: non-success retcode -- name it + show comment
                             self.tele.error(
-                                f"\u274C BOOST{bi+1} rejected rc={b_rc} ({b_rc_name}) "
-                                f"comment={b_cmt!r}")
+                                f"\u274C BOOST{bi+1} rejected rc={b_rc} ({md_escape(b_rc_name)}) "
+                                f"comment={md_escape(repr(b_cmt))}")
 
     # Detect closures
     for ticket in list(self.shadow_positions):
