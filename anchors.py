@@ -26,13 +26,23 @@ def _resolved_anchor_hm(self, label, broker_date, hour, minute):
     """Resolve an anchor's (broker_hour, broker_minute), applying the Monday-only
     A1 cold-start cushion. Forex opens Mon 00:00 broker; A1 at 02:30 is only 2.5h
     after week-open (Monday offset re-detect + thin M5 history -> 'no bars' risk),
-    so on Mondays A1 fires ~3h after open instead. Uses the BROKER date's weekday
-    so the Monday test is correct relative to A1's own broker day. Other anchors,
-    and A1 on Tue-Fri, are unchanged; cfg.monday_a1_override=None disables it. The
-    A1 label is NOT changed (journal/Firebase/aggregation keys stay stable)."""
+    so on Mondays A1 fires later (03:30 broker = 6 AM IST) instead. Uses the BROKER
+    date's weekday so the Monday test is correct relative to A1's own broker day.
+    Other anchors, and A1 on Tue-Fri, are unchanged; cfg.monday_a1_override=None
+    disables it. The A1 label is NOT changed (journal/Firebase/aggregation keys
+    stay stable). This is the SINGLE source of truth for A1 time resolution --
+    both _process_anchor_if_due and the readiness line call it.
+
+    Test hook: AUREON_TEST_FORCE_MONDAY_A1=1 forces the override on ANY weekday so
+    the 03:30 resolution can be verified mid-week (combine with the quiet-feed /
+    offset-revalidate test toggles to reproduce the full Monday scenario). TEST
+    ONLY, defaults OFF, surfaced in the 'TEST MODE ACTIVE' banner line."""
     ovr = getattr(self.cfg, 'monday_a1_override', None)
-    if ovr is not None and label.startswith('A1') and broker_date.weekday() == 0:
-        return int(ovr[0]), int(ovr[1])
+    if ovr is not None and label.startswith('A1'):
+        force = os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
+            in ('1', 'true', 'yes', 'on')
+        if force or broker_date.weekday() == 0:
+            return int(ovr[0]), int(ovr[1])
     return hour, minute
 
 def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):

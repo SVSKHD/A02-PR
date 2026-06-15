@@ -44,7 +44,7 @@ def main():
     # import cycle (live_trader imports the split modules, not bot)
 
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
-    parser.add_argument('mode', choices=['backtest', 'paper', 'live'])
+    parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -55,6 +55,8 @@ def main():
 
     parser.add_argument('--i-understand-the-risks', action='store_true',
                         help="Required for live mode")
+    parser.add_argument('--force', action='store_true',
+                        help="selftest: allow market-order steps on a non-demo account")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
 
@@ -102,6 +104,15 @@ def main():
                       "Re-read AUREON_V2_SPEC.md §4 (Risk Management) and §5 (Live Adjustments) first.")
             sys.exit(1)
         run_live(cfg, paper=False)
+
+    elif args.mode == 'selftest':
+        # On-demand placement + rescue/boost self-test against the connected MT5
+        # demo terminal. Runs ONLY here (never from the live loop / a timer);
+        # refuses to run unless the book is flat. Proves the boost path places at
+        # rc=10009 in ~2 minutes instead of waiting for a real live rescue.
+        from selftest import run_selftest
+        ok = run_selftest(cfg, force=args.force)
+        sys.exit(0 if ok else 1)
 
 
 if __name__ == '__main__':
