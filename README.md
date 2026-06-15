@@ -88,7 +88,8 @@ Refactored from two oversized files (`live_trader.py` ~2,374 lines, `bot.py`
 | `trails.py` | Per-bar trail management, SL push, stop-through handling, exit classifier. Bound onto `LiveTrader`. |
 | `journal.py` | 19-col CSV journal, daily/today summaries, `summarize_recent`, Firebase EOD save + weekly reconcile. Bound onto `LiveTrader`. |
 | `live_trader.py` | **Slim orchestrator:** `LiveTrader` class shell + event loop + `run_live`; binds the method modules above. |
-| `bot.py` | CLI entry — `backtest` / `paper` / `live`; re-exports the old public surface. |
+| `bot.py` | CLI entry — `backtest` / `paper` / `live` / `selftest`; re-exports the old public surface. |
+| `selftest.py` | On-demand placement + rescue/boost self-test harness (`python bot.py selftest`). Vol_min throwaway orders, PASS/FAIL per step, refuses unless flat. |
 | `firebase_journal.py` | Firestore client + record builders + idempotent daily/weekly writes (fail-safe). |
 | `telemetry.py` | Thread-safe Telegram + console + file engine, severity levels, Markdown-escape + plain-text failover. |
 | `watchdog.py` | Parent supervisor: spawn/restart, heartbeat, Telegram command loop, **auto-deploy**. |
@@ -187,6 +188,18 @@ Outputs `output/trades.csv` and `output/stats.json` (aggregate + monthly P&L).
 python watchdog.py paper --lot 0.35
 python watchdog.py live  --lot 0.35 --i-understand-the-risks
 ```
+
+### 4b. Self-test the rescue/boost fleet (when flat, on demo)
+```bash
+python bot.py selftest          # add --force to run market steps on a non-demo account
+```
+Exercises the entire placement + rescue/boost path against the connected MT5 demo
+terminal with vol_min throwaway orders (cancelled/closed immediately) and prints a
+`RESULT: 9/9 PASS — fleet ready` block to console + Telegram. It proves the boost
+MARKET path places at `rc=10009` (the historical 0-for-7 failure) in ~2 minutes
+instead of waiting for a real live rescue. Refuses to run unless the book is flat;
+runs only via this command (never the live loop). Run it before relying on the
+fleet — see `MERGE_GATE.md`.
 Control from Telegram: `/status`, `/today`, `/pause`, `/resume`, `/flatten`,
 `/restart`, `/stop`. On a crash the watchdog auto-restarts with exponential
 backoff and notifies on Telegram. `/status` works during weekend sleep and

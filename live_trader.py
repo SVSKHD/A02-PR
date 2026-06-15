@@ -222,6 +222,14 @@ class LiveTrader:
             f"Anchors: {[a[0] for a in cfg.anchors]}, "
             f"kill switch: -{cfg.daily_loss_pct*100:.1f}%"
         )
+        # TEST MODE banner: surface any active test-scope toggle loudly so a
+        # forced code path is never mistaken for production behavior. Defaults OFF.
+        if os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
+                in ('1', 'true', 'yes', 'on'):
+            self.tele.warn(
+                "🧪 TEST MODE ACTIVE — AUREON_TEST_FORCE_MONDAY_A1=1: A1 resolves "
+                "via monday_a1_override on ANY weekday (test only, not production)."
+            )
 
 
     def _broker_date(self, utc_now: pd.Timestamp) -> DateType:

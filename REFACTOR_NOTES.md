@@ -410,6 +410,10 @@ separate strategy change to v2.5.4 — tell me and I'll do it; it is NOT in this
 
 ### Anchor-timing discrepancy for the human — A1 02:30 vs 03:00 (REPORT ONLY)
 
+> **RESOLVED in v3.0.3:** the Monday shift is kept and moved to **03:30 broker**
+> (see the v3.0.3 section above). `monday_a1_override=(3, 30)`; set it to `None` to
+> restore pure 02:30 every day. The note below is retained for history.
+
 Today's readiness line showed **A1 03:00 broker**, diverging from the intended
 unchanged **02:30**. Cause: `Config.anchors[0]` is still `("A1_02h_Asia", 2, 30)`, but
 the Monday-A1 override (`cfg.monday_a1_override = (3, 0)`, from the #8 work merged into
@@ -445,6 +449,55 @@ Fix (v3.0.1):
   `_send_telegram` retries once as PLAIN text on a parse-400 so a message is never lost.
 - Truthful banner: the `LiveTrader v2.5.3 initialized` line was a stale hardcoded
   literal; it now reads `version.__version__`.
+
+## 2026-06-15 — v3.0.3: on-demand self-test harness + Monday A1 -> 03:30
+
+### selftest.py (new module) + `python bot.py selftest`
+On-demand harness that exercises the entire placement + rescue/boost path against
+the connected MT5 demo terminal and prints/Telegrams a PASS/FAIL report per step.
+Built so the 0-for-7-class failure (boost order silently rejected) is caught in a
+~2-minute self-test, not during a real live rescue we waited hours to set up.
+
+Nine steps: (1) connection/terminal/symbol-full, (2) tick freshness, (3)
+comment<=31 guard on the longest comments the system generates + the exact 34-char
+legacy bug string (proves `mt5_comment()` kills it), (4) real stop placement at
+±$50 then cancel, (5) the MARKET/boost path (the exact 0-for-7 call) then close,
+(6) SL/TP modify, (7) rescue classification (twin-open=rescue / twin-closed=normal,
+pure logic via `classify_second_fill`, mirrors the fills.py `_twin_open` rule), (8)
+full rescue dry-run placing the real boost fleet -> each must return 10009 -> closed,
+(9) Telegram parse-safety (md_escape dynamic values + an actual send, asserting no
+unclosed-entity 400). Report ends with `RESULT: n/9 PASS — fleet ready`.
+
+Hard safety: runs ONLY via the CLI (never the live loop / a timer); a `_preflight`
+refuses to run if ANY position/pending is open ("run when FLAT"); a demo-account
+guard SKIPs the four market-order steps on a non-demo account unless `--force`;
+all real orders are vol_min throwaway, placed far or torn down immediately, and a
+`run()` try/finally `_cleanup` closes/cancels everything tracked even if a step
+raises. `selftest` does NOT import MetaTrader5 at module load (only `run_selftest`
+constructs the adapter), so `import selftest` works on a box without MT5.
+
+### Monday-only A1 -> 03:30 broker (was 03:00)
+The quiet-feed cold-wake risk is worst in the first hours of the week, so the
+Monday A1 shift moves later: `cfg.monday_a1_override` `(3, 0)` -> `(3, 30)` (6:00
+AM IST). Tue-Fri A1 stays 02:30; A2/A3/A4 unchanged; label `A1_02h_Asia` stable.
+
+**Drift reconciliation (the task asked to find any second A1-time resolver and
+remove it):** there is NONE. `anchors._resolved_anchor_hm` is already the SINGLE
+source of truth — called by both `_process_anchor_if_due` (the anchor-due check)
+and `_post_readiness` (the readiness line). The live "A1 03:00 broker" readiness
+line was NOT a rogue override; it was the prior `monday_a1_override=(3,0)`
+resolving correctly on a Monday. So no duplicate code was removed — the one clean
+mechanism already existed; only its value changed (03:00 -> 03:30). The weekday
+test uses the BROKER date the anchor belongs to (`broker_date.weekday() == 0`).
+
+**Test hook (now built):** `AUREON_TEST_FORCE_MONDAY_A1=1` makes `_resolved_anchor_hm`
+apply the override on ANY weekday, so the 03:30 resolution can be verified mid-week;
+LiveTrader.__init__ posts a `🧪 TEST MODE ACTIVE` banner line when it is set. This
+is the FIRST `AUREON_TEST_*` toggle in the repo. The broader cold-wake test scope
+flagged above (`AUREON_TEST_SIMULATE_QUIET_FEED`, `AUREON_TEST_FORCE_OFFSET_REVALIDATE`,
+a dedicated `test_config.py`) is still NOT built — only the Monday-A1 toggle this
+task required was added; the quiet-feed/offset-revalidate simulators remain for a
+future, deliberately-scoped commit.
 
 Note: today's A3 was a GENUINE rescue (twin open at -$630 SL) -- the twin-open guard
 worked correctly; only the boost placement failed, now fixed. The next genuine rescue

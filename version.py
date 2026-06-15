@@ -111,9 +111,32 @@ History (one line per behavioral change):
          (md_escape) + a plain-text failover so a Markdown 400 never drops a message;
          the LiveTrader init banner reads version.__version__ (was a stale hardcoded
          2.5.3). Unblocks the crash-branch boost upside.
+  3.0.3  ON-DEMAND SELF-TEST harness (selftest.py + `python bot.py selftest`):
+         exercises the ENTIRE placement + rescue/boost path against the live demo
+         broker with vol_min throwaway orders and reports PASS/FAIL per step to
+         console + Telegram -- connection, tick freshness, comment<=31 guard, real
+         stop placement (cancelled), the MARKET/boost path (the 0-for-7 call,
+         closed), SL/TP modify, rescue classification (twin-open=rescue /
+         twin-closed=normal, pure logic), full rescue dry-run (real boosts -> 10009
+         -> closed), and Telegram parse-safety (no unclosed-entity 400). Hard
+         safety: runs ONLY via the CLI (never the live loop / a timer), refuses if
+         any position/pending is open ("run when flat"), demo-account guard on the
+         market steps (--force overrides), and a try/finally that closes/cancels
+         every throwaway order even if a step raises. Proves the boost fleet places
+         at 10009 in ~2 minutes instead of waiting for a real live rescue.
+         Monday-only A1 -> 03:30 broker (6 AM IST), was 03:00: the quiet-feed
+         cold-wake risk is worst in the first hours of the week, so a later Monday
+         A1 lands when the feed is reliably live. ONE source of truth confirmed --
+         _resolved_anchor_hm (used by both the anchor-due check and the readiness
+         line); no rogue override existed (the live "03:00" was the prior
+         (3,0) value resolving correctly on a Monday). cfg.monday_a1_override
+         (3,30); None disables (pure 02:30). A2/A3/A4 + A1 Tue-Fri unchanged; label
+         "A1_02h_Asia" stable; weekday tested in BROKER-date terms. Test hook
+         AUREON_TEST_FORCE_MONDAY_A1=1 forces the override on any weekday (TEST
+         ONLY, default OFF, shown in a 'TEST MODE ACTIVE' banner line).
 """
 
-__version__ = "3.0.1"
+__version__ = "3.0.3"
 CODENAME = "Astra Hawk"
 
 
