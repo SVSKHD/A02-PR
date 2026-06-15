@@ -1,23 +1,50 @@
-# AUREON v2 — Multi-Anchor XAUUSD Bot
+# AUREON v3 — Multi-Anchor XAUUSD Bot
 
-Anchor-breakout trading bot for gold (XAUUSD) M1, with **4 independent session anchors per day** (Asia, London, London-NY overlap, NY) and **dual-side fill-or-kill** OCO discipline per anchor.
+Automated **4-anchor daily straddle** bot for gold (XAUUSD), built on MetaTrader 5
+(Python). Four session anchors per day (Asia, London, London-NY overlap, NY),
+**No-OCO** straddle discipline per anchor, a profit-protecting hold + ladder, a
+crash-branch rescue/boost fleet, and full Telegram operations.
 
-## What's in this package
+> **Current version: `v3.0.1` (Astra Hawk).** `version.py` is the single source of
+> truth — the startup banner prints the version + a module receipt so the version
+> you see in Telegram is, by construction, the version that is running.
 
-| File | What it is |
-|------|------------|
-| `AUREON_V2_SPEC.md` | The complete strategy specification — the "prompt." Read this first. |
-| `bot.py` | Entry point: backtest engine + MT5 adapter + CLI. |
-| `live_trader.py` | Production live/paper trading loop with full trail management, OCO emulation, state persistence, EOD close, kill switch, telemetry, and command handling. |
-| `telemetry.py` | Thread-safe notification engine (Telegram + console + file). |
-| `watchdog.py` | Parent supervisor — spawns bot, monitors heartbeat, auto-restarts on crash, listens to Telegram commands. |
-| `fetch_data.py` | **NEW.** Pulls XAUUSD M1 from MT5 over an arbitrary date range (chunked, deduped). |
-| `auto_analyze.py` | **NEW.** Daily orchestrator: fetches rolling 12-month data → runs backtest → sends summary to Telegram → saves markdown report. Designed for cron / systemd timer. |
-| `TELEGRAM_SETUP.md` | Step-by-step Telegram bot creation + integration guide. |
-| `requirements.txt` | Python dependencies. |
-| `README.md` | This file. |
+Deployed on a Windows VPS at `C:\A02-PR\`, watchdog-supervised, currently running
+on a Pepperstone demo (account-validation phase).
 
-## Architecture
+---
+
+## Strategy (frozen spec)
+
+Four daily anchor straddles on gold. At each anchor: capture the M5 close, place a
+**buy stop +$5** and a **sell stop −$5** from the anchor price. **No-OCO** — the
+sibling stays live after the first fill, so a reversal can second-fill.
+
+- **SL $18 · TP $30.** First fill starts a **45-minute hold** (no trail exits
+  inside the hold; SL / TP / ladder stay live).
+- **Anchors (broker = UTC+3 / IST):** A1 02:30 / 5:00 AM · A2 10:00 / 12:30 PM ·
+  A3 13:50 / 4:20 PM · A4 16:40 / 7:10 PM. On **Mondays only**, A1 fires at 03:00
+  broker (cold-start cushion; `cfg.monday_a1_override`).
+- **Ladder (one-way ratchet).** NORMAL leg: +$2.5 → BE · +$6 → lock +$4 · +$10 →
+  trail peak−$2 (floor +$8). RESCUE leg: only the +$10 tier.
+- **$10 fleet trigger.** When a leg is −$10, the sibling fill becomes a RESCUE leg
+  plus **2 market BOOSTS** in the rescue direction ($6 SL, $30 TP each).
+- **TSTOP.** At minute 45, if peak favorable < $1 → close at market.
+- **Post-hold trail.** arm $2.50, gap $2.00.
+- **Kill switch.** −3% daily equity halts all anchors; EOD flatten at 23:00 broker.
+- Worst-case anchor ≈ −$1,050; worst day (kill switch) ≈ −$1,500 — both inside
+  risk limits.
+
+The exact mechanics live in `strategy.update_position_on_bar()` — the same pure
+function the backtest and the live loop both call, so live behavior matches
+backtest modulo spread / slippage / execution delay.
+
+---
+
+## Architecture (v3.0.0 — 13-module split)
+
+Refactored from two oversized files (`live_trader.py` ~2,374 lines, `bot.py`
+~1,030) into focused, acyclic modules.
 
 ```
                     ┌──────────────────────┐
@@ -29,34 +56,104 @@ Anchor-breakout trading bot for gold (XAUUSD) M1, with **4 independent session a
                     │  - heartbeat check   │
                     │  - auto-restart      │
                     │  - telegram polling  │
+                    │  - auto-deploy gate  │  (optional, default OFF)
                     └──────────┬───────────┘
-                               │ subprocess + files
+                               │ subprocess + run/ files
                     ┌──────────▼───────────┐
-                    │  bot.py + LiveTrader │
-                    │  - trading logic     │
-                    │  - MT5 orders        │
-                    │  - heartbeat write   │
-                    │  - status write      │
-                    │  - command consume   │
-                    └──────────────────────┘
-                               │
+                    │  bot.py (CLI entry)  │
+                    │     └─ live_trader   │  LiveTrader orchestrator
+                    │        - event loop  │
+                    │        - MT5 orders  │
+                    │        - heartbeat   │
+                    │        - status/cmds │
+                    └──────────┬───────────┘
                                ▼
                           MT5 broker
 ```
 
-Both `watchdog.py` and `bot.py` use the same `telemetry.py` module to push alerts to the same Telegram chat — you see a unified stream.
+### Module map
 
-## Validated performance (12-month backtest, May 2025 → May 2026)
+| Module | Role |
+|--------|------|
+| `version.py` | **Single source of truth** for `__version__` + behavioral changelog + `banner()`. |
+| `config.py` | `Config` dataclass — every tunable (distances, SL/TP, ladder, anchors, Monday override, offset, stale-tick retry, risk %). |
+| `utils.py` | Pure helpers: logging, `initial_sl/tp`, anchor/EOD UTC math, `m5_close_at`. Imports no AUREON module (cycle-proof). |
+| `strategy.py` | **Pure core:** `Position` + `update_position_on_bar` (freeze, role-aware ladder, trail, SL/TP) + `realize_pnl_usd`. No I/O. |
+| `mt5_adapter.py` | **Only** importer of `MetaTrader5`. Offset detection (live + stale-tick), M5/M1 reads, order place/modify/cancel/close, `mt5_comment()` (≤31-char truncation). |
+| `backtest.py` | `run_backtest` + `summarize_backtest` (reuses `strategy`). |
+| `state.py` | Persistent state load/save (atomic + `.bak`), PID lock. Bound onto `LiveTrader`. |
+| `risk.py` | Lot sizing, kill switch, day-start equity, flatten-all. Bound onto `LiveTrader`. |
+| `anchors.py` | Anchor scheduling + placement, Monday override, stale-tick retry, A1 confirmation, warmup/reconnect, MT5 forensics. Bound onto `LiveTrader`. |
+| `fills.py` | Broker reconcile: fill/closure detection, No-OCO sibling handling, RESCUE detection (twin-open check) + boost trigger. Bound onto `LiveTrader`. |
+| `trails.py` | Per-bar trail management, SL push, stop-through handling, exit classifier. Bound onto `LiveTrader`. |
+| `journal.py` | 19-col CSV journal, daily/today summaries, `summarize_recent`, Firebase EOD save + weekly reconcile. Bound onto `LiveTrader`. |
+| `live_trader.py` | **Slim orchestrator:** `LiveTrader` class shell + event loop + `run_live`; binds the method modules above. |
+| `bot.py` | CLI entry — `backtest` / `paper` / `live`; re-exports the old public surface. |
+| `firebase_journal.py` | Firestore client + record builders + idempotent daily/weekly writes (fail-safe). |
+| `telemetry.py` | Thread-safe Telegram + console + file engine, severity levels, Markdown-escape + plain-text failover. |
+| `watchdog.py` | Parent supervisor: spawn/restart, heartbeat, Telegram command loop, **auto-deploy**. |
+| `env_loader.py` | Loads `.env` before submodules read env vars. |
 
-| Metric | Value |
-|--------|------:|
-| Total pips | +944 |
-| Average pips / month | **+73** |
-| Win rate | 96.5% |
-| Max drawdown | −$2,000 (−4.0%) |
-| 4% kill-switch hits | 0 |
-| Months > +100 pips | 4 of 13 (Oct, Nov, Mar, Apr) |
-| Months negative | 0 of 13 |
+The methods in `state / risk / anchors / fills / trails / journal` were moved
+**byte-identical** out of `live_trader.py` and bound back onto `LiveTrader` (proof
+in `REFACTOR_NOTES.md`), so every call site, `state.json` key, Telegram string and
+the 19-col journal schema are unchanged.
+
+---
+
+## Event loop (`LiveTrader._tick`, every 5s)
+
+1. **Market closed?** → weekend deep-sleep + auto-resume Monday (heartbeat kept
+   alive; offset re-detect on wake).
+2. **Heartbeat** → touch `run/heartbeat`.
+3. **New broker day?** → reset daily P&L, clear processed-anchors, unlock kill switch.
+4. **Reconcile** → pull open positions + pendings; detect fills (No-OCO sibling),
+   detect closures (update daily P&L), trigger RESCUE + boosts when a leg is −$10.
+5. **Commands** → consume `/flatten /pause /resume` from the watchdog.
+6. **Kill switch?** → flatten everything, lock for the day.
+7. **EOD?** → flatten the book, write the Firebase EOD journal (once/day).
+8. **Anchor due?** → capture M5, place buy stop + sell stop (stale-tick retry, A1
+   confirmation); complete any deferred placement.
+9. **M1 bar closed?** → run `update_position_on_bar` for each leg, push SL if it
+   advanced (stop-through → market close).
+10. **Status snapshot** → write `run/status.json`.
+
+---
+
+## Auto-deploy (auto git pull) — implemented, default OFF
+
+The watchdog can keep the VPS in sync with `master` on its own. **It is wired into
+the watchdog run loop (`_autodeploy_check`) but gated behind an env toggle**, so a
+merge never surprise-deploys.
+
+**How it works:**
+1. **Poll** — every `AUTODEPLOY_POLL_MIN` minutes the watchdog reads remote
+   `master` HEAD via `git ls-remote` (no working-tree change).
+2. **Validate off-tree** — a new sha is fetched and checked in an isolated
+   `git worktree`: `py_compile` of every `*.py` + an import smoke test of all
+   modules. A broken merge **never** touches the live tree.
+3. **Stage** — a validated sha becomes `update_pending` (Telegram notice).
+4. **Apply at a safe window only** — the bot publishes `flat` / `eod_done` in
+   `status.json`; the watchdog applies **only when the book is flat or at EOD**
+   (never mid-trade): graceful-stop → `git merge --ff-only origin/master` →
+   relaunch. `ff-only` keeps git-ignored `.env` / `state.json` /
+   `firebase_key.json` / `logs` intact. A failed ff-only merge relaunches the
+   **current** code (never leaves the bot down) and alerts.
+
+**Enable it** (on the VPS `.env`, which is git-ignored):
+```bash
+AUTODEPLOY_ENABLED=1
+AUTODEPLOY_POLL_MIN=5
+```
+With it OFF (the default), the watchdog still runs normally — it just never pulls.
+The startup banner prints `Auto-deploy: ON/off` so you can confirm which is live.
+
+> **Status:** the pull/validate/gated-restart path is implemented and tested in
+> code. Because the toggle lives in the VPS-local `.env` (not in git), whether it
+> is *currently active* depends on that file — check the watchdog startup banner
+> (`Auto-deploy: ON/off`) on the VPS to confirm.
+
+---
 
 ## Quick start
 
@@ -65,137 +162,79 @@ Both `watchdog.py` and `bot.py` use the same `telemetry.py` module to push alert
 pip install -r requirements.txt
 ```
 
-### 2. Set up Telegram (highly recommended)
-See `TELEGRAM_SETUP.md` for full instructions. Short version:
+### 2. Configure (.env)
+Copy `.env.example` → `.env` and fill in Telegram + (optionally) Firebase /
+auto-deploy / test-scope toggles. `.env` is git-ignored.
 ```bash
-export AUREON_TELEGRAM_TOKEN="123:AAE..."        # from @BotFather
-export AUREON_TELEGRAM_CHAT="987654321"          # your chat id
-export AUREON_TELEGRAM_MIN_SEVERITY="INFO"       # INFO|SUCCESS|WARN|ERROR|CRITICAL
+AUREON_TELEGRAM_TOKEN="123:AAE..."        # from @BotFather
+AUREON_TELEGRAM_CHAT="987654321"          # your chat id
+AUREON_TELEGRAM_MIN_SEVERITY="INFO"       # INFO|SUCCESS|WARN|ERROR|CRITICAL
 ```
 
-### 3. Backtest on your own M1 CSV
-Your CSV must have columns: `time, open, high, low, close` with UTC timestamps.
-
+### 3. Backtest on an M1 CSV
+CSV columns: `time, open, high, low, close` (UTC timestamps).
 ```bash
 python bot.py backtest \
   --csv your_XAUUSD_M1.csv \
-  --start 2025-01-01 \
-  --end   2026-05-19 \
-  --lot   0.5 \
-  --balance 50000 \
+  --start 2025-01-01 --end 2026-05-19 \
+  --lot 0.35 --balance 50000 \
   --output-dir ./output
 ```
+Outputs `output/trades.csv` and `output/stats.json` (aggregate + monthly P&L).
 
-Output:
-- `output/trades.csv` — every trade with anchor label, entry, exit, P&L
-- `output/stats.json` — aggregate stats + monthly P&L
-
-### 4. Paper trade with watchdog + Telegram (recommended)
+### 4. Paper / live (watchdog-supervised)
 ```bash
-python watchdog.py paper \
-  \
-  \
-  --lot 0.5
+python watchdog.py paper --lot 0.35
+python watchdog.py live  --lot 0.35 --i-understand-the-risks
 ```
+Control from Telegram: `/status`, `/today`, `/pause`, `/resume`, `/flatten`,
+`/restart`, `/stop`. On a crash the watchdog auto-restarts with exponential
+backoff and notifies on Telegram. `/status` works during weekend sleep and
+returns last-trading-day per-anchor P&L + week-to-date.
 
-Then control from Telegram with `/status`, `/today`, `/pause`, `/flatten`.
+---
 
-If the bot crashes, the watchdog restarts it automatically (exponential backoff, max 8 attempts before giving up). You get a Telegram notification on every crash and recovery.
+## State, journal & secrets
 
-### 5. Live trade
-**Read the spec's risk section first.** Then:
+- **`state.json`** (default `aureon_v2_state.json`) — daily P&L, processed
+  anchors, kill-switch lock, shadow positions + pendings (rescue flags survive
+  restarts). Atomic write + `.bak` fallback.
+- **`run/`** — `heartbeat`, `status.json`, `commands.json`, `today_trades.csv`,
+  `deployed_sha.txt`.
+- **`trades_<YYYY-MM>.csv`** — the 19-column local journal.
+- **Firestore `aureon_forex`** — EOD-only, one idempotent doc per day
+  (`firebase_journal.py`); weekly reconcile backfills any missed day. Requires
+  `firebase_key.json` (git-ignored, never committed).
 
-```bash
-python watchdog.py live \
-  \
-  \
-  \
-  --lot 0.5 \
-  --i-understand-the-risks
-```
+---
 
-### 6. Auto-start on boot (Linux systemd)
-See `TELEGRAM_SETUP.md` → "Auto-start on boot (Linux systemd)" for the service file. Then:
-```bash
-sudo systemctl enable aureon
-sudo systemctl start aureon
-journalctl -u aureon -f
-```
+## Operational docs
 
-## Configuration
+| Doc | What it covers |
+|-----|----------------|
+| `AUREON_V2_SPEC.md` | The full strategy specification. |
+| `REFACTOR_NOTES.md` | The 13-module split, byte-identical move proof, change log. |
+| `DEPLOY_RUNBOOK.md` | VPS deploy steps. |
+| `PRE_DEPLOY_CHECK.md` | Pre-deploy checklist. |
+| `MERGE_GATE.md` | Merge / validation gate. |
+| `HARDENING_NOTES.md` | Wake/offset/A1 hardening notes. |
 
-Defaults are encoded in `bot.py:Config`. Override via CLI flags:
-- `--lot 0.5` — lot size per leg
-- `--balance 50000` — starting balance (for kill-switch math)
+---
 
-To change anchor times or strategy parameters, edit the `Config` dataclass at the top of `bot.py`.
+## Known open items
 
-## What the live/paper mode does (now fully implemented)
+- **Boost fleet — fixed but unproven live.** `v3.0.1` fixes the root cause (MT5
+  silently rejects order comments > 31 chars); the next genuine rescue must show
+  boosts placing at `rc=10009` to confirm the crash-branch upside.
+- **Multi-week green demo record** required before any funded-account money.
+- **A1 Monday time** — the readiness line has shown 03:00 broker on a deployed
+  build vs the intended 02:30; reconcile which is desired (`monday_a1_override`).
 
-The `LiveTrader` class in `live_trader.py` runs a single event loop that ticks every 5 seconds and performs these checks in order:
-
-1. **New broker day?** → reset daily P&L, clear processed-anchors list, unlock kill switch
-2. **Broker reconcile** → pull open positions and pending orders from MT5; detect fills (OCO trigger) and closures (update daily P&L)
-3. **Kill switch tripped?** → flatten everything at market, lock for the rest of the day
-4. **EOD reached (23:00 broker)?** → close every open position, cancel every pending
-5. **Anchor time due?** → capture M5 close, place buy stop and sell stop, register OCO pair
-6. **M1 bar closed?** → for every managed position, run the exact same `update_position_on_bar()` function the backtest uses, modify SL on broker if it advanced
-
-### OCO emulation
-MT5 has no native OCO. When two pending orders are placed for an anchor (buy stop + sell stop), they're registered as siblings in shadow state. As soon as the reconcile step detects that one became a position, the bot cancels the other.
-
-### State persistence
-Every state change is saved to `aureon_v2_state.json` (atomic write via `.tmp` + rename). On restart, the bot restores:
-- today's running daily P&L
-- which anchors have already been processed today
-- whether the kill switch is locked
-- (paper mode does not persist)
-
-### Trail logic equivalence
-The live loop uses the **same** `update_position_on_bar()` function as the backtest, so live trail behavior matches backtest exactly — modulo spread, slippage, and the inevitable 1–5 second delay between bar close and SL modification arriving at the broker.
-
-## What is still NOT in the package (intentional — these are operational, not strategic)
-
-| Missing feature | Where you'd add it | Why it matters |
-|-----------------|--------------------|----------------|
-| News blackout (FOMC/NFP/CPI ±5 min) | In `LiveTrader._process_anchor_if_due()`, check a calendar before placing | Avoids slippage on news spikes |
-| Telegram/email alerts | In `LiveTrader._tick()` exception handler + kill-switch event | So you find out when things break |
-| Retry on order rejection | Wrap `adapter.place_stop_order()` in retry-with-backoff | MT5 rejects ~0.1% of orders for transient reasons |
-| Multiple instruments | Generalize `cfg.symbol` to a list, run one LiveTrader per symbol | Diversification |
-| Systemd service file | `/etc/systemd/system/aureon.service` | Auto-restart on crash, run on boot |
-
-## Required Python packages
-
-```
-pandas >= 2.0
-numpy  >= 1.24
-MetaTrader5 >= 5.0.45    # only needed for paper/live modes
-```
-
-(Listed in `requirements.txt`.)
-
-## How the strategy works in 30 seconds
-
-1. At each of 4 anchor times daily (02:00, 10:00, 14:00, 17:00 broker), capture the M5 close.
-2. Place 2 pending stop orders: BUY at anchor+$5, SELL at anchor−$5.
-3. First fill = the trade. The other is killed (OCO).
-4. Manage with $20 SL, $20 TP, and a $0.30 continuous trail behind peak favorable.
-5. Each anchor's trade is independent. 4 simultaneous positions max.
-6. At 23:00 broker, close anything still open.
-7. If daily P&L hits −4%, kill switch fires: flatten everything, no more trades today.
-
-Result: ~73 pips/month average, 96.5% win rate, max drawdown stays under 4%.
-
-## Failure modes to watch for
-
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| Way more SLs than expected | Wider spread than backtest assumed | Subtract spread from trail buffer in live |
-| Trail not moving | `min_step` too high for current volatility | Lower `min_step` to $0.05 |
-| Missed anchor | Broker server time != UTC+3 (DST issue) | Verify in MT5: Tools → Options → Server tab |
-| Both legs filling within 1 minute | Single M1 bar wider than $10 (news spike) | Add news blackout |
-| Account drawdown > 5% | Multiple correlated kill-switch days | Reduce lot size 50% and review last 2 weeks |
+---
 
 ## License
 
-This is YOUR strategy and YOUR risk. The code is provided as-is for educational and backtesting purposes. Past performance does not guarantee future results. **Live performance will be 10-20% below backtest due to spread, slippage, and execution friction.**
+This is YOUR strategy and YOUR risk. Provided as-is for educational and
+backtesting purposes. Past performance does not guarantee future results. **Live
+performance will be below backtest due to spread, slippage, and execution
+friction.**
