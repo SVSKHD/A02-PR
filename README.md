@@ -92,6 +92,7 @@ Refactored from two oversized files (`live_trader.py` ~2,374 lines, `bot.py`
 | `selftest.py` | On-demand placement + rescue/boost self-test harness (`python bot.py selftest`). Vol_min throwaway orders, PASS/FAIL per step, refuses unless flat. |
 | `verify_firebase.py` | Firebase backfill verifier (`python bot.py verifyfb`). Read-only by default; cross-checks journal CSVs vs Firestore, names MISSING days, `--backfill <date>` re-writes one day idempotently. Fail-safe. |
 | `rescue_log.py` | Rescue FLEET-EVENT logger (observer only). Records each $10 fleet trigger (trigger/rescue/2 boosts) → `rescue_events.csv` + Firestore sub-collection; branch label CRASH_WIN / WHIPSAW_LOSS / SCRATCH. `python bot.py rescuestats` prints the tally. |
+| `bescratch.py` | READ-ONLY BE-scratch "left on table" analyzer (`python bot.py bescratchscan`). Measures how often the +$2.5→BE rung scratches a trend and what it costs; replays looser rungs over recorded trades. No engine change. |
 | `firebase_journal.py` | Firestore client + record builders + idempotent daily/weekly writes (fail-safe). |
 | `telemetry.py` | Thread-safe Telegram + console + file engine, severity levels, Markdown-escape + plain-text failover. |
 | `watchdog.py` | Parent supervisor: spawn/restart, heartbeat, Telegram command loop, **auto-deploy**. |
@@ -213,6 +214,22 @@ Cross-checks every trading day in `run/journal/trades_*.csv` against the
 (e.g. confirming a Monday EOD write actually landed). Read-only by default — it
 **never auto-writes**; a single day is re-written only with `--backfill`. If
 Firestore is unreachable it warns and exits 0, so it can never touch trading.
+
+### BE-scratch "left on table" analyzer (v3.0.7, read-only)
+Measures whether the +$2.5→breakeven ladder rung is costing profit by scratching
+trends flat — **before** anyone loosens it.
+```bash
+python bot.py bescratchscan                 # uses run/journal + run/price_log
+python bot.py bescratchscan --m1csv bars.csv --horizon 30
+```
+Classifies each trade as a BE-scratch (BE/near-BE exit with the +$2.5 rung armed),
+computes **left on table** over a stated lookforward (entry + 45m hold + 30m), splits
+**continued-in-favor vs reversed (BE correctly saved us)**, breaks down per anchor
+(A1–A4), and replays a **counterfactual rung grid** `[+2.5/+3.5/+4/+5]` through a
+parity-tested mirror of the strategy engine — reporting net P&L, scratches avoided,
+extra SL hits, and runners saved, then a data-driven verdict. **Read-only**: no
+Firestore writes, no config change, no orders; missing price history is marked
+`insufficient_data`, never guessed.
 
 ### Rescue fleet-event dataset (v3.0.6)
 Every $10 fleet trigger (a leg hits −$10 with its twin open → RESCUE + 2 BOOSTS)

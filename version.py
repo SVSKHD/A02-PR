@@ -183,9 +183,24 @@ History (one line per behavioral change):
          backfilled) so verifyfb shows real balance instead of `bal n/a`. (3)
          requirements firmed: firebase-admin + python-dotenv required so a clean VPS
          rebuild can't silently lose journaling. selftest gains a 12th check.
+  3.0.7  READ-ONLY measurement tool, ZERO engine change (no live trading / ladder /
+         exit behavior touched; diff is bescratch.py + bot.py subcommand only).
+         `python bot.py bescratchscan` quantifies how often the +$2.5->breakeven
+         ladder rung scratches a trade flat then the trend continues, and how much
+         that costs, BEFORE deciding to loosen it. Reads the live journal
+         (trades_*.csv -> Firestore fallback) + the bot's own per-second price_log
+         (-> M1 bars; --m1csv fallback); per trade classifies BE-scratch (BE/near-BE
+         exit with the +$2.5 rung armed), computes "left on table" over a stated
+         lookforward (entry+45m hold +30m), splits continued-in-favor vs reversed
+         (BE-saved), per-anchor A1-A4 breakdown, and a counterfactual rung grid
+         [+2.5/+3.5/+4/+5] replayed through a faithful mirror of
+         strategy.update_position_on_bar (parity-tested at +2.5) reporting net P&L /
+         scratches avoided / extra SL hits / runners saved, ending in a data-driven
+         verdict. Insufficient price history is marked insufficient_data, never
+         guessed. No Firestore writes, no config change, no order placement.
 """
 
-__version__ = "3.0.6"
+__version__ = "3.0.7"
 CODENAME = "Astra Hawk"
 
 

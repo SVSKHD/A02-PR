@@ -45,7 +45,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
-                                         'verifyfb', 'rescuestats'])
+                                         'verifyfb', 'rescuestats', 'bescratchscan'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -60,6 +60,12 @@ def main():
                         help="selftest: allow market-order steps on a non-demo account")
     parser.add_argument('--backfill', metavar='YYYY-MM-DD', default=None,
                         help="verifyfb: re-write ONE day's Firestore doc from the journal CSV")
+    parser.add_argument('--m1csv', default=None,
+                        help="bescratchscan: M1 price CSV to replay from (else uses run/price_log)")
+    parser.add_argument('--horizon', type=int, default=30,
+                        help="bescratchscan: post-exit lookforward minutes (default 30)")
+    parser.add_argument('--run-dir', default=None,
+                        help="bescratchscan: run dir holding journal/ + price_log/ (default $AUREON_RUN_DIR or ./run)")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
 
@@ -130,6 +136,14 @@ def main():
         # from rescue_events.csv. Never touches the broker or trading.
         from rescue_log import run_rescuestats
         sys.exit(run_rescuestats())
+
+    elif args.mode == 'bescratchscan':
+        # READ-ONLY measurement: quantify the +$2.5->BE rung's "left on table"
+        # cost and replay looser rungs over recorded trades. No live change.
+        from bescratch import run_bescratchscan
+        sys.exit(run_bescratchscan(
+            start=args.start, end=args.end, run_dir=args.run_dir,
+            m1csv=args.m1csv, horizon_min=args.horizon))
 
 
 if __name__ == '__main__':

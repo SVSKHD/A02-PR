@@ -646,3 +646,45 @@ REQUIRED so a clean VPS rebuild can't silently lose journaling.
   correct comments/rc — reconcile completes with no error. EOD balance round-trip
   verified (doc stores close_balance/equity; verifyfb reads it).
 - CRLF preserved (telemetry.py / rescue_log.py conventions handled).
+
+## 2026-06-16 — v3.0.7: BE-scratch "left on table" analyzer (READ-ONLY)
+
+Measurement task. ZERO engine change — diff is `bescratch.py` (new) + `bot.py`
+(subcommand wiring) only. No strategy / anchors / trails / fills / risk / config /
+state file touched. No Firestore writes, no live config change, no order placement.
+
+### `python bot.py bescratchscan`
+Quantifies how often the +$2.5 -> breakeven ladder rung (strategy.py: `fav >= 2.50
+-> lock entry`) scratches a trade flat on a pullback that then keeps trending, and
+how much that costs — so the decision to loosen it is data-driven, not one
+screenshot.
+
+Data sources (stated in the output header):
+- trades: run/journal/trades_*.csv (live record; has `max_favorable` $-excursion +
+  `exit_reason`) -> Firestore aureon_forex fallback (read-only stream).
+- prices: the bot's own run/price_log/price_*.csv (per-second mid, written live)
+  resampled to M1 OHLC -> `--m1csv` fallback. No price coverage => the trade is
+  marked `insufficient_data` and excluded from the replay (never guessed).
+
+Per BE-scratch (exit_reason in BE/SL_be AND max_favorable >= 2.5):
+- "left on table" = max favorable excursion over [exit, entry+45m hold +30m] × lot ×
+  100; split continued-in-favor vs reversed (BE correctly saved a loss); per-anchor
+  A1-A4 breakdown (is it concentrated in the A2/A4 trend anchors?).
+- Counterfactual rung grid [+2.5/+3.5/+4/+5]: each trade with price coverage is
+  replayed by `_replay_one` — a FAITHFUL MIRROR of strategy.update_position_on_bar
+  with only the BE-lock rung threshold parametrized (the trail arm = same threshold;
+  everything else identical). The mirror is PARITY-TESTED against the real engine at
+  +2.5 (50/50 random paths match exactly). Reports net P&L, scratches avoided, extra
+  full-SL hits, runners saved, vs the +2.5 baseline replay; a "replay fidelity" line
+  prints the +2.5 replayed net for sanity vs the journal.
+
+Assumptions stated in the header: lookforward = entry + 45m hold + 30m post-exit;
+replay bars are MID-based (the live engine triggers on bid/ask, so SL/TP can
+under-trigger ~half a spread) — surfaced, not hidden. The verdict line names the
+best looser rung's net delta and whether loosening is supported by the data, e.g.
+"loosening to +4->BE would net $+X (Y scratches avoided, Z extra SL hits) -> WORTH
+IT / NOT supported."
+
+Why a mirror instead of reusing the engine: the +2.5 BE-lock rung is hardcoded in
+strategy.py (not a config knob), so varying it requires a parametrized copy. The
+copy is analysis-only, kept in lock-step with strategy.py, and parity-tested.
