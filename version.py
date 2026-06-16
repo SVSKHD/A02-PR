@@ -168,9 +168,24 @@ History (one line per behavioral change):
          formatting); on-time anchors show matching times and no LATE tag. selftest
          gains an 11th check (mocked clock: late placement fires within the window
          with a re-captured price; clean give-up after the window).
+  3.0.6  RESCUE FLEET-EVENT LOGGER (observer only; rescue/boost mechanics, sizing,
+         geometry all FROZEN) + EOD balance fix + requirements. (1) Every $10 fleet
+         trigger (leg -$10 + twin open -> RESCUE + 2 BOOSTS) is recorded as one
+         event: trigger/rescue legs, both boosts (ticket/fill/rc/≤31-char comment,
+         boosts_placed_ok), and on close the fleet net $ + branch CRASH_WIN /
+         WHIPSAW_LOSS / SCRATCH (|net|<$50). Rows append to run/rescue_events.csv
+         and mirror to Firestore aureon_forex/{date}/rescue_events/{event_id}; a
+         📊 FLEET EVENT telegram posts on close with the running crash/whipsaw/
+         scratch tally. New `python bot.py rescuestats` prints the tally + per-event
+         table (read-only). All hooks in fills.py are pure observation wrapped so a
+         logging error can never reach the engine. (2) EOD Firebase docs now store
+         close_balance + equity from MT5 account_info (fix-forward; old docs not
+         backfilled) so verifyfb shows real balance instead of `bal n/a`. (3)
+         requirements firmed: firebase-admin + python-dotenv required so a clean VPS
+         rebuild can't silently lose journaling. selftest gains a 12th check.
 """
 
-__version__ = "3.0.5"
+__version__ = "3.0.6"
 CODENAME = "Astra Hawk"
 
 

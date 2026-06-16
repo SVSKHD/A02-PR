@@ -202,6 +202,26 @@ def _reconcile_with_broker(self):
             if is_rescue:
                 self.tele.info(f"\U0001F691 RESCUE leg active (ticket {ticket}): no early locks, "
                                f"free to run until +$10 covers the twin's loss.")
+                # v3.0.6 OBSERVER (zero engine effect): identify the trigger (twin)
+                # leg and prepare to collect boost records so the whole fleet event
+                # can be logged on close. Pure reads; never alters rescue/boost.
+                _fleet_boosts = []
+                _trig_tk = info.get('sibling_ticket')
+                if not (_trig_tk in self.shadow_positions and _trig_tk in broker_pos_tickets):
+                    _trig_tk = next((tk for tk, sp in self.shadow_positions.items()
+                                     if tk in broker_pos_tickets
+                                     and sp.get('anchor_label') == info['anchor_label']
+                                     and not sp.get('boost') and tk != ticket), None)
+                _trig_sp = self.shadow_positions.get(_trig_tk, {})
+                _trig_pnl = None
+                try:
+                    if _trig_sp.get('entry_price') and _trig_sp.get('side'):
+                        _s = 1.0 if _trig_sp['side'] == 'BUY' else -1.0
+                        _trig_pnl = round(
+                            _s * (float(info['entry_price']) - float(_trig_sp['entry_price']))
+                            * self.cfg.lot_size * 100, 2)
+                except Exception:
+                    _trig_pnl = None
                 # v2.9.5 SL-RESCUE BOOST (Hithesh): at this exact moment the
                 # first leg is -$10; open extra trades in the rescue
                 # direction with a tight $6 SL each, so the remaining $8 to
@@ -231,11 +251,12 @@ def _reconcile_with_broker(self):
                         self.tele.info(
                             f"… attempting BOOST{bi+1} {b_side} {self.cfg.lot_size} "
                             f"@ market | SL ${b_sl} TP ${b_tp}")
+                        b_cmt_used = f"AUR_{info['anchor_label'][:2]}_{b_side[0]}_B{bi+1}"
                         try:
                             b_res = self.adapter.place_market_order(
                                 self.cfg.symbol, b_side, self.cfg.lot_size,
                                 sl=b_sl, tp=b_tp,
-                                comment=f"AUR_{info['anchor_label'][:2]}_{b_side[0]}_B{bi+1}",
+                                comment=b_cmt_used,
                                 dry_run=self.paper)
                         except Exception as e:
                             log.warning(f"BOOST{bi+1} order error: {e!r}")
@@ -243,6 +264,8 @@ def _reconcile_with_broker(self):
                             # log-only, so Telegram showed the announce and then
                             # NOTHING. Every boost now reports fate to Telegram.
                             self.tele.error(f"❌ BOOST{bi+1} EXCEPTION: {md_escape(repr(e))} -- order NOT placed")
+                            _fleet_boosts.append({'ticket': None, 'fill': None,
+                                                  'rc': None, 'comment': b_cmt_used})
                             continue
                         if b_res is None:
                             # v3.0.0: broker returned no result object at all --
@@ -254,6 +277,8 @@ def _reconcile_with_broker(self):
                                 pass
                             self.tele.error(
                                 f"❌ BOOST{bi+1} result=None -- order NOT placed{_le}")
+                            _fleet_boosts.append({'ticket': None, 'fill': None,
+                                                  'rc': None, 'comment': b_cmt_used})
                             continue
                         b_rc = getattr(b_res, 'retcode', None)
                         b_rc_name = _MT5_RETCODE_MAP.get(b_rc, f"UNKNOWN_{b_rc}")
@@ -276,11 +301,48 @@ def _reconcile_with_broker(self):
                             self.tele.success(
                                 f"\u2705\u26A1 BOOST{bi+1} {b_side} FILLED @ ${b_fp} "
                                 f"(ticket {b_tk}) rc={b_rc} ({b_rc_name})")
+                            _fleet_boosts.append({'ticket': int(b_tk) if b_tk else None,
+                                                  'fill': b_fp, 'rc': b_rc,
+                                                  'comment': b_cmt_used})
                         else:
                             # v3.0.0: non-success retcode -- name it + show comment
                             self.tele.error(
                                 f"\u274C BOOST{bi+1} rejected rc={b_rc} ({md_escape(b_rc_name)}) "
                                 f"comment={md_escape(repr(b_cmt))}")
+                            _fleet_boosts.append({'ticket': None, 'fill': None,
+                                                  'rc': b_rc, 'comment': b_cmt_used})
+
+                # v3.0.6 OBSERVER: register the complete fleet event so it can be
+                # finalized on close (CSV + Firestore + tally). Wrapped so a
+                # logging error can NEVER reach the rescue/boost engine. Runs even
+                # if rescue_boost is disabled (_fleet_boosts stays []).
+                try:
+                    _members = set()
+                    if _trig_tk is not None:
+                        _members.add(int(_trig_tk))
+                    _members.add(int(ticket))
+                    for _b in _fleet_boosts:
+                        if _b.get('ticket'):
+                            _members.add(int(_b['ticket']))
+                    _bn = len(_fleet_boosts)
+                    _boosts_ok = (_bn > 0 and all(b.get('rc') == 10009 for b in _fleet_boosts))
+                    self._rescue_event_open({
+                        'event_id': f"{self.state.get('last_broker_date','?')}_"
+                                    f"{info['anchor_label'][:2]}_{ticket}",
+                        'date_ist': self.state.get('last_broker_date'),
+                        'anchor': info['anchor_label'],
+                        'sched_iso': info.get('sched_utc'),
+                        'open_iso': pd.Timestamp.now(tz='UTC').isoformat(),
+                        'trigger': {'ticket': int(_trig_tk) if _trig_tk is not None else None,
+                                    'side': _trig_sp.get('side'), 'trigger_pnl': _trig_pnl},
+                        'rescue': {'ticket': int(ticket), 'side': info['side'],
+                                   'fill': float(info['entry_price'])},
+                        'boosts': _fleet_boosts,
+                        'boosts_placed_ok': _boosts_ok,
+                        'members': _members,
+                    })
+                except Exception as _e:
+                    log.warning(f"rescue_event_open failed (non-fatal): {_e!r}")
 
     # Detect closures
     for ticket in list(self.shadow_positions):
@@ -294,6 +356,13 @@ def _reconcile_with_broker(self):
                 pnl_usd = float(close_deal.profit) + float(close_deal.swap) + float(close_deal.commission)
                 self.state['daily_pnl'] += pnl_usd
                 close_price = float(close_deal.price)
+                # v3.0.6 OBSERVER: attribute this close to its fleet event (if any)
+                # and finalize the event once all members have closed. Wrapped so a
+                # logging error can never affect the close path.
+                try:
+                    self._rescue_event_on_close(ticket, pnl_usd)
+                except Exception as _e:
+                    log.warning(f"rescue_event_on_close({ticket}) failed (non-fatal): {_e!r}")
                 # v2.9.8 EXIT CLASSIFIER: name the RULE that fired by comparing
                 # the close to the bot's own intended stop (current_sl), instead
                 # of guessing from distance-to-entry. Jun-12 A1 lesson: a +$10

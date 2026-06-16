@@ -116,10 +116,13 @@ def build_anchor(label, anchor_price=None, trades=None):
     }
 
 
-def save_daily_journal(day, anchors=None, trades=None, total_pnl=None, meta=None):
+def save_daily_journal(day, anchors=None, trades=None, total_pnl=None, meta=None,
+                       close_balance=None, equity=None):
     """Write ONE document aureon_forex/{day}. `anchors` is a list of build_anchor
-    dicts; `trades` is an optional flat fallback list. Returns True on write,
-    False otherwise. Fail-safe: swallows every error."""
+    dicts; `trades` is an optional flat fallback list. v3.0.6: close_balance /
+    equity (from MT5 account_info at EOD) are stored when provided so the day doc
+    no longer reads `bal n/a`. Returns True on write, False otherwise. Fail-safe:
+    swallows every error."""
     try:
         day_str = str(day)
         anchors = anchors or []
@@ -134,6 +137,10 @@ def save_daily_journal(day, anchors=None, trades=None, total_pnl=None, meta=None
             "total_pnl": round(float(total_pnl), 2),
             "written_at": datetime.now(timezone.utc).isoformat(),
         }
+        if close_balance is not None:
+            doc["close_balance"] = _f(close_balance)
+        if equity is not None:
+            doc["equity"] = _f(equity)
         if meta:
             doc["meta"] = meta
         db = _client()
@@ -147,6 +154,26 @@ def save_daily_journal(day, anchors=None, trades=None, total_pnl=None, meta=None
         return True
     except Exception as e:
         log.warning(f"firebase_journal.save_daily_journal failed: {e!r}")
+        return False
+
+
+def save_rescue_event(day, event_id, doc):
+    """v3.0.6: write ONE fleet-event doc to the sub-collection
+    aureon_forex/{day}/rescue_events/{event_id}, so the crash-vs-whipsaw dataset
+    survives a VPS rebuild. OBSERVER ONLY -- fail-safe, never raises."""
+    try:
+        db = _client()
+        if db is None:
+            log.info(f"firebase_journal: would save rescue_event {day}/{event_id} "
+                     f"-- client unavailable")
+            return False
+        (db.collection(COLLECTION).document(str(day))
+           .collection("rescue_events").document(str(event_id)).set(doc))
+        log.info(f"firebase_journal: saved rescue_event {day}/{event_id} "
+                 f"-> {COLLECTION}/{day}/rescue_events")
+        return True
+    except Exception as e:
+        log.warning(f"firebase_journal.save_rescue_event failed: {e!r}")
         return False
 
 

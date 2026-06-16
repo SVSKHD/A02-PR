@@ -91,6 +91,7 @@ Refactored from two oversized files (`live_trader.py` ~2,374 lines, `bot.py`
 | `bot.py` | CLI entry — `backtest` / `paper` / `live` / `selftest`; re-exports the old public surface. |
 | `selftest.py` | On-demand placement + rescue/boost self-test harness (`python bot.py selftest`). Vol_min throwaway orders, PASS/FAIL per step, refuses unless flat. |
 | `verify_firebase.py` | Firebase backfill verifier (`python bot.py verifyfb`). Read-only by default; cross-checks journal CSVs vs Firestore, names MISSING days, `--backfill <date>` re-writes one day idempotently. Fail-safe. |
+| `rescue_log.py` | Rescue FLEET-EVENT logger (observer only). Records each $10 fleet trigger (trigger/rescue/2 boosts) → `rescue_events.csv` + Firestore sub-collection; branch label CRASH_WIN / WHIPSAW_LOSS / SCRATCH. `python bot.py rescuestats` prints the tally. |
 | `firebase_journal.py` | Firestore client + record builders + idempotent daily/weekly writes (fail-safe). |
 | `telemetry.py` | Thread-safe Telegram + console + file engine, severity levels, Markdown-escape + plain-text failover. |
 | `watchdog.py` | Parent supervisor: spawn/restart, heartbeat, Telegram command loop, **auto-deploy**. |
@@ -212,6 +213,20 @@ Cross-checks every trading day in `run/journal/trades_*.csv` against the
 (e.g. confirming a Monday EOD write actually landed). Read-only by default — it
 **never auto-writes**; a single day is re-written only with `--backfill`. If
 Firestore is unreachable it warns and exits 0, so it can never touch trading.
+
+### Rescue fleet-event dataset (v3.0.6)
+Every $10 fleet trigger (a leg hits −$10 with its twin open → RESCUE + 2 BOOSTS)
+is logged as one event — trigger/rescue legs, both boosts (ticket / fill / rc /
+≤31-char comment), and on close the fleet **net** + a branch: `CRASH_WIN`
+(directional, net +), `WHIPSAW_LOSS` (mean-revert, net −), or `SCRATCH` (|net| <
+$50). Rows append to `run/rescue_events.csv` and mirror to Firestore
+`aureon_forex/{date}/rescue_events/{event_id}`; a `📊 FLEET EVENT` Telegram posts
+on close with the running crash/whipsaw/scratch tally. Read the dataset with:
+```bash
+python bot.py rescuestats     # running tally + per-event table (read-only)
+```
+**Observer only** — this never alters rescue/boost trigger logic, sizing, or
+geometry; all hooks are wrapped so a logging error can't reach the engine.
 
 ### Anchor late-retry (v3.0.5)
 If an anchor doesn't **place** by its scheduled time — for any reason (quiet feed,

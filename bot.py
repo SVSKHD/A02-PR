@@ -44,7 +44,8 @@ def main():
     # import cycle (live_trader imports the split modules, not bot)
 
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
-    parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest', 'verifyfb'])
+    parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
+                                         'verifyfb', 'rescuestats'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -123,6 +124,12 @@ def main():
         # 0, never touches trading. Safe to run live while flat (read-only path).
         from verify_firebase import run_verifyfb
         sys.exit(run_verifyfb(backfill=args.backfill))
+
+    elif args.mode == 'rescuestats':
+        # Read-only: print the running crash-vs-whipsaw tally + per-event table
+        # from rescue_events.csv. Never touches the broker or trading.
+        from rescue_log import run_rescuestats
+        sys.exit(run_rescuestats())
 
 
 if __name__ == '__main__':

@@ -595,3 +595,54 @@ the shadow pendings -> shadow positions so fill/close print accurate times;
   re-captured price, (B) a clean single `❌ ANCHOR MISSED` after the window. Mock
   run: **11/11 PASS**. On-time path verified unchanged (places once, no LATE tag).
 - CRLF preserved (telemetry.py stays LF per its committed convention).
+
+## 2026-06-16 — v3.0.6: rescue fleet-event logger + EOD balance fix + requirements
+
+Journal/observer layer only. Rescue/boost trigger logic, sizing, geometry, ladder,
+hold, kill switch — all FROZEN. No frozen-engine file changed (anchors / trails /
+strategy / risk / mt5_adapter / state untouched).
+
+### Task 1 — rescue fleet-event logger (the crash-vs-whipsaw dataset)
+New `rescue_log.py` records every $10 fleet trigger (a leg hits -$10 with its twin
+open -> RESCUE + 2 BOOSTS) as one event and finalizes it once all members close:
+net $ across trigger+rescue+boosts and a branch (CRASH_WIN / WHIPSAW_LOSS / SCRATCH
+at |net| < $50). Rows append to run/rescue_events.csv and mirror to Firestore
+aureon_forex/{date}/rescue_events/{event_id} (new firebase_journal.save_rescue_event,
+fail-safe). A 📊 FLEET EVENT telegram posts on close with the running tally;
+`python bot.py rescuestats` prints the tally + per-event table.
+
+Observer integration in fills.py (`_reconcile_with_broker`) is intentionally
+minimal and ZERO-engine-risk: (a) a `_fleet_boosts` list collects each boost's
+ticket/fill/rc/comment as the EXISTING boost loop runs (the placement call is
+byte-equivalent — the inline comment string was lifted to `b_cmt_used` and reused);
+(b) after the boost block, `_rescue_event_open(...)` registers the event; (c) in the
+close loop, `_rescue_event_on_close(ticket, pnl)` attributes each close. (a)/(b)/(c)
+are all wrapped so a logging error can never reach rescue/boost. The trigger (twin)
+leg is identified by pure reads of shadow_positions + broker_pos_tickets.
+In-flight events live in memory (`self._rescue_events` / `_rescue_event_by_ticket`)
+and are lost on a mid-event restart -- acceptable for an observer; the CSV/Firestore
+row is written at finalize.
+
+Branch rule: |net| < $50 -> SCRATCH; else net > 0 -> CRASH_WIN; else WHIPSAW_LOSS.
+The running tally is recomputed from the CSV each finalize (survives restart).
+
+### Task 2 — EOD `bal n/a` fix (fix-forward)
+journal._firebase_save_daily now reads MT5 account_info at EOD and passes
+close_balance + equity to save_daily_journal, which stores them top-level on the
+day doc. verifyfb's summary already reads doc-level `close_balance`, so it now shows
+the real balance. Old docs are NOT backfilled (per task).
+
+### Task 3 — requirements.txt
+firebase-admin and python-dotenv were already pinned; comments firmed to mark them
+REQUIRED so a clean VPS rebuild can't silently lose journaling.
+
+### Acceptance
+- version -> 3.0.6 + startup receipt; `python bot.py rescuestats` runs (empty tally OK).
+- selftest gains a 12th check (`fleet logger`): synthesizes three fleet events and
+  asserts a rescue_events.csv row + Firebase write + correct branch label
+  (CRASH_WIN / WHIPSAW_LOSS / SCRATCH) + running tally. Mock run: **12/12 PASS**.
+- Integration-tested the REAL `_reconcile_with_broker` rescue-fill path: event
+  registered with members [trigger, rescue, boost1, boost2], boosts_placed_ok,
+  correct comments/rc — reconcile completes with no error. EOD balance round-trip
+  verified (doc stores close_balance/equity; verifyfb reads it).
+- CRLF preserved (telemetry.py / rescue_log.py conventions handled).

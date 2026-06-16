@@ -268,9 +268,20 @@ def _firebase_save_daily(self, broker_date):
             grouped[label]['trades'].append(rec)
         anchors = [firebase_journal.build_anchor(label, g['price'], g['trades'])
                    for label, g in grouped.items()]
+        # v3.0.6: capture the day's CLOSE balance + equity from MT5 so the doc no
+        # longer reads `bal n/a` (fix-forward; old docs are not backfilled).
+        close_balance = equity = None
+        try:
+            ainfo = self.adapter.get_account_info() if self.adapter else {}
+            if ainfo:
+                close_balance = ainfo.get('balance')
+                equity = ainfo.get('equity')
+        except Exception as be:
+            log.warning(f"firebase EOD: could not read account balance: {be!r}")
         firebase_journal.save_daily_journal(
             day_str, anchors=anchors, total_pnl=round(total, 2),
-            meta={'source': 'eod', 'broker_date': str(broker_date)})
+            meta={'source': 'eod', 'broker_date': str(broker_date)},
+            close_balance=close_balance, equity=equity)
     except Exception as e:
         log.warning(f"firebase EOD journal skipped (non-fatal): {e!r}")
 
