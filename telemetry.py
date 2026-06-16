@@ -42,7 +42,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import IntEnum
 from typing import Dict, Optional
 
@@ -89,6 +89,43 @@ class TelegramConfig:
     bot_token: str
     chat_id: str
     min_severity: Severity = Severity.INFO
+
+
+# ============================================================================
+# Timestamp header (v3.0.4) — the SINGLE source for every Telegram timestamp
+# ============================================================================
+# Server/broker clock is UTC+3; IST is broker+2:30 (= UTC+5:30). Both are derived
+# from ONE captured instant in _ts_components() so server and IST can never drift
+# apart. Do NOT hand-format timestamps anywhere else — call ts_header().
+BROKER_UTC_OFFSET = timedelta(hours=3)
+IST_FROM_BROKER = timedelta(hours=2, minutes=30)
+
+
+def _ts_components(now_utc=None):
+    """Return (server_dt, ist_dt) for one captured instant. server is UTC+3,
+    ist is server+2:30; by construction ist - server == 2:30 exactly. `now_utc`
+    is for testing (naive treated as UTC); defaults to datetime.now(UTC)."""
+    base = now_utc or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    base = base.astimezone(timezone.utc)
+    server = base + BROKER_UTC_OFFSET
+    ist = server + IST_FROM_BROKER
+    return server, ist
+
+
+def ts_header(now_utc=None):
+    """The timestamp line prepended to EVERY outbound Telegram message:
+        🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16
+    12-hour human IST first, then `server HH:MM · IST HH:MM` (24h), then the IST
+    weekday + date. Derived from a single instant (see _ts_components)."""
+    server, ist = _ts_components(now_utc)
+    h12 = ist.hour % 12 or 12
+    ampm = "AM" if ist.hour < 12 else "PM"
+    return (f"🕐 {h12}:{ist.minute:02d} {ampm} IST "
+            f"(server {server.hour:02d}:{server.minute:02d} · "
+            f"IST {ist.hour:02d}:{ist.minute:02d}) — "
+            f"{ist.strftime('%a')} {ist.strftime('%b')} {ist.day}")
 
 
 # ============================================================================
@@ -248,8 +285,12 @@ class Telemetry:
     def _send_telegram(self, sev: Severity, msg: str, tags: dict):
         emoji = SEVERITY_EMOJI.get(sev, "")
         component = self.component
+        # v3.0.4: prepend the timestamp header to EVERY outbound message from the
+        # SINGLE source (ts_header), captured at send time so server/IST cannot
+        # drift. Every alert type (anchor/fill/close/rescue/boost/TSTOP/EOD/
+        # verifyfb) inherits it here — no call site hand-formats a timestamp.
         # Markdown-safe: escape underscores in tag values
-        body = f"{emoji} *{component}*\n{msg}"
+        body = f"{ts_header()}\n{emoji} *{component}*\n{msg}"
         if tags:
             tag_lines = "\n".join(f"• `{k}`: {v}" for k, v in tags.items())
             body += f"\n{tag_lines}"

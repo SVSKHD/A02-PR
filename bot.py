@@ -44,7 +44,7 @@ def main():
     # import cycle (live_trader imports the split modules, not bot)
 
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
-    parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest'])
+    parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest', 'verifyfb'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -57,6 +57,8 @@ def main():
                         help="Required for live mode")
     parser.add_argument('--force', action='store_true',
                         help="selftest: allow market-order steps on a non-demo account")
+    parser.add_argument('--backfill', metavar='YYYY-MM-DD', default=None,
+                        help="verifyfb: re-write ONE day's Firestore doc from the journal CSV")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
 
@@ -113,6 +115,14 @@ def main():
         from selftest import run_selftest
         ok = run_selftest(cfg, force=args.force)
         sys.exit(0 if ok else 1)
+
+    elif args.mode == 'verifyfb':
+        # Firebase backfill verifier. Read-only by default (lists docs, names
+        # MISSING trading days vs the local journal CSVs); --backfill <date>
+        # re-writes ONE day idempotently. Fail-safe: unreachable Firestore -> exit
+        # 0, never touches trading. Safe to run live while flat (read-only path).
+        from verify_firebase import run_verifyfb
+        sys.exit(run_verifyfb(backfill=args.backfill))
 
 
 if __name__ == '__main__':

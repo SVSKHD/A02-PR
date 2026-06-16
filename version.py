@@ -134,9 +134,24 @@ History (one line per behavioral change):
          "A1_02h_Asia" stable; weekday tested in BROKER-date terms. Test hook
          AUREON_TEST_FORCE_MONDAY_A1=1 forces the override on any weekday (TEST
          ONLY, default OFF, shown in a 'TEST MODE ACTIVE' banner line).
+  3.0.4  Two independent, no-strategy-change features.
+         (1) Firebase backfill VERIFIER (verify_firebase.py + `python bot.py
+         verifyfb`): read-only by default -- lists every aureon_forex doc with a
+         one-line summary (net / trade count / balance), cross-checks the local
+         journal CSVs and names MISSING trading days, and suggests the backfill
+         command. `--backfill <YYYY-MM-DD>` re-writes ONE day idempotently (clean
+         .set() overwrite from the CSV); it NEVER auto-writes. Fail-safe: an
+         unreachable Firestore warns and exits 0, so it can never touch trading.
+         A 10th selftest check covers ts_header. (2) TIMESTAMPED Telegram: one
+         helper ts_header() in telemetry is the SINGLE source for every outbound
+         message's timestamp, prepended in _send_telegram so ALL alert types
+         (anchor/fill/close/rescue/boost/TSTOP/EOD/verifyfb) inherit it; format
+         '🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16', server (UTC+3)
+         and IST (broker+2:30) derived from ONE captured instant so they can't
+         drift. No trading/spec behavior changed.
 """
 
-__version__ = "3.0.3"
+__version__ = "3.0.4"
 CODENAME = "Astra Hawk"
 
 

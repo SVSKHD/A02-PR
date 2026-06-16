@@ -90,6 +90,7 @@ Refactored from two oversized files (`live_trader.py` ~2,374 lines, `bot.py`
 | `live_trader.py` | **Slim orchestrator:** `LiveTrader` class shell + event loop + `run_live`; binds the method modules above. |
 | `bot.py` | CLI entry — `backtest` / `paper` / `live` / `selftest`; re-exports the old public surface. |
 | `selftest.py` | On-demand placement + rescue/boost self-test harness (`python bot.py selftest`). Vol_min throwaway orders, PASS/FAIL per step, refuses unless flat. |
+| `verify_firebase.py` | Firebase backfill verifier (`python bot.py verifyfb`). Read-only by default; cross-checks journal CSVs vs Firestore, names MISSING days, `--backfill <date>` re-writes one day idempotently. Fail-safe. |
 | `firebase_journal.py` | Firestore client + record builders + idempotent daily/weekly writes (fail-safe). |
 | `telemetry.py` | Thread-safe Telegram + console + file engine, severity levels, Markdown-escape + plain-text failover. |
 | `watchdog.py` | Parent supervisor: spawn/restart, heartbeat, Telegram command loop, **auto-deploy**. |
@@ -200,6 +201,24 @@ MARKET path places at `rc=10009` (the historical 0-for-7 failure) in ~2 minutes
 instead of waiting for a real live rescue. Refuses to run unless the book is flat;
 runs only via this command (never the live loop). Run it before relying on the
 fleet — see `MERGE_GATE.md`.
+
+### 4c. Verify the Firebase journal (read-only; safe while flat)
+```bash
+python bot.py verifyfb                       # report-only: lists docs, names MISSING days
+python bot.py verifyfb --backfill 2026-06-15 # re-write ONE day from the journal CSV (idempotent)
+```
+Cross-checks every trading day in `run/journal/trades_*.csv` against the
+`aureon_forex` Firestore collection and reports which days are present vs MISSING
+(e.g. confirming a Monday EOD write actually landed). Read-only by default — it
+**never auto-writes**; a single day is re-written only with `--backfill`. If
+Firestore is unreachable it warns and exits 0, so it can never touch trading.
+
+### Timestamped alerts (v3.0.4)
+Every outbound Telegram message is prefixed with a single-source header, e.g.
+`🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16` — 12-hour IST, then the
+server (UTC+3) and IST (broker+2:30) 24-hour clocks derived from one captured
+instant, then the date. Built once in `telemetry.ts_header()` and prepended in
+`_send_telegram`; no call site hand-formats timestamps.
 Control from Telegram: `/status`, `/today`, `/pause`, `/resume`, `/flatten`,
 `/restart`, `/stop`. On a crash the watchdog auto-restarts with exponential
 backoff and notifies on Telegram. `/status` works during weekend sleep and
