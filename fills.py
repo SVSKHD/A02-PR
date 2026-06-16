@@ -22,6 +22,57 @@ from mt5_adapter import _MT5_RETCODE_MAP
 log = logging.getLogger("AUREON")
 
 
+# ============================================================================
+# Alert formatters (v3.0.7) — pure, NEVER raise
+# ============================================================================
+# The silent fill/close regression: building these message strings could throw
+# (a missing/None field) and the throw was swallowed, so the alert vanished with
+# nothing logged. These formatters NEVER raise: partial enrichment degrades the
+# line but a fill/close ALWAYS produces a non-empty message. The timestamp header
+# is still prepended centrally in Telemetry._send_telegram (single source).
+
+def format_fill_alert(info, ticket, evt_block=""):
+    """Build the FILL telegram body. Never raises. `info` is the shadow-pending
+    dict (anchor_label/side/entry_price); `evt_block` is the optional scheduled-
+    vs-actual time block (already guarded by _anchor_evt_block)."""
+    info = info or {}
+    try:
+        label = info.get('anchor_label', '?')
+        side = info.get('side', '?')
+        ep = info.get('entry_price')
+        ep_txt = f"${float(ep):.2f}" if ep is not None else "$?"
+        return (f"🎯 FILL: *{label}* {side} @ {ep_txt} (ticket {ticket})"
+                + (evt_block or ""))
+    except Exception as e:
+        log.warning(f"format_fill_alert degraded ({e!r})")
+        return f"🎯 FILL: *{info.get('anchor_label', '?')}* (ticket {ticket})"
+
+
+def format_close_alert(shadow, outcome, close_price, pnl_usd, daily_pnl,
+                       slip_txt="", hold_txt="", nh_txt="", evt_block=""):
+    """Build the CLOSE telegram body. Never raises. Enrichment fragments
+    (slip_txt / hold_txt / nh_txt / evt_block) may be None or missing -- a None
+    close_price or pnl degrades to '$?'/'n/a' but the close ALWAYS alerts."""
+    shadow = shadow or {}
+    slip_txt = slip_txt or ""
+    hold_txt = hold_txt or ""
+    nh_txt = nh_txt or ""
+    evt_block = evt_block or ""
+    try:
+        label = shadow.get('anchor_label', '?')
+        side = shadow.get('side', '?')
+        cp_txt = f"${float(close_price):.2f}" if close_price is not None else "$?"
+        pnl_txt = f"${float(pnl_usd):+.2f}" if pnl_usd is not None else "n/a"
+        daily_txt = f"${float(daily_pnl):+.2f}" if daily_pnl is not None else "n/a"
+        return (f"📤 CLOSE: *{label}* {side} `{outcome}`{slip_txt} @ {cp_txt}\n"
+                f"P&L: `{pnl_txt}`  |  Daily total: `{daily_txt}`{hold_txt}{nh_txt}"
+                + evt_block)
+    except Exception as e:
+        log.warning(f"format_close_alert degraded ({e!r})")
+        return (f"📤 CLOSE: *{shadow.get('anchor_label', '?')}* "
+                f"{shadow.get('side', '?')} `{outcome}`")
+
+
 def _anchor_evt_block(self, rec, actual_utc=None):
     """v3.0.5: scheduled-vs-actual time block for a fill/close message. `rec` is a
     shadow dict that may carry 'sched_utc' (rides along from placement); falls back
@@ -110,10 +161,12 @@ def _reconcile_with_broker(self):
         if ticket not in broker_pend_tickets and ticket in broker_pos_tickets:
             info = self.shadow_pendings.pop(ticket)
             sibling = info['sibling_ticket']
-            self.tele.info(
-                f"🎯 FILL: *{info['anchor_label']}* {info['side']} "
-                f"@ ${info['entry_price']:.2f} (ticket {ticket})"
-                + self._anchor_evt_block(info)
+            # v3.0.7: build via the never-raising formatter and send important=True
+            # so the fill alert can never be dropped by a formatter throw or by
+            # INFO rate limiting (a fill often lands seconds after placement).
+            self.tele.send(
+                format_fill_alert(info, ticket, self._anchor_evt_block(info)),
+                Severity.INFO, important=True
             )
             # Cancel sibling (OCO) — v2.3: sibling may be None if other side was skipped pre-flight
             # OCO vs No-OCO sibling handling
@@ -428,12 +481,15 @@ def _reconcile_with_broker(self):
                 if _nh is not None:
                     _nh_pnl = _sgn * (float(_nh) - _entry) * self.cfg.lot_size * 100
                     nh_txt = f"\nno-hold trail would have exited @ ${float(_nh):.2f} (`${_nh_pnl:+.2f}`)"
+                # v3.0.7: never-raising formatter + important=True so a close
+                # alert can never be lost to a formatter throw or rate limiting.
                 self.tele.send(
-                    f"📤 CLOSE: *{shadow['anchor_label']}* {shadow['side']} "
-                    f"`{outcome}`{slip_txt} @ ${close_price:.2f}\n"
-                    f"P&L: `${pnl_usd:+.2f}`  |  Daily total: `${self.state['daily_pnl']:+.2f}`{hold_txt}{nh_txt}"
-                    + self._anchor_evt_block(shadow),
-                    sev
+                    format_close_alert(
+                        shadow, outcome, close_price, pnl_usd,
+                        self.state['daily_pnl'],
+                        slip_txt=slip_txt, hold_txt=hold_txt, nh_txt=nh_txt,
+                        evt_block=self._anchor_evt_block(shadow)),
+                    sev, important=True
                 )
                 # Append to today's trade log
                 with open(self.daylog_path, "a", newline="") as f:
@@ -449,5 +505,18 @@ def _reconcile_with_broker(self):
                 except Exception as je:
                     log.warning(f"journal write failed for {ticket}: {je}")
                 self._save_state()
+            else:
+                # v3.0.7: the position is gone from the broker but its closing
+                # deal isn't in history yet (timing). Previously this branch did
+                # nothing -- the close vanished with NO alert. Always announce a
+                # detected close, even degraded, so a close is never silent.
+                self.tele.send(
+                    format_close_alert(
+                        shadow, 'CLOSED', None, None, self.state.get('daily_pnl'),
+                        evt_block=self._anchor_evt_block(shadow)),
+                    Severity.WARN, important=True
+                )
+                log.warning(f"close detected for {ticket} but no close deal in "
+                            f"history yet -- alerted degraded")
         except Exception as e:
             self.tele.warn(f"Could not fetch close deal for {ticket}: {e}")

@@ -90,7 +90,8 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     # NORMAL leg (1st fill -- job: catch the breakout, bank profits):
     #   fav >= $10  -> SL locked at peak - $2 (floor +$8)
     #   fav >= $6   -> SL locked at entry +/- $4
-    #   fav >= $2.5 -> SL locked at breakeven (v2.9.2: was $3)
+    #   fav >= $5.0 -> SL locked at breakeven (v3.0.7: was $2.5; the +$2.5 arm
+    #                  scratched trend trades to $0 on ordinary gold noise)
     # RESCUE leg (No-OCO 2nd fill -- by construction it only fills after price
     # traveled $10 against its twin; its job is to COVER the twin's loss, so it
     # must stay free to run. Early BE-locks scratch it at $0 exactly when the
@@ -114,7 +115,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     elif pos.role != 'rescue':
         if fav >= 6.00:
             _ratchet(pos.entry_price + _sgn * 4.00)
-        elif fav >= 2.50:
+        elif fav >= 5.00:   # v3.0.7: BE arm +$2.5 -> +$5.0 (stop stays at entry)
             _ratchet(pos.entry_price)
 
     if not in_freeze and fav >= cfg.be_trigger:

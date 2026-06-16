@@ -198,6 +198,26 @@ History (one line per behavioral change):
          scratches avoided / extra SL hits / runners saved, ending in a data-driven
          verdict. Insufficient price history is marked insufficient_data, never
          guessed. No Firestore writes, no config change, no order placement.
+         + FIX silent fill/close Telegram alerts (REGRESSION from the v3.0.4
+         ts_header refactor): fills/closes executed on MT5 but their alerts
+         vanished with nothing logged. (A) ts_header() now NEVER raises -- on any
+         internal error it falls back to a plain UTC stamp and continues, so a bad
+         timestamp can't block a message. (B) the telegram send wrapper logs every
+         failure at WARNING WITH the message body (no more silent drops), and a
+         rate-limit no longer throttles must-see events: fills/closes send with
+         important=True (a fill landing seconds after placement used to be dropped
+         as a duplicate INFO). (C) fill/close bodies are built by pure, never-
+         raising formatters (format_fill_alert / format_close_alert) that degrade
+         gracefully when slip/held/open_time/price/pnl are missing; a detected
+         close with no history deal yet now alerts degraded instead of vanishing.
+         selftest gains 4 checks (fill-alert, close-alert, ts fallback, BE rung).
+         + LOOSEN the NORMAL-leg BE ladder rung +$2.5 -> +$5.0 (stop stays at
+         entry). The +$2.5 arm scratched trend trades to $0 on ordinary gold noise
+         (~5 scratches in 11 days, A2/A4). Single rung change: +$6->+$4, +$10->
+         peak-$2 (floor +$8), the RESCUE +$10-only ladder, SL/TP, hold, TSTOP and
+         the trail (arm $2.50 / gap $2.00) are all UNCHANGED. Counterfactual
+         unmeasurable pre-2026-06-16; judgment-call loosening, re-evaluate vs
+         price_log in ~2 weeks. Banner ladder now reads `5>BE | 6>+4 | 10>peak-2`.
 """
 
 __version__ = "3.0.7"

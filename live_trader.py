@@ -720,7 +720,7 @@ class LiveTrader:
             f"Lot: `{self.cfg.lot_size}` ({auto_lot_label})\n"
             f"Kill switch: `-{self.cfg.daily_loss_pct*100:.1f}%`\n"
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
-            f"Ladder: `2.5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
+            f"Ladder: `5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
             f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
             f"v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`\n"
