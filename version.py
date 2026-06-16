@@ -226,9 +226,27 @@ History (one line per behavioral change):
          inside the hold. selftest gains a 17th check (in-hold +$5 stays put, +$6
          lock still fires in-hold, +$5 post-hold engages, +$7 in-hold locks +$4 but
          does NOT move to entry).
+  3.0.8  TELEGRAM REACHABILITY (alerting/infra only; NO trading/exit/ladder change).
+         The VPS ISP DNS-poisons api.telegram.org (system resolver returns a
+         sinkhole IP) so every send/poll timed out, flooded the log and stalled
+         cycles. (1) DNS-PIN (telegram_net): all Telegram HTTP (telemetry
+         sendMessage + watchdog getUpdates) now connects to a known-good IP past
+         the poisoned resolver -- Cloudflare DoH (1.1.1.1 literal) first, then a
+         configurable pinned-IP list (default 149.154.166.110), rotating on
+         failure and falling back to the system resolver so it self-heals. The
+         request URL/SNI/Host stay api.telegram.org so TLS verification is
+         UNCHANGED (never verify=False). Toggle telegram_dns_pin_enabled (default
+         ON); loud startup line `Telegram DNS-pin ON -> <ip>`. (2) BACKOFF: connect
+         timeout cut 10s/35s -> 5s; on a failure streak the poll/retry interval
+         grows 30->60->120->cap 300s and resets on first success; log flood
+         collapsed to one warning + a periodic summary (FailureStreak). Sends/polls
+         stay off the trading path (telemetry worker thread / watchdog process), so
+         an unreachable Telegram can never block a fill. selftest gains an 18th
+         check (pin resolves a Telegram-range IP; TLS verification stays ON). NOTE:
+         if alerts still fail after the pin the ISP is IP-blocking too -> VPS VPN.
 """
 
-__version__ = "3.0.7"
+__version__ = "3.0.8"
 CODENAME = "Astra Hawk"
 
 

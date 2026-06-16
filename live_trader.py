@@ -89,6 +89,7 @@ except ImportError:
     AUREON_VERSION = '2.9.2'  # fallback if version.py missing
 
 from telemetry import telemetry_from_env, Severity
+import telegram_net  # v3.0.8: DNS-pin Telegram past a poisoned ISP resolver
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
@@ -710,6 +711,11 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def run(self):
+        # v3.0.8: let the Config dataclass override the env defaults for the
+        # Telegram DNS-pin before the first banner send goes out.
+        telegram_net.configure(
+            enabled=getattr(self.cfg, 'telegram_dns_pin_enabled', True),
+            pinned_ips=getattr(self.cfg, 'telegram_pinned_ips', None))
         # v2.5.3: escape underscores so Telegram Markdown doesn't italicize
         auto_lot_label = "auto\\_lot=on" if self.cfg.auto_lot else "auto\\_lot=off"
         fp_cap_label = (f"\nFP\\_ZERO\\_MAX\\_LOT: `{self.FP_ZERO_MAX_LOT}` ⚠ CAP ACTIVE"
@@ -722,6 +728,7 @@ class LiveTrader:
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
             f"Ladder: `5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
+            f"{telegram_net.pin_status_line()}\n"
             f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
             f"v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`\n"
             f"Modules ({len(LOADED_MODULES)}): `{' '.join(LOADED_MODULES)}`"

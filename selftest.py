@@ -57,6 +57,7 @@ STEP_NAMES = {
     15: "ts fallback",
     16: "BE rung",
     17: "hold gate",
+    18: "tg dns-pin",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -721,6 +722,30 @@ class SelfTest:
             return
         self._record(17, PASS if ok else FAIL, detail)
 
+    def _step_tg_pin(self):
+        # v3.0.8: the Telegram DNS-pin must resolve api.telegram.org to a known-
+        # good IP (a DoH-resolved Telegram-range IP, or the pinned default
+        # 149.154.166.110) and TLS certificate verification MUST stay ON. No live
+        # send is required -- this checks the resolution + verification posture.
+        import telegram_net as tn
+        try:
+            tn.refresh_doh(force=True)   # best-effort; falls back to pinned if no net
+            ip = tn.first_candidate_ip()
+            in_tg_range = (ip == "149.154.166.110") or ip.startswith("149.154.")
+            verify_on = tn.TLS_VERIFY is True
+            line = tn.pin_status_line()
+            if tn.is_enabled():
+                line_ok = ("DNS-pin ON" in line) and (ip in line)
+            else:
+                line_ok = "OFF" in line
+            ok = in_tg_range and verify_on and line_ok
+            detail = (f"ip={ip} tg_range={in_tg_range} tls_verify={verify_on} "
+                      f"| '{line}'")
+        except Exception as e:
+            self._record(18, FAIL, f"raised: {e!r}")
+            return
+        self._record(18, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -779,6 +804,7 @@ class SelfTest:
             self._step_ts_fallback()
             self._step_be_rung()
             self._step_hold_gate()
+            self._step_tg_pin()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -792,7 +818,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = 0
-        for n in range(1, 18):
+        for n in range(1, 19):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -805,12 +831,12 @@ class SelfTest:
         fleet_steps = (4, 5, 6, 8)
         fleet_ready = all(self.results.get(s, ("", ""))[0] == PASS for s in fleet_steps)
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/17 PASS — fleet ready"
+            verdict = f"RESULT: {n_pass}/18 PASS — fleet ready"
         elif n_fail == 0:
             ready = "fleet ready" if fleet_ready else "fleet UNVERIFIED (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/17 PASS, {n_skip} SKIP — {ready}"
+            verdict = f"RESULT: {n_pass}/18 PASS, {n_skip} SKIP — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/17 PASS, {n_fail} FAIL — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/18 PASS, {n_fail} FAIL — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)
