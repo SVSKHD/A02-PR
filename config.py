@@ -113,3 +113,13 @@ class Config:
     # Operational
     log_level: str = "INFO"
     state_file: str = "aureon_v2_state.json"
+
+    # Telegram reachability (v3.0.8). The VPS ISP DNS-poisons api.telegram.org;
+    # pin the connect IP past the poisoned system resolver while keeping TLS/SNI
+    # verification against api.telegram.org. DoH (Cloudflare 1.1.1.1) is tried
+    # first, then this list; if all pinned IPs fail the bot falls back to the
+    # system resolver so it self-heals once the network is fixed. Env overrides:
+    # AUREON_TELEGRAM_DNS_PIN (on/off), AUREON_TELEGRAM_PINNED_IPS (csv).
+    telegram_dns_pin_enabled: bool = True
+    telegram_pinned_ips: List[str] = field(
+        default_factory=lambda: ["149.154.166.110"])

@@ -56,6 +56,7 @@ from typing import Optional, Dict
 import requests
 
 from telemetry import telemetry_from_env, Severity
+import telegram_net  # v3.0.8: DNS-pin the getUpdates poll past a poisoned resolver
 
 
 # ============================================================================
@@ -465,26 +466,36 @@ class Watchdog:
         if not self.tg_enabled:
             return
         last_update_id = 0
+        url = f"https://api.telegram.org/bot{self.tg_token}/getUpdates"
+        # v3.0.8: connect=5s fails fast on a poisoned-DNS sinkhole instead of
+        # the old 35s stall; read must exceed the long-poll hold time.
+        poll_timeout = (5, TELEGRAM_POLL_TIMEOUT + 5)
         # Discover existing updates first to skip backlog
         try:
-            r = requests.get(f"https://api.telegram.org/bot{self.tg_token}/getUpdates",
-                             params={"timeout": 0, "limit": 1, "offset": -1}, timeout=5)
+            r = telegram_net.get(url, params={"timeout": 0, "limit": 1, "offset": -1},
+                                 timeout=(5, 10))
             for upd in r.json().get("result", []):
                 last_update_id = upd["update_id"]
         except Exception:
             pass
 
-        backoff = 1.0
+        # v3.0.8: exponential backoff (30 -> 60 -> 120 -> cap 300s after 3
+        # consecutive errors) + collapsed logging (one warning, then a summary
+        # every ~5m) so a poisoned resolver can't flood the log one-line-per-poll.
+        streak = telegram_net.FailureStreak(
+            "Telegram poll", base_interval=30.0, max_interval=300.0,
+            summary_every_s=300.0, logger=logging.getLogger("AUREON"))
         while not self.shutdown_requested:
             try:
-                r = requests.get(
-                    f"https://api.telegram.org/bot{self.tg_token}/getUpdates",
+                r = telegram_net.get(
+                    url,
                     params={"offset": last_update_id + 1,
                             "timeout": TELEGRAM_POLL_TIMEOUT},
-                    timeout=TELEGRAM_POLL_TIMEOUT + 5,
+                    timeout=poll_timeout,
                 )
                 if r.status_code != 200:
                     raise RuntimeError(f"Telegram HTTP {r.status_code}: {r.text[:200]}")
+                streak.on_success()
                 for upd in r.json().get("result", []):
                     last_update_id = upd["update_id"]
                     msg = upd.get("message") or upd.get("edited_message") or {}
@@ -499,11 +510,10 @@ class Watchdog:
                         self._handle_command(cmd, text)
                     except Exception as e:
                         self.tele.error(f"Failed to handle `{cmd}`: {e}")
-                backoff = 1.0
             except Exception as e:
-                logging.warning(f"Telegram polling error: {e}")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                if streak.on_failure(e):
+                    logging.warning(f"Telegram polling error: {e}")
+                time.sleep(streak.interval())
 
     # ------------------------------------------------------------------------
     # Main supervisor loop
@@ -515,6 +525,7 @@ class Watchdog:
             f"Bot args: `{' '.join(self.bot_args)}`\n"
             f"Run dir: `{self.run_dir}`\n"
             f"Telegram polling: `{'on' if self.tg_enabled else 'off'}`\n"
+            f"{telegram_net.pin_status_line()}\n"
             f"Auto-deploy: `{'ON' if self.autodeploy_enabled else 'off'}`"
             f"{f' (poll {self.autodeploy_poll_min:.0f}m)' if self.autodeploy_enabled else ''}\n"
             f"Send `/help` to see commands."

@@ -54,6 +54,15 @@ try:
 except ImportError:
     _REQUESTS_OK = False
 
+# v3.0.8: all Telegram HTTP goes through telegram_net (DNS-pin past a poisoned
+# ISP resolver + collapsed-log backoff). Imported lazily-safe: if it can't load,
+# telemetry still works (telegram sink just uses plain requests below).
+try:
+    import telegram_net
+    _TG_NET_OK = True
+except Exception:
+    _TG_NET_OK = False
+
 
 # ============================================================================
 # Severity
@@ -195,6 +204,11 @@ class Telemetry:
         self._queue: "queue.Queue[dict]" = queue.Queue(maxsize=1000)
         self._stop_event = threading.Event()
         self._last_tg_sent: Dict[Severity, float] = {}
+        # v3.0.8: collapse Telegram-send failure spam into one warning + periodic
+        # summary, and never raise on the trading thread (sends run on the worker).
+        self._tg_streak = (telegram_net.FailureStreak("Telegram sends",
+                                                      logger=logging.getLogger("telemetry"))
+                           if _TG_NET_OK else None)
 
         # Console logger
         self._log = logging.getLogger("telemetry")
@@ -217,6 +231,9 @@ class Telemetry:
                        f"(telegram={'on' if self.telegram else 'off'}, "
                        f"log_file={'on' if self._fh else 'off'})")
         self.send(startup_msg, Severity.DEBUG)
+        # v3.0.8: loud one-line DNS-pin receipt on the console at startup.
+        if self.telegram and _TG_NET_OK:
+            self._log.info(telegram_net.pin_status_line())
 
     # ------------------------------------------------------------------------
     # Public API
@@ -354,32 +371,44 @@ class Telemetry:
         # Telegram limit is 4096 chars
         if len(body) > 4000:
             body = body[:4000] + "\n... (truncated)"
+        # v3.0.8: route through telegram_net (DNS-pin + (5,10) timeouts) so a
+        # poisoned ISP resolver can't black-hole the send. Falls back to plain
+        # requests if telegram_net failed to import.
+        _http = telegram_net if _TG_NET_OK else None
         try:
             url = f"https://api.telegram.org/bot{self.telegram.bot_token}/sendMessage"
-            r = requests.post(url, json={
+            payload = {
                 "chat_id": self.telegram.chat_id,
                 "text": body,
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": True,
-            }, timeout=10)
+            }
+            r = (_http.post(url, json=payload) if _http
+                 else requests.post(url, json=payload, timeout=(5, 10)))
+            if self._tg_streak:
+                self._tg_streak.on_success()   # an HTTP reply = Telegram reachable
             if r.status_code != 200:
                 self._log.warning(f"Telegram returned {r.status_code}: {r.text[:200]}")
                 # A Markdown parse failure must never DROP a message (an unescaped
                 # _/*/backtick in an interpolated value). Retry once as PLAIN text.
                 if r.status_code == 400 and "parse" in r.text.lower():
+                    plain = {
+                        "chat_id": self.telegram.chat_id,
+                        "text": body,
+                        "disable_web_page_preview": True,
+                    }
                     try:
-                        requests.post(url, json={
-                            "chat_id": self.telegram.chat_id,
-                            "text": body,
-                            "disable_web_page_preview": True,
-                        }, timeout=10)
+                        (_http.post(url, json=plain) if _http
+                         else requests.post(url, json=plain, timeout=(5, 10)))
                     except Exception as e2:
                         self._log.warning(
                             f"Telegram plain-text retry failed: {e2} | body was:\n{body}")
         except Exception as e:
-            # v3.0.7: NEVER drop a send silently. Log the failure AND the message
-            # body at WARNING so a vanished fill/close alert is always traceable.
-            self._log.warning(f"Telegram send failed: {e!r} | body was:\n{body}")
+            # v3.0.7: NEVER drop a send silently. v3.0.8: collapse the flood --
+            # log the FIRST failure of a streak fully (with body), suppress the
+            # rest, and emit a periodic summary (see FailureStreak).
+            if self._tg_streak is None or self._tg_streak.on_failure(e):
+                self._log.warning(f"Telegram send failed: {e!r} | body was:\n{body}")
 
 
 # ============================================================================
