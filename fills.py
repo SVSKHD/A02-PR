@@ -16,10 +16,28 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from telemetry import telemetry_from_env, Severity, md_escape
+from telemetry import telemetry_from_env, Severity, md_escape, anchor_time_block
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
+
+
+def _anchor_evt_block(self, rec, actual_utc=None):
+    """v3.0.5: scheduled-vs-actual time block for a fill/close message. `rec` is a
+    shadow dict that may carry 'sched_utc' (rides along from placement); falls back
+    to resolving the schedule from the anchor label. No LATE tag here (the ⏰ tag is
+    placement-specific; a fill/close is naturally minutes after the anchor).
+    Returns '' (no extra lines) if the scheduled time can't be resolved."""
+    try:
+        sched_iso = rec.get('sched_utc')
+        sched_utc = (pd.Timestamp(sched_iso) if sched_iso
+                     else self._anchor_sched_utc(rec.get('anchor_label')))
+        if sched_utc is None:
+            return ""
+        actual = actual_utc or pd.Timestamp.now(tz='UTC')
+        return "\n" + anchor_time_block(sched_utc, actual, ontime_grace_s=float('inf'))
+    except Exception:
+        return ""
 
 
 def _reconcile_with_broker(self):
@@ -95,6 +113,7 @@ def _reconcile_with_broker(self):
             self.tele.info(
                 f"🎯 FILL: *{info['anchor_label']}* {info['side']} "
                 f"@ ${info['entry_price']:.2f} (ticket {ticket})"
+                + self._anchor_evt_block(info)
             )
             # Cancel sibling (OCO) — v2.3: sibling may be None if other side was skipped pre-flight
             # OCO vs No-OCO sibling handling
@@ -178,6 +197,7 @@ def _reconcile_with_broker(self):
                 'max_fav':      float(broker_p.price_open),
                 'fill_time':    fill_time_utc.isoformat(),  # v2.3: persisted, restart-safe
                 'role':         'rescue' if is_rescue else 'normal',  # v2.9 / v2.9.8 structural
+                'sched_utc':    info.get('sched_utc'),  # v3.0.5: for close-msg times
             }
             if is_rescue:
                 self.tele.info(f"\U0001F691 RESCUE leg active (ticket {ticket}): no early locks, "
@@ -342,7 +362,8 @@ def _reconcile_with_broker(self):
                 self.tele.send(
                     f"📤 CLOSE: *{shadow['anchor_label']}* {shadow['side']} "
                     f"`{outcome}`{slip_txt} @ ${close_price:.2f}\n"
-                    f"P&L: `${pnl_usd:+.2f}`  |  Daily total: `${self.state['daily_pnl']:+.2f}`{hold_txt}{nh_txt}",
+                    f"P&L: `${pnl_usd:+.2f}`  |  Daily total: `${self.state['daily_pnl']:+.2f}`{hold_txt}{nh_txt}"
+                    + self._anchor_evt_block(shadow),
                     sev
                 )
                 # Append to today's trade log

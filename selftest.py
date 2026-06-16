@@ -50,6 +50,7 @@ STEP_NAMES = {
     8: "rescue dry-run",
     9: "telegram fmt",
     10: "ts header",
+    11: "late retry",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -397,6 +398,95 @@ class SelfTest:
         self._record(10, PASS if ok else FAIL,
                      f"IST-server={diff} (want 2:30:00) | '{line}'")
 
+    def _step_late_retry(self):
+        # v3.0.5: drive the REAL anchor late-retry machine (anchors._process_
+        # anchor_if_due) with a mocked clock + a stubbed _process_anchor, against a
+        # minimal stand-in `self`. Two assertions: (A) a missed scheduled time
+        # re-fires LATE within the window with a RE-CAPTURED (current) price; (B)
+        # after the window elapses with no placement, it gives up cleanly with one
+        # ❌ ANCHOR MISSED. No broker / no MT5.
+        import types
+        import pandas as pd
+        import anchors as _a
+        from utils import anchor_datetime_utc
+        from datetime import date as _date
+
+        LABEL = "A2_10h_London"
+
+        def make_stub(succeed_at_min=None):
+            s = types.SimpleNamespace()
+            s.paused = False
+            s.paper = True
+            s.offset_validated = True
+            s.ANCHOR_LATE_RETRY_INTERVAL_S = 30
+            s.ANCHOR_ONTIME_GRACE_S = 120
+            s.cfg = types.SimpleNamespace(
+                anchors=[(LABEL, 10, 0)], broker_tz_offset_hours=3,
+                monday_a1_override=None, anchor_late_window_min=10,
+                stale_tick_threshold_s=60.0, symbol="XAUUSD")
+            s.state = {"processed_anchors_today": [], "missed_anchors_today": []}
+            s._deferred_anchor = None
+            s._last_anchor_attempt = {}
+            s.placements = []          # (delta_min, recaptured_price)
+            s.tele = types.SimpleNamespace(
+                info=lambda m: None, warn=lambda m: None,
+                error=lambda m: s.misses.append(m), success=lambda m: None)
+            s.misses = []
+            # current price walks with time so a re-capture differs from sched-time
+            s.adapter = types.SimpleNamespace(
+                tick_time_offset_hours=0,
+                mt5=types.SimpleNamespace(
+                    symbol_info_tick=lambda sym: types.SimpleNamespace(
+                        time=int(s._now.timestamp()), bid=s._price, ask=s._price)))
+            s._save_state = lambda: None
+            s._resolved_anchor_hm = types.MethodType(_a._resolved_anchor_hm, s)
+            s._anchor_datetime_utc = anchor_datetime_utc
+            s._broker_date = lambda utc: utc.date()
+            s._mark_anchor_placed = types.MethodType(_a._mark_anchor_placed, s)
+            s._anchor_missed = types.MethodType(_a._anchor_missed, s)
+
+            def _proc(label, anchor_utc):
+                delta_min = (s._now - anchor_utc).total_seconds() / 60.0
+                if succeed_at_min is not None and delta_min >= succeed_at_min:
+                    s.placements.append((round(delta_min, 1), s._price))  # re-captured
+                    s._mark_anchor_placed(label)
+                # else: simulate a failed attempt (no deferred, stays unplaced)
+            s._process_anchor = _proc
+            return s
+
+        sched = anchor_datetime_utc(_date(2026, 6, 16), 10, 3, 0)  # Tue 10:00 broker
+        base_price = 4300.0
+
+        # (A) succeed on the attempt at/after +5 min — within the 10-min window.
+        sa = make_stub(succeed_at_min=5)
+        for mins in range(0, 12):                  # 0..11 min, one tick/min
+            sa._now = sched + pd.Timedelta(minutes=mins)
+            sa._price = base_price + mins          # price walks each minute
+            _a._process_anchor_if_due(sa, sa._now.date(), sa._now)
+        a_ok = (LABEL in sa.state["processed_anchors_today"]
+                and len(sa.placements) == 1
+                and sa.placements[0][0] >= 5 and sa.placements[0][0] < 10
+                and sa.placements[0][1] != base_price        # re-captured, not stale
+                and not sa.misses)
+
+        # (B) never succeeds -> clean give-up MISS after the window, exactly once.
+        sb = make_stub(succeed_at_min=None)
+        for mins in range(0, 14):
+            sb._now = sched + pd.Timedelta(minutes=mins)
+            sb._price = base_price + mins
+            _a._process_anchor_if_due(sb, sb._now.date(), sb._now)
+        b_ok = (LABEL in sb.state["missed_anchors_today"]
+                and len(sb.misses) == 1
+                and not sb.placements
+                and "ANCHOR MISSED" in sb.misses[0])
+
+        ok = a_ok and b_ok
+        detail = (f"late-fire@+{sa.placements[0][0] if sa.placements else '?'}m "
+                  f"recap=${sa.placements[0][1] if sa.placements else '?'} "
+                  f"(sched-price ${base_price}); miss={'1' if b_ok else 'BAD'} "
+                  f"a_ok={a_ok} b_ok={b_ok}")
+        self._record(11, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -448,6 +538,7 @@ class SelfTest:
                 self._record(8, SKIP, skip_reason)
             self._step_telegram_fmt()
             self._step_ts_header()
+            self._step_late_retry()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -461,7 +552,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = 0
-        for n in range(1, 11):
+        for n in range(1, 12):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -474,12 +565,12 @@ class SelfTest:
         fleet_steps = (4, 5, 6, 8)
         fleet_ready = all(self.results.get(s, ("", ""))[0] == PASS for s in fleet_steps)
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/10 PASS — fleet ready"
+            verdict = f"RESULT: {n_pass}/11 PASS — fleet ready"
         elif n_fail == 0:
             ready = "fleet ready" if fleet_ready else "fleet UNVERIFIED (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/10 PASS, {n_skip} SKIP — {ready}"
+            verdict = f"RESULT: {n_pass}/11 PASS, {n_skip} SKIP — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/10 PASS, {n_fail} FAIL — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/11 PASS, {n_fail} FAIL — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)

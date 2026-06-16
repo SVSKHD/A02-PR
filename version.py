@@ -149,9 +149,28 @@ History (one line per behavioral change):
          '🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16', server (UTC+3)
          and IST (broker+2:30) derived from ONE captured instant so they can't
          drift. No trading/spec behavior changed.
+  3.0.5  ANCHOR LATE-RETRY + clear anchor timestamps (recovery + telemetry only;
+         straddle geometry / ladder / rescue / hold / kill switch / schedule all
+         frozen). (1) If an anchor did not PLACE by its scheduled time -- for ANY
+         reason (quiet feed, stale tick, wake, warmup fail, transient rc) -- it is
+         re-attempted on the stale-retry cadence for cfg.anchor_late_window_min
+         (=10) minutes, then gives up with a loud ❌ ANCHOR MISSED (scheduled time,
+         reason if known, minutes waited) -- the alert that ends the silent misses.
+         The late straddle RE-CAPTURES the anchor price at the moment it places
+         (existing current-price anchoring), geometry unchanged. processed_anchors_
+         today is now the PLACED set (success gate) so one placement per anchor per
+         day is guaranteed even with retries; hard stops (kill switch / EOD /
+         weekend / paused / window-elapsed) are enforced by the tick loop BEFORE
+         re-attempt and never overridden. A late fire posts ⏰ LATE ANCHOR (WARN).
+         (2) Every anchor message (placement / LATE / MISSED / fill / close) shows
+         BOTH scheduled and actual times (server + IST) via the v3.0.4 ts_header
+         derivation (new telemetry.anchor_time_block; single source, no hand-
+         formatting); on-time anchors show matching times and no LATE tag. selftest
+         gains an 11th check (mocked clock: late placement fires within the window
+         with a re-captured price; clean give-up after the window).
 """
 
-__version__ = "3.0.4"
+__version__ = "3.0.5"
 CODENAME = "Astra Hawk"
 
 

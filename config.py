@@ -100,6 +100,16 @@ class Config:
     stale_retry_window_s: float = 90.0     # NEW: total poll window before skip
     stale_retry_poll_s: float = 5.0        # NEW: poll cadence within the window
 
+    # v3.0.5: anchor LATE-PLACEMENT window. If an anchor did not PLACE by its
+    # scheduled time (any cause: quiet feed, stale tick, wake, warmup fail,
+    # transient rc, ...), keep re-attempting on the stale-retry cadence for this
+    # many minutes after the scheduled time, then give up with a loud MISS alert.
+    # Geometry is unchanged -- the late straddle just re-captures the anchor price
+    # at the moment it actually places. Hard stops (kill switch / EOD / weekend /
+    # window-elapsed) are never overridden. 0 disables late-retry (original 120s
+    # window behavior). One placement per anchor per day regardless.
+    anchor_late_window_min: int = 10
+
     # Operational
     log_level: str = "INFO"
     state_file: str = "aureon_v2_state.json"
