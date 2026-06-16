@@ -198,6 +198,34 @@ History (one line per behavioral change):
          scratches avoided / extra SL hits / runners saved, ending in a data-driven
          verdict. Insufficient price history is marked insufficient_data, never
          guessed. No Firestore writes, no config change, no order placement.
+         + FIX silent fill/close Telegram alerts (REGRESSION from the v3.0.4
+         ts_header refactor): fills/closes executed on MT5 but their alerts
+         vanished with nothing logged. (A) ts_header() now NEVER raises -- on any
+         internal error it falls back to a plain UTC stamp and continues, so a bad
+         timestamp can't block a message. (B) the telegram send wrapper logs every
+         failure at WARNING WITH the message body (no more silent drops), and a
+         rate-limit no longer throttles must-see events: fills/closes send with
+         important=True (a fill landing seconds after placement used to be dropped
+         as a duplicate INFO). (C) fill/close bodies are built by pure, never-
+         raising formatters (format_fill_alert / format_close_alert) that degrade
+         gracefully when slip/held/open_time/price/pnl are missing; a detected
+         close with no history deal yet now alerts degraded instead of vanishing.
+         selftest gains 4 checks (fill-alert, close-alert, ts fallback, BE rung).
+         + LOOSEN the NORMAL-leg BE ladder rung +$2.5 -> +$5.0 (stop stays at
+         entry). The +$2.5 arm scratched trend trades to $0 on ordinary gold noise
+         (~5 scratches in 11 days, A2/A4). Single rung change: +$6->+$4, +$10->
+         peak-$2 (floor +$8), the RESCUE +$10-only ladder, SL/TP, hold, TSTOP and
+         the trail (arm $2.50 / gap $2.00) are all UNCHANGED. Counterfactual
+         unmeasurable pre-2026-06-16; judgment-call loosening, re-evaluate vs
+         price_log in ~2 weeks. Banner ladder now reads `5>BE | 6>+4 | 10>peak-2`.
+         + HOLD-GATE the breakeven-to-entry stop move: it must NOT engage inside
+         the 45m hold (live 2026-06-16: A2/A3 hit +$5 fav early, pulled back and
+         BE-scratched to $0 at 6.2m/2.8m held -- the disease is the TIMING, not the
+         threshold). The BE-to-entry rung now also requires hold expiry; the higher
+         protective locks (+$6->+$4, +$10->peak-2) and hard SL/TP stay active
+         inside the hold. selftest gains a 17th check (in-hold +$5 stays put, +$6
+         lock still fires in-hold, +$5 post-hold engages, +$7 in-hold locks +$4 but
+         does NOT move to entry).
 """
 
 __version__ = "3.0.7"

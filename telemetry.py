@@ -126,13 +126,32 @@ def _clock_str(now_utc=None):
             f"IST {ist.hour:02d}:{ist.minute:02d})")
 
 
+def _utc_fallback_header():
+    """v3.0.7: the plain-UTC timestamp ts_header() degrades to if the normal
+    server/IST derivation ever fails. Still a 🕐 line so every message visibly
+    carries a stamp; the trailing tag makes the degradation auditable."""
+    try:
+        return f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} (utc-fallback)"
+    except Exception:
+        return "🕐 (timestamp unavailable)"
+
+
 def ts_header(now_utc=None):
     """The timestamp line prepended to EVERY outbound Telegram message:
         🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16
     12-hour human IST first, then `server HH:MM · IST HH:MM` (24h), then the IST
-    weekday + date. Derived from a single instant (see _ts_components)."""
-    _, ist = _ts_components(now_utc)
-    return f"🕐 {_clock_str(now_utc)} — {ist.strftime('%a')} {ist.strftime('%b')} {ist.day}"
+    weekday + date. Derived from a single instant (see _ts_components).
+
+    v3.0.7 (silent-alert fix): this function must NEVER raise. A bad/None/missing
+    datetime on the fill/close path used to throw here and the exception was
+    swallowed by the send wrapper, dropping the message silently. On ANY internal
+    error we fall back to a plain UTC string and CONTINUE -- a timestamp must
+    never block a Telegram message."""
+    try:
+        _, ist = _ts_components(now_utc)
+        return f"🕐 {_clock_str(now_utc)} — {ist.strftime('%a')} {ist.strftime('%b')} {ist.day}"
+    except Exception:
+        return _utc_fallback_header()
 
 
 def anchor_time_block(scheduled_utc, actual_utc=None, ontime_grace_s=120):
@@ -205,8 +224,14 @@ class Telemetry:
 
     def send(self, msg: str,
              severity: Severity = Severity.INFO,
-             tags: Optional[dict] = None):
-        """Enqueue a message for delivery. Non-blocking, thread-safe."""
+             tags: Optional[dict] = None,
+             important: bool = False):
+        """Enqueue a message for delivery. Non-blocking, thread-safe.
+
+        `important=True` exempts the message from per-severity rate limiting so a
+        must-see event is never silently dropped. v3.0.7: fills and closes are
+        sent important=True -- a fill arriving within 5s of its placement (both
+        INFO) used to be rate-limited away, vanishing with no trace."""
         try:
             self._queue.put_nowait({
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -214,6 +239,7 @@ class Telemetry:
                 "msg": msg,
                 "severity": int(severity),
                 "tags": tags or {},
+                "important": bool(important),
             })
         except queue.Full:
             # Telemetry must never block trading — drop the message
@@ -280,7 +306,9 @@ class Telemetry:
 
         # Telegram
         if self.telegram and sev >= self.telegram.min_severity:
-            if not self._rate_limited(sev):
+            # important events (fills/closes) bypass rate limiting entirely so an
+            # event that must reach the human is never silently throttled away.
+            if event.get("important") or not self._rate_limited(sev):
                 self._send_telegram(sev, msg, event.get("tags", {}))
 
     # ------------------------------------------------------------------------
@@ -346,9 +374,12 @@ class Telemetry:
                             "disable_web_page_preview": True,
                         }, timeout=10)
                     except Exception as e2:
-                        self._log.warning(f"Telegram plain-text retry failed: {e2}")
+                        self._log.warning(
+                            f"Telegram plain-text retry failed: {e2} | body was:\n{body}")
         except Exception as e:
-            self._log.warning(f"Telegram send failed: {e}")
+            # v3.0.7: NEVER drop a send silently. Log the failure AND the message
+            # body at WARNING so a vanished fill/close alert is always traceable.
+            self._log.warning(f"Telegram send failed: {e!r} | body was:\n{body}")
 
 
 # ============================================================================

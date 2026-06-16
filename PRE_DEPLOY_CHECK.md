@@ -82,7 +82,7 @@ completed end-to-end. ✔
 Lot: `0.35` (auto\_lot=off)
 Kill switch: `-3.0%`
 Hold: `45m` | TSTOP: `fav<$1.00` | NoOCO: `True`
-Ladder: `2.5>BE | 6>+4 | 10>peak-2` | Trail: `gap $2.00, arm $2.50`
+Ladder: `5>BE | 6>+4 | 10>peak-2` | Trail: `gap $2.00, arm $2.50`
 SL/TP: `$18/$30` | Roles: `normal + RESCUE 2nd legs`
 Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: 2 (15s, 30s)
 v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`

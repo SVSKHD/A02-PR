@@ -52,6 +52,11 @@ STEP_NAMES = {
     10: "ts header",
     11: "late retry",
     12: "fleet logger",
+    13: "fill alert",
+    14: "close alert",
+    15: "ts fallback",
+    16: "BE rung",
+    17: "hold gate",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -547,6 +552,175 @@ class SelfTest:
             _fj.save_rescue_event = _orig
         self._record(12, PASS if ok else FAIL, detail)
 
+    def _step_fill_alert(self):
+        # v3.0.7 Part A: the FILL formatter must ALWAYS produce a non-empty,
+        # timestamped message and NEVER raise -- both with full enrichment AND
+        # with fields missing (the silent-fill regression). We compose the body
+        # the way _send_telegram does (ts_header prepended) and assert the 🕐
+        # stamp is present (real or fallback).
+        from fills import format_fill_alert
+        from telemetry import ts_header, anchor_time_block
+        try:
+            sched = pd.Timestamp('2026-06-16T10:00:00Z')
+            full = format_fill_alert(
+                {'anchor_label': 'A2_10h_London', 'side': 'BUY',
+                 'entry_price': 4300.50}, ticket=12345,
+                evt_block="\n" + anchor_time_block(sched, sched,
+                                                   ontime_grace_s=float('inf')))
+            # deliberately-missing: None entry_price, no side, no evt_block
+            degraded = format_fill_alert(
+                {'anchor_label': 'A3_1340_Overlap', 'entry_price': None},
+                ticket=999, evt_block=None)
+            bits, ok = [], True
+            for nm, body in (("full", full), ("degraded", degraded)):
+                composed = f"{ts_header()}\n{body}"
+                nonempty = bool(body and body.strip())
+                has_ts = "🕐" in composed
+                ok = ok and nonempty and has_ts
+                bits.append(f"{nm}: nonempty={nonempty} ts={has_ts}")
+        except Exception as e:
+            self._record(13, FAIL, f"raised: {e!r}")
+            return
+        self._record(13, PASS if ok else FAIL, "; ".join(bits))
+
+    def _step_close_alert(self):
+        # v3.0.7 Part A: the CLOSE formatter must ALWAYS produce a non-empty,
+        # timestamped message and NEVER raise -- with realistic inputs AND with
+        # None open_time(->no held), None slip, None held_min, None price, None
+        # pnl. Compose with ts_header and assert the 🕐 stamp.
+        from fills import format_close_alert
+        from telemetry import ts_header
+        try:
+            full = format_close_alert(
+                {'anchor_label': 'A3_1340_Overlap', 'side': 'SELL'},
+                outcome='BE', close_price=4298.20, pnl_usd=0.0, daily_pnl=153.5,
+                slip_txt=" (slip +0.30 vs stop $4298.50)",
+                hold_txt="  |  held `12.3m`", nh_txt="", evt_block="")
+            # open_time None -> held_min None -> hold_txt None; slip None; price/pnl None
+            degraded = format_close_alert(
+                {'anchor_label': 'A2_10h', 'side': 'BUY'}, outcome='CLOSED',
+                close_price=None, pnl_usd=None, daily_pnl=None,
+                slip_txt=None, hold_txt=None, nh_txt=None, evt_block=None)
+            bits, ok = [], True
+            for nm, body in (("full", full), ("degraded", degraded)):
+                composed = f"{ts_header()}\n{body}"
+                nonempty = bool(body and body.strip())
+                has_ts = "🕐" in composed
+                ok = ok and nonempty and has_ts
+                bits.append(f"{nm}: nonempty={nonempty} ts={has_ts}")
+        except Exception as e:
+            self._record(14, FAIL, f"raised: {e!r}")
+            return
+        self._record(14, PASS if ok else FAIL, "; ".join(bits))
+
+    def _step_ts_fallback(self):
+        # v3.0.7 Part A: ts_header() must NEVER raise. Feed it bad input (a string
+        # and a bare object, neither a datetime) and assert it returns a non-empty
+        # fallback 🕐 string instead of throwing and blowing up the send path.
+        from telemetry import ts_header
+        raised = False
+        outs = []
+        for bad in ("not-a-datetime", object(), 12345):
+            try:
+                out = ts_header(bad)
+            except Exception:
+                raised = True
+                out = ""
+            outs.append(out)
+        ok = (not raised
+              and all(isinstance(o, str) and o.strip().startswith("🕐")
+                      for o in outs))
+        self._record(15, PASS if ok else FAIL,
+                     f"raised={raised} | sample='{outs[0]}'")
+
+    def _step_be_rung(self):
+        # v3.0.7 Part B: NORMAL-leg BE ladder rung moved +$2.5 -> +$5.0. Drive the
+        # REAL strategy.update_position_on_bar. The BE-to-entry move is now also
+        # HOLD-GATED (see _step_hold_gate), so we test the +$5 THRESHOLD post-hold
+        # with the trail disabled (be_trigger raised out of range) so only the BE
+        # rung can move SL: at +$4.9 fav the SL stays at the initial $18 stop; at
+        # +$5.0 fav it locks to breakeven (entry). RESCUE must NOT lock below +$10.
+        import dataclasses
+        from strategy import Position, update_position_on_bar
+        try:
+            cfg = dataclasses.replace(self.cfg, be_trigger=999.0)  # trail disabled
+            entry = 4300.0
+            sl0 = entry - cfg.sl_dist            # BUY initial stop
+            ts0 = pd.Timestamp('2026-06-16T10:00:00Z')
+
+            def run_fav(fav, role='normal'):
+                p = Position(anchor_label='TEST', side='BUY', entry_price=entry,
+                             entry_time=ts0, current_sl=sl0,
+                             tp_level=entry + cfg.tp_dist, max_fav=entry + fav,
+                             lot=cfg.lot_size, role=role)
+                # post-hold bar (50m) so the hold-gated BE rung can engage; trail
+                # is disabled via cfg so the BE rung is observed in isolation.
+                ts1 = ts0 + pd.Timedelta(minutes=50)
+                bar = pd.Series({'high': entry + fav, 'low': entry + fav,
+                                 'close': entry + fav})
+                update_position_on_bar(p, bar, ts1, cfg)
+                return p.current_sl
+
+            sl_49 = run_fav(4.9)
+            sl_50 = run_fav(5.0)
+            sl_resc = run_fav(9.0, role='rescue')
+            be_at_49 = abs(sl_49 - entry) < 0.01
+            be_at_50 = abs(sl_50 - entry) < 0.01
+            resc_locked = abs(sl_resc - sl0) > 0.01
+            ok = (not be_at_49) and be_at_50 and (not resc_locked)
+            detail = (f"+4.9 SL={sl_49:.2f}(BE={be_at_49}) | "
+                      f"+5.0 SL={sl_50:.2f}(BE={be_at_50}) | "
+                      f"rescue+9 SL={sl_resc:.2f}(locked={resc_locked})")
+        except Exception as e:
+            self._record(16, FAIL, f"raised: {e!r}")
+            return
+        self._record(16, PASS if ok else FAIL, detail)
+
+    def _step_hold_gate(self):
+        # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
+        # inside the 45m hold (live 2026-06-16: A2/A3 BE-scratched at 6.2m/2.8m).
+        # The higher protective locks (+$6->+$4, +$10->peak-2) MUST stay active
+        # inside the hold. Drive the REAL strategy core at the held times below.
+        from strategy import Position, update_position_on_bar
+        try:
+            cfg = self.cfg
+            entry = 4300.0
+            sl0 = entry - cfg.sl_dist
+            ts0 = pd.Timestamp('2026-06-16T10:00:00Z')
+
+            def run(fav, held_min, role='normal'):
+                p = Position(anchor_label='TEST', side='BUY', entry_price=entry,
+                             entry_time=ts0, current_sl=sl0,
+                             tp_level=entry + cfg.tp_dist, max_fav=entry + fav,
+                             lot=cfg.lot_size, role=role)
+                bar = pd.Series({'high': entry + fav, 'low': entry + fav,
+                                 'close': entry + fav})
+                update_position_on_bar(p, bar, ts0 + pd.Timedelta(minutes=held_min), cfg)
+                return round(p.current_sl, 2)
+
+            at_entry = lambda sl: abs(sl - entry) < 0.01
+            at_sl0 = lambda sl: abs(sl - sl0) < 0.01
+            at_lock4 = lambda sl: abs(sl - (entry + 4.0)) < 0.01
+
+            checks = {
+                # +$3 fav, 3m held -> SL still ORIGINAL (no move to entry)
+                "+3@3m_no_move":   at_sl0(run(3, 3)),
+                # the disease: +$5 fav, 3m held -> GATED, SL still ORIGINAL
+                "+5@3m_gated":     at_sl0(run(5, 3)),
+                # +$6 fav, 10m held -> the +$6->+$4 lock STILL engages in the hold
+                "+6@10m_lock4":    at_lock4(run(6, 10)),
+                # +$5 fav, 50m held -> post-hold, BE/entry move permitted (>= entry)
+                "+5@50m_posthold": run(5, 50) >= entry - 0.01,
+                # +$7 fav, 2m held -> +$6 lock engages but NOT a move to entry
+                "+7@2m_lock_noBE": at_lock4(run(7, 2)) and not at_entry(run(7, 2)),
+            }
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'Y' if v else 'N'}" for k, v in checks.items())
+        except Exception as e:
+            self._record(17, FAIL, f"raised: {e!r}")
+            return
+        self._record(17, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -600,6 +774,11 @@ class SelfTest:
             self._step_ts_header()
             self._step_late_retry()
             self._step_fleet_logger()
+            self._step_fill_alert()
+            self._step_close_alert()
+            self._step_ts_fallback()
+            self._step_be_rung()
+            self._step_hold_gate()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -613,7 +792,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = 0
-        for n in range(1, 13):
+        for n in range(1, 18):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -626,12 +805,12 @@ class SelfTest:
         fleet_steps = (4, 5, 6, 8)
         fleet_ready = all(self.results.get(s, ("", ""))[0] == PASS for s in fleet_steps)
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/12 PASS — fleet ready"
+            verdict = f"RESULT: {n_pass}/17 PASS — fleet ready"
         elif n_fail == 0:
             ready = "fleet ready" if fleet_ready else "fleet UNVERIFIED (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/12 PASS, {n_skip} SKIP — {ready}"
+            verdict = f"RESULT: {n_pass}/17 PASS, {n_skip} SKIP — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/12 PASS, {n_fail} FAIL — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/17 PASS, {n_fail} FAIL — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)
