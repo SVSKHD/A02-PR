@@ -51,6 +51,7 @@ STEP_NAMES = {
     9: "telegram fmt",
     10: "ts header",
     11: "late retry",
+    12: "fleet logger",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -487,6 +488,65 @@ class SelfTest:
                   f"a_ok={a_ok} b_ok={b_ok}")
         self._record(11, PASS if ok else FAIL, detail)
 
+    def _step_fleet_logger(self):
+        # v3.0.6: drive the REAL rescue fleet-event logger (rescue_log) with three
+        # synthesized events and assert each writes a rescue_events.csv row, mirrors
+        # to Firebase (mocked), and gets the correct branch label from its net.
+        import tempfile, csv as _csv, os as _os, types
+        import rescue_log as _rl
+        import firebase_journal as _fj
+        tmp = tempfile.mkdtemp(prefix="aureon_fleet_")
+        fb_calls = []
+        _orig = _fj.save_rescue_event
+        _fj.save_rescue_event = lambda day, eid, doc: (fb_calls.append((day, eid)) or True)
+        try:
+            stub = types.SimpleNamespace()
+            stub.run_dir = tmp
+            stub.state = {"last_broker_date": "2026-06-16"}
+            stub._rescue_events = {}
+            stub._rescue_event_by_ticket = {}
+            stub.sent = []
+            stub.tele = types.SimpleNamespace(send=lambda m, s=None: stub.sent.append(m))
+            stub._rescue_event_open = types.MethodType(_rl._rescue_event_open, stub)
+            stub._rescue_event_on_close = types.MethodType(_rl._rescue_event_on_close, stub)
+            stub._rescue_event_finalize = types.MethodType(_rl._rescue_event_finalize, stub)
+
+            def run_event(tk0, pnls, boosts_ok=True):
+                members = [tk0, tk0 + 1, tk0 + 2, tk0 + 3]  # trigger, rescue, b1, b2
+                stub._rescue_event_open({
+                    'event_id': f"2026-06-16_A3_{tk0}", 'date_ist': '2026-06-16',
+                    'anchor': 'A3_1340_Overlap', 'sched_iso': None, 'open_iso': 'x',
+                    'trigger': {'ticket': tk0, 'side': 'BUY', 'trigger_pnl': -10.0},
+                    'rescue': {'ticket': tk0 + 1, 'side': 'SELL', 'fill': 4300.0},
+                    'boosts': [
+                        {'ticket': tk0 + 2, 'fill': 4300.0, 'rc': 10009, 'comment': 'AUR_A3_S_B1'},
+                        {'ticket': tk0 + 3, 'fill': 4300.0,
+                         'rc': 10009 if boosts_ok else 10016, 'comment': 'AUR_A3_S_B2'}],
+                    'boosts_placed_ok': boosts_ok, 'members': set(members)})
+                for tk, p in zip(members, pnls):
+                    stub._rescue_event_on_close(tk, p)
+
+            run_event(1000, [-18, 150, 40, 28])    # net +200 -> CRASH_WIN
+            run_event(2000, [-18, -120, -6, -56])  # net -200 -> WHIPSAW_LOSS
+            run_event(3000, [-18, 20, 6, 2])       # net  +10 -> SCRATCH
+
+            path = _os.path.join(tmp, "rescue_events.csv")
+            with open(path) as f:
+                rows = list(_csv.DictReader(f))
+            branches = [r['branch'] for r in rows]
+            tally = _rl.rescue_tally(path)
+            ok = (len(rows) == 3
+                  and branches == ['CRASH_WIN', 'WHIPSAW_LOSS', 'SCRATCH']
+                  and abs(float(rows[0]['net_usd']) - 200) < 0.01
+                  and len(fb_calls) == 3
+                  and tally == {'CRASH_WIN': 1, 'WHIPSAW_LOSS': 1, 'SCRATCH': 1}
+                  and len(stub.sent) == 3)
+            detail = (f"rows={len(rows)} branches={branches} fb_writes={len(fb_calls)} "
+                      f"tally=c{tally['CRASH_WIN']}/w{tally['WHIPSAW_LOSS']}/s{tally['SCRATCH']}")
+        finally:
+            _fj.save_rescue_event = _orig
+        self._record(12, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -539,6 +599,7 @@ class SelfTest:
             self._step_telegram_fmt()
             self._step_ts_header()
             self._step_late_retry()
+            self._step_fleet_logger()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -552,7 +613,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = 0
-        for n in range(1, 12):
+        for n in range(1, 13):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -565,12 +626,12 @@ class SelfTest:
         fleet_steps = (4, 5, 6, 8)
         fleet_ready = all(self.results.get(s, ("", ""))[0] == PASS for s in fleet_steps)
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/11 PASS — fleet ready"
+            verdict = f"RESULT: {n_pass}/12 PASS — fleet ready"
         elif n_fail == 0:
             ready = "fleet ready" if fleet_ready else "fleet UNVERIFIED (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/11 PASS, {n_skip} SKIP — {ready}"
+            verdict = f"RESULT: {n_pass}/12 PASS, {n_skip} SKIP — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/11 PASS, {n_fail} FAIL — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/12 PASS, {n_fail} FAIL — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)

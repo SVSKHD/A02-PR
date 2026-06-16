@@ -209,6 +209,9 @@ class LiveTrader:
         self._deferred_anchor: Optional[Dict] = None
         # v3.0.5: per-anchor late-retry throttle (label -> last attempt UTC ts)
         self._last_anchor_attempt: Dict = {}
+        # v3.0.6: in-flight rescue FLEET events (observer-only; lost on restart).
+        self._rescue_events: Dict = {}            # event_id -> event record
+        self._rescue_event_by_ticket: Dict = {}   # member ticket -> event_id
 
         # Pause flag (set via /pause command)
         self.paused = False
@@ -243,6 +246,12 @@ class LiveTrader:
             f"v3.0.5: anchor late-retry online — anchor_late_window_min="
             f"`{getattr(cfg, 'anchor_late_window_min', 0)}` "
             f"(missed anchors re-fire within the window; loud MISS after)."
+        )
+        # v3.0.6 module receipt: rescue fleet-event logger (observer only) + EOD
+        # balance capture. No change to rescue/boost mechanics.
+        self.tele.info(
+            "v3.0.6: rescue fleet-event logger online (rescue_events.csv + "
+            "Firestore; `python bot.py rescuestats`) — observer only."
         )
         # TEST MODE banner: surface any active test-scope toggle loudly so a
         # forced code path is never mistaken for production behavior. Defaults OFF.
@@ -930,7 +939,11 @@ import anchors as _anchors_mod
 import fills as _fills_mod
 import trails as _trails_mod
 import journal as _journal_mod
+import rescue_log as _rescue_mod
 
+LiveTrader._rescue_event_open       = _rescue_mod._rescue_event_open
+LiveTrader._rescue_event_on_close   = _rescue_mod._rescue_event_on_close
+LiveTrader._rescue_event_finalize   = _rescue_mod._rescue_event_finalize
 LiveTrader._load_state              = _state_mod._load_state
 LiveTrader._save_state              = _state_mod._save_state
 LiveTrader._acquire_pid_lock        = _state_mod._acquire_pid_lock
