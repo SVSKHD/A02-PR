@@ -118,6 +118,15 @@ class LiveTrader:
     }
     DEFER_WAIT_DEFAULT = 15
 
+    # v3.0.5: anchor LATE-PLACEMENT recovery. ANCHOR_ONTIME_GRACE_S is the cutoff
+    # (seconds after the scheduled time) beyond which a placement is tagged LATE;
+    # normal defer + settle completes well under it, so on-time anchors never read
+    # LATE. Within the cfg.anchor_late_window_min window, an unplaced anchor is
+    # re-attempted at most every ANCHOR_LATE_RETRY_INTERVAL_S (matches the
+    # stale-retry cadence; prevents per-tick re-attempt spam).
+    ANCHOR_ONTIME_GRACE_S = 120
+    ANCHOR_LATE_RETRY_INTERVAL_S = 30
+
     # v2.5.2: retry on rc=-1 / no_response from broker
     MAX_PLACEMENT_RETRIES = 2          # initial + 2 retries = 3 attempts total
     RETRY_BACKOFF_BASE_SEC = 15        # delays: 15s, 30s
@@ -198,6 +207,8 @@ class LiveTrader:
         # v2.5: deferred anchor placement (non-blocking 5s settle wait)
         # v2.5.2: now carries retry_count for rc=-1 recovery
         self._deferred_anchor: Optional[Dict] = None
+        # v3.0.5: per-anchor late-retry throttle (label -> last attempt UTC ts)
+        self._last_anchor_attempt: Dict = {}
 
         # Pause flag (set via /pause command)
         self.paused = False
@@ -226,6 +237,12 @@ class LiveTrader:
         self.tele.info(
             "v3.0.4: timestamped alerts (ts_header, single source) + Firebase "
             "verifier `python bot.py verifyfb` online."
+        )
+        # v3.0.5 module receipt: anchor late-retry window + scheduled/actual times.
+        self.tele.info(
+            f"v3.0.5: anchor late-retry online — anchor_late_window_min="
+            f"`{getattr(cfg, 'anchor_late_window_min', 0)}` "
+            f"(missed anchors re-fire within the window; loud MISS after)."
         )
         # TEST MODE banner: surface any active test-scope toggle loudly so a
         # forced code path is never mistaken for production behavior. Defaults OFF.
@@ -298,6 +315,8 @@ class LiveTrader:
             self.state['daily_pnl'] = 0.0
             self.state['last_broker_date'] = str(broker_date)
             self.state['processed_anchors_today'] = []
+            self.state['missed_anchors_today'] = []   # v3.0.5: reset late-window give-ups
+            self._last_anchor_attempt = {}            # v3.0.5: clear late-retry throttle
             self.state['kill_switch_locked'] = False
             # v2.5.4: re-baseline the daily kill switch to TODAY's opening equity.
             # Prevents prior-day losses (and the start-of-day gap from a fixed
@@ -924,6 +943,9 @@ LiveTrader._process_anchor_if_due   = _anchors_mod._process_anchor_if_due
 LiveTrader._process_anchor          = _anchors_mod._process_anchor
 LiveTrader._complete_deferred_anchor= _anchors_mod._complete_deferred_anchor
 LiveTrader._place_orders_for_anchor = _anchors_mod._place_orders_for_anchor
+LiveTrader._anchor_sched_utc        = _anchors_mod._anchor_sched_utc
+LiveTrader._mark_anchor_placed      = _anchors_mod._mark_anchor_placed
+LiveTrader._anchor_missed           = _anchors_mod._anchor_missed
 LiveTrader._dump_mt5_state          = _anchors_mod._dump_mt5_state
 LiveTrader._warmup_trade_channel    = _anchors_mod._warmup_trade_channel
 LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
@@ -932,6 +954,7 @@ LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
 LiveTrader._await_fresh_tick_for_placement = _anchors_mod._await_fresh_tick_for_placement
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)
 LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
+LiveTrader._anchor_evt_block        = _fills_mod._anchor_evt_block
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close
 LiveTrader._write_journal           = _journal_mod._write_journal
 LiveTrader._send_daily_summary      = _journal_mod._send_daily_summary

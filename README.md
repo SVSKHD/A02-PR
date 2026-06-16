@@ -213,6 +213,19 @@ Cross-checks every trading day in `run/journal/trades_*.csv` against the
 **never auto-writes**; a single day is re-written only with `--backfill`. If
 Firestore is unreachable it warns and exits 0, so it can never touch trading.
 
+### Anchor late-retry (v3.0.5)
+If an anchor doesn't **place** by its scheduled time — for any reason (quiet feed,
+stale tick, Monday wake, channel-warmup fail, transient broker `rc`) — the bot
+keeps re-attempting on the stale-retry cadence for `anchor_late_window_min`
+(default **10**) minutes, re-capturing the anchor price at the moment it actually
+places (straddle geometry ±$5 / SL $18 / TP $30 unchanged). A late fire posts
+`⏰ LATE ANCHOR`; if the window elapses with no placement it posts a loud
+`❌ ANCHOR MISSED` (scheduled time, reason, minutes waited) — the alert that ends
+silent misses. Hard stops are never overridden: no late-place through the kill
+switch, past EOD, on weekends, or once the window elapses; one placement per
+anchor per day. Every anchor message (placement / LATE / MISSED / fill / close)
+shows both the scheduled and actual time (server + IST).
+
 ### Timestamped alerts (v3.0.4)
 Every outbound Telegram message is prefixed with a single-source header, e.g.
 `🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16` — 12-hour IST, then the

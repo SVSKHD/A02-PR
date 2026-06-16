@@ -114,18 +114,47 @@ def _ts_components(now_utc=None):
     return server, ist
 
 
+def _clock_str(now_utc=None):
+    """'5:00 AM IST (server 02:30 · IST 05:00)' for one instant — 12-hour IST
+    then the server (UTC+3) and IST (broker+2:30) 24h clocks. Shared by ts_header
+    and anchor_time_block so the server/IST derivation is single-source."""
+    server, ist = _ts_components(now_utc)
+    h12 = ist.hour % 12 or 12
+    ampm = "AM" if ist.hour < 12 else "PM"
+    return (f"{h12}:{ist.minute:02d} {ampm} IST "
+            f"(server {server.hour:02d}:{server.minute:02d} · "
+            f"IST {ist.hour:02d}:{ist.minute:02d})")
+
+
 def ts_header(now_utc=None):
     """The timestamp line prepended to EVERY outbound Telegram message:
         🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16
     12-hour human IST first, then `server HH:MM · IST HH:MM` (24h), then the IST
     weekday + date. Derived from a single instant (see _ts_components)."""
-    server, ist = _ts_components(now_utc)
-    h12 = ist.hour % 12 or 12
-    ampm = "AM" if ist.hour < 12 else "PM"
-    return (f"🕐 {h12}:{ist.minute:02d} {ampm} IST "
-            f"(server {server.hour:02d}:{server.minute:02d} · "
-            f"IST {ist.hour:02d}:{ist.minute:02d}) — "
-            f"{ist.strftime('%a')} {ist.strftime('%b')} {ist.day}")
+    _, ist = _ts_components(now_utc)
+    return f"🕐 {_clock_str(now_utc)} — {ist.strftime('%a')} {ist.strftime('%b')} {ist.day}"
+
+
+def anchor_time_block(scheduled_utc, actual_utc=None, ontime_grace_s=120):
+    """v3.0.5: the scheduled-vs-actual anchor time block used by every anchor
+    message (placement / LATE / MISSED / fill / close):
+
+        scheduled: 12:30 PM IST (server 10:00 · IST 12:30)
+        actual:    12:38 PM IST (server 10:08 · IST 12:38)  ⏰ +8m LATE
+
+    Both clocks come from _clock_str (single source). The `⏰ +Nm LATE` tag is
+    appended only when actual is more than ontime_grace_s after scheduled; for an
+    on-time anchor actual==scheduled and the tag is omitted. Accepts datetime /
+    pandas Timestamp (naive treated as UTC)."""
+    sched_lbl = _clock_str(scheduled_utc)
+    if actual_utc is None:
+        actual_utc = scheduled_utc
+    act_lbl = _clock_str(actual_utc)
+    s_server, _ = _ts_components(scheduled_utc)
+    a_server, _ = _ts_components(actual_utc)
+    secs = (a_server - s_server).total_seconds()
+    tag = f"  ⏰ +{int(secs // 60)}m LATE" if secs >= ontime_grace_s else ""
+    return f"  scheduled: {sched_lbl}\n  actual:    {act_lbl}{tag}"
 
 
 # ============================================================================

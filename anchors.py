@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from telemetry import telemetry_from_env, Severity
+from telemetry import telemetry_from_env, Severity, anchor_time_block
 from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
 
 log = logging.getLogger("AUREON")
@@ -45,22 +45,109 @@ def _resolved_anchor_hm(self, label, broker_date, hour, minute):
             return int(ovr[0]), int(ovr[1])
     return hour, minute
 
+def _anchor_sched_utc(self, label):
+    """Resolve the scheduled UTC instant for an anchor label on the current broker
+    date (Monday A1 shift applied). Used to print scheduled vs actual times on
+    fill/close messages. Best-effort; None if the label isn't found / on error."""
+    try:
+        bdate = self._broker_date(pd.Timestamp.now(tz='UTC'))
+        for lbl, h, m in self.cfg.anchors:
+            if lbl == label:
+                rh, rm = self._resolved_anchor_hm(lbl, bdate, h, m)
+                return self._anchor_datetime_utc(
+                    bdate, rh, self.cfg.broker_tz_offset_hours, rm)
+    except Exception:
+        return None
+    return None
+
+def _mark_anchor_placed(self, label):
+    """Record an anchor as PLACED (its single fire for the day). Gates all further
+    attempts -- guarantees one placement per anchor per day even with late-retry."""
+    if label not in self.state['processed_anchors_today']:
+        self.state['processed_anchors_today'].append(label)
+        self._save_state()
+
+def _anchor_missed(self, label, anchor_utc, utc_now):
+    """v3.0.5: the late window elapsed with no successful placement -> give up
+    cleanly and LOUDLY. This is the alert that ends the silent misses. Best-effort
+    reason from current conditions; fires once per anchor per day."""
+    missed = self.state.setdefault('missed_anchors_today', [])
+    if label in missed:
+        return
+    # Best-effort reason (we don't gate on cause; this is just diagnostics).
+    reason = "unknown"
+    try:
+        if not self.paper and not getattr(self, "offset_validated", False):
+            reason = "broker time offset never validated"
+        else:
+            tk = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+            if tk is None or getattr(tk, "time", 0) <= 0:
+                reason = "no live tick from broker"
+            else:
+                off = (getattr(self.adapter, 'tick_time_offset_hours', 0) or 0) * 3600
+                age = abs(pd.Timestamp.now(tz='UTC').timestamp() - (tk.time - off))
+                if age > getattr(self.cfg, 'stale_tick_threshold_s', 60.0):
+                    reason = f"feed stale ({age:.0f}s) through the whole window"
+    except Exception:
+        pass
+    waited_min = max(0, (utc_now - anchor_utc).total_seconds() / 60.0)
+    self.tele.error(
+        f"❌ *ANCHOR MISSED — {label}*\n"
+        f"{anchor_time_block(anchor_utc, utc_now)}\n"
+        f"  reason: {reason}\n"
+        f"  waited `{waited_min:.0f}m` (late window "
+        f"{getattr(self.cfg, 'anchor_late_window_min', 10)}m) — no placement, moving on."
+    )
+    log.warning(f"{label}: ANCHOR MISSED after {waited_min:.0f}m — reason: {reason}")
+    missed.append(label)
+    self._save_state()
+
 def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
     if self.paused:
         return
+    # v3.0.5: bounded LATE-PLACEMENT window. An anchor stays eligible for
+    # re-attempt for cfg.anchor_late_window_min after its scheduled time; the
+    # original behavior is window_s=120 (anchor_late_window_min=0). Hard stops
+    # (kill switch / EOD / weekend / paused) are enforced by the caller BEFORE
+    # this runs, so an unplaced anchor is never late-placed through them.
+    late_window_min = getattr(self.cfg, 'anchor_late_window_min', 0)
+    window_s = max(120.0, late_window_min * 60.0)
+    retry_interval = getattr(self, 'ANCHOR_LATE_RETRY_INTERVAL_S', 30)
+    grace = getattr(self, 'ANCHOR_ONTIME_GRACE_S', 120)
     for label, hour, minute in self.cfg.anchors:
+        # processed_anchors_today is the PLACED set: a placed anchor never re-fires
+        # (one placement per anchor per day).
         if label in self.state['processed_anchors_today']:
+            continue
+        if label in self.state.get('missed_anchors_today', []):
             continue
         # Monday-only A1 shift (cold-start cushion) resolved off the broker date.
         r_hour, r_minute = self._resolved_anchor_hm(label, broker_date, hour, minute)
         anchor_utc = self._anchor_datetime_utc(
             broker_date, r_hour, self.cfg.broker_tz_offset_hours, r_minute)
         delta = (utc_now - anchor_utc).total_seconds()
-        # Window: 0 to 120 seconds after the anchor minute
-        if 0 <= delta < 120:
+        if delta < 0:
+            continue
+        if delta < window_s:
+            # On-time OR inside the late window: (re-)attempt placement.
+            # Skip if an attempt is already in flight (single deferred slot) so we
+            # never double-place; throttle re-attempts to the stale-retry cadence
+            # so a persistently-failing cause can't spam Telegram every tick.
+            if self._deferred_anchor is not None:
+                continue
+            last = self._last_anchor_attempt.get(label)
+            if last is not None and (utc_now - last).total_seconds() < retry_interval:
+                continue
+            self._last_anchor_attempt[label] = utc_now
+            if delta >= grace:
+                log.warning(
+                    f"{label}: LATE re-attempt at +{delta/60.0:.1f}m "
+                    f"(window {window_s/60.0:.0f}m) — placement not yet completed")
             self._process_anchor(label, anchor_utc)
-            self.state['processed_anchors_today'].append(label)
             self._save_state()
+        else:
+            # Late window elapsed with no successful placement -> clean MISS.
+            self._anchor_missed(label, anchor_utc, utc_now)
 
 def _process_anchor(self, label: str, anchor_utc: pd.Timestamp):
     # v2.5: account floor check — halt new entries if balance dropped too far
@@ -407,12 +494,24 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
 
     mode_tag = " [GAP MODE: half-lot, $10 SL]" if gap_mode else ""
     retry_tag = f" [RETRY {retry_count}]" if retry_count > 0 else ""     # v2.5.2
-    self.tele.info(
-        f"⚓ *{label}*{retry_tag} anchor=${anchor_price:.2f}{mode_tag}\n"
+    # v3.0.5: scheduled-vs-actual times on every placement; if this fire is past
+    # the on-time grace it is a LATE ANCHOR (loud WARN). anchor_price is the price
+    # RE-CAPTURED at this placement moment (current-price anchoring), not the stale
+    # scheduled-time price -- geometry (±$5 / SL / TP) is unchanged.
+    now_utc = pd.Timestamp.now(tz='UTC')
+    secs_late = (now_utc - anchor_utc).total_seconds()
+    is_late = secs_late >= getattr(self, 'ANCHOR_ONTIME_GRACE_S', 120)
+    header = (f"⏰ *LATE ANCHOR {label}*{retry_tag}" if is_late
+              else f"⚓ *{label}*{retry_tag}")
+    placement_msg = (
+        f"{header}\n"
+        f"{anchor_time_block(anchor_utc, now_utc)}\n"
+        f"  anchor=${anchor_price:.2f} (re-captured){mode_tag}\n"
         f"  BUY  stop @ ${buy_stop}  (SL ${sl_buy}, TP ${tp_buy})\n"
         f"  SELL stop @ ${sell_stop} (SL ${sl_sell}, TP ${tp_sell})\n"
         f"  Lot: `{gap_lot}`"
     )
+    (self.tele.warn if is_late else self.tele.info)(placement_msg)
 
     # PRE-FLIGHT VALIDATION — don't send orders that will be rejected.
     # v2.3: if only ONE side is invalid, place the valid side alone.
@@ -495,17 +594,24 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     sell_ok = (sell_ticket is not None) if not skip_sell else True
 
     if buy_ok and sell_ok:
+        # v3.0.5: this anchor has PLACED -> mark it (gates any further/late
+        # attempts; one placement per anchor per day). sched_utc rides along on
+        # the shadow pendings so fill/close can print scheduled vs actual times.
+        self._mark_anchor_placed(label)
+        sched_iso = anchor_utc.isoformat()
         if buy_ticket is not None:
             self.shadow_pendings[buy_ticket] = {
                 'anchor_label': label, 'side': 'BUY',
                 'sibling_ticket': sell_ticket,  # None when SELL was skipped — fill handler tolerates None
                 'entry_price': buy_stop,
+                'sched_utc': sched_iso,
             }
         if sell_ticket is not None:
             self.shadow_pendings[sell_ticket] = {
                 'anchor_label': label, 'side': 'SELL',
                 'sibling_ticket': buy_ticket,  # None when BUY was skipped
                 'entry_price': sell_stop,
+                'sched_utc': sched_iso,
             }
         # Hot polling window
         self._hot_poll_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=30)
@@ -608,7 +714,10 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                     'max_fav': float(fill_price),
                     'recovery': True,
                     'fill_time': pd.Timestamp.now(tz='UTC').isoformat(),  # v2.3
+                    'sched_utc': anchor_utc.isoformat(),  # v3.0.5
                 }
+            # v3.0.5: an in-flight recovery fill IS this anchor's placement.
+            self._mark_anchor_placed(label)
             self.tele.success(
                 f"✅ *{label} recovery {breakout_side} filled @ ${fill_price}*"
             )

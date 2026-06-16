@@ -543,3 +543,55 @@ the spec example incl. AM/PM, single-digit day, and the midnight wrap.
   2:30 and the rendered line carries both clocks. Mock-MT5 run: **10/10 PASS**.
 - `verifyfb` dispatch + `--backfill` flag wired in `bot.py`; CRLF preserved on all
   CRLF files (telemetry.py stays LF, matching its committed convention).
+
+## 2026-06-16 — v3.0.5: anchor late-retry + clear anchor timestamps
+
+Recovery + telemetry only. NO change to anchor schedule, straddle ±$5, SL/TP,
+ladder, rescue/boost, hold, or kill switch.
+
+### Task 1 — bounded anchor late-placement (10-min window)
+Root problem: an anchor that failed to PLACE by its scheduled time was marked
+done and lost for the day with zero recovery (the silent-miss class, e.g. a 12:30
+IST anchor that never fired). Fix: `_process_anchor_if_due` now keeps an unplaced
+anchor eligible for re-attempt for `cfg.anchor_late_window_min` (=10) minutes past
+its scheduled time, on the stale-retry cadence (`ANCHOR_LATE_RETRY_INTERVAL_S=30`,
+throttled so a persistent failure can't spam Telegram every tick). It does NOT
+gate on cause — any reason that left the anchor unplaced triggers retry.
+
+Key semantic change: `processed_anchors_today` is now the **PLACED** set (marked
+via `_mark_anchor_placed` only on a successful straddle / single-side / in-flight
+recovery), not "attempted". That is what makes retry possible AND guarantees one
+placement per anchor per day. A new `missed_anchors_today` records give-ups. Both
+reset on the new broker day; `_last_anchor_attempt` (in-memory throttle) too.
+
+Re-capture: the late straddle uses the price RE-CAPTURED at the moment it places
+(the existing v2.5.4 current-price anchoring in `_complete_deferred_anchor`), not
+the stale scheduled-time M5 close — geometry off the current price, unchanged.
+
+Hard stops are inherited, not re-implemented: the tick loop already `return`s
+before `_process_anchor_if_due` on kill-switch-locked (live_trader ~837), EOD
+(~849), and market-closed/weekend (~798), and `_process_anchor_if_due` returns on
+`paused`. So an unplaced anchor is never late-placed through any hard stop, and the
+in-flight `_await_fresh_tick_for_placement` already aborts on kill/EOD. After the
+window elapses, `_anchor_missed` fires once: `❌ ANCHOR MISSED` with scheduled
+time, best-effort reason (offset unvalidated / no tick / stale feed / unknown),
+and minutes waited. A late (but successful) fire posts `⏰ LATE ANCHOR` (WARN).
+
+### Task 2 — scheduled-vs-actual times on every anchor message
+New `telemetry.anchor_time_block(scheduled_utc, actual_utc)` renders the two-line
+block (12h IST + server/IST 24h for each), reusing the v3.0.4 `_ts_components`
+derivation (refactored a shared `_clock_str` out of `ts_header`; single source, no
+hand-formatting). It carries the `⏰ +Nm LATE` tag only when actual is >120s after
+scheduled (placement messages); fill/close pass `ontime_grace_s=inf` to suppress
+the tag (a fill is naturally minutes after the anchor). `sched_utc` rides along on
+the shadow pendings -> shadow positions so fill/close print accurate times;
+`_anchor_sched_utc(label)` is the fallback resolver.
+
+### Acceptance
+- `version.py` -> 3.0.5; startup posts a v3.0.5 receipt with `anchor_late_window_min`.
+- selftest gains an **11th** check (`late retry`): drives the REAL
+  `_process_anchor_if_due` with a mocked clock + stubbed `_process_anchor` and
+  asserts (A) a missed scheduled time re-fires LATE within the window with a
+  re-captured price, (B) a clean single `❌ ANCHOR MISSED` after the window. Mock
+  run: **11/11 PASS**. On-time path verified unchanged (places once, no LATE tag).
+- CRLF preserved (telemetry.py stays LF per its committed convention).

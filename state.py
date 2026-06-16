@@ -38,7 +38,8 @@ def _load_state(self) -> Dict:
     return {
         'daily_pnl': 0.0,
         'last_broker_date': None,
-        'processed_anchors_today': [],
+        'processed_anchors_today': [],   # v3.0.5: now the PLACED set (success gate)
+        'missed_anchors_today': [],      # v3.0.5: anchors that gave up after the late window
         'kill_switch_locked': False,
         'day_start_equity': None,  # v2.5.4: today's opening equity — kill baseline
         'shadow_positions_extended': {},  # v2.5: persisted max_fav/fill_time per ticket
