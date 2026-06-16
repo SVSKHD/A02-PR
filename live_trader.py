@@ -222,6 +222,11 @@ class LiveTrader:
             f"Anchors: {[a[0] for a in cfg.anchors]}, "
             f"kill switch: -{cfg.daily_loss_pct*100:.1f}%"
         )
+        # v3.0.4 module receipt: confirm the new surfaces are loaded at startup.
+        self.tele.info(
+            "v3.0.4: timestamped alerts (ts_header, single source) + Firebase "
+            "verifier `python bot.py verifyfb` online."
+        )
         # TEST MODE banner: surface any active test-scope toggle loudly so a
         # forced code path is never mistaken for production behavior. Defaults OFF.
         if os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \

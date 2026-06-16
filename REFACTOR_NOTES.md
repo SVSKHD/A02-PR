@@ -502,3 +502,44 @@ future, deliberately-scoped commit.
 Note: today's A3 was a GENUINE rescue (twin open at -$630 SL) -- the twin-open guard
 worked correctly; only the boost placement failed, now fixed. The next genuine rescue
 should show boosts placing with `rc=10009`.
+
+## 2026-06-16 — v3.0.4: Firebase backfill verifier + timestamped Telegram
+
+Two independent features in one PR, cleanly separated by module. No trading/spec
+behavior changed (anchors, straddle, ladder, rescue, hold, kill switch frozen).
+
+### Task 1 — `verify_firebase.py` + `python bot.py verifyfb`
+Read-only Firestore reconciler. Lists every `aureon_forex` doc with a one-line
+summary, cross-checks the local monthly journal CSVs (`run/journal/trades_*.csv`,
+via the existing `firebase_journal._days_from_csvs`) and names MISSING trading
+days, e.g. confirming Mon Jun-15's EOD write actually landed when Sat Jun-13 did.
+`--backfill <YYYY-MM-DD>` re-writes ONE day idempotently (clean `.set()` overwrite
+through `firebase_journal.save_daily_journal`, `meta.source=verifyfb_backfill`); it
+NEVER auto-writes. Fail-safe: unreachable Firestore warns + exits 0 so it can never
+touch trading. Exit codes: 0 clean / unreachable / backfill ok, 1 missing-found /
+backfill-failed. Reuses the already-fail-safe `firebase_journal` helpers — no new
+Firestore plumbing.
+
+**No per-day close balance exists** in the schema (the journal CSV tracks
+`realized_pnl_usd` + ticket; the Firestore doc tracks `total_pnl` + `n_trades`,
+not balance). The summary surfaces net + trade count and prints balance as `n/a`
+rather than inventing one; `_close_balance()` will show a real value only if a
+doc/meta ever carries `close_balance`/`balance`.
+
+### Task 2 — `telemetry.ts_header()` on every Telegram message
+One helper is the SINGLE source for every outbound timestamp. `_ts_components()`
+captures one UTC instant and derives server (UTC+3) and IST (server+2:30 = UTC+5:30)
+from it, so the two clocks can never drift; `ts_header()` renders
+`🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16`. It is prepended once in
+`Telemetry._send_telegram`, so ALL alert types (anchor/fill/close/rescue/boost/
+TSTOP/EOD/verifyfb) inherit it without any call site hand-formatting a timestamp.
+Date/weekday are the IST date (the human-facing lead). Verified byte-exact against
+the spec example incl. AM/PM, single-digit day, and the midnight wrap.
+
+### Acceptance
+- `version.py` -> 3.0.4; startup banner reads `version.__version__` + a v3.0.4
+  module receipt line (`timestamped alerts + verifyfb online`).
+- `selftest` gains a 10th check (`ts header`): asserts server/IST differ by exactly
+  2:30 and the rendered line carries both clocks. Mock-MT5 run: **10/10 PASS**.
+- `verifyfb` dispatch + `--backfill` flag wired in `bot.py`; CRLF preserved on all
+  CRLF files (telemetry.py stays LF, matching its committed convention).

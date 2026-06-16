@@ -49,6 +49,7 @@ STEP_NAMES = {
     7: "rescue class",
     8: "rescue dry-run",
     9: "telegram fmt",
+    10: "ts header",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -382,6 +383,20 @@ class SelfTest:
         self._record(9, PASS if ok else FAIL,
                      f"escape_ok={fmt_ok}, {http_detail}")
 
+    def _step_ts_header(self):
+        # v3.0.4: the timestamp header is the single source for every Telegram
+        # timestamp. Assert it derives server + IST from one instant and they
+        # differ by exactly 2:30, and that the rendered line carries both clocks.
+        from datetime import timedelta
+        from telemetry import ts_header, _ts_components
+        server, ist = _ts_components()
+        diff = ist - server
+        line = ts_header()
+        ok = (diff == timedelta(hours=2, minutes=30)
+              and "server" in line and "IST" in line and line.startswith("🕐"))
+        self._record(10, PASS if ok else FAIL,
+                     f"IST-server={diff} (want 2:30:00) | '{line}'")
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -432,6 +447,7 @@ class SelfTest:
             else:
                 self._record(8, SKIP, skip_reason)
             self._step_telegram_fmt()
+            self._step_ts_header()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -445,7 +461,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = 0
-        for n in range(1, 10):
+        for n in range(1, 11):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -458,12 +474,12 @@ class SelfTest:
         fleet_steps = (4, 5, 6, 8)
         fleet_ready = all(self.results.get(s, ("", ""))[0] == PASS for s in fleet_steps)
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/9 PASS — fleet ready"
+            verdict = f"RESULT: {n_pass}/10 PASS — fleet ready"
         elif n_fail == 0:
             ready = "fleet ready" if fleet_ready else "fleet UNVERIFIED (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/9 PASS, {n_skip} SKIP — {ready}"
+            verdict = f"RESULT: {n_pass}/10 PASS, {n_skip} SKIP — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/9 PASS, {n_fail} FAIL — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/10 PASS, {n_fail} FAIL — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)
