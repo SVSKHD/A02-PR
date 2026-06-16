@@ -218,6 +218,14 @@ History (one line per behavioral change):
          the trail (arm $2.50 / gap $2.00) are all UNCHANGED. Counterfactual
          unmeasurable pre-2026-06-16; judgment-call loosening, re-evaluate vs
          price_log in ~2 weeks. Banner ladder now reads `5>BE | 6>+4 | 10>peak-2`.
+         + HOLD-GATE the breakeven-to-entry stop move: it must NOT engage inside
+         the 45m hold (live 2026-06-16: A2/A3 hit +$5 fav early, pulled back and
+         BE-scratched to $0 at 6.2m/2.8m held -- the disease is the TIMING, not the
+         threshold). The BE-to-entry rung now also requires hold expiry; the higher
+         protective locks (+$6->+$4, +$10->peak-2) and hard SL/TP stay active
+         inside the hold. selftest gains a 17th check (in-hold +$5 stays put, +$6
+         lock still fires in-hold, +$5 post-hold engages, +$7 in-hold locks +$4 but
+         does NOT move to entry).
 """
 
 __version__ = "3.0.7"

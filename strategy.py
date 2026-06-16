@@ -89,9 +89,10 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     #
     # NORMAL leg (1st fill -- job: catch the breakout, bank profits):
     #   fav >= $10  -> SL locked at peak - $2 (floor +$8)
-    #   fav >= $6   -> SL locked at entry +/- $4
-    #   fav >= $5.0 -> SL locked at breakeven (v3.0.7: was $2.5; the +$2.5 arm
-    #                  scratched trend trades to $0 on ordinary gold noise)
+    #   fav >= $6   -> SL locked at entry +/- $4  (fires during the hold)
+    #   fav >= $5.0 -> SL locked at breakeven, ONLY AFTER the 45m hold
+    #                  (v3.0.7: arm was $2.5; raised to $5 AND hold-gated -- the
+    #                  BE-to-entry move inside the hold scratched trends to $0)
     # RESCUE leg (No-OCO 2nd fill -- by construction it only fills after price
     # traveled $10 against its twin; its job is to COVER the twin's loss, so it
     # must stay free to run. Early BE-locks scratch it at $0 exactly when the
@@ -115,7 +116,13 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     elif pos.role != 'rescue':
         if fav >= 6.00:
             _ratchet(pos.entry_price + _sgn * 4.00)
-        elif fav >= 5.00:   # v3.0.7: BE arm +$2.5 -> +$5.0 (stop stays at entry)
+        elif fav >= 5.00 and not in_freeze:
+            # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
+            # inside the 45m hold. Live 2026-06-16: A2/A4 hit +$5 fav early, then
+            # pulled back and BE-scratched to $0 at 6.2m/2.8m held. Raising the arm
+            # to +$5 did not fix this -- the disease is the TIMING. The higher
+            # protective locks (+$6->+$4, +$10->peak-2 above) stay active inside
+            # the hold; ONLY this entry move waits for hold expiry.
             _ratchet(pos.entry_price)
 
     if not in_freeze and fav >= cfg.be_trigger:
