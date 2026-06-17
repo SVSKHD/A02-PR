@@ -1,16 +1,20 @@
-"""AUREON v3.1.0 — Discord embed CARD builders (pure, no network, no discord.py).
+"""AUREON v3.1.1 — Discord embed CARD builders (pure, no network, no discord.py).
 
-Every alert is a rich Discord embed (a "card"): a title, a state color, a grid of
-fields, and a footer = ts_header() (IST + server + date, the single timestamp
-source). These builders are pure dict factories so the selftest can prove each
-card BUILDS and stays within Discord's embed limits without any network or the
-discord.py dependency. discord_client.py posts them; nothing here imports it.
+Every alert is a rich Discord embed (a "card"): a short headline TITLE, a state
+COLOR, an AUTHOR line (AUREON · {anchor}), a GRID of inline fields, and a clean
+single-line ts FOOTER. Cards are built to be SCANNABLE in under 2 seconds — the
+title + color tell the outcome, the fields give the detail, P&L stands alone.
 
-Discord embed limits enforced here: title <=256, field name <=256, field value
-<=1024, description <=4096, <=25 fields, footer <=2048.
+No Telegram MarkdownV2 here: embeds render structure, not *stars*/`backticks`.
+
+These builders are pure dict factories so the selftest can prove each card BUILDS
+and stays within Discord's embed limits without any network or discord.py.
+
+Discord limits enforced: title <=256, field name <=256, field value <=1024,
+description <=4096, <=25 fields, footer/author <=256.
 """
 
-# State colors (one source of truth; mirrors the task's color system).
+# State colors (one source of truth).
 GREEN  = 0x22c55e   # TP, profitable close, CRASH_WIN
 RED    = 0xef4444   # SL, losing close, WHIPSAW_LOSS, kill-switch
 AMBER  = 0xf59e0b   # BE/scratch close, ladder locks (TIER/LOCK4/+4)
@@ -18,24 +22,30 @@ BLUE   = 0x3b82f6   # anchor placed, fill (info)
 ORANGE = 0xf97316   # rescue, boost (high attention)
 GREY   = 0x6b7280   # heartbeat, status, startup banner
 
-# Discord hard limits.
 MAX_TITLE = 256
 MAX_FIELD_NAME = 256
 MAX_FIELD_VALUE = 1024
 MAX_DESC = 4096
-MAX_FOOTER = 2048
+MAX_FOOTER = 256
+MAX_AUTHOR = 256
 MAX_FIELDS = 25
 
 
-def _ts_footer():
-    """Footer = the single-source timestamp header. Imported lazily so this
-    module never imports telemetry at load time (avoids any import cycle) and so
-    a ts_header failure can never break a card (ts_header is itself crash-proof)."""
+def _card_footer():
+    """Clean one-line timestamp footer:
+        🕐 12:30 PM IST · server 10:00 · Wed Jun 17
+    Derived from the single-source instant (telemetry._ts_components). Imported
+    lazily so this module never imports telemetry at load time, and never raises."""
     try:
-        from telemetry import ts_header
-        return ts_header()
+        from telemetry import _ts_components
+        server, ist = _ts_components()
+        h12 = ist.hour % 12 or 12
+        ampm = "AM" if ist.hour < 12 else "PM"
+        return (f"🕐 {h12}:{ist.minute:02d} {ampm} IST · "
+                f"server {server.hour:02d}:{server.minute:02d} · "
+                f"{ist.strftime('%a')} {ist.strftime('%b')} {ist.day}")
     except Exception:
-        return "🕐 (timestamp unavailable)"
+        return "🕐"
 
 
 def _clip(s, n):
@@ -43,8 +53,14 @@ def _clip(s, n):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _short(anchor):
+    """Anchor short tag for the title: 'A2_10h_London' -> 'A2'."""
+    if not anchor:
+        return "?"
+    return str(anchor).split("_")[0]
+
+
 def _field(name, value, inline=True):
-    # Discord rejects empty field values; coerce to a non-empty placeholder.
     v = "" if value is None else str(value)
     if v.strip() == "":
         v = "—"
@@ -53,11 +69,15 @@ def _field(name, value, inline=True):
             "inline": bool(inline)}
 
 
-def build_embed(title, color, fields=None, description=None, footer=None):
+def build_embed(title, color, fields=None, description=None, footer=None,
+                author=None):
     """Assemble a limit-safe embed dict. `fields` is a list of (name, value[,
-    inline]) tuples or pre-built field dicts. NEVER raises."""
+    inline]) tuples. `author` is a string (rendered as the small author line).
+    NEVER raises."""
     try:
         out = {"title": _clip(title, MAX_TITLE), "color": int(color)}
+        if author:
+            out["author"] = {"name": _clip(author, MAX_AUTHOR)}
         if description:
             out["description"] = _clip(description, MAX_DESC)
         flds = []
@@ -70,17 +90,22 @@ def build_embed(title, color, fields=None, description=None, footer=None):
                 flds.append(_field(name, value, inline))
         if flds:
             out["fields"] = flds
-        out["footer"] = {"text": _clip(footer or _ts_footer(), MAX_FOOTER)}
+        out["footer"] = {"text": _clip(footer or _card_footer(), MAX_FOOTER)}
         return out
     except Exception:
-        # A card must never crash the alert path; degrade to a minimal embed.
         return {"title": _clip(str(title), MAX_TITLE), "color": int(GREY),
-                "footer": {"text": _clip(_ts_footer(), MAX_FOOTER)}}
+                "footer": {"text": _clip(_card_footer(), MAX_FOOTER)}}
+
+
+def _author(anchor):
+    return f"AUREON · {anchor}" if anchor else "AUREON"
 
 
 def _money(v):
+    """Signed, $-prefixed, 2dp: +$226.80 / -$210.00 / n/a."""
     try:
-        return f"${float(v):+,.2f}"
+        f = float(v)
+        return f"{'+' if f >= 0 else '-'}${abs(f):,.2f}"
     except (TypeError, ValueError):
         return "n/a"
 
@@ -92,18 +117,22 @@ def _price(v):
         return "—"
 
 
+def _held(held_min):
+    return f"{held_min:.1f}m" if isinstance(held_min, (int, float)) else "—"
+
+
 # ============================================================================
-# One builder per event type
+# One builder per event type (signatures unchanged; layout cleaned up v3.1.1)
 # ============================================================================
 def card_anchor_placed(anchor, anchor_price, buy_sl, buy_tp, sell_sl, sell_tp,
                        lot, footer=None):
     return build_embed(
-        f"⚓ {anchor}", BLUE,
+        f"⚓ {_short(anchor)} placed", BLUE, author=_author(anchor),
         fields=[
-            ("Anchor price", _price(anchor_price)),
+            ("Anchor", _price(anchor_price)),
             ("Lot", lot),
-            ("BUY stop", f"SL {_price(buy_sl)} / TP {_price(buy_tp)}", False),
-            ("SELL stop", f"SL {_price(sell_sl)} / TP {_price(sell_tp)}", False),
+            ("BUY SL", _price(buy_sl)), ("BUY TP", _price(buy_tp)),
+            ("SELL SL", _price(sell_sl)), ("SELL TP", _price(sell_tp)),
         ], footer=footer)
 
 
@@ -117,8 +146,9 @@ def card_fill(anchor, side, entry, ticket, role=None, sl=None, tp=None,
         ("TP", _price(tp)),
     ]
     if sched_actual:
-        fields.append(("Scheduled vs Actual", sched_actual, False))
-    return build_embed(f"🎯 FILL {anchor} {side}", BLUE, fields=fields, footer=footer)
+        fields.append(("Scheduled vs actual", sched_actual, False))
+    return build_embed(f"🎯 {_short(anchor)} {side} FILL", BLUE,
+                       author=_author(anchor), fields=fields, footer=footer)
 
 
 def close_color(pnl, reason):
@@ -132,23 +162,25 @@ def close_color(pnl, reason):
 
 def card_close(anchor, side, reason, entry, exit_price, pnl, held_min=None,
                day_total=None, nh_shadow=None, footer=None):
-    held = f"{held_min:.1f}m" if isinstance(held_min, (int, float)) else "—"
+    # Grid: Entry | Exit | P&L  /  Held | Reason | Day total
     fields = [
-        ("Entry → Exit", f"{_price(entry)} → {_price(exit_price)}", False),
-        ("P&L", f"**{_money(pnl)}**"),
-        ("Exit reason", reason or "—"),
-        ("Held", held),
+        ("Entry", _price(entry)),
+        ("Exit", _price(exit_price)),
+        ("P&L", _money(pnl)),
+        ("Held", _held(held_min)),
+        ("Reason", reason or "—"),
         ("Day total", _money(day_total)),
     ]
     if nh_shadow:
         fields.append(("No-hold shadow", nh_shadow, False))
-    return build_embed(f"📤 CLOSE {anchor} {side} — {reason}",
-                       close_color(pnl, reason), fields=fields, footer=footer)
+    return build_embed(f"📤 {_short(anchor)} {side} · {reason}",
+                       close_color(pnl, reason), author=_author(anchor),
+                       fields=fields, footer=footer)
 
 
 def card_rescue(anchor, trapped_leg, rescue_leg, twin_pnl, footer=None):
     return build_embed(
-        f"🚑 RESCUE {anchor}", ORANGE,
+        f"🚑 {_short(anchor)} RESCUE", ORANGE, author=_author(anchor),
         fields=[
             ("Trapped leg", trapped_leg, False),
             ("Rescue leg", rescue_leg, False),
@@ -169,19 +201,19 @@ def card_boost(n, side, entry, sl, tp, rc=None, footer=None):
 
 
 _BRANCH_COLOR = {"CRASH_WIN": GREEN, "WHIPSAW_LOSS": RED, "SCRATCH": AMBER}
+_BRANCH_TAG = {"CRASH_WIN": "CRASH WIN", "WHIPSAW_LOSS": "WHIPSAW", "SCRATCH": "SCRATCH"}
 
 
 def card_fleet(anchor, branch, leg_pnls, net, counterfactual=None, footer=None):
     """leg_pnls: list of (label, pnl) tuples."""
-    fields = []
-    for label, pnl in (leg_pnls or []):
-        fields.append((str(label), _money(pnl)))
-    fields.append(("Event NET", f"**{_money(net)}**", False))
-    fields.append(("Branch", branch))
+    b = str(branch).upper()
+    fields = [(str(label), _money(pnl)) for label, pnl in (leg_pnls or [])]
+    fields.append(("Event NET", _money(net)))
+    fields.append(("Branch", _BRANCH_TAG.get(b, branch)))
     if counterfactual is not None:
-        fields.append(("No-boost counterfactual", _money(counterfactual)))
-    return build_embed(f"🛟 FLEET {anchor} — {branch}",
-                       _BRANCH_COLOR.get(str(branch).upper(), GREY),
+        fields.append(("No-boost", _money(counterfactual)))
+    return build_embed(f"🛟 {_short(anchor)} FLEET · {_BRANCH_TAG.get(b, branch)}",
+                       _BRANCH_COLOR.get(b, GREY), author=_author(anchor),
                        fields=fields, footer=footer)
 
 
@@ -206,31 +238,28 @@ def card_heartbeat(balance=None, equity=None, open_n=0, pending_n=0,
             ("Equity", _price(equity)),
             ("Open", open_n),
             ("Pending", pending_n),
-            ("Anchors today", anchors_today or "—"),
-            ("Last event", last_event or "—", False),
+            ("Anchors", anchors_today or "—"),
+            ("Last event", last_event or "—"),
         ], footer=footer)
 
 
 def card_status(snapshot, footer=None):
-    """snapshot: dict of label -> value (account+anchors+positions). Rendered as a
-    grey full-snapshot card; long lists collapse into the description."""
-    fields = []
-    for k, v in list((snapshot or {}).items())[:MAX_FIELDS - 1]:
-        fields.append((str(k), v))
-    return build_embed("📊 AUREON Status", GREY, fields=fields, footer=footer)
+    """snapshot: dict of label -> value (account+anchors+positions)."""
+    fields = [(str(k), v) for k, v in list((snapshot or {}).items())[:MAX_FIELDS]]
+    return build_embed("📊 AUREON status", GREY, fields=fields, footer=footer)
 
 
 def card_connect(footer=None):
     return build_embed(
         "✅ AUREON connected", GREY,
-        description="Commands ready — try `/status`.", footer=footer)
+        description="Commands ready — try /status.", footer=footer)
 
 
 def card_intent_warning(footer=None):
     return build_embed(
         "⚠️ Message Content Intent OFF", RED,
-        description=("Alerts work, **COMMANDS WILL NOT**. Enable *Message Content "
-                     "Intent* for this bot in the Discord Developer Portal "
+        description=("Alerts work, COMMANDS WILL NOT. Enable Message Content "
+                     "Intent for this bot in the Discord Developer Portal "
                      "(Bot → Privileged Gateway Intents), then restart."),
         footer=footer)
 
@@ -243,7 +272,20 @@ SEVERITY_COLOR = {
 
 
 def card_generic(title, text, color=GREY, footer=None):
-    """A plain colored card for any message without a dedicated builder. The text
-    becomes the description (Discord markdown; no Telegram MarkdownV2 escaping)."""
+    """A plain colored card for any message without a dedicated builder. Telegram
+    MarkdownV2 artifacts (*, `, _ escapes) are stripped so embeds read cleanly."""
+    clean = _strip_md(text)
     return build_embed(_clip(title, MAX_TITLE), color,
-                       description=text, footer=footer)
+                       description=clean, footer=footer)
+
+
+def _strip_md(text):
+    """Remove leftover Telegram MarkdownV2 emphasis so generic cards aren't full
+    of *stars*/`backticks`/\\escapes. Plain, scannable text."""
+    if not text:
+        return text
+    s = str(text)
+    for ch in ("*", "`", "_"):
+        s = s.replace(ch, "")
+    s = s.replace("\\", "")
+    return s

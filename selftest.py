@@ -443,8 +443,10 @@ class SelfTest:
             s._last_anchor_attempt = {}
             s.placements = []          # (delta_min, recaptured_price)
             s.tele = types.SimpleNamespace(
-                info=lambda m: None, warn=lambda m: None,
-                error=lambda m: s.misses.append(m), success=lambda m: None)
+                info=lambda *a, **k: None, warn=lambda *a, **k: None,
+                error=lambda m=None, *a, **k: s.misses.append(m),
+                success=lambda *a, **k: None,
+                send=lambda m=None, *a, **k: None)
             s.misses = []
             # current price walks with time so a re-capture differs from sched-time
             s.adapter = types.SimpleNamespace(
@@ -519,7 +521,11 @@ class SelfTest:
             stub._rescue_events = {}
             stub._rescue_event_by_ticket = {}
             stub.sent = []
-            stub.tele = types.SimpleNamespace(send=lambda m, s=None: stub.sent.append(m))
+            # v3.1.1: stub must accept the REAL send signature (text + severity
+            # positional, plus important/critical/card/event_key kwargs) and
+            # swallow anything new via **k so it never breaks when send() grows.
+            stub.tele = types.SimpleNamespace(
+                send=lambda m=None, *a, **k: stub.sent.append(m))
             stub._rescue_event_open = types.MethodType(_rl._rescue_event_open, stub)
             stub._rescue_event_on_close = types.MethodType(_rl._rescue_event_on_close, stub)
             stub._rescue_event_finalize = types.MethodType(_rl._rescue_event_finalize, stub)
