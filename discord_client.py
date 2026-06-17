@@ -35,16 +35,71 @@ try:
 except Exception:
     _REQUESTS_OK = False
 
-try:
-    from telegram_net import FailureStreak
-except Exception:                       # pragma: no cover - telegram_net is in-repo
-    FailureStreak = None
-
 log = logging.getLogger("AUREON")
 
 DISCORD_API = "https://discord.com/api/v10"
 CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 10.0
+
+
+# ============================================================================
+# FailureStreak — exponential backoff + collapsed logging (shared infra)
+# ============================================================================
+class FailureStreak:
+    """Tracks consecutive failures for one channel (sends or polls):
+      - on_failure(): log the FIRST failure of a streak fully (returns True);
+        suppress the rest and emit ONE summary line every `summary_every_s`.
+      - interval(): the current retry/poll interval — `base` for the first few
+        failures, then doubling once past 3 consecutive, capped at `cap`.
+      - on_success(): reset; log a one-line recovery if we had been failing.
+    Not thread-safe by design — each channel owns its own instance on one thread.
+    """
+
+    def __init__(self, name, base_interval=30.0, max_interval=300.0,
+                 summary_every_s=300.0, logger=None):
+        self.name = name
+        self.base = float(base_interval)
+        self.cap = float(max_interval)
+        self.summary_every = float(summary_every_s)
+        self.log = logger or log
+        self.count = 0
+        self._first_ts = None
+        self._last_summary_ts = 0.0
+        self._suppressed = 0
+
+    def interval(self):
+        if self.count <= 2:
+            return self.base
+        # 3 consecutive -> 2x base, then keep doubling, capped.
+        return min(self.base * (2 ** (self.count - 2)), self.cap)
+
+    def on_failure(self, err=None):
+        """Record a failure; return True if the caller should log it FULLY now."""
+        now = time.time()
+        self.count += 1
+        if self.count == 1:
+            self._first_ts = now
+            self._last_summary_ts = now
+            self._suppressed = 0
+            return True
+        self._suppressed += 1
+        if now - self._last_summary_ts >= self.summary_every:
+            mins = (now - self._first_ts) / 60.0
+            self.log.warning(
+                f"{self.name} unreachable for {mins:.0f}m, "
+                f"{self._suppressed} attempt(s) failed since last summary "
+                f"(suppressing per-attempt logs)")
+            self._last_summary_ts = now
+            self._suppressed = 0
+        return False
+
+    def on_success(self):
+        if self.count > 0:
+            self.log.info(f"{self.name} reachable again (after {self.count} "
+                          f"consecutive failure(s))")
+        self.count = 0
+        self._first_ts = None
+        self._suppressed = 0
 
 
 @dataclass
@@ -77,9 +132,9 @@ class DiscordClient:
         self.cfg = cfg
         self._log = logger or log
         self._lock = threading.Lock()
-        self._streak = (FailureStreak("Discord", base_interval=30.0,
-                                      max_interval=300.0, summary_every_s=300.0,
-                                      logger=self._log) if FailureStreak else None)
+        self._streak = FailureStreak("Discord", base_interval=30.0,
+                                     max_interval=300.0, summary_every_s=300.0,
+                                     logger=self._log)
         # Dedup state.
         self._seen_keys: "deque[str]" = deque(maxlen=1000)   # event keys posted
         self._seen_set: Set[str] = set()

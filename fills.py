@@ -29,8 +29,20 @@ log = logging.getLogger("AUREON")
 # The silent fill/close regression: building these message strings could throw
 # (a missing/None field) and the throw was swallowed, so the alert vanished with
 # nothing logged. These formatters NEVER raise: partial enrichment degrades the
-# line but a fill/close ALWAYS produces a non-empty message. The timestamp header
-# is still prepended centrally in Telemetry._send_telegram (single source).
+# line but a fill/close ALWAYS produces a non-empty message. The timestamp lives
+# in each Discord card's footer (ts_header), built centrally — no call site
+# hand-formats a timestamp.
+
+def is_rescue_fill(flag_hint, twin_open):
+    """v3.1.3: a No-OCO 2nd fill runs as a RESCUE (fires boosts in the breakout
+    direction) when EITHER its twin is still open (structural recovery) OR the
+    rescue_on_fill flag is set (the first leg filled and the sibling only fills
+    after price travels the full $10 spread against it). Dropping the old
+    twin-open AND-requirement is the lone-leg hedging change: a leg whose twin
+    already closed is still rescued when the breakout runs against it. A genuine
+    FIRST fill (no flag, no open twin) is NOT a rescue."""
+    return bool(twin_open or flag_hint)
+
 
 def format_fill_alert(info, ticket, evt_block=""):
     """Build the FILL telegram body. Never raises. `info` is the shadow-pending
@@ -239,17 +251,25 @@ def _reconcile_with_broker(self):
                     and sp.get('anchor_label') == info['anchor_label']
                     and not sp.get('boost')
                     for tk, sp in self.shadow_positions.items())
-                is_rescue = _twin_open
+                is_rescue = _twin_open or _flag_hint
                 if _twin_open and not _flag_hint:
                     self.tele.warn(
                         f"⚠️ rescue flag was MISSING for {info['anchor_label']} "
                         f"{info['side']} -- recovered structurally (twin still "
                         f"open). Check log for flag-loss cause.")
                 elif _flag_hint and not _twin_open:
-                    self.tele.warn(
-                        f"ℹ️ stale rescue flag IGNORED for {info['anchor_label']} "
-                        f"{info['side']} -- twin already closed; running as a "
-                        f"normal breakout leg (no boosts).")
+                    # v3.1.3 LONE-LEG HEDGING RESCUE: the No-OCO twin already
+                    # closed, but this sibling only fills after price traveled the
+                    # full $10 spread against the (now-lone) leg -- i.e. a breakout
+                    # is underway. Fire the rescue in the breakout direction
+                    # (opposite the losing leg) to offset it and catch the trend.
+                    # This deliberately reverses the v3.0.0 twin-open guard: the
+                    # Jun-17 A4 lone SELL ran to -630 unhedged; a rescue at -10
+                    # would have offset it. HEDGING, never martingale.
+                    self.tele.info(
+                        f"🚑 LONE-LEG RESCUE for {info['anchor_label']} "
+                        f"{info['side']} -- twin already closed; hedging the "
+                        f"breakout (boosts go opposite the losing leg).")
             self.shadow_positions[ticket] = {
                 'anchor_label': info['anchor_label'],
                 'side':         info['side'],

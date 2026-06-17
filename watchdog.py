@@ -7,12 +7,12 @@ Parent supervisor for the trading bot. Responsibilities:
   1. Spawn bot.py as a subprocess
   2. Monitor heartbeat (file mtime in run dir)
   3. Auto-restart on crash, with exponential backoff
-  4. Listen to Telegram commands and translate them to:
+  4. Listen to Discord commands and translate them to:
      - Direct actions (/restart, /stop, /status)
      - Commands forwarded to bot via shared file (/flatten, /pause, /resume)
 
-Telegram commands
------------------
+Commands
+--------
   /status     — current state (positions, daily P&L, kill switch)
   /restart    — graceful bot restart (watchdog handles)
   /stop       — graceful shutdown of watchdog + bot
@@ -31,8 +31,8 @@ Inter-process communication
 Usage
 -----
   # Make sure MT5 terminal is RUNNING AND LOGGED IN on this machine first.
-  export AUREON_TELEGRAM_TOKEN="123:abc..."
-  export AUREON_TELEGRAM_CHAT="987654321"
+  export DISCORD_BOT_TOKEN="..."
+  export DISCORD_CHANNEL_ID="987654321"
   python watchdog.py paper
   python watchdog.py live --i-understand-the-risks
   python watchdog.py backtest --csv data.csv   # also supervises backtest if you like
@@ -49,14 +49,10 @@ try:
 except ImportError:
     AUREON_VERSION = '?'
 import sys
-import threading
 import time
 from typing import Optional, Dict
 
-import requests
-
 from telemetry import telemetry_from_env, Severity
-import telegram_net  # v3.0.8: DNS-pin the getUpdates poll past a poisoned resolver
 import discord_cards as dc  # v3.1.2: rich /status card
 
 
@@ -69,7 +65,6 @@ CRASH_BACKOFF_BASE      = 5          # 5s, 10s, 20s, ... up to MAX
 CRASH_BACKOFF_MAX       = 600        # cap backoff at 10 minutes
 MAX_CONSECUTIVE_CRASHES = 8          # give up after 8 in a row
 CRASH_RESET_AFTER_S     = 600        # 10 min of stability = forget crash count
-TELEGRAM_POLL_TIMEOUT   = 30         # long-poll seconds
 ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
                     "resume","today","help","start"}
 
@@ -109,11 +104,6 @@ class Watchdog:
         self.restart_requested = False
         self.consecutive_crashes = 0
         self.last_start_ts = 0.0
-
-        # Telegram polling
-        self.tg_token = os.environ.get("AUREON_TELEGRAM_TOKEN", "").strip()
-        self.tg_chat  = os.environ.get("AUREON_TELEGRAM_CHAT",  "").strip()
-        self.tg_enabled = bool(self.tg_token and self.tg_chat)
 
         # Auto-deploy (INFRA, default OFF). When ON, poll master, pull+validate,
         # and restart the bot ONLY when the book is flat / at EOD (never mid-trade).
@@ -331,7 +321,7 @@ class Watchdog:
         os.replace(tmp, self.commands_path)
 
     # ------------------------------------------------------------------------
-    # Telegram command handling
+    # Command handling
     # ------------------------------------------------------------------------
 
     def _status_card(self, status: dict):
@@ -500,60 +490,6 @@ class Watchdog:
         elif cmd == "today":
             self.tele.info(self._format_today_summary())
 
-    def _telegram_polling_loop(self):
-        """Long-poll the Telegram bot API for commands. Runs in a daemon thread."""
-        if not self.tg_enabled:
-            return
-        last_update_id = 0
-        url = f"https://api.telegram.org/bot{self.tg_token}/getUpdates"
-        # v3.0.8: connect=5s fails fast on a poisoned-DNS sinkhole instead of
-        # the old 35s stall; read must exceed the long-poll hold time.
-        poll_timeout = (5, TELEGRAM_POLL_TIMEOUT + 5)
-        # Discover existing updates first to skip backlog
-        try:
-            r = telegram_net.get(url, params={"timeout": 0, "limit": 1, "offset": -1},
-                                 timeout=(5, 10))
-            for upd in r.json().get("result", []):
-                last_update_id = upd["update_id"]
-        except Exception:
-            pass
-
-        # v3.0.8: exponential backoff (30 -> 60 -> 120 -> cap 300s after 3
-        # consecutive errors) + collapsed logging (one warning, then a summary
-        # every ~5m) so a poisoned resolver can't flood the log one-line-per-poll.
-        streak = telegram_net.FailureStreak(
-            "Telegram poll", base_interval=30.0, max_interval=300.0,
-            summary_every_s=300.0, logger=logging.getLogger("AUREON"))
-        while not self.shutdown_requested:
-            try:
-                r = telegram_net.get(
-                    url,
-                    params={"offset": last_update_id + 1,
-                            "timeout": TELEGRAM_POLL_TIMEOUT},
-                    timeout=poll_timeout,
-                )
-                if r.status_code != 200:
-                    raise RuntimeError(f"Telegram HTTP {r.status_code}: {r.text[:200]}")
-                streak.on_success()
-                for upd in r.json().get("result", []):
-                    last_update_id = upd["update_id"]
-                    msg = upd.get("message") or upd.get("edited_message") or {}
-                    chat_id = str(msg.get("chat", {}).get("id", ""))
-                    if chat_id != self.tg_chat:
-                        continue  # ignore messages from other chats
-                    text = (msg.get("text") or "").strip()
-                    if not text.startswith("/"):
-                        continue
-                    cmd = text.split()[0]
-                    try:
-                        self._handle_command(cmd, text, source="Telegram")
-                    except Exception as e:
-                        self.tele.error(f"Failed to handle `{cmd}`: {e}")
-            except Exception as e:
-                if streak.on_failure(e):
-                    logging.warning(f"Telegram polling error: {e}")
-                time.sleep(streak.interval())
-
     # ------------------------------------------------------------------------
     # Main supervisor loop
     # ------------------------------------------------------------------------
@@ -563,16 +499,11 @@ class Watchdog:
             f"🤖 *AUREON Watchdog started*\n"
             f"Bot args: `{' '.join(self.bot_args)}`\n"
             f"Run dir: `{self.run_dir}`\n"
-            f"Telegram polling: `{'on' if self.tg_enabled else 'off'}`\n"
-            f"{telegram_net.pin_status_line()}\n"
+            f"Alerts: Discord (embed cards)\n"
             f"Auto-deploy: `{'ON' if self.autodeploy_enabled else 'off'}`"
             f"{f' (poll {self.autodeploy_poll_min:.0f}m)' if self.autodeploy_enabled else ''}\n"
             f"Send `/help` to see commands."
         )
-        # v3.0.9: rebuild + periodic re-resolve in the watchdog process too, so the
-        # getUpdates poll re-pins like a restart instead of holding a stale socket.
-        telegram_net.rebuild("watchdog-start")
-        telegram_net.start_refresh_timer()
 
         # Signal handlers
         def _sigterm(sig, frame):
@@ -581,17 +512,11 @@ class Watchdog:
         signal.signal(signal.SIGTERM, _sigterm)
         signal.signal(signal.SIGINT,  _sigterm)
 
-        # v3.1.0: Discord is the primary command channel. Start its gateway (own
+        # v3.1.0: Discord is the sole command channel. Start its gateway (own
         # daemon thread; verifies Message Content Intent, posts the connect card).
         _dc = getattr(self.tele, 'discord', None)
         if _dc is not None:
             _dc.start_gateway(self._handle_command)
-
-        # Telegram polling thread — only if Telegram is still an active channel.
-        if self.tg_enabled and 'telegram' in getattr(self.tele, 'alert_channels', []):
-            t = threading.Thread(target=self._telegram_polling_loop,
-                                 name="telegram-poll", daemon=True)
-            t.start()
 
         # Spawn bot
         self._spawn_bot()

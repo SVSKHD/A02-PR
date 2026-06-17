@@ -23,6 +23,7 @@ class Position:
     max_fav: float
     lot: float
     role: str = 'normal'  # v2.9: 'normal' (1st leg) | 'rescue' (No-OCO 2nd leg)
+    boost: bool = False   # v3.1.3: SL-rescue BOOST leg (trail-after-+8 handoff)
     closed: bool = False
     exit_price: Optional[float] = None
     exit_time: Optional[pd.Timestamp] = None
@@ -107,7 +108,16 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if level < pos.current_sl:
                 pos.current_sl = level
     _sgn = 1.0 if pos.side == 'BUY' else -1.0
-    if fav >= 10.00:
+    if getattr(pos, 'boost', False):
+        # v3.1.3 BOOST TRAIL HANDOFF: once a boost's favorable excursion clears
+        # +$8, protect the +$8 floor AND ride the post-hold trail (peak - gap)
+        # above it, one-way ratchet (never retreats below +$8). Replaces the old
+        # hard +$8 lock so a real breakout run (e.g. 4334->4359) is not left on
+        # the table. Boosts ONLY; the normal/rescue-leg ladders below are unchanged.
+        if fav >= 8.00:
+            _ratchet(pos.entry_price + _sgn * 8.00)                     # +$8 floor
+            _ratchet(pos.entry_price + _sgn * (fav - cfg.trail_gap))    # peak - gap
+    elif fav >= 10.00:
         # v2.9.1: above +$10 the lock FOLLOWS the peak at $2 distance (ratchet),
         # floor +$8. Captures most of a hold-period spike (peak +$12.8 -> lock
         # +$10.8 = +$540 @0.5) instead of a flat +$8, while $2 of room keeps

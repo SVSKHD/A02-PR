@@ -77,6 +77,7 @@ def _manage_trails_on_bar_close(self):
             max_fav=shadow['max_fav'],
             lot=self.cfg.lot_size,
             role=shadow.get('role', 'normal'),  # v2.9 role-aware ladder
+            boost=bool(shadow.get('boost', False)),  # v3.1.3 boost trail-after-+8
         )
         old_max_fav = shadow.get('max_fav')
         update_position_on_bar(pos, bar_series, bar_time, self.cfg)

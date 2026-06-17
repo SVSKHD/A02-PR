@@ -3,7 +3,7 @@ AUREON v2 — .env file loader.
 
 Loads environment variables from a .env file in the current working directory
 (or the AUREON_ENV_FILE override path). Existing OS env vars take precedence
-over .env values, which is the safe default — if you set AUREON_TELEGRAM_TOKEN
+over .env values, which is the safe default — if you set DISCORD_BOT_TOKEN
 in your shell, it won't be silently overridden by a stale .env.
 
 This module is imported by bot.py, watchdog.py, auto_analyze.py, fetch_data.py,

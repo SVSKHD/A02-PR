@@ -9,7 +9,7 @@ cost a real trade because the only way to diagnose was AFTER a live rescue we
 had waited hours to set up. This harness exercises the ENTIRE placement +
 rescue/boost path ON DEMAND against the connected MT5 demo terminal, with tiny
 throwaway orders placed far from market (or closed/cancelled immediately), and
-reports a clear PASS/FAIL per step to console + Telegram. The boost path now
+reports a clear PASS/FAIL per step to console + Discord. The boost path now
 proves it places at rc=10009 in ~2 minutes instead of during a real rescue.
 
 SAFETY (hard rules)
@@ -32,7 +32,7 @@ from typing import List, Optional, Tuple
 import pandas as pd
 
 from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
-from telemetry import telemetry_from_env, Severity, md_escape
+from telemetry import telemetry_from_env, Severity
 
 log = logging.getLogger("AUREON")
 
@@ -48,21 +48,21 @@ STEP_NAMES = {
     6: "sl modify",
     7: "rescue class",
     8: "rescue dry-run",
-    9: "telegram fmt",
-    10: "ts header",
-    11: "late retry",
-    12: "fleet logger",
-    13: "fill alert",
-    14: "close alert",
-    15: "ts fallback",
-    16: "BE rung",
-    17: "hold gate",
-    18: "tg dns-pin",
-    19: "boost SL",
-    20: "discord cards",
-    21: "discord dedup",
-    22: "discord hb",
-    23: "discord conn",
+    9: "ts header",
+    10: "late retry",
+    11: "fleet logger",
+    12: "fill alert",
+    13: "close alert",
+    14: "ts fallback",
+    15: "BE rung",
+    16: "hold gate",
+    17: "boost SL",
+    18: "discord cards",
+    19: "discord dedup",
+    20: "discord hb",
+    21: "discord conn",
+    22: "lone rescue",
+    23: "boost trail",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -358,48 +358,8 @@ class SelfTest:
                 self._close(tk)
         self._record(8, PASS if all_ok else FAIL, ", ".join(outcomes) + ", closed")
 
-    def _step_telegram_fmt(self):
-        # Render the boost / rescue / reject lines with values containing _, $, -
-        # and assert the dynamic parts are parse-safe (md_escape), then actually
-        # send one line and confirm no unclosed-entity 400.
-        def unescaped_specials(s: str) -> int:
-            n = 0
-            for i, ch in enumerate(s):
-                if ch in ("_", "*", "`", "[") and (i == 0 or s[i - 1] != "\\"):
-                    n += 1
-            return n
-        dyn_vals = ["UNKNOWN_-1", "AUR_A3_S_B1", "-$12.34", "A3_1340_Overlap_SELL"]
-        fmt_ok = all(unescaped_specials(md_escape(v)) == 0 for v in dyn_vals)
-        boost_line = (f"⚡ BOOST1 BUY rejected rc={md_escape('UNKNOWN_-1')} "
-                      f"comment={md_escape('AUR_A3_S_B1')}")
-        rescue_line = f"🚑 RESCUE leg active ({md_escape('A3_1340_Overlap_SELL')})"
-        reject_line = f"❌ reject {md_escape('-$12.34')} ({md_escape('UNKNOWN_-1')})"
-        sample = "\n".join([boost_line, rescue_line, reject_line])
-        tg = getattr(self.tele, 'telegram', None)
-        http_detail = "telegram off (format-only)"
-        http_ok = True
-        if tg is not None:
-            try:
-                import requests
-                url = f"https://api.telegram.org/bot{tg.bot_token}/sendMessage"
-                body = f"🧪 *AUREON-selftest* telegram fmt check\n{sample}"
-                r = requests.post(url, json={
-                    "chat_id": tg.chat_id, "text": body,
-                    "parse_mode": "Markdown", "disable_web_page_preview": True,
-                }, timeout=10)
-                http_ok = (r.status_code == 200)
-                http_detail = f"http {r.status_code}"
-                if not http_ok:
-                    http_detail += f": {r.text[:80]}"
-            except Exception as e:
-                http_ok = False
-                http_detail = f"send raised: {e!r}"
-        ok = fmt_ok and http_ok
-        self._record(9, PASS if ok else FAIL,
-                     f"escape_ok={fmt_ok}, {http_detail}")
-
     def _step_ts_header(self):
-        # v3.0.4: the timestamp header is the single source for every Telegram
+        # v3.0.4: the timestamp header is the single source for every alert
         # timestamp. Assert it derives server + IST from one instant and they
         # differ by exactly 2:30, and that the rendered line carries both clocks.
         from datetime import timedelta
@@ -409,7 +369,7 @@ class SelfTest:
         line = ts_header()
         ok = (diff == timedelta(hours=2, minutes=30)
               and "server" in line and "IST" in line and line.startswith("🕐"))
-        self._record(10, PASS if ok else FAIL,
+        self._record(9, PASS if ok else FAIL,
                      f"IST-server={diff} (want 2:30:00) | '{line}'")
 
     def _step_late_retry(self):
@@ -501,7 +461,7 @@ class SelfTest:
                   f"recap=${sa.placements[0][1] if sa.placements else '?'} "
                   f"(sched-price ${base_price}); miss={'1' if b_ok else 'BAD'} "
                   f"a_ok={a_ok} b_ok={b_ok}")
-        self._record(11, PASS if ok else FAIL, detail)
+        self._record(10, PASS if ok else FAIL, detail)
 
     def _step_fleet_logger(self):
         # v3.0.6: drive the REAL rescue fleet-event logger (rescue_log) with three
@@ -564,14 +524,14 @@ class SelfTest:
                       f"tally=c{tally['CRASH_WIN']}/w{tally['WHIPSAW_LOSS']}/s{tally['SCRATCH']}")
         finally:
             _fj.save_rescue_event = _orig
-        self._record(12, PASS if ok else FAIL, detail)
+        self._record(11, PASS if ok else FAIL, detail)
 
     def _step_fill_alert(self):
         # v3.0.7 Part A: the FILL formatter must ALWAYS produce a non-empty,
         # timestamped message and NEVER raise -- both with full enrichment AND
         # with fields missing (the silent-fill regression). We compose the body
-        # the way _send_telegram does (ts_header prepended) and assert the 🕐
-        # stamp is present (real or fallback).
+        # with ts_header prepended and assert the 🕐 stamp is present (real or
+        # fallback).
         from fills import format_fill_alert
         from telemetry import ts_header, anchor_time_block
         try:
@@ -593,9 +553,9 @@ class SelfTest:
                 ok = ok and nonempty and has_ts
                 bits.append(f"{nm}: nonempty={nonempty} ts={has_ts}")
         except Exception as e:
-            self._record(13, FAIL, f"raised: {e!r}")
+            self._record(12, FAIL, f"raised: {e!r}")
             return
-        self._record(13, PASS if ok else FAIL, "; ".join(bits))
+        self._record(12, PASS if ok else FAIL, "; ".join(bits))
 
     def _step_close_alert(self):
         # v3.0.7 Part A: the CLOSE formatter must ALWAYS produce a non-empty,
@@ -623,9 +583,9 @@ class SelfTest:
                 ok = ok and nonempty and has_ts
                 bits.append(f"{nm}: nonempty={nonempty} ts={has_ts}")
         except Exception as e:
-            self._record(14, FAIL, f"raised: {e!r}")
+            self._record(13, FAIL, f"raised: {e!r}")
             return
-        self._record(14, PASS if ok else FAIL, "; ".join(bits))
+        self._record(13, PASS if ok else FAIL, "; ".join(bits))
 
     def _step_ts_fallback(self):
         # v3.0.7 Part A: ts_header() must NEVER raise. Feed it bad input (a string
@@ -644,7 +604,7 @@ class SelfTest:
         ok = (not raised
               and all(isinstance(o, str) and o.strip().startswith("🕐")
                       for o in outs))
-        self._record(15, PASS if ok else FAIL,
+        self._record(14, PASS if ok else FAIL,
                      f"raised={raised} | sample='{outs[0]}'")
 
     def _step_be_rung(self):
@@ -686,9 +646,9 @@ class SelfTest:
                       f"+5.0 SL={sl_50:.2f}(BE={be_at_50}) | "
                       f"rescue+9 SL={sl_resc:.2f}(locked={resc_locked})")
         except Exception as e:
-            self._record(16, FAIL, f"raised: {e!r}")
+            self._record(15, FAIL, f"raised: {e!r}")
             return
-        self._record(16, PASS if ok else FAIL, detail)
+        self._record(15, PASS if ok else FAIL, detail)
 
     def _step_hold_gate(self):
         # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
@@ -731,33 +691,9 @@ class SelfTest:
             ok = all(checks.values())
             detail = " ".join(f"{k}={'Y' if v else 'N'}" for k, v in checks.items())
         except Exception as e:
-            self._record(17, FAIL, f"raised: {e!r}")
+            self._record(16, FAIL, f"raised: {e!r}")
             return
-        self._record(17, PASS if ok else FAIL, detail)
-
-    def _step_tg_pin(self):
-        # v3.0.8: the Telegram DNS-pin must resolve api.telegram.org to a known-
-        # good IP (a DoH-resolved Telegram-range IP, or the pinned default
-        # 149.154.166.110) and TLS certificate verification MUST stay ON. No live
-        # send is required -- this checks the resolution + verification posture.
-        import telegram_net as tn
-        try:
-            tn.refresh_doh(force=True)   # best-effort; falls back to pinned if no net
-            ip = tn.first_candidate_ip()
-            in_tg_range = (ip == "149.154.166.110") or ip.startswith("149.154.")
-            verify_on = tn.TLS_VERIFY is True
-            line = tn.pin_status_line()
-            if tn.is_enabled():
-                line_ok = ("DNS-pin ON" in line) and (ip in line)
-            else:
-                line_ok = "OFF" in line
-            ok = in_tg_range and verify_on and line_ok
-            detail = (f"ip={ip} tg_range={in_tg_range} tls_verify={verify_on} "
-                      f"| '{line}'")
-        except Exception as e:
-            self._record(18, FAIL, f"raised: {e!r}")
-            return
-        self._record(18, PASS if ok else FAIL, detail)
+        self._record(16, PASS if ok else FAIL, detail)
 
     def _step_boost_sl(self):
         # v3.0.9: the SL-rescue boost stop is config-driven (boost_sl_dollars,
@@ -779,9 +715,9 @@ class SelfTest:
             detail = (f"boost_sl=${sl_d:.0f} (want $10) | BUY entry-${sl_d:.0f}"
                       f"=${buy_sl:.2f} | {n}x whipsaw cap -${cap:.0f}")
         except Exception as e:
-            self._record(19, FAIL, f"raised: {e!r}")
+            self._record(17, FAIL, f"raised: {e!r}")
             return
-        self._record(19, PASS if ok else FAIL, detail)
+        self._record(17, PASS if ok else FAIL, detail)
 
     def _step_discord_cards(self):
         # v3.1.0: every embed CARD builder must produce a Discord-valid embed
@@ -831,9 +767,9 @@ class SelfTest:
             detail = (f"{len(cards)} cards valid, colors TP/SL/BE ok={color_ok}"
                       if ok else f"issues={set(bad)} color_ok={color_ok}")
         except Exception as e:
-            self._record(20, FAIL, f"raised: {e!r}")
+            self._record(18, FAIL, f"raised: {e!r}")
             return
-        self._record(20, PASS if ok else FAIL, detail)
+        self._record(18, PASS if ok else FAIL, detail)
 
     def _step_discord_dedup(self):
         # v3.1.0: a critical event keyed by ticket must post ONCE (not twice on
@@ -864,9 +800,9 @@ class SelfTest:
             detail = (f"same->1={one} distinct->2={two} queued={queued} "
                       f"flushed={flushed} no_dup={no_dup}")
         except Exception as e:
-            self._record(21, FAIL, f"raised: {e!r}")
+            self._record(19, FAIL, f"raised: {e!r}")
             return
-        self._record(21, PASS if ok else FAIL, detail)
+        self._record(19, PASS if ok else FAIL, detail)
 
     def _step_discord_heartbeat(self):
         # v3.1.0: heartbeat card builds non-empty and carries the ts_header footer.
@@ -877,9 +813,9 @@ class SelfTest:
                   and bool(c.get('footer', {}).get('text')))
             detail = f"title={c.get('title')!r} footer={c['footer']['text']!r}"
         except Exception as e:
-            self._record(22, FAIL, f"raised: {e!r}")
+            self._record(20, FAIL, f"raised: {e!r}")
             return
-        self._record(22, PASS if ok else FAIL, detail)
+        self._record(20, PASS if ok else FAIL, detail)
 
     def _step_discord_connect(self):
         # v3.1.0: gateway/reachability is environment-dependent -> WARN (never
@@ -889,7 +825,7 @@ class SelfTest:
         cfg = dcl.config_from_env()
         intent_wired = hasattr(dcl.DiscordClient, 'start_gateway')
         if cfg is None:
-            self._record(23, WARN, "Discord not configured (set DISCORD_BOT_TOKEN/"
+            self._record(21, WARN, "Discord not configured (set DISCORD_BOT_TOKEN/"
                          f"CHANNEL_ID); intent self-check wired={intent_wired}")
             return
         # configured: try a single reachability post of the connect card.
@@ -898,13 +834,74 @@ class SelfTest:
             import discord_cards as dc
             reached = client.post_card(dc.card_connect())
             if reached:
-                self._record(23, PASS, f"connect card posted; intent-check wired="
+                self._record(21, PASS, f"connect card posted; intent-check wired="
                              f"{intent_wired}")
             else:
-                self._record(23, WARN, "Discord unreachable (network) — alerts will "
+                self._record(21, WARN, "Discord unreachable (network) — alerts will "
                              f"retry/queue; intent-check wired={intent_wired}")
         except Exception as e:
-            self._record(23, WARN, f"connect attempt raised (network): {e!r}")
+            self._record(21, WARN, f"connect attempt raised (network): {e!r}")
+
+    def _step_lone_rescue(self):
+        # v3.1.3 LONE-LEG HEDGING RESCUE: a No-OCO 2nd fill fires the rescue +
+        # boosts even when the twin already CLOSED (flag set, twin closed). Drives
+        # the REAL decision helper fills.is_rescue_fill. Also confirms the rescue
+        # invariants the lone path reuses unchanged: -$10 trigger (the $10 straddle
+        # spread = sibling fill), 2 boosts, boost SL $10, whipsaw cap -$700.
+        from fills import is_rescue_fill
+        try:
+            cfg = self.cfg
+            lone = is_rescue_fill(flag_hint=True, twin_open=False)   # twin closed -> FIRES
+            first = is_rescue_fill(flag_hint=False, twin_open=False)  # genuine 1st fill -> no
+            struct = is_rescue_fill(flag_hint=False, twin_open=True)  # twin open -> fires
+            n = int(getattr(cfg, 'rescue_boost_count', 2))
+            sl = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+            spread = 2.0 * float(getattr(cfg, 'trigger_dist', 5.0))   # straddle = $10 apart
+            cap = n * sl * cfg.lot_size * 100
+            ok = (lone and (not first) and struct and n == 2 and sl == 10.0
+                  and abs(spread - 10.0) < 1e-9 and abs(cap - 700.0) < 1e-6)
+            detail = (f"lone-fires={lone} first-fill={first} struct={struct} | "
+                      f"trigger=${spread:.0f} boosts={n} SL=${sl:.0f} cap=-${cap:.0f}")
+        except Exception as e:
+            self._record(22, FAIL, f"raised: {e!r}")
+            return
+        self._record(22, PASS if ok else FAIL, detail)
+
+    def _step_boost_trail(self):
+        # v3.1.3 BOOST TRAIL HANDOFF: drive the REAL strategy core. In-freeze (so
+        # the generic post-hold trail is off and only the boost handoff acts): a
+        # boost holds +$8 as a one-way floor once fav>=8 and rides peak-$2 above;
+        # below +8 it keeps its $10 SL. Rescue-leg (non-boost) is unchanged.
+        from strategy import Position, update_position_on_bar
+        try:
+            cfg = self.cfg
+            entry = 4300.0
+            ts0 = pd.Timestamp('2026-06-17T13:50:00Z')
+
+            def bsl(fav, boost=True, role='rescue', max_fav=None):
+                p = Position(anchor_label='T', side='BUY', entry_price=entry,
+                             entry_time=ts0, current_sl=entry - 10.0,
+                             tp_level=entry + 30.0, max_fav=entry + (max_fav or fav),
+                             lot=cfg.lot_size, role=role, boost=boost)
+                bar = pd.Series({'high': entry + fav, 'low': entry + fav - 0.01,
+                                 'close': entry + fav})
+                update_position_on_bar(p, bar, ts0 + pd.Timedelta(minutes=3), cfg)
+                return round(p.current_sl - entry, 2)
+
+            below = (bsl(6) == -10.0)        # <8: no lock, keeps $10 boost SL
+            floor8 = (bsl(8) == 8.0)         # +8 floor engages
+            held = (bsl(9) == 8.0)           # held at +8 until peak-2 exceeds it
+            ride = (bsl(12) == 10.0)         # rides peak-$2 above the floor
+            # ratchet: peaked +15 (SL +13) then pulls back to fav 9 -> must NOT drop
+            ratchet = (bsl(9, max_fav=15) == 13.0)
+            rescue_same = (bsl(9, boost=False) == -10.0)  # non-boost rescue unchanged
+            ok = below and floor8 and held and ride and ratchet and rescue_same
+            detail = (f"<8={below} floor8={floor8} held={held} ride12={ride} "
+                      f"ratchet={ratchet} rescue-unchanged={rescue_same}")
+        except Exception as e:
+            self._record(23, FAIL, f"raised: {e!r}")
+            return
+        self._record(23, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # Orchestration
@@ -955,7 +952,6 @@ class SelfTest:
                 self._run_guarded(8, self._step_rescue_dryrun)
             else:
                 self._record(8, SKIP, skip_reason)
-            self._step_telegram_fmt()
             self._step_ts_header()
             self._step_late_retry()
             self._step_fleet_logger()
@@ -964,12 +960,13 @@ class SelfTest:
             self._step_ts_fallback()
             self._step_be_rung()
             self._step_hold_gate()
-            self._step_tg_pin()
             self._step_boost_sl()
             self._step_discord_cards()
             self._step_discord_dedup()
             self._step_discord_heartbeat()
             self._step_discord_connect()
+            self._step_lone_rescue()
+            self._step_boost_trail()
         finally:
             self._cleanup()
         return self._report(ts)
