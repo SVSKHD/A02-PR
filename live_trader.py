@@ -91,6 +91,7 @@ except ImportError:
 
 from telemetry import telemetry_from_env, Severity
 import telegram_net  # v3.0.8: DNS-pin Telegram past a poisoned ISP resolver
+import discord_cards as dc  # v3.1.2: startup banner as a field-grid card
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
@@ -788,8 +789,12 @@ class LiveTrader:
         fp_cap_label = (f"\nFP\\_ZERO\\_MAX\\_LOT: `{self.FP_ZERO_MAX_LOT}` ⚠ CAP ACTIVE"
                         if self.FP_ZERO_MAX_LOT is not None
                         else "\nFP\\_ZERO\\_MAX\\_LOT: `None` (Pepperstone demo — no cap)")
-        self.tele.success(
-            f"🚀 *AUREON v{AUREON_VERSION} {'PAPER' if self.paper else 'LIVE'} starting*\n"
+        _mode = 'PAPER' if self.paper else 'LIVE'
+        _alerts_val = (f"Discord cards · heartbeat {_hb}m"
+                       if getattr(self.tele, 'discord', None) is not None
+                       else "Telegram (text)")
+        self.tele.send(
+            f"🚀 *AUREON v{AUREON_VERSION} {_mode} starting*\n"
             f"Lot: `{self.cfg.lot_size}` ({auto_lot_label})\n"
             f"Kill switch: `-{self.cfg.daily_loss_pct*100:.1f}%`\n"
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
@@ -800,7 +805,16 @@ class LiveTrader:
             f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
             f"v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`\n"
             f"Modules ({len(LOADED_MODULES)}): `{' '.join(LOADED_MODULES)}`"
-            + fp_cap_label
+            + fp_cap_label,
+            Severity.SUCCESS, important=True,
+            card=dc.card_startup(
+                f"v{AUREON_VERSION}", _mode,
+                f"{self.cfg.lot_size} ({'auto' if self.cfg.auto_lot else 'manual'})",
+                f"-{self.cfg.daily_loss_pct*100:.1f}%",
+                f"{self.cfg.freeze_minutes}m / fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}",
+                "5>BE | 6>+4 | 10>peak-2",
+                f"${_boost_sl:.0f} (cap -${_whip_cap:.0f})",
+                _alerts_val),
         )
         # v3.1.0: start the Discord heartbeat (no-op if Discord disabled).
         self._start_discord_heartbeat()

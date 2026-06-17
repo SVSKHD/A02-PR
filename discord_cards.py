@@ -53,6 +53,18 @@ def _clip(s, n):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _esc(s):
+    """Backslash-escape Discord markdown specials so identifiers with underscores
+    (anchor labels like A1_02h_Asia, order comments, tickets) render VERBATIM in
+    field VALUES / descriptions instead of being eaten as *italic*/`code` — the
+    'A102hAsia' bug. Embed titles/author/field-names don't render markdown, so
+    only values + descriptions are escaped. Backslash itself is escaped first."""
+    s = "" if s is None else str(s)
+    for ch in ("\\", "_", "*", "`", "~"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
 def _short(anchor):
     """Anchor short tag for the title: 'A2_10h_London' -> 'A2'."""
     if not anchor:
@@ -62,8 +74,7 @@ def _short(anchor):
 
 def _field(name, value, inline=True):
     v = "" if value is None else str(value)
-    if v.strip() == "":
-        v = "—"
+    v = _esc(v) if v.strip() else "—"
     return {"name": _clip(name, MAX_FIELD_NAME),
             "value": _clip(v, MAX_FIELD_VALUE),
             "inline": bool(inline)}
@@ -79,7 +90,7 @@ def build_embed(title, color, fields=None, description=None, footer=None,
         if author:
             out["author"] = {"name": _clip(author, MAX_AUTHOR)}
         if description:
-            out["description"] = _clip(description, MAX_DESC)
+            out["description"] = _clip(_esc(description), MAX_DESC)
         flds = []
         for f in (fields or [])[:MAX_FIELDS]:
             if isinstance(f, dict):
@@ -273,19 +284,34 @@ SEVERITY_COLOR = {
 
 def card_generic(title, text, color=GREY, footer=None):
     """A plain colored card for any message without a dedicated builder. Telegram
-    MarkdownV2 artifacts (*, `, _ escapes) are stripped so embeds read cleanly."""
-    clean = _strip_md(text)
+    bold/code markers are dropped; underscores are KEPT (build_embed escapes them)
+    so anchor names like A1_02h_Asia survive instead of becoming 'A102hAsia'."""
     return build_embed(_clip(title, MAX_TITLE), color,
-                       description=clean, footer=footer)
+                       description=_tg_clean(text), footer=footer)
 
 
-def _strip_md(text):
-    """Remove leftover Telegram MarkdownV2 emphasis so generic cards aren't full
-    of *stars*/`backticks`/\\escapes. Plain, scannable text."""
+def _tg_clean(text):
+    """Normalize Telegram MarkdownV2 source into clean Discord text: undo Telegram
+    backslash-escapes, then drop *bold*/`code` markers. Underscores are left for
+    build_embed to escape (so identifiers render verbatim, not italicized)."""
     if not text:
         return text
     s = str(text)
-    for ch in ("*", "`", "_"):
-        s = s.replace(ch, "")
-    s = s.replace("\\", "")
+    s = s.replace("\\_", "_").replace("\\*", "*").replace("\\`", "`")
+    s = s.replace("*", "").replace("`", "")
     return s
+
+
+def card_startup(version, mode, lot, kill, hold_tstop, ladder, boost_sl, alerts,
+                 footer=None):
+    """🚀 startup banner as a field grid (Title + bold-label fields), not a blob."""
+    return build_embed(
+        f"🚀 AUREON {version} {mode}", GREEN,
+        fields=[
+            ("Lot", lot),
+            ("Kill switch", kill),
+            ("Hold / TSTOP", hold_tstop),
+            ("Ladder", ladder),
+            ("Boost SL", boost_sl),
+            ("Alerts", alerts),
+        ], footer=footer)

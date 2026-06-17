@@ -57,6 +57,7 @@ import requests
 
 from telemetry import telemetry_from_env, Severity
 import telegram_net  # v3.0.8: DNS-pin the getUpdates poll past a poisoned resolver
+import discord_cards as dc  # v3.1.2: rich /status card
 
 
 # ============================================================================
@@ -333,6 +334,43 @@ class Watchdog:
     # Telegram command handling
     # ------------------------------------------------------------------------
 
+    def _status_card(self, status: dict):
+        """v3.1.2: /status as a clean field-grid card (account · P&L · positions)."""
+        def _money(v):
+            try:
+                f = float(v)
+                return f"{'+' if f >= 0 else '-'}${abs(f):,.2f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        def _price(v):
+            try:
+                return f"${float(v):,.2f}"
+            except (TypeError, ValueError):
+                return "—"
+
+        bal = status.get("broker_balance")
+        eq = status.get("broker_equity")
+        locked = status.get("kill_switch_locked")
+        kill_th = status.get("kill_threshold_usd", 0) or 0
+        anchors = status.get("anchors_processed_today", []) or []
+        hb_age = self._heartbeat_age()
+        snap = {}
+        if status.get("broker_login"):
+            snap["Account"] = f"#{status.get('broker_login')} @ {status.get('broker_server','?')}"
+        snap["Balance"] = _price(bal)
+        snap["Equity"] = _price(eq)
+        if bal is not None and eq is not None:
+            snap["Floating P&L"] = _money(eq - bal)
+        snap["Realized P&L"] = _money(status.get("daily_pnl_realized", 0))
+        snap["Open"] = status.get("open_positions", 0)
+        snap["Pending"] = status.get("pending_orders", 0)
+        snap["Anchors today"] = " ".join(anchors) if anchors else "none yet"
+        snap["Kill switch"] = (("🔴 LOCKED" if locked else "🟢 OK")
+                               + (f" (-${kill_th:,.0f})" if kill_th else ""))
+        snap["Heartbeat"] = f"{hb_age:.0f}s ago" if hb_age is not None else "none yet"
+        return dc.card_status(snap)
+
     def _format_status(self, status: dict) -> str:
         if status.get("sleeping"):
             return self._format_sleeping_status(status)
@@ -428,7 +466,7 @@ class Watchdog:
                          f"→ `${float(r['pnl_usd']):+.0f}` ({r['outcome']})")
         return "\n".join(lines)
 
-    def _handle_command(self, cmd: str, raw_text: str):
+    def _handle_command(self, cmd: str, raw_text: str, source: str = "Discord"):
         cmd = cmd.lower().lstrip("/")
         if cmd not in ALLOWED_COMMANDS:
             return
@@ -440,14 +478,15 @@ class Watchdog:
                 # weekend/holiday deep-sleep: the payload IS the sleep summary
                 self.tele.info(self._format_status(status))
             elif status:
-                self.tele.info(f"📊 *AUREON Status*\n{self._format_status(status)}")
+                self.tele.send(self._format_status(status), Severity.INFO,
+                               card=self._status_card(status))
             else:
                 self.tele.warn("No status available — bot may still be starting")
         elif cmd == "restart":
-            self.tele.warn("🔄 Restart requested via Telegram")
+            self.tele.warn(f"🔄 Restart requested via {source}")
             self.restart_requested = True
         elif cmd == "stop":
-            self.tele.warn("🛑 Shutdown requested via Telegram")
+            self.tele.warn(f"🛑 Shutdown requested via {source}")
             self.shutdown_requested = True
         elif cmd == "flatten":
             self._write_command("flatten")
@@ -507,7 +546,7 @@ class Watchdog:
                         continue
                     cmd = text.split()[0]
                     try:
-                        self._handle_command(cmd, text)
+                        self._handle_command(cmd, text, source="Telegram")
                     except Exception as e:
                         self.tele.error(f"Failed to handle `{cmd}`: {e}")
             except Exception as e:
