@@ -34,7 +34,7 @@ RESCUE_CSV_HEADER = [
     "rescue_ticket", "rescue_side", "rescue_fill",
     "boost1_ticket", "boost1_fill", "boost1_rc", "boost1_comment",
     "boost2_ticket", "boost2_fill", "boost2_rc", "boost2_comment",
-    "boosts_placed_ok", "net_usd", "branch",
+    "boosts_placed_ok", "net_usd", "no_boost_net", "branch",
 ]
 
 BRANCHES = ("CRASH_WIN", "WHIPSAW_LOSS", "SCRATCH")
@@ -108,6 +108,15 @@ def _rescue_event_finalize(self, ev):
     boosts = ev.get("boosts") or []
     close_iso = pd.Timestamp.now(tz="UTC").isoformat()
 
+    # v3.1.4: NO-BOOST counterfactual — what the event would have netted with the
+    # rescue/trigger legs ALONE (boost tickets excluded). Logged for every event
+    # (fleet AND lone-leg) so rescuestats can answer "do the boosts help on LONE
+    # legs specifically" separately. Pure observation; no engine change.
+    _boost_tks = {int(b["ticket"]) for b in boosts if b.get("ticket") is not None}
+    no_boost_net = round(sum(p for tk, p in ev["closed"].items()
+                             if int(tk) not in _boost_tks), 2)
+    ev["no_boost_net"] = no_boost_net
+
     def _b(i, key):
         return boosts[i].get(key) if i < len(boosts) else None
 
@@ -126,7 +135,7 @@ def _rescue_event_finalize(self, ev):
         "boost2_ticket": _b(1, "ticket"), "boost2_fill": _b(1, "fill"),
         "boost2_rc": _b(1, "rc"), "boost2_comment": _b(1, "comment"),
         "boosts_placed_ok": bool(ev.get("boosts_placed_ok")),
-        "net_usd": net, "branch": branch,
+        "net_usd": net, "no_boost_net": no_boost_net, "branch": branch,
     }
 
     path = _rescue_csv_path_for(self.run_dir)

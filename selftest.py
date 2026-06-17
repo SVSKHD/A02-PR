@@ -63,6 +63,7 @@ STEP_NAMES = {
     21: "discord conn",
     22: "lone rescue",
     23: "boost trail",
+    24: "lone branches",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -903,6 +904,104 @@ class SelfTest:
             return
         self._record(23, PASS if ok else FAIL, detail)
 
+    def _step_lone_branches(self):
+        # v3.1.4 LONE-LEG BRANCH RESOLUTION (dry-run; no real orders). Proves the
+        # lone-leg rescue (trigger=None, members = rescue leg + 2 boosts) resolves
+        # to the right outcome on three simulated price paths, that the downside is
+        # BOUNDED by the -$700 boost cap, and that the no-boost counterfactual is
+        # logged per event. Boost P&Ls for TREND/WHIPSAW come from the REAL
+        # strategy core driven over a price path (proving trail-past-+8 / $10 SL).
+        import tempfile, csv as _csv, os as _os, types
+        import rescue_log as _rl
+        import firebase_journal as _fj
+        from strategy import Position, update_position_on_bar, realize_pnl_usd
+        cfg = self.cfg
+        lot = cfg.lot_size
+        ts0 = pd.Timestamp('2026-06-17T13:50:00Z')
+
+        def sim_boost(bars, entry=100.0):
+            # BUY boost ($10 SL, $30 TP), post-hold; feed (high, low) bars until it
+            # closes; return realized USD P&L (or None if it never closed).
+            p = Position(anchor_label='T', side='BUY', entry_price=entry,
+                         entry_time=ts0, current_sl=entry - 10.0,
+                         tp_level=entry + 30.0, max_fav=entry, lot=lot,
+                         role='rescue', boost=True)
+            for hi, lo in bars:
+                bar = pd.Series({'high': hi, 'low': lo, 'close': (hi + lo) / 2})
+                if update_position_on_bar(p, bar, ts0 + pd.Timedelta(minutes=60), cfg):
+                    break
+            return round(realize_pnl_usd(p, cfg), 2) if p.closed else None
+
+        # TREND: rise to +25 then pull back to the trail stop -> rides well past +8.
+        b_trend = sim_boost([(125.0, 100.5), (125.0, 123.0)])
+        # WHIPSAW: immediate reverse -> boost hits its $10 SL.
+        b_whip = sim_boost([(100.5, 89.0)])
+        cap = round(2 * float(getattr(cfg, 'boost_sl_dollars', 10.0)) * lot * 100, 2)
+
+        _fj_orig = _fj.save_rescue_event
+        _fj.save_rescue_event = lambda d, e, doc: True
+        tmp = tempfile.mkdtemp(prefix="aureon_lone_")
+        try:
+            stub = types.SimpleNamespace(
+                run_dir=tmp, state={"last_broker_date": "2026-06-17"},
+                _rescue_events={}, _rescue_event_by_ticket={}, sent=[])
+            stub.tele = types.SimpleNamespace(send=lambda m=None, *a, **k: stub.sent.append(m))
+            stub._rescue_event_open = types.MethodType(_rl._rescue_event_open, stub)
+            stub._rescue_event_on_close = types.MethodType(_rl._rescue_event_on_close, stub)
+            stub._rescue_event_finalize = types.MethodType(_rl._rescue_event_finalize, stub)
+
+            def lone_event(tk0, rescue_pnl, b1, b2):
+                # LONE leg: twin already closed -> trigger ticket is None; members
+                # are the rescue leg + its 2 boosts only.
+                rk, k1, k2 = tk0 + 1, tk0 + 2, tk0 + 3
+                stub._rescue_event_open({
+                    'event_id': f"2026-06-17_A4_{tk0}", 'date_ist': '2026-06-17',
+                    'anchor': 'A4_1640_NYopen', 'sched_iso': None, 'open_iso': 'x',
+                    'trigger': {'ticket': None, 'side': None, 'trigger_pnl': None},
+                    'rescue': {'ticket': rk, 'side': 'BUY', 'fill': 4334.0},
+                    'boosts': [{'ticket': k1, 'fill': 4334.0, 'rc': 10009, 'comment': 'AUR_A4_B_B1'},
+                               {'ticket': k2, 'fill': 4334.0, 'rc': 10009, 'comment': 'AUR_A4_B_B2'}],
+                    'boosts_placed_ok': True, 'members': {rk, k1, k2}})
+                for tk, p in ((rk, rescue_pnl), (k1, b1), (k2, b2)):
+                    stub._rescue_event_on_close(tk, p)
+
+            lone_event(1000, rescue_pnl=400.0, b1=b_trend, b2=b_trend)   # TREND
+            lone_event(2000, rescue_pnl=-50.0, b1=b_whip,  b2=b_whip)    # WHIPSAW
+            lone_event(3000, rescue_pnl=5.0,   b1=10.0,    b2=-5.0)      # SCRATCH (chop)
+
+            path = _os.path.join(tmp, "rescue_events.csv")
+            with open(path) as f:
+                rows = list(_csv.DictReader(f))
+            by = {r['event_id'].split('_')[-1]: r for r in rows}
+            trend, whip, scr = by['1000'], by['2000'], by['3000']
+
+            checks = {
+                # boost rode the trail well past +$8 (floor +8 = $%.0f) in the trend
+                "trend_boost_rides>8": (b_trend is not None and b_trend > 8 * lot * 100),
+                "trend=CRASH_WIN":     trend['branch'] == 'CRASH_WIN',
+                "trend_net>0":         float(trend['net_usd']) > 0,
+                # whipsaw boost is capped at its $10 SL ( -$10 * lot * 100 )
+                "whip_boost=-$10SL":   (b_whip is not None and abs(b_whip + 10 * lot * 100) < 0.01),
+                "whip=WHIPSAW_LOSS":   whip['branch'] == 'WHIPSAW_LOSS',
+                "boost_cap_respected": (2 * b_whip) >= -cap - 0.01,   # never worse than -700
+                "scratch=SCRATCH":     scr['branch'] == 'SCRATCH',
+                # no-boost counterfactual logged = rescue leg alone (boosts excluded)
+                "cf_logged_trend":     abs(float(trend['no_boost_net']) - 400.0) < 0.01,
+                "cf_logged_whip":      abs(float(whip['no_boost_net']) - (-50.0)) < 0.01,
+                # lone events carry NO trigger ticket
+                "lone_no_trigger":     all((r['trigger_ticket'] or '') == '' for r in rows),
+            }
+            ok = all(checks.values())
+            detail = (f"boost trend={b_trend} whip={b_whip} cap=-${cap:.0f} | "
+                      + " ".join(f"{k}={'Y' if v else 'N'}" for k, v in checks.items()))
+        except Exception as e:
+            _fj.save_rescue_event = _fj_orig
+            self._record(24, FAIL, f"raised: {e!r}")
+            return
+        finally:
+            _fj.save_rescue_event = _fj_orig
+        self._record(24, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -967,6 +1066,7 @@ class SelfTest:
             self._step_discord_connect()
             self._step_lone_rescue()
             self._step_boost_trail()
+            self._step_lone_branches()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -980,7 +1080,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 24):
+        for n in range(1, 25):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -997,12 +1097,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/23 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/24 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/23 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/24 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/23 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/24 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)

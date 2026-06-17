@@ -337,9 +337,22 @@ History (one line per behavioral change):
          +$8 -- a real run (4334->4359) is no longer left on the table. Boosts only
          (new Position.boost flag); normal/rescue-leg trails unchanged. selftest
          adds lone-leg-rescue and boost-trail steps.
+  3.1.4  TEST-ONLY: lone-leg rescue BRANCH-RESOLUTION coverage + no-boost
+         counterfactual logging. v3.1.3 step 22 proved the lone rescue FIRES with
+         the right structure; new step 24 "lone branches" proves the two outcomes
+         RESOLVE correctly on dry-run simulated price paths (no real orders): TREND
+         -> boosts (real strategy core) ride the trail well past +$8, event nets
+         positive and classifies CRASH_WIN (the A4-Jun17 case that motivated the
+         feature); WHIPSAW -> each boost is bounded at its $10 SL, the -$700 pair
+         cap is never exceeded, classifies WHIPSAW_LOSS (the key safety bound);
+         CHOP -> SCRATCH. rescue_log now also computes + logs the NO-BOOST
+         counterfactual (rescue/trigger legs alone, boosts excluded) as a new
+         rescue_events.csv column for BOTH fleet and lone events, so rescuestats
+         can isolate "do the boosts help on lone legs". No live rescue/boost logic
+         changed. selftest -> 24 steps.
 """
 
-__version__ = "3.1.3"
+__version__ = "3.1.4"
 CODENAME = "Astra Hawk"
 
 
