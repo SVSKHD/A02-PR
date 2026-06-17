@@ -204,7 +204,7 @@ def _send_daily_summary(self, day_str: str, pnl: float):
            f"P&L: `${pnl:+,.2f}`\n"
            f"Trades: `{n_trades}` (wins `{wins}`, SLs `{sls}`)")
     sev = Severity.SUCCESS if pnl > 0 else Severity.WARN
-    self.tele.send(msg, sev)
+    self.tele.send(msg, sev, important=True, critical=True)  # v3.0.9: queue if unreachable
 
 
 def _send_today_summary(self):

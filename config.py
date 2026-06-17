@@ -45,7 +45,13 @@ class Config:
     # anchor; measured Jun-11 A3). Boosts run as rescue legs: no small locks,
     # $10 tier, post-hold trail, TSTOP at 45m.
     rescue_boost_count: int = 2
-    rescue_boost_sl: float = 6.0
+    boost_sl_dollars: float = 10.0  # v3.0.9: boost SL $6 -> $10. First live fleet
+    # (2026-06-17 A1) whipsawed: a $6 stop (entry-$6) was tagged by a $6 dip then
+    # price ran +$8 -- the rescue leg (no tight stop) rode it while both boosts
+    # were already dead. A $10 stop sits below that dip so the boosts survive and
+    # ride too (today's replay: -$406.70 -> ~+$465). Per-pair whipsaw cap is now
+    # -$700 (2 x $10 x 0.35 x 100). Validated n=1 only -- $10 dies on dips deeper
+    # than $10 and loses more on a true crash; a tunable bet pending rescuestats.
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all
@@ -123,3 +129,12 @@ class Config:
     telegram_dns_pin_enabled: bool = True
     telegram_pinned_ips: List[str] = field(
         default_factory=lambda: ["149.154.166.110"])
+    # v3.0.9: do automatically what a manual restart does. Rebuild the Telegram
+    # session (re-resolve DoH + re-pin + fresh socket) on startup, on each wake,
+    # after a failure streak, and every telegram_session_refresh_min minutes --
+    # the operator's "works on restart, then jams" points to a stale socket.
+    telegram_session_refresh_min: float = 15.0
+    # One guaranteed compact status at first anchor-readiness each day (balance,
+    # anchors today, pinned IP) on a freshly-rebuilt session. Env: AUREON_TELEGRAM
+    # _MORNING_REFRESH (on/off).
+    telegram_morning_refresh: bool = True

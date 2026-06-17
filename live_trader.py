@@ -348,6 +348,30 @@ class LiveTrader:
                      "outcome", "pnl_usd", "ticket"])
             # Refresh balance/equity and recompute lot for the new day
             self._refresh_from_broker(reason=f"new day {broker_date}")
+            # v3.0.9: one guaranteed morning status on a freshly-rebuilt session.
+            self._telegram_morning_status(broker_date)
+
+    def _telegram_morning_status(self, broker_date):
+        """v3.0.9: at the first readiness of each broker day, rebuild the Telegram
+        session (re-resolve DoH + re-pin + fresh socket, like a restart) and send
+        ONE compact status — balance, today's anchors, pinned IP — so the operator
+        gets a reliable morning ping whenever Telegram is reachable. Never raises;
+        never blocks trading (the send is queued on the telemetry worker)."""
+        if not getattr(self.cfg, 'telegram_morning_refresh', True):
+            return
+        try:
+            telegram_net.rebuild("morning")
+            bal = self.state.get('day_start_equity')
+            bal_txt = f"${bal:,.2f}" if isinstance(bal, (int, float)) else "n/a"
+            anchors = " ".join(a[0].split('_')[0] for a in self.cfg.anchors)
+            pin = telegram_net.pin_status_line()
+            self.tele.send(
+                f"🌅 *Morning OK {broker_date}*\n"
+                f"Balance: `{bal_txt}` | Anchors: `{anchors}`\n"
+                f"{pin}",
+                Severity.INFO, important=True)
+        except Exception as e:
+            log.warning(f"morning status failed (non-fatal): {e!r}")
 
     # ------------------------------------------------------------------------
     # Heartbeat, status, commands
@@ -715,7 +739,12 @@ class LiveTrader:
         # Telegram DNS-pin before the first banner send goes out.
         telegram_net.configure(
             enabled=getattr(self.cfg, 'telegram_dns_pin_enabled', True),
-            pinned_ips=getattr(self.cfg, 'telegram_pinned_ips', None))
+            pinned_ips=getattr(self.cfg, 'telegram_pinned_ips', None),
+            session_refresh_min=getattr(self.cfg, 'telegram_session_refresh_min', 15.0))
+        _boost_sl = float(getattr(self.cfg, 'boost_sl_dollars', 10.0))
+        _boost_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
+        _whip_cap = _boost_n * _boost_sl * self.cfg.lot_size * 100
+        _morning = "on" if getattr(self.cfg, 'telegram_morning_refresh', True) else "off"
         # v2.5.3: escape underscores so Telegram Markdown doesn't italicize
         auto_lot_label = "auto\\_lot=on" if self.cfg.auto_lot else "auto\\_lot=off"
         fp_cap_label = (f"\nFP\\_ZERO\\_MAX\\_LOT: `{self.FP_ZERO_MAX_LOT}` ⚠ CAP ACTIVE"
@@ -728,7 +757,8 @@ class LiveTrader:
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
             f"Ladder: `5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
-            f"{telegram_net.pin_status_line()}\n"
+            f"Boost: `{_boost_n}x SL ${_boost_sl:.0f}` | whipsaw cap `-${_whip_cap:.0f}`\n"
+            f"{telegram_net.pin_status_line()} | morning-refresh `{_morning}`\n"
             f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
             f"v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`\n"
             f"Modules ({len(LOADED_MODULES)}): `{' '.join(LOADED_MODULES)}`"

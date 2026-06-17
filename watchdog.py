@@ -530,6 +530,10 @@ class Watchdog:
             f"{f' (poll {self.autodeploy_poll_min:.0f}m)' if self.autodeploy_enabled else ''}\n"
             f"Send `/help` to see commands."
         )
+        # v3.0.9: rebuild + periodic re-resolve in the watchdog process too, so the
+        # getUpdates poll re-pins like a restart instead of holding a stale socket.
+        telegram_net.rebuild("watchdog-start")
+        telegram_net.start_refresh_timer()
 
         # Signal handlers
         def _sigterm(sig, frame):

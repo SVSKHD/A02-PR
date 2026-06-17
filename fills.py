@@ -166,7 +166,7 @@ def _reconcile_with_broker(self):
             # INFO rate limiting (a fill often lands seconds after placement).
             self.tele.send(
                 format_fill_alert(info, ticket, self._anchor_evt_block(info)),
-                Severity.INFO, important=True
+                Severity.INFO, important=True, critical=True
             )
             # Cancel sibling (OCO) — v2.3: sibling may be None if other side was skipped pre-flight
             # OCO vs No-OCO sibling handling
@@ -282,16 +282,20 @@ def _reconcile_with_broker(self):
                 if getattr(self.cfg, 'rescue_boost_enabled', False):
                     b_side = info['side']
                     b_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
-                    b_sld = float(getattr(self.cfg, 'rescue_boost_sl', 6.0))
+                    # v3.0.9: boost SL $6 -> $10 (config boost_sl_dollars), legacy
+                    # rescue_boost_sl honored as a fallback for old configs.
+                    b_sld = float(getattr(self.cfg, 'boost_sl_dollars',
+                                          getattr(self.cfg, 'rescue_boost_sl', 10.0)))
                     b_ep = float(info['entry_price'])
                     sgn = 1.0 if b_side == 'BUY' else -1.0
                     b_sl = round(b_ep - sgn * b_sld, 2)
                     b_tp = round(b_ep + sgn * self.cfg.tp_dist, 2)
-                    self.tele.warn(
+                    self.tele.send(
                         f"\u26A1 SL-RESCUE BOOST: opening {b_n}x{self.cfg.lot_size} "
-                        f"{b_side} @ market | SL ${b_sl} (tight ${b_sld:.0f}) | TP ${b_tp}\n"
+                        f"{b_side} @ market | SL ${b_sl} (${b_sld:.0f} SL each) | TP ${b_tp}\n"
                         f"Goal: +${b_n * 8 * self.cfg.lot_size * 100:.0f} covers the twin "
-                        f"if its SL hits; capped -${b_n * b_sld * self.cfg.lot_size * 100:.0f} on whipsaw."
+                        f"if its SL hits; capped -${b_n * b_sld * self.cfg.lot_size * 100:.0f} on whipsaw.",
+                        Severity.WARN, important=True, critical=True
                     )
                     for bi in range(b_n):
                         # v3.0.0 Fix B (boost-fill diagnostics): boosts are
@@ -351,9 +355,10 @@ def _reconcile_with_broker(self):
                                     'role':         'rescue',
                                     'boost':        True,
                                 }
-                            self.tele.success(
+                            self.tele.send(
                                 f"\u2705\u26A1 BOOST{bi+1} {b_side} FILLED @ ${b_fp} "
-                                f"(ticket {b_tk}) rc={b_rc} ({b_rc_name})")
+                                f"(ticket {b_tk}) rc={b_rc} ({b_rc_name})",
+                                Severity.SUCCESS, important=True, critical=True)
                             _fleet_boosts.append({'ticket': int(b_tk) if b_tk else None,
                                                   'fill': b_fp, 'rc': b_rc,
                                                   'comment': b_cmt_used})
@@ -489,7 +494,7 @@ def _reconcile_with_broker(self):
                         self.state['daily_pnl'],
                         slip_txt=slip_txt, hold_txt=hold_txt, nh_txt=nh_txt,
                         evt_block=self._anchor_evt_block(shadow)),
-                    sev, important=True
+                    sev, important=True, critical=True
                 )
                 # Append to today's trade log
                 with open(self.daylog_path, "a", newline="") as f:
@@ -514,7 +519,7 @@ def _reconcile_with_broker(self):
                     format_close_alert(
                         shadow, 'CLOSED', None, None, self.state.get('daily_pnl'),
                         evt_block=self._anchor_evt_block(shadow)),
-                    Severity.WARN, important=True
+                    Severity.WARN, important=True, critical=True
                 )
                 log.warning(f"close detected for {ticket} but no close deal in "
                             f"history yet -- alerted degraded")

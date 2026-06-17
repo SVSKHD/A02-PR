@@ -58,6 +58,7 @@ STEP_NAMES = {
     16: "BE rung",
     17: "hold gate",
     18: "tg dns-pin",
+    19: "boost SL",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -258,7 +259,8 @@ class SelfTest:
             return
         lot = self.vmin
         price = t.ask
-        b_sl = round(price - float(self.cfg.rescue_boost_sl), 2)
+        b_sl = round(price - float(getattr(self.cfg, 'boost_sl_dollars',
+                     getattr(self.cfg, 'rescue_boost_sl', 10.0))), 2)
         b_tp = round(price + self.cfg.tp_dist, 2)
         cmt = "AUR_ST_B_B1"
         res = self.adapter.place_market_order(
@@ -327,7 +329,8 @@ class SelfTest:
         side = 'BUY'
         lot = self.vmin
         price = t.ask
-        b_sl = round(price - float(self.cfg.rescue_boost_sl), 2)
+        b_sl = round(price - float(getattr(self.cfg, 'boost_sl_dollars',
+                     getattr(self.cfg, 'rescue_boost_sl', 10.0))), 2)
         b_tp = round(price + self.cfg.tp_dist, 2)
         n = int(getattr(self.cfg, 'rescue_boost_count', 2))
         # Mirror the structural rescue gate before "firing": twin must be open.
@@ -746,6 +749,30 @@ class SelfTest:
             return
         self._record(18, PASS if ok else FAIL, detail)
 
+    def _step_boost_sl(self):
+        # v3.0.9: the SL-rescue boost stop is config-driven (boost_sl_dollars,
+        # default $10) and replaces the old $6. Assert the configured value and
+        # that the boost-SL geometry placed by fills.py equals entry -/+ that
+        # value, plus the -$700 per-pair whipsaw cap (2 x $10 x 0.35 x 100).
+        try:
+            sl_d = float(getattr(self.cfg, 'boost_sl_dollars',
+                                 getattr(self.cfg, 'rescue_boost_sl', 10.0)))
+            n = int(getattr(self.cfg, 'rescue_boost_count', 2))
+            entry = 4341.40
+            # mirror fills.py: b_sl = entry - sgn*sl_d (BUY sgn=+1)
+            buy_sl = round(entry - 1.0 * sl_d, 2)
+            sell_sl = round(entry + 1.0 * sl_d, 2)
+            cap = n * sl_d * self.cfg.lot_size * 100
+            geom_ok = (abs(buy_sl - (entry - sl_d)) < 0.001
+                       and abs(sell_sl - (entry + sl_d)) < 0.001)
+            ok = (sl_d == 10.0) and geom_ok and n >= 1
+            detail = (f"boost_sl=${sl_d:.0f} (want $10) | BUY entry-${sl_d:.0f}"
+                      f"=${buy_sl:.2f} | {n}x whipsaw cap -${cap:.0f}")
+        except Exception as e:
+            self._record(19, FAIL, f"raised: {e!r}")
+            return
+        self._record(19, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -805,6 +832,7 @@ class SelfTest:
             self._step_be_rung()
             self._step_hold_gate()
             self._step_tg_pin()
+            self._step_boost_sl()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -818,7 +846,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = 0
-        for n in range(1, 19):
+        for n in range(1, 20):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -831,12 +859,12 @@ class SelfTest:
         fleet_steps = (4, 5, 6, 8)
         fleet_ready = all(self.results.get(s, ("", ""))[0] == PASS for s in fleet_steps)
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/18 PASS — fleet ready"
+            verdict = f"RESULT: {n_pass}/19 PASS — fleet ready"
         elif n_fail == 0:
             ready = "fleet ready" if fleet_ready else "fleet UNVERIFIED (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/18 PASS, {n_skip} SKIP — {ready}"
+            verdict = f"RESULT: {n_pass}/19 PASS, {n_skip} SKIP — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/18 PASS, {n_fail} FAIL — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/19 PASS, {n_fail} FAIL — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)

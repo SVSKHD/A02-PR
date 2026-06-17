@@ -50,8 +50,6 @@ CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 10.0
 TLS_VERIFY = True                          # NEVER disable; assert in selftest
 
-_DOH_TTL_S = 1800.0                         # re-resolve at most every 30 min
-
 
 # ============================================================================
 # Socket-level host override (thread-local so concurrent callers never race)
@@ -99,22 +97,43 @@ def _env_pinned_ips():
     return ips or list(DEFAULT_PINNED_IPS)
 
 
+def _env_refresh_min():
+    try:
+        return float(os.environ.get("AUREON_TELEGRAM_REFRESH_MIN", "15").strip() or 15)
+    except ValueError:
+        return 15.0
+
+
 _enabled_flag = _env_enabled()
 _pinned_ips = _env_pinned_ips()
+_session_refresh_min = _env_refresh_min()   # rebuild/re-resolve cadence (min)
 _doh_ips = []            # last DoH-resolved IP(s)
 _doh_ts = 0.0           # when we last resolved
 _cfg_lock = threading.Lock()
+_timer_started = False
 
 
-def configure(enabled=None, pinned_ips=None):
+def _doh_ttl_s():
+    # The DoH cache is considered stale after one refresh interval, so a
+    # long-running process re-resolves on its own cadence (v3.0.9: was a fixed
+    # 30m). A manual restart used to be the only thing that re-resolved.
+    return max(60.0, _session_refresh_min * 60.0)
+
+
+def configure(enabled=None, pinned_ips=None, session_refresh_min=None):
     """Let the Config dataclass override the env defaults at startup (idempotent).
     Safe to call before/after telemetry is built; defaults already work."""
-    global _enabled_flag, _pinned_ips
+    global _enabled_flag, _pinned_ips, _session_refresh_min
     with _cfg_lock:
         if enabled is not None:
             _enabled_flag = bool(enabled)
         if pinned_ips:
             _pinned_ips = [str(ip).strip() for ip in pinned_ips if str(ip).strip()]
+        if session_refresh_min is not None:
+            try:
+                _session_refresh_min = float(session_refresh_min)
+            except (TypeError, ValueError):
+                pass
     _install_patch()
 
 
@@ -163,7 +182,7 @@ def refresh_doh(force=False):
     """Refresh the DoH-resolved IP cache if stale (or forced). Never raises."""
     global _doh_ips, _doh_ts
     now = time.time()
-    if not force and _doh_ips and (now - _doh_ts) < _DOH_TTL_S:
+    if not force and _doh_ips and (now - _doh_ts) < _doh_ttl_s():
         return _doh_ips
     ips = resolve_via_doh()
     if ips:
@@ -203,11 +222,16 @@ def _is_telegram_url(url):
     return isinstance(url, str) and url.startswith(f"https://{PINNED_HOST}")
 
 
-def request(method, url, **kwargs):
+def request(method, url, fresh=False, **kwargs):
     """Drop-in for requests.request that DNS-pins Telegram. Returns a Response on
     any HTTP reply (incl. non-200 — that means we REACHED Telegram), and raises
     the last connection error only if every candidate AND the system resolver
-    fail to connect. TLS verification is always ON."""
+    fail to connect. TLS verification is always ON.
+
+    `fresh=True` (v3.0.9) forces a brand-new DoH re-resolve before connecting —
+    the per-message fresh-connect fallback for a dead/stale pinned socket. Every
+    call already uses a transient session (no shared keep-alive pool), so a
+    fresh request is genuinely a new socket; `fresh` additionally re-pins the IP."""
     kwargs.setdefault("timeout", (CONNECT_TIMEOUT, READ_TIMEOUT))
     kwargs.setdefault("verify", TLS_VERIFY)
     if not _NET_OK:
@@ -215,6 +239,8 @@ def request(method, url, **kwargs):
     if not is_enabled() or not _is_telegram_url(url):
         return requests.request(method, url, **kwargs)
 
+    if fresh:
+        refresh_doh(force=True)
     _install_patch()
     last_exc = None
     for ip in candidate_ips():
@@ -236,12 +262,57 @@ def request(method, url, **kwargs):
     raise last_exc
 
 
-def get(url, **kwargs):
-    return request("GET", url, **kwargs)
+def get(url, fresh=False, **kwargs):
+    return request("GET", url, fresh=fresh, **kwargs)
 
 
-def post(url, **kwargs):
-    return request("POST", url, **kwargs)
+def post(url, fresh=False, **kwargs):
+    return request("POST", url, fresh=fresh, **kwargs)
+
+
+# ============================================================================
+# Session rebuild — do automatically what a manual restart does (v3.0.9)
+# ============================================================================
+# Operator observation: "when we restart it works, then it jams." That pattern
+# is a stale pinned socket / dead keep-alive — not necessarily a hard ISP block.
+# A restart re-resolves DoH and opens fresh sockets; rebuild() does the same on a
+# timer, on wake, and after a failure streak, without a restart.
+def rebuild(reason=""):
+    """Tear down + rebuild the Telegram connection: force a fresh DoH re-resolve
+    and re-pin. (Sends already use transient sessions, so there is no long-lived
+    pool to close; the meaningful state is the resolved IP.) Returns the IP we
+    will connect to next. Never raises."""
+    try:
+        refresh_doh(force=True)
+    except Exception:
+        pass
+    ip = first_candidate_ip()
+    if is_enabled():
+        log.info(f"Telegram session rebuilt ({reason or 'manual'}) → {ip}")
+    return ip
+
+
+def start_refresh_timer():
+    """Start ONE daemon thread per process that rebuilds the session every
+    `telegram_session_refresh_min` minutes, so a long-idle process re-resolves
+    even with no traffic. Idempotent; never blocks the caller."""
+    global _timer_started
+    if _timer_started or not _NET_OK:
+        return
+    with _cfg_lock:
+        if _timer_started:
+            return
+        _timer_started = True
+
+    def _loop():
+        while True:
+            time.sleep(max(60.0, _session_refresh_min * 60.0))
+            try:
+                rebuild("timer")
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, name="telegram-refresh", daemon=True).start()
 
 
 # ============================================================================
