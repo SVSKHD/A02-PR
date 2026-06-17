@@ -306,9 +306,21 @@ History (one line per behavioral change):
          one-line ts footer (🕐 12:30 PM IST · server 10:00 · Wed Jun 17), and all
          Telegram MarkdownV2 artifacts stripped. requirements pin discord.py +
          firebase-admin so a clean VPS rebuild can't lose Discord/Firebase.
+  3.1.2  Tiered/clean cards for ALL types + two label fixes (cosmetic; NO trading
+         change). (1) Status and Startup were dense text blobs routed as generic
+         cards; they are now Title + bold-field-name GRIDs like the rest (status:
+         account/P&L/positions; startup: lot/kill/hold/ladder/boost/alerts).
+         Hierarchy = TITLE (headline) > field NAMES (labels) > field VALUES (data)
+         > footer (timestamp), the only "bigger text" Discord allows. (2) FIX
+         command source: /restart & /stop said "via Telegram" even from Discord —
+         now "via {source}" (Discord gateway -> Discord, Telegram poll ->
+         Telegram). (3) FIX anchor underscores eaten ('A1_02h_Asia' -> 'A102hAsia'
+         italic): field VALUES + descriptions now backslash-escape markdown
+         specials so identifiers render verbatim; the generic-card cleaner no
+         longer DELETES underscores (it dropped them in 3.1.1). version -> 3.1.2.
 """
 
-__version__ = "3.1.1"
+__version__ = "3.1.2"
 CODENAME = "Astra Hawk"
 
 
