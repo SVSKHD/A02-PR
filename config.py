@@ -120,30 +120,10 @@ class Config:
     log_level: str = "INFO"
     state_file: str = "aureon_v2_state.json"
 
-    # Telegram reachability (v3.0.8). The VPS ISP DNS-poisons api.telegram.org;
-    # pin the connect IP past the poisoned system resolver while keeping TLS/SNI
-    # verification against api.telegram.org. DoH (Cloudflare 1.1.1.1) is tried
-    # first, then this list; if all pinned IPs fail the bot falls back to the
-    # system resolver so it self-heals once the network is fixed. Env overrides:
-    # AUREON_TELEGRAM_DNS_PIN (on/off), AUREON_TELEGRAM_PINNED_IPS (csv).
-    telegram_dns_pin_enabled: bool = True
-    telegram_pinned_ips: List[str] = field(
-        default_factory=lambda: ["149.154.166.110"])
-    # v3.0.9: do automatically what a manual restart does. Rebuild the Telegram
-    # session (re-resolve DoH + re-pin + fresh socket) on startup, on each wake,
-    # after a failure streak, and every telegram_session_refresh_min minutes --
-    # the operator's "works on restart, then jams" points to a stale socket.
-    telegram_session_refresh_min: float = 15.0
-    # One guaranteed compact status at first anchor-readiness each day (balance,
-    # anchors today, pinned IP) on a freshly-rebuilt session. Env: AUREON_TELEGRAM
-    # _MORNING_REFRESH (on/off).
-    telegram_morning_refresh: bool = True
-
-    # Alerting/control channel (v3.1.0). Telegram is hard-IP-blocked at the VPS
-    # ISP; Discord (discord.com) is reachable, so Discord is the sole alert +
-    # command channel by default, using rich embed CARDS. Override with env
-    # AUREON_ALERT_CHANNELS (csv, e.g. "discord,telegram"). Discord is enabled by
-    # DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID (.env); commands need the gateway
-    # (discord.py) + Message Content Intent ON in the Developer Portal.
+    # Alerting/control channel (v3.1.0). Discord (discord.com) is the sole alert +
+    # command channel, using rich embed CARDS. Override with env
+    # AUREON_ALERT_CHANNELS (csv). Discord is enabled by DISCORD_BOT_TOKEN +
+    # DISCORD_CHANNEL_ID (.env); commands need the gateway (discord.py) +
+    # Message Content Intent ON in the Developer Portal.
     alert_channels: List[str] = field(default_factory=lambda: ["discord"])
     discord_heartbeat_min: int = 60   # heartbeat card cadence (0 disables)

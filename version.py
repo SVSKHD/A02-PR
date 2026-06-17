@@ -318,9 +318,28 @@ History (one line per behavioral change):
          italic): field VALUES + descriptions now backslash-escape markdown
          specials so identifiers render verbatim; the generic-card cleaner no
          longer DELETES underscores (it dropped them in 3.1.1). version -> 3.1.2.
+  3.1.3  Three changes, one deploy (alerting + rescue/boost; straddle geometry,
+         hold, kill-switch, normal-leg ladder all FROZEN). (1) FULL TELEGRAM RIP:
+         Telegram is deleted, not flagged off — telegram_net.py (DNS-pin/DoH/
+         session-rebuild) removed, all _send_telegram/critical-queue/TelegramConfig
+         and TELEGRAM_*/tg_* config + .env keys gone; Discord is the sole channel
+         (FailureStreak backoff moved into discord_client). selftest drops the two
+         Telegram steps. (2) LONE-LEG HEDGING RESCUE: the No-OCO twin-open
+         precondition is removed so a leg whose twin already closed STILL fires the
+         fleet rescue + 2 boosts when price travels the $10 spread against it (the
+         sibling fills) -- boosts go in the breakout direction (opposite the losing
+         leg), HEDGING not martingale. Jun-17 A4 lone SELL ran to -630 unhedged;
+         this offsets it. Trigger -$10, boost SL $10, whipsaw cap -$700, rescue-
+         class exits and CRASH_WIN/WHIPSAW_LOSS/SCRATCH logging all UNCHANGED; lone
+         events log to rescue_events.csv + Firestore like fleet events. (3) BOOST
+         TRAIL HANDOFF: once a boost clears +$8 fav it rides the post-hold trail
+         (peak - gap $2.00) with +$8 as a one-way floor, instead of hard-locking at
+         +$8 -- a real run (4334->4359) is no longer left on the table. Boosts only
+         (new Position.boost flag); normal/rescue-leg trails unchanged. selftest
+         adds lone-leg-rescue and boost-trail steps.
 """
 
-__version__ = "3.1.2"
+__version__ = "3.1.3"
 CODENAME = "Astra Hawk"
 
 

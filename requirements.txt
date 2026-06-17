@@ -1,7 +1,7 @@
 pandas>=2.0
 numpy>=1.24
 requests>=2.31
-python-dotenv>=1.0   # .env loader (env_loader.py) — REQUIRED for Telegram/keys
+python-dotenv>=1.0   # .env loader (env_loader.py) — REQUIRED for Discord/keys
 MetaTrader5>=5.0.45 ; sys_platform == "win32"
 # REQUIRED for journaling: EOD/weekly trade journal + rescue fleet-event mirror
 # (Firestore). A clean VPS rebuild MUST install this or journaling silently no-ops.

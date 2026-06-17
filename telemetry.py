@@ -4,10 +4,10 @@ AUREON v2 — telemetry.
 Thread-safe notification engine with multiple sinks:
   - Console (always)
   - Log file (always, if path set)
-  - Telegram (if credentials set)
+  - Discord (if credentials set) — sole alert channel via rich embed cards
 
 Trading code calls Telemetry.send(msg, severity, tags=...).
-Telegram delivery happens on a background worker thread so the trading
+Discord delivery happens on a background worker thread so the trading
 loop never blocks on network I/O. Failures during delivery are swallowed
 and logged — telemetry must never crash the trading bot.
 
@@ -20,7 +20,7 @@ Severities and emojis
   ERROR     ❌  order rejected, MT5 reconnect failed
   CRITICAL  🚨  kill switch, account-floor breach, repeated crashes
 
-Rate limits per severity (Telegram only)
+Rate limits per severity (alerts only)
 ---------------------------------------
   DEBUG       skipped
   INFO        max 1 every 5 seconds
@@ -29,10 +29,9 @@ Rate limits per severity (Telegram only)
 
 Configuration via environment variables
 ---------------------------------------
-  AUREON_TELEGRAM_TOKEN          bot token from @BotFather
-  AUREON_TELEGRAM_CHAT           target chat id (your private chat or a group)
-  AUREON_TELEGRAM_MIN_SEVERITY   INFO|SUCCESS|WARN|ERROR|CRITICAL (default INFO)
-  AUREON_LOG_FILE                /var/log/aureon.log (optional)
+  AUREON_ALERT_MIN_SEVERITY   INFO|SUCCESS|WARN|ERROR|CRITICAL (default INFO)
+  AUREON_ALERT_CHANNELS       comma list of channels (default "discord")
+  AUREON_LOG_FILE             /var/log/aureon.log (optional)
 """
 
 import json
@@ -42,30 +41,21 @@ import queue
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import IntEnum
 from typing import Dict, Optional
 
 # requests is the only network dep. Lazy-imported to keep the module usable
-# even when requests isn't installed (telegram sink just disables itself).
+# even when requests isn't installed.
 try:
     import requests
     _REQUESTS_OK = True
 except ImportError:
     _REQUESTS_OK = False
 
-# v3.0.8: all Telegram HTTP goes through telegram_net (DNS-pin past a poisoned
-# ISP resolver + collapsed-log backoff). Imported lazily-safe: if it can't load,
-# telemetry still works (telegram sink just uses plain requests below).
-try:
-    import telegram_net
-    _TG_NET_OK = True
-except Exception:
-    _TG_NET_OK = False
-
-# v3.1.0: Discord is the primary alert/command channel (Telegram is hard-blocked
-# at the VPS ISP). Imported guarded so telemetry still works if discord_* fail.
+# v3.1.0: Discord is the sole alert/command channel (Telegram removed —
+# hard-blocked at the VPS ISP). Imported guarded so telemetry still works if
+# discord_* fail.
 try:
     import discord_client
     import discord_cards
@@ -100,18 +90,7 @@ SEVERITY_FROM_STRING = {s.name: s for s in Severity}
 
 
 # ============================================================================
-# Config
-# ============================================================================
-
-@dataclass
-class TelegramConfig:
-    bot_token: str
-    chat_id: str
-    min_severity: Severity = Severity.INFO
-
-
-# ============================================================================
-# Timestamp header (v3.0.4) — the SINGLE source for every Telegram timestamp
+# Timestamp header (v3.0.4) — the SINGLE source for every alert timestamp
 # ============================================================================
 # Server/broker clock is UTC+3; IST is broker+2:30 (= UTC+5:30). Both are derived
 # from ONE captured instant in _ts_components() so server and IST can never drift
@@ -156,7 +135,7 @@ def _utc_fallback_header():
 
 
 def ts_header(now_utc=None):
-    """The timestamp line prepended to EVERY outbound Telegram message:
+    """The timestamp line used on Discord cards:
         🕐 5:00 AM IST (server 02:30 · IST 05:00) — Tue Jun 16
     12-hour human IST first, then `server HH:MM · IST HH:MM` (24h), then the IST
     weekday + date. Derived from a single instant (see _ts_components).
@@ -165,7 +144,7 @@ def ts_header(now_utc=None):
     datetime on the fill/close path used to throw here and the exception was
     swallowed by the send wrapper, dropping the message silently. On ANY internal
     error we fall back to a plain UTC string and CONTINUE -- a timestamp must
-    never block a Telegram message."""
+    never block an alert."""
     try:
         _, ist = _ts_components(now_utc)
         return f"🕐 {_clock_str(now_utc)} — {ist.strftime('%a')} {ist.strftime('%b')} {ist.day}"
@@ -206,18 +185,15 @@ class Telemetry:
     """
 
     def __init__(self,
-                 telegram: Optional[TelegramConfig] = None,
                  log_file: Optional[str] = None,
                  component: str = "AUREON",
                  discord=None,
                  alert_channels=None,
                  min_severity: "Severity" = None):
-        # v3.1.0: Discord is the primary channel; Telegram is secondary/disabled.
+        # v3.1.0: Discord is the sole alert channel.
         # alert_channels (default ["discord"]) gates which sinks are live.
         self.alert_channels = [c.strip().lower() for c in
                                (alert_channels or ["discord"]) if c.strip()]
-        self.telegram = (telegram if telegram and _REQUESTS_OK
-                         and "telegram" in self.alert_channels else None)
         self._discord_min_sev = min_severity if min_severity is not None else Severity.INFO
         self._discord = None
         if discord is not None and _DISCORD_OK and "discord" in self.alert_channels:
@@ -230,16 +206,7 @@ class Telemetry:
         self.component = component
         self._queue: "queue.Queue[dict]" = queue.Queue(maxsize=1000)
         self._stop_event = threading.Event()
-        self._last_tg_sent: Dict[Severity, float] = {}
-        # v3.0.8: collapse Telegram-send failure spam into one warning + periodic
-        # summary, and never raise on the trading thread (sends run on the worker).
-        self._tg_streak = (telegram_net.FailureStreak("Telegram sends",
-                                                      logger=logging.getLogger("telemetry"))
-                           if _TG_NET_OK else None)
-        # v3.0.9: critical messages (fills/closes/rescue/boost/EOD) that fail to
-        # send are queued here (newest-first) and flushed on the next successful
-        # connection, each carrying its ORIGINAL rendered body (ts_header intact).
-        self._critical_q: "deque[str]" = deque(maxlen=50)
+        self._last_tg_sent: Dict[Severity, float] = {}   # per-severity rate-limit state
 
         # Console logger
         self._log = logging.getLogger("telemetry")
@@ -260,23 +227,15 @@ class Telemetry:
 
         startup_msg = (f"Telemetry started "
                        f"(discord={'on' if self._discord else 'off'}, "
-                       f"telegram={'on' if self.telegram else 'off'}, "
                        f"log_file={'on' if self._fh else 'off'})")
         self.send(startup_msg, Severity.DEBUG)
-        # v3.0.8/9: Telegram DNS-pin receipt (only if Telegram is still a channel).
-        if self.telegram and _TG_NET_OK:
-            telegram_net.rebuild("startup")
-            telegram_net.start_refresh_timer()
-            self._log.info(telegram_net.pin_status_line())
         if self._discord:
-            self._log.info("Alerts: Discord (embed cards) primary")
+            self._log.info("Alerts: Discord (embed cards)")
 
     def discord_status_line(self) -> str:
         """One-line banner receipt of the alert channel state."""
         if self._discord:
             return "Alerts: Discord (embed cards)"
-        if self.telegram:
-            return "Alerts: Telegram (text)"
         return "Alerts: console/log only"
 
     @property
@@ -299,7 +258,7 @@ class Telemetry:
 
         v3.1.0: `card` is a pre-built Discord embed (rich card) for this event; if
         omitted Discord posts a generic colored card from (severity, msg). The
-        SAME msg is the Telegram/console text. `event_key` (e.g. "close:123456")
+        SAME msg is the console/log text. `event_key` (e.g. "close:123456")
         dedups critical events on Discord so a reconnect/flush never double-posts.
 
         `important=True` exempts the message from per-severity rate limiting so a
@@ -308,9 +267,9 @@ class Telemetry:
         INFO) used to be rate-limited away, vanishing with no trace.
 
         `critical=True` (v3.0.9): fills/closes/rescue/boost/EOD. If the send fails
-        (Telegram unreachable) the rendered body is QUEUED and re-sent the instant
-        any connection succeeds, so the operator never has to open MT5 to learn a
-        fill/close happened."""
+        (Discord unreachable) the card is QUEUED (in discord_client) and re-sent
+        the instant any connection succeeds, so the operator never has to open MT5
+        to learn a fill/close happened."""
         try:
             self._queue.put_nowait({
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -391,16 +350,11 @@ class Telemetry:
         # silently throttled away.
         allow = bool(event.get("important")) or not self._rate_limited(sev)
 
-        # Discord (v3.1.0 primary): rich embed cards, dedup by event_key.
+        # Discord (v3.1.0 sole channel): rich embed cards, dedup by event_key.
         if self._discord and sev >= self._discord_min_sev and allow:
             self._discord.deliver(sev.name, msg, card=event.get("card"),
                                   event_key=event.get("event_key"),
                                   critical=bool(event.get("critical")))
-
-        # Telegram (secondary/disabled by default).
-        if self.telegram and sev >= self.telegram.min_severity and allow:
-            self._send_telegram(sev, msg, event.get("tags", {}),
-                                critical=bool(event.get("critical")))
 
     # ------------------------------------------------------------------------
     # Rate limiting
@@ -426,109 +380,24 @@ class Telemetry:
         self._last_tg_sent[sev] = now
         return False
 
-    # ------------------------------------------------------------------------
-    # Telegram delivery
-    # ------------------------------------------------------------------------
-
-    def _send_telegram(self, sev: Severity, msg: str, tags: dict,
-                       critical: bool = False):
-        emoji = SEVERITY_EMOJI.get(sev, "")
-        component = self.component
-        # v3.0.4: prepend the timestamp header to EVERY outbound message from the
-        # SINGLE source (ts_header), captured at send time so server/IST cannot
-        # drift. Every alert type (anchor/fill/close/rescue/boost/TSTOP/EOD/
-        # verifyfb) inherits it here — no call site hand-formats a timestamp.
-        body = f"{ts_header()}\n{emoji} *{component}*\n{msg}"
-        if tags:
-            tag_lines = "\n".join(f"• `{k}`: {v}" for k, v in tags.items())
-            body += f"\n{tag_lines}"
-        # Telegram limit is 4096 chars
-        if len(body) > 4000:
-            body = body[:4000] + "\n... (truncated)"
-
-        if self._post_body(body):
-            if self._tg_streak:
-                self._tg_streak.on_success()
-            self._flush_critical()          # ride a good connection to drain queue
-        else:
-            # v3.0.7: never silent. v3.0.8: collapse the flood (first failure of a
-            # streak logged fully + body, then summaries). v3.0.9: queue criticals.
-            if self._tg_streak is None or self._tg_streak.on_failure(None):
-                self._log.warning(f"Telegram send failed (unreachable) | body was:\n{body}")
-            if critical:
-                self._critical_q.append(body)
-
-    def _post_body(self, body: str) -> bool:
-        """POST one fully-rendered body to Telegram. Returns True if Telegram was
-        REACHED (any HTTP reply), False if the connection failed even after a
-        fresh-connect retry. Never raises. v3.0.9: a failure on the (transient)
-        pooled session is retried ONCE on a brand-new fresh-resolved connection —
-        many jams are a single dead socket that a fresh connect gets through."""
-        _http = telegram_net if _TG_NET_OK else None
-        url = f"https://api.telegram.org/bot{self.telegram.bot_token}/sendMessage"
-        payload = {"chat_id": self.telegram.chat_id, "text": body,
-                   "parse_mode": "Markdown", "disable_web_page_preview": True}
-        for fresh in (False, True):
-            try:
-                if _http:
-                    r = _http.post(url, json=payload, fresh=fresh)
-                else:
-                    r = requests.post(url, json=payload, timeout=(5, 10))
-                if r.status_code != 200:
-                    self._log.warning(f"Telegram returned {r.status_code}: {r.text[:200]}")
-                    # A Markdown parse failure must never DROP a message (an
-                    # unescaped _/*/backtick). Retry once as PLAIN text.
-                    if r.status_code == 400 and "parse" in r.text.lower():
-                        plain = {"chat_id": self.telegram.chat_id, "text": body,
-                                 "disable_web_page_preview": True}
-                        try:
-                            (_http.post(url, json=plain) if _http
-                             else requests.post(url, json=plain, timeout=(5, 10)))
-                        except Exception as e2:
-                            self._log.warning(
-                                f"Telegram plain-text retry failed: {e2} | body was:\n{body}")
-                return True                  # reached Telegram (any HTTP reply)
-            except Exception:
-                if not _http:
-                    return False             # no fresh-connect path without telegram_net
-                continue                     # fall through to the fresh retry
-        return False
-
-    def _flush_critical(self):
-        """Drain queued critical messages NEWEST-FIRST on a good connection, each
-        with its original ts_header body. Stops (and re-queues) on the first
-        failure so order/state survive a flaky connection."""
-        while self._critical_q:
-            body = self._critical_q.pop()    # rightmost = newest
-            if not self._post_body(body):
-                self._critical_q.append(body)
-                break
-
 
 # ============================================================================
 # Factory from environment
 # ============================================================================
 
 def md_escape(s):
-    """Escape Telegram (legacy) Markdown specials in an INTERPOLATED value so a
-    dynamic _ / * / ` / [ cannot open an entity that never closes (the boost
-    can't-parse-entities 400). Escape values, not whole pre-formatted messages."""
-    s = str(s)
-    for ch in ("_", "*", "`", "["):
-        s = s.replace(ch, "\\" + ch)
-    return s
+    # Passthrough — Telegram markdown escaping is gone; Discord cards handle
+    # their own escaping. Kept for backward-compatible imports (e.g. fills.py).
+    return str(s)
 
 
 def telemetry_from_env(component: str = "AUREON") -> Telemetry:
     """
     Build a Telemetry instance from environment variables.
-    v3.1.0: Discord is the primary channel (enabled with DISCORD_BOT_TOKEN +
-    DISCORD_CHANNEL_ID). Telegram is secondary, active only if "telegram" is in
-    AUREON_ALERT_CHANNELS (default "discord"). Always returns a working Telemetry.
+    v3.1.0: Discord is the sole alert channel (enabled with DISCORD_BOT_TOKEN +
+    DISCORD_CHANNEL_ID). Always returns a working Telemetry.
     """
-    token = os.environ.get("AUREON_TELEGRAM_TOKEN", "").strip()
-    chat  = os.environ.get("AUREON_TELEGRAM_CHAT",  "").strip()
-    sev_name = os.environ.get("AUREON_TELEGRAM_MIN_SEVERITY", "INFO").upper()
+    sev_name = os.environ.get("AUREON_ALERT_MIN_SEVERITY", "INFO").upper()
     min_sev = SEVERITY_FROM_STRING.get(sev_name, Severity.INFO)
 
     log_file = os.environ.get("AUREON_LOG_FILE", "").strip() or None
@@ -537,9 +406,8 @@ def telemetry_from_env(component: str = "AUREON") -> Telemetry:
     channels = [c.strip().lower() for c in raw_channels.split(",") if c.strip()] \
         or ["discord"]
 
-    tg = TelegramConfig(token, chat, min_sev) if (token and chat) else None
     dc = discord_client.config_from_env() if _DISCORD_OK else None
-    return Telemetry(telegram=tg, log_file=log_file, component=component,
+    return Telemetry(log_file=log_file, component=component,
                      discord=dc, alert_channels=channels, min_severity=min_sev)
 
 

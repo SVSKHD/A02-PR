@@ -90,7 +90,6 @@ except ImportError:
     AUREON_VERSION = '2.9.2'  # fallback if version.py missing
 
 from telemetry import telemetry_from_env, Severity
-import telegram_net  # v3.0.8: DNS-pin Telegram past a poisoned ISP resolver
 import discord_cards as dc  # v3.1.2: startup banner as a field-grid card
 from mt5_adapter import _MT5_RETCODE_MAP
 
@@ -350,30 +349,6 @@ class LiveTrader:
                      "outcome", "pnl_usd", "ticket"])
             # Refresh balance/equity and recompute lot for the new day
             self._refresh_from_broker(reason=f"new day {broker_date}")
-            # v3.0.9: one guaranteed morning status on a freshly-rebuilt session.
-            self._telegram_morning_status(broker_date)
-
-    def _telegram_morning_status(self, broker_date):
-        """v3.0.9: at the first readiness of each broker day, rebuild the Telegram
-        session (re-resolve DoH + re-pin + fresh socket, like a restart) and send
-        ONE compact status — balance, today's anchors, pinned IP — so the operator
-        gets a reliable morning ping whenever Telegram is reachable. Never raises;
-        never blocks trading (the send is queued on the telemetry worker)."""
-        if not getattr(self.cfg, 'telegram_morning_refresh', True):
-            return
-        try:
-            telegram_net.rebuild("morning")
-            bal = self.state.get('day_start_equity')
-            bal_txt = f"${bal:,.2f}" if isinstance(bal, (int, float)) else "n/a"
-            anchors = " ".join(a[0].split('_')[0] for a in self.cfg.anchors)
-            pin = telegram_net.pin_status_line()
-            self.tele.send(
-                f"🌅 *Morning OK {broker_date}*\n"
-                f"Balance: `{bal_txt}` | Anchors: `{anchors}`\n"
-                f"{pin}",
-                Severity.INFO, important=True)
-        except Exception as e:
-            log.warning(f"morning status failed (non-fatal): {e!r}")
 
     def _start_discord_heartbeat(self):
         """v3.1.0: post a 💓 heartbeat CARD every discord_heartbeat_min minutes on
@@ -766,33 +741,20 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def run(self):
-        # v3.0.8: let the Config dataclass override the env defaults for the
-        # Telegram DNS-pin before the first banner send goes out.
-        telegram_net.configure(
-            enabled=getattr(self.cfg, 'telegram_dns_pin_enabled', True),
-            pinned_ips=getattr(self.cfg, 'telegram_pinned_ips', None),
-            session_refresh_min=getattr(self.cfg, 'telegram_session_refresh_min', 15.0))
         _boost_sl = float(getattr(self.cfg, 'boost_sl_dollars', 10.0))
         _boost_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
         _whip_cap = _boost_n * _boost_sl * self.cfg.lot_size * 100
-        _morning = "on" if getattr(self.cfg, 'telegram_morning_refresh', True) else "off"
-        # v3.1.0: alert-channel banner line (Discord primary, embed cards).
+        # v3.1.0: alert-channel banner line (Discord, embed cards).
         _hb = int(getattr(self.cfg, 'discord_heartbeat_min', 60))
-        if getattr(self.tele, 'discord', None) is not None:
-            _alert_line = (f"Alerts: Discord (embed cards) — commands ON, "
-                           f"heartbeat {_hb}m")
-        else:
-            _alert_line = (f"{telegram_net.pin_status_line()} | "
-                           f"morning-refresh `{_morning}`")
-        # v2.5.3: escape underscores so Telegram Markdown doesn't italicize
+        _alert_line = (f"Alerts: Discord (embed cards) — commands ON, "
+                       f"heartbeat {_hb}m")
+        # escape underscores so Markdown doesn't italicize
         auto_lot_label = "auto\\_lot=on" if self.cfg.auto_lot else "auto\\_lot=off"
         fp_cap_label = (f"\nFP\\_ZERO\\_MAX\\_LOT: `{self.FP_ZERO_MAX_LOT}` ⚠ CAP ACTIVE"
                         if self.FP_ZERO_MAX_LOT is not None
                         else "\nFP\\_ZERO\\_MAX\\_LOT: `None` (Pepperstone demo — no cap)")
         _mode = 'PAPER' if self.paper else 'LIVE'
-        _alerts_val = (f"Discord cards · heartbeat {_hb}m"
-                       if getattr(self.tele, 'discord', None) is not None
-                       else "Telegram (text)")
+        _alerts_val = f"Discord cards · heartbeat {_hb}m"
         self.tele.send(
             f"🚀 *AUREON v{AUREON_VERSION} {_mode} starting*\n"
             f"Lot: `{self.cfg.lot_size}` ({auto_lot_label})\n"
