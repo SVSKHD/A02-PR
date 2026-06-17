@@ -294,9 +294,21 @@ History (one line per behavioral change):
          checks: card-build = PASS on correctness, reachability/gateway = WARN on
          network. .env: DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, optional
          DISCORD_ALLOWED_USER_IDS / DISCORD_WEBHOOK_URL.
+  3.1.1  FIX selftest fleet-logger stub crash + clean Discord card layout (no
+         trading/live-alerting change). (1) The selftest mock tele.send still had
+         the old (text, severity) signature and raised TypeError on the v3.1.0
+         important=/critical=/card=/event_key= kwargs; the stub now mirrors the
+         real signature and swallows any future kwargs via **k (every injected
+         stub sender hardened). (2) Discord cards are now clean field-GRID embeds:
+         short emoji title (📤 A2 BUY · BE), AUREON · {anchor} author line, inline
+         fields (Entry|Exit|P&L / Held|Reason|Day total), P&L in its own field
+         with sign + $ and the card color carrying win/loss at a glance, a clean
+         one-line ts footer (🕐 12:30 PM IST · server 10:00 · Wed Jun 17), and all
+         Telegram MarkdownV2 artifacts stripped. requirements pin discord.py +
+         firebase-admin so a clean VPS rebuild can't lose Discord/Firebase.
 """
 
-__version__ = "3.1.0"
+__version__ = "3.1.1"
 CODENAME = "Astra Hawk"
 
 
