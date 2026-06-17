@@ -6,3 +6,7 @@ MetaTrader5>=5.0.45 ; sys_platform == "win32"
 # REQUIRED for journaling: EOD/weekly trade journal + rescue fleet-event mirror
 # (Firestore). A clean VPS rebuild MUST install this or journaling silently no-ops.
 firebase-admin>=6.0
+# v3.1.0: Discord is the alert + command channel. SENDING uses the REST API
+# (requests, above) and needs NO extra package; discord.py is REQUIRED only for
+# the command GATEWAY (receiving /status etc.). Install on the VPS for commands.
+discord.py>=2.3

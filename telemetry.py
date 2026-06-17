@@ -64,6 +64,15 @@ try:
 except Exception:
     _TG_NET_OK = False
 
+# v3.1.0: Discord is the primary alert/command channel (Telegram is hard-blocked
+# at the VPS ISP). Imported guarded so telemetry still works if discord_* fail.
+try:
+    import discord_client
+    import discord_cards
+    _DISCORD_OK = True
+except Exception:
+    _DISCORD_OK = False
+
 
 # ============================================================================
 # Severity
@@ -199,8 +208,25 @@ class Telemetry:
     def __init__(self,
                  telegram: Optional[TelegramConfig] = None,
                  log_file: Optional[str] = None,
-                 component: str = "AUREON"):
-        self.telegram = telegram if telegram and _REQUESTS_OK else None
+                 component: str = "AUREON",
+                 discord=None,
+                 alert_channels=None,
+                 min_severity: "Severity" = None):
+        # v3.1.0: Discord is the primary channel; Telegram is secondary/disabled.
+        # alert_channels (default ["discord"]) gates which sinks are live.
+        self.alert_channels = [c.strip().lower() for c in
+                               (alert_channels or ["discord"]) if c.strip()]
+        self.telegram = (telegram if telegram and _REQUESTS_OK
+                         and "telegram" in self.alert_channels else None)
+        self._discord_min_sev = min_severity if min_severity is not None else Severity.INFO
+        self._discord = None
+        if discord is not None and _DISCORD_OK and "discord" in self.alert_channels:
+            try:
+                self._discord = discord_client.DiscordClient(
+                    discord, logger=logging.getLogger("discord"))
+            except Exception as e:
+                logging.getLogger("telemetry").warning(
+                    f"Discord client init failed (non-fatal): {e!r}")
         self.component = component
         self._queue: "queue.Queue[dict]" = queue.Queue(maxsize=1000)
         self._stop_event = threading.Event()
@@ -233,16 +259,30 @@ class Telemetry:
         self._worker.start()
 
         startup_msg = (f"Telemetry started "
-                       f"(telegram={'on' if self.telegram else 'off'}, "
+                       f"(discord={'on' if self._discord else 'off'}, "
+                       f"telegram={'on' if self.telegram else 'off'}, "
                        f"log_file={'on' if self._fh else 'off'})")
         self.send(startup_msg, Severity.DEBUG)
-        # v3.0.8: loud one-line DNS-pin receipt on the console at startup.
-        # v3.0.9: rebuild the session at startup and start the periodic refresh
-        # timer so a long-running process re-resolves like a restart would.
+        # v3.0.8/9: Telegram DNS-pin receipt (only if Telegram is still a channel).
         if self.telegram and _TG_NET_OK:
             telegram_net.rebuild("startup")
             telegram_net.start_refresh_timer()
             self._log.info(telegram_net.pin_status_line())
+        if self._discord:
+            self._log.info("Alerts: Discord (embed cards) primary")
+
+    def discord_status_line(self) -> str:
+        """One-line banner receipt of the alert channel state."""
+        if self._discord:
+            return "Alerts: Discord (embed cards)"
+        if self.telegram:
+            return "Alerts: Telegram (text)"
+        return "Alerts: console/log only"
+
+    @property
+    def discord(self):
+        """The DiscordClient (or None) — for the command gateway + heartbeat."""
+        return self._discord
 
     # ------------------------------------------------------------------------
     # Public API
@@ -252,8 +292,15 @@ class Telemetry:
              severity: Severity = Severity.INFO,
              tags: Optional[dict] = None,
              important: bool = False,
-             critical: bool = False):
+             critical: bool = False,
+             card: Optional[dict] = None,
+             event_key: Optional[str] = None):
         """Enqueue a message for delivery. Non-blocking, thread-safe.
+
+        v3.1.0: `card` is a pre-built Discord embed (rich card) for this event; if
+        omitted Discord posts a generic colored card from (severity, msg). The
+        SAME msg is the Telegram/console text. `event_key` (e.g. "close:123456")
+        dedups critical events on Discord so a reconnect/flush never double-posts.
 
         `important=True` exempts the message from per-severity rate limiting so a
         must-see event is never silently dropped. v3.0.7: fills and closes are
@@ -273,6 +320,8 @@ class Telemetry:
                 "tags": tags or {},
                 "important": bool(important),
                 "critical": bool(critical),
+                "card": card,
+                "event_key": event_key,
             })
         except queue.Full:
             # Telemetry must never block trading — drop the message
@@ -337,13 +386,21 @@ class Telemetry:
             except Exception as e:
                 self._log.warning(f"File sink error: {e}")
 
-        # Telegram
-        if self.telegram and sev >= self.telegram.min_severity:
-            # important events (fills/closes) bypass rate limiting entirely so an
-            # event that must reach the human is never silently throttled away.
-            if event.get("important") or not self._rate_limited(sev):
-                self._send_telegram(sev, msg, event.get("tags", {}),
-                                    critical=bool(event.get("critical")))
+        # Decide rate-limit/important ONCE so every channel agrees. important
+        # events (fills/closes) bypass rate limiting so a must-see event is never
+        # silently throttled away.
+        allow = bool(event.get("important")) or not self._rate_limited(sev)
+
+        # Discord (v3.1.0 primary): rich embed cards, dedup by event_key.
+        if self._discord and sev >= self._discord_min_sev and allow:
+            self._discord.deliver(sev.name, msg, card=event.get("card"),
+                                  event_key=event.get("event_key"),
+                                  critical=bool(event.get("critical")))
+
+        # Telegram (secondary/disabled by default).
+        if self.telegram and sev >= self.telegram.min_severity and allow:
+            self._send_telegram(sev, msg, event.get("tags", {}),
+                                critical=bool(event.get("critical")))
 
     # ------------------------------------------------------------------------
     # Rate limiting
@@ -465,8 +522,9 @@ def md_escape(s):
 def telemetry_from_env(component: str = "AUREON") -> Telemetry:
     """
     Build a Telemetry instance from environment variables.
-    Always returns a working Telemetry; Telegram is enabled only if both
-    AUREON_TELEGRAM_TOKEN and AUREON_TELEGRAM_CHAT are set.
+    v3.1.0: Discord is the primary channel (enabled with DISCORD_BOT_TOKEN +
+    DISCORD_CHANNEL_ID). Telegram is secondary, active only if "telegram" is in
+    AUREON_ALERT_CHANNELS (default "discord"). Always returns a working Telemetry.
     """
     token = os.environ.get("AUREON_TELEGRAM_TOKEN", "").strip()
     chat  = os.environ.get("AUREON_TELEGRAM_CHAT",  "").strip()
@@ -475,8 +533,14 @@ def telemetry_from_env(component: str = "AUREON") -> Telemetry:
 
     log_file = os.environ.get("AUREON_LOG_FILE", "").strip() or None
 
+    raw_channels = os.environ.get("AUREON_ALERT_CHANNELS", "discord")
+    channels = [c.strip().lower() for c in raw_channels.split(",") if c.strip()] \
+        or ["discord"]
+
     tg = TelegramConfig(token, chat, min_sev) if (token and chat) else None
-    return Telemetry(telegram=tg, log_file=log_file, component=component)
+    dc = discord_client.config_from_env() if _DISCORD_OK else None
+    return Telemetry(telegram=tg, log_file=log_file, component=component,
+                     discord=dc, alert_channels=channels, min_severity=min_sev)
 
 
 # ============================================================================

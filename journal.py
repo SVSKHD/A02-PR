@@ -204,7 +204,16 @@ def _send_daily_summary(self, day_str: str, pnl: float):
            f"P&L: `${pnl:+,.2f}`\n"
            f"Trades: `{n_trades}` (wins `{wins}`, SLs `{sls}`)")
     sev = Severity.SUCCESS if pnl > 0 else Severity.WARN
-    self.tele.send(msg, sev, important=True, critical=True)  # v3.0.9: queue if unreachable
+    # v3.1.0: rich EOD card; queue if unreachable, deduped by day.
+    try:
+        import discord_cards as _dc
+        _bal = self.state.get('day_start_equity')
+        _card = _dc.card_eod(day_str, pnl, n_trades, balance=_bal,
+                             anchors_hit=f"{wins}W/{sls}SL of {n_trades}")
+    except Exception:
+        _card = None
+    self.tele.send(msg, sev, important=True, critical=True,
+                   card=_card, event_key=f"eod:{day_str}")
 
 
 def _send_today_summary(self):

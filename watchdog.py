@@ -542,8 +542,14 @@ class Watchdog:
         signal.signal(signal.SIGTERM, _sigterm)
         signal.signal(signal.SIGINT,  _sigterm)
 
-        # Telegram polling thread
-        if self.tg_enabled:
+        # v3.1.0: Discord is the primary command channel. Start its gateway (own
+        # daemon thread; verifies Message Content Intent, posts the connect card).
+        _dc = getattr(self.tele, 'discord', None)
+        if _dc is not None:
+            _dc.start_gateway(self._handle_command)
+
+        # Telegram polling thread — only if Telegram is still an active channel.
+        if self.tg_enabled and 'telegram' in getattr(self.tele, 'alert_channels', []):
             t = threading.Thread(target=self._telegram_polling_loop,
                                  name="telegram-poll", daemon=True)
             t.start()

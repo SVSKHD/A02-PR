@@ -154,13 +154,22 @@ def _rescue_event_finalize(self, ev):
     n_ok = sum(1 for b in boosts if b.get("rc") == 10009)
     ok_mark = "✅" if ev.get("boosts_placed_ok") else "❌"
     sev = Severity.SUCCESS if net > 0 else Severity.WARN
+    # v3.1.0: rich fleet card (green/red/amber by branch), deduped by event_id.
+    try:
+        import discord_cards as _dc
+        _legs = [(f"leg {tk}", pnl) for tk, pnl in (ev.get("closed") or {}).items()]
+        _card = _dc.card_fleet(ev.get("anchor"), branch, _legs, net,
+                               counterfactual=ev.get("no_boost_net"))
+    except Exception:
+        _card = None
     self.tele.send(
         f"📊 FLEET EVENT — {ev.get('anchor')}\n"
         f"boosts: {ok_mark} {n_ok}/{n_boost} @ rc=10009\n"
         f"branch: {branch}   net: ${net:+.0f}\n"
         f"running: crash {tally['CRASH_WIN']} · whipsaw {tally['WHIPSAW_LOSS']} "
         f"· scratch {tally['SCRATCH']}",
-        sev,
+        sev, important=True, critical=True,
+        card=_card, event_key=f"fleet:{ev.get('event_id')}",
     )
     log.info(f"FLEET EVENT finalized {ev['event_id']}: net ${net:+.2f} {branch}")
     self._rescue_events.pop(ev["event_id"], None)
