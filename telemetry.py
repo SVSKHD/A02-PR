@@ -41,6 +41,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import IntEnum
@@ -209,6 +210,10 @@ class Telemetry:
         self._tg_streak = (telegram_net.FailureStreak("Telegram sends",
                                                       logger=logging.getLogger("telemetry"))
                            if _TG_NET_OK else None)
+        # v3.0.9: critical messages (fills/closes/rescue/boost/EOD) that fail to
+        # send are queued here (newest-first) and flushed on the next successful
+        # connection, each carrying its ORIGINAL rendered body (ts_header intact).
+        self._critical_q: "deque[str]" = deque(maxlen=50)
 
         # Console logger
         self._log = logging.getLogger("telemetry")
@@ -232,7 +237,11 @@ class Telemetry:
                        f"log_file={'on' if self._fh else 'off'})")
         self.send(startup_msg, Severity.DEBUG)
         # v3.0.8: loud one-line DNS-pin receipt on the console at startup.
+        # v3.0.9: rebuild the session at startup and start the periodic refresh
+        # timer so a long-running process re-resolves like a restart would.
         if self.telegram and _TG_NET_OK:
+            telegram_net.rebuild("startup")
+            telegram_net.start_refresh_timer()
             self._log.info(telegram_net.pin_status_line())
 
     # ------------------------------------------------------------------------
@@ -242,13 +251,19 @@ class Telemetry:
     def send(self, msg: str,
              severity: Severity = Severity.INFO,
              tags: Optional[dict] = None,
-             important: bool = False):
+             important: bool = False,
+             critical: bool = False):
         """Enqueue a message for delivery. Non-blocking, thread-safe.
 
         `important=True` exempts the message from per-severity rate limiting so a
         must-see event is never silently dropped. v3.0.7: fills and closes are
         sent important=True -- a fill arriving within 5s of its placement (both
-        INFO) used to be rate-limited away, vanishing with no trace."""
+        INFO) used to be rate-limited away, vanishing with no trace.
+
+        `critical=True` (v3.0.9): fills/closes/rescue/boost/EOD. If the send fails
+        (Telegram unreachable) the rendered body is QUEUED and re-sent the instant
+        any connection succeeds, so the operator never has to open MT5 to learn a
+        fill/close happened."""
         try:
             self._queue.put_nowait({
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -257,6 +272,7 @@ class Telemetry:
                 "severity": int(severity),
                 "tags": tags or {},
                 "important": bool(important),
+                "critical": bool(critical),
             })
         except queue.Full:
             # Telemetry must never block trading — drop the message
@@ -326,7 +342,8 @@ class Telemetry:
             # important events (fills/closes) bypass rate limiting entirely so an
             # event that must reach the human is never silently throttled away.
             if event.get("important") or not self._rate_limited(sev):
-                self._send_telegram(sev, msg, event.get("tags", {}))
+                self._send_telegram(sev, msg, event.get("tags", {}),
+                                    critical=bool(event.get("critical")))
 
     # ------------------------------------------------------------------------
     # Rate limiting
@@ -356,14 +373,14 @@ class Telemetry:
     # Telegram delivery
     # ------------------------------------------------------------------------
 
-    def _send_telegram(self, sev: Severity, msg: str, tags: dict):
+    def _send_telegram(self, sev: Severity, msg: str, tags: dict,
+                       critical: bool = False):
         emoji = SEVERITY_EMOJI.get(sev, "")
         component = self.component
         # v3.0.4: prepend the timestamp header to EVERY outbound message from the
         # SINGLE source (ts_header), captured at send time so server/IST cannot
         # drift. Every alert type (anchor/fill/close/rescue/boost/TSTOP/EOD/
         # verifyfb) inherits it here — no call site hand-formats a timestamp.
-        # Markdown-safe: escape underscores in tag values
         body = f"{ts_header()}\n{emoji} *{component}*\n{msg}"
         if tags:
             tag_lines = "\n".join(f"• `{k}`: {v}" for k, v in tags.items())
@@ -371,44 +388,64 @@ class Telemetry:
         # Telegram limit is 4096 chars
         if len(body) > 4000:
             body = body[:4000] + "\n... (truncated)"
-        # v3.0.8: route through telegram_net (DNS-pin + (5,10) timeouts) so a
-        # poisoned ISP resolver can't black-hole the send. Falls back to plain
-        # requests if telegram_net failed to import.
-        _http = telegram_net if _TG_NET_OK else None
-        try:
-            url = f"https://api.telegram.org/bot{self.telegram.bot_token}/sendMessage"
-            payload = {
-                "chat_id": self.telegram.chat_id,
-                "text": body,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            }
-            r = (_http.post(url, json=payload) if _http
-                 else requests.post(url, json=payload, timeout=(5, 10)))
+
+        if self._post_body(body):
             if self._tg_streak:
-                self._tg_streak.on_success()   # an HTTP reply = Telegram reachable
-            if r.status_code != 200:
-                self._log.warning(f"Telegram returned {r.status_code}: {r.text[:200]}")
-                # A Markdown parse failure must never DROP a message (an unescaped
-                # _/*/backtick in an interpolated value). Retry once as PLAIN text.
-                if r.status_code == 400 and "parse" in r.text.lower():
-                    plain = {
-                        "chat_id": self.telegram.chat_id,
-                        "text": body,
-                        "disable_web_page_preview": True,
-                    }
-                    try:
-                        (_http.post(url, json=plain) if _http
-                         else requests.post(url, json=plain, timeout=(5, 10)))
-                    except Exception as e2:
-                        self._log.warning(
-                            f"Telegram plain-text retry failed: {e2} | body was:\n{body}")
-        except Exception as e:
-            # v3.0.7: NEVER drop a send silently. v3.0.8: collapse the flood --
-            # log the FIRST failure of a streak fully (with body), suppress the
-            # rest, and emit a periodic summary (see FailureStreak).
-            if self._tg_streak is None or self._tg_streak.on_failure(e):
-                self._log.warning(f"Telegram send failed: {e!r} | body was:\n{body}")
+                self._tg_streak.on_success()
+            self._flush_critical()          # ride a good connection to drain queue
+        else:
+            # v3.0.7: never silent. v3.0.8: collapse the flood (first failure of a
+            # streak logged fully + body, then summaries). v3.0.9: queue criticals.
+            if self._tg_streak is None or self._tg_streak.on_failure(None):
+                self._log.warning(f"Telegram send failed (unreachable) | body was:\n{body}")
+            if critical:
+                self._critical_q.append(body)
+
+    def _post_body(self, body: str) -> bool:
+        """POST one fully-rendered body to Telegram. Returns True if Telegram was
+        REACHED (any HTTP reply), False if the connection failed even after a
+        fresh-connect retry. Never raises. v3.0.9: a failure on the (transient)
+        pooled session is retried ONCE on a brand-new fresh-resolved connection —
+        many jams are a single dead socket that a fresh connect gets through."""
+        _http = telegram_net if _TG_NET_OK else None
+        url = f"https://api.telegram.org/bot{self.telegram.bot_token}/sendMessage"
+        payload = {"chat_id": self.telegram.chat_id, "text": body,
+                   "parse_mode": "Markdown", "disable_web_page_preview": True}
+        for fresh in (False, True):
+            try:
+                if _http:
+                    r = _http.post(url, json=payload, fresh=fresh)
+                else:
+                    r = requests.post(url, json=payload, timeout=(5, 10))
+                if r.status_code != 200:
+                    self._log.warning(f"Telegram returned {r.status_code}: {r.text[:200]}")
+                    # A Markdown parse failure must never DROP a message (an
+                    # unescaped _/*/backtick). Retry once as PLAIN text.
+                    if r.status_code == 400 and "parse" in r.text.lower():
+                        plain = {"chat_id": self.telegram.chat_id, "text": body,
+                                 "disable_web_page_preview": True}
+                        try:
+                            (_http.post(url, json=plain) if _http
+                             else requests.post(url, json=plain, timeout=(5, 10)))
+                        except Exception as e2:
+                            self._log.warning(
+                                f"Telegram plain-text retry failed: {e2} | body was:\n{body}")
+                return True                  # reached Telegram (any HTTP reply)
+            except Exception:
+                if not _http:
+                    return False             # no fresh-connect path without telegram_net
+                continue                     # fall through to the fresh retry
+        return False
+
+    def _flush_critical(self):
+        """Drain queued critical messages NEWEST-FIRST on a good connection, each
+        with its original ts_header body. Stops (and re-queues) on the first
+        failure so order/state survive a flaky connection."""
+        while self._critical_q:
+            body = self._critical_q.pop()    # rightmost = newest
+            if not self._post_body(body):
+                self._critical_q.append(body)
+                break
 
 
 # ============================================================================

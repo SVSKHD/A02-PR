@@ -244,9 +244,35 @@ History (one line per behavioral change):
          an unreachable Telegram can never block a fill. selftest gains an 18th
          check (pin resolves a Telegram-range IP; TLS verification stays ON). NOTE:
          if alerts still fail after the pin the ISP is IP-blocking too -> VPS VPN.
+  3.0.9  Boost SL tune + Telegram session-rebuild (NO straddle/hold/ladder/normal-
+         leg change). (1) BOOST SL $6 -> $10 (config boost_sl_dollars, was the
+         hardcoded-ish rescue_boost_sl=6). First live fleet (2026-06-17 A1)
+         whipsawed: a $6 stop was tagged by a $6 dip, both boosts died, THEN price
+         ran +$8 and the rescue leg rode it alone (-$406.70). A $10 stop sits below
+         that dip so the boosts survive and ride too (today's replay ~+$465).
+         Per-pair whipsaw cap -$420 -> -$700; rescue alert text updated. Validated
+         n=1 only -- $10 dies on dips deeper than $10 and loses more on a true
+         crash; a tunable bet pending rescuestats (which still classifies crash vs
+         whipsaw + the no-boost counterfactual). ONLY the boost SL changed. (2)
+         TELEGRAM SESSION-REBUILD (operator: "works on restart, then jams" = stale
+         pinned socket, not necessarily a hard block): rebuild the connection
+         (re-resolve DoH + re-pin + fresh socket) automatically on startup, each
+         wake, after a failure streak, and every telegram_session_refresh_min (15)
+         minutes; a failed send retries ONCE on a brand-new fresh-resolved
+         connection. (3) MORNING REFRESH (telegram_morning_refresh, default ON):
+         at first readiness each broker day, rebuild + send one compact 🌅 status
+         (balance, anchors, pinned IP). (4) CRITICAL QUEUE: fills/closes/rescue/
+         boost/EOD are tagged critical; if a send fails the rendered body (original
+         ts_header) is queued (cap 50) and flushed newest-first the instant any
+         connection succeeds -- the operator never needs MT5 to learn a fill/close
+         happened. Steady-state backoff/quiet-summaries unchanged; all of this
+         stays off the trading path. selftest gains a 19th check (boost SL =
+         boost_sl_dollars). HONEST LIMIT: a HARD ISP IP-block defeats even fresh
+         connects -> only a VPS VPN/proxy fixes it; the queue still delivers the
+         moment any connection works.
 """
 
-__version__ = "3.0.8"
+__version__ = "3.0.9"
 CODENAME = "Astra Hawk"
 
 
