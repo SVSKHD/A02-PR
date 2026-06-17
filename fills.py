@@ -18,6 +18,7 @@ import pandas as pd
 
 from telemetry import telemetry_from_env, Severity, md_escape, anchor_time_block
 from mt5_adapter import _MT5_RETCODE_MAP
+import discord_cards as dc  # v3.1.0: rich embed cards (pure; safe to import)
 
 log = logging.getLogger("AUREON")
 
@@ -164,9 +165,17 @@ def _reconcile_with_broker(self):
             # v3.0.7: build via the never-raising formatter and send important=True
             # so the fill alert can never be dropped by a formatter throw or by
             # INFO rate limiting (a fill often lands seconds after placement).
+            # v3.1.0: also attach a rich Discord card, deduped by event_key.
+            _evt = self._anchor_evt_block(info)
             self.tele.send(
-                format_fill_alert(info, ticket, self._anchor_evt_block(info)),
-                Severity.INFO, important=True, critical=True
+                format_fill_alert(info, ticket, _evt),
+                Severity.INFO, important=True, critical=True,
+                card=dc.card_fill(info.get('anchor_label'), info.get('side'),
+                                  info.get('entry_price'), ticket,
+                                  role=info.get('role', 'normal'),
+                                  sl=info.get('current_sl'), tp=info.get('tp_level'),
+                                  sched_actual=(_evt.strip() or None)),
+                event_key=f"fill:{ticket}",
             )
             # Cancel sibling (OCO) — v2.3: sibling may be None if other side was skipped pre-flight
             # OCO vs No-OCO sibling handling
@@ -295,7 +304,12 @@ def _reconcile_with_broker(self):
                         f"{b_side} @ market | SL ${b_sl} (${b_sld:.0f} SL each) | TP ${b_tp}\n"
                         f"Goal: +${b_n * 8 * self.cfg.lot_size * 100:.0f} covers the twin "
                         f"if its SL hits; capped -${b_n * b_sld * self.cfg.lot_size * 100:.0f} on whipsaw.",
-                        Severity.WARN, important=True, critical=True
+                        Severity.WARN, important=True, critical=True,
+                        card=dc.card_rescue(info['anchor_label'],
+                                            trapped_leg=f"twin (sibling of {ticket})",
+                                            rescue_leg=f"{b_side} @ ${b_ep:.2f}",
+                                            twin_pnl=None),
+                        event_key=f"rescue:{ticket}",
                     )
                     for bi in range(b_n):
                         # v3.0.0 Fix B (boost-fill diagnostics): boosts are
@@ -358,7 +372,10 @@ def _reconcile_with_broker(self):
                             self.tele.send(
                                 f"\u2705\u26A1 BOOST{bi+1} {b_side} FILLED @ ${b_fp} "
                                 f"(ticket {b_tk}) rc={b_rc} ({b_rc_name})",
-                                Severity.SUCCESS, important=True, critical=True)
+                                Severity.SUCCESS, important=True, critical=True,
+                                card=dc.card_boost(bi + 1, b_side, b_fp, b_sl, b_tp,
+                                                   f"{b_rc} ({b_rc_name})"),
+                                event_key=f"boost:{b_tk}")
                             _fleet_boosts.append({'ticket': int(b_tk) if b_tk else None,
                                                   'fill': b_fp, 'rc': b_rc,
                                                   'comment': b_cmt_used})
@@ -494,7 +511,14 @@ def _reconcile_with_broker(self):
                         self.state['daily_pnl'],
                         slip_txt=slip_txt, hold_txt=hold_txt, nh_txt=nh_txt,
                         evt_block=self._anchor_evt_block(shadow)),
-                    sev, important=True, critical=True
+                    sev, important=True, critical=True,
+                    card=dc.card_close(shadow.get('anchor_label'),
+                                       shadow.get('side'), outcome,
+                                       shadow.get('entry_price'), close_price,
+                                       pnl_usd, held_min=hold_min,
+                                       day_total=self.state['daily_pnl'],
+                                       nh_shadow=(nh_txt.strip() or None)),
+                    event_key=f"close:{ticket}",
                 )
                 # Append to today's trade log
                 with open(self.daylog_path, "a", newline="") as f:
@@ -519,7 +543,12 @@ def _reconcile_with_broker(self):
                     format_close_alert(
                         shadow, 'CLOSED', None, None, self.state.get('daily_pnl'),
                         evt_block=self._anchor_evt_block(shadow)),
-                    Severity.WARN, important=True, critical=True
+                    Severity.WARN, important=True, critical=True,
+                    card=dc.card_close(shadow.get('anchor_label'),
+                                       shadow.get('side'), 'CLOSED',
+                                       shadow.get('entry_price'), None, None,
+                                       day_total=self.state.get('daily_pnl')),
+                    event_key=f"close:{ticket}",
                 )
                 log.warning(f"close detected for {ticket} but no close deal in "
                             f"history yet -- alerted degraded")

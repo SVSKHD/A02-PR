@@ -138,3 +138,12 @@ class Config:
     # anchors today, pinned IP) on a freshly-rebuilt session. Env: AUREON_TELEGRAM
     # _MORNING_REFRESH (on/off).
     telegram_morning_refresh: bool = True
+
+    # Alerting/control channel (v3.1.0). Telegram is hard-IP-blocked at the VPS
+    # ISP; Discord (discord.com) is reachable, so Discord is the sole alert +
+    # command channel by default, using rich embed CARDS. Override with env
+    # AUREON_ALERT_CHANNELS (csv, e.g. "discord,telegram"). Discord is enabled by
+    # DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID (.env); commands need the gateway
+    # (discord.py) + Message Content Intent ON in the Developer Portal.
+    alert_channels: List[str] = field(default_factory=lambda: ["discord"])
+    discord_heartbeat_min: int = 60   # heartbeat card cadence (0 disables)

@@ -270,9 +270,33 @@ History (one line per behavioral change):
          boost_sl_dollars). HONEST LIMIT: a HARD ISP IP-block defeats even fresh
          connects -> only a VPS VPN/proxy fixes it; the queue still delivers the
          moment any connection works.
+  3.1.0  DISCORD replaces Telegram as the sole alert + command channel (Telegram
+         is hard-IP-blocked at the VPS ISP; discord.com is reachable). Trading/
+         exit/ladder logic untouched -- alerting/control layer only. (1) RICH EMBED
+         CARDS: discord_cards.py builds one color-coded card per event (anchor/
+         fill/close/rescue/boost/fleet/EOD/heartbeat/status/connect/intent), with a
+         fielded grid + ts_header footer, within Discord's embed limits. Colors:
+         green TP/win/CRASH_WIN, red SL/loss/WHIPSAW/kill, amber BE/scratch/locks,
+         blue anchor/fill, orange rescue/boost, grey heartbeat/status/banner. (2)
+         discord_client.py SENDS via the REST API (requests; works with NO
+         discord.py) and optionally runs a gateway (discord.py) for COMMANDS, off
+         the trading path. Startup intent self-check warns LOUDLY if Message
+         Content Intent is OFF (alerts work, commands won't); connect card on first
+         gateway connect. (3) DEDUP: critical events by event key (ticket+type) so
+         no double-post across reconnect/flush; general messages by content hash in
+         a 60s bucket. (4) CRITICAL QUEUE (cap 50) flushes newest-first on next
+         success, dedup-checked. (5) HEARTBEAT card every discord_heartbeat_min
+         (60), dedup-aware. (6) COMMANDS port the watchdog set (status/help/
+         restart/stop/flatten/pause/resume/today), restricted to DISCORD_CHANNEL_ID
+         + optional DISCORD_ALLOWED_USER_IDS. (7) alert_channels default
+         ["discord"]; Telegram disabled by default and removed from the selftest
+         hard-gate; no Telegram failure can affect Discord. selftest splits alert
+         checks: card-build = PASS on correctness, reachability/gateway = WARN on
+         network. .env: DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, optional
+         DISCORD_ALLOWED_USER_IDS / DISCORD_WEBHOOK_URL.
 """
 
-__version__ = "3.0.9"
+__version__ = "3.1.0"
 CODENAME = "Astra Hawk"
 
 

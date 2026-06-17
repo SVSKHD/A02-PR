@@ -59,6 +59,10 @@ STEP_NAMES = {
     17: "hold gate",
     18: "tg dns-pin",
     19: "boost SL",
+    20: "discord cards",
+    21: "discord dedup",
+    22: "discord hb",
+    23: "discord conn",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -773,6 +777,129 @@ class SelfTest:
             return
         self._record(19, PASS if ok else FAIL, detail)
 
+    def _step_discord_cards(self):
+        # v3.1.0: every embed CARD builder must produce a Discord-valid embed
+        # (title <=256, field value <=1024, <=25 fields, footer present) and carry
+        # the ts_header footer. Pure code check -> PASS on correctness, no network.
+        import discord_cards as dc
+        try:
+            cards = [
+                dc.card_anchor_placed('A1_02h_Asia', 4300.5, 4282.5, 4330.5,
+                                      4270.5, 4318.5, 0.35),
+                dc.card_fill('A1', 'BUY', 4300.5, 12345, 'normal', 4282.5, 4330.5,
+                             'scheduled 10:00 / actual 10:02'),
+                dc.card_close('A1', 'BUY', 'TP', 4300.5, 4330.5, 1050.0,
+                              held_min=44.0, day_total=1200.0),
+                dc.card_close('A2', 'SELL', 'SL', 4300.5, 4282.5, -630.0,
+                              held_min=45.0, day_total=-480.0),
+                dc.card_close('A3', 'BUY', 'BE', 4300.5, 4300.6, 0.0,
+                              held_min=12.3, day_total=153.5),
+                dc.card_rescue('A1', 'twin trapped', 'SELL rescue', -10.0),
+                dc.card_boost(1, 'SELL', 4300.5, 4310.5, 4270.5, '10009 DONE'),
+                dc.card_fleet('A1', 'CRASH_WIN',
+                              [('trigger', -630), ('rescue', 226)], -84,
+                              counterfactual=-406),
+                dc.card_eod('2026-06-17', 465.0, 4, balance=50465.0,
+                            anchors_hit='A1 A2'),
+                dc.card_heartbeat(50465.0, 50470.0, 1, 1, 'A1 A2', 'FILL A2'),
+                dc.card_status({'Balance': '$50,465', 'Open': 1, 'Pending': 1}),
+                dc.card_connect(), dc.card_intent_warning(),
+                dc.card_generic('AUREON INFO', 'plain text', dc.BLUE),
+            ]
+            bad = []
+            for c in cards:
+                if len(c.get('title', '')) > 256:
+                    bad.append('title')
+                if len(c.get('fields', [])) > 25:
+                    bad.append('fieldcount')
+                for f in c.get('fields', []):
+                    if len(f['name']) > 256 or len(f['value']) > 1024 or not f['value']:
+                        bad.append('field')
+                if not c.get('footer', {}).get('text'):
+                    bad.append('footer')
+            # color correctness on the close cards (green/red/amber)
+            color_ok = (cards[2]['color'] == dc.GREEN
+                        and cards[3]['color'] == dc.RED
+                        and cards[4]['color'] == dc.AMBER)
+            ok = (not bad) and color_ok
+            detail = (f"{len(cards)} cards valid, colors TP/SL/BE ok={color_ok}"
+                      if ok else f"issues={set(bad)} color_ok={color_ok}")
+        except Exception as e:
+            self._record(20, FAIL, f"raised: {e!r}")
+            return
+        self._record(20, PASS if ok else FAIL, detail)
+
+    def _step_discord_dedup(self):
+        # v3.1.0: a critical event keyed by ticket must post ONCE (not twice on
+        # reconnect/queue-flush); distinct events always post. Drive the REAL
+        # DiscordClient with a stubbed transport (no network).
+        import discord_client as dcl, discord_cards as dc
+        try:
+            client = dcl.DiscordClient(dcl.DiscordConfig('x', '123'))
+            posts, up = [], {'v': True}
+            client._post_embed = lambda e: (posts.append(e.get('title')) or True) \
+                if up['v'] else False
+            c = dc.card_close('A1', 'BUY', 'TP', 1, 2, 10)
+            client.deliver('SUCCESS', 'c', card=c, event_key='close:1', critical=True)
+            client.deliver('SUCCESS', 'c', card=c, event_key='close:1', critical=True)
+            one = (len(posts) == 1)
+            client.deliver('SUCCESS', 'c2', card=c, event_key='close:2', critical=True)
+            two = (len(posts) == 2)
+            # queue while down, then on recovery the SAME event posts exactly once
+            # (the queued copy is dedup-skipped on flush).
+            up['v'] = False
+            client.deliver('WARN', 'f', card=c, event_key='fill:9', critical=True)
+            queued = (len(client._critical_q) == 1)
+            up['v'] = True
+            client.deliver('WARN', 'f', card=c, event_key='fill:9', critical=True)
+            flushed = ('fill:9' in client._seen_set)
+            no_dup = (len(posts) == 3 and len(client._critical_q) == 0)
+            ok = one and two and queued and flushed and no_dup
+            detail = (f"same->1={one} distinct->2={two} queued={queued} "
+                      f"flushed={flushed} no_dup={no_dup}")
+        except Exception as e:
+            self._record(21, FAIL, f"raised: {e!r}")
+            return
+        self._record(21, PASS if ok else FAIL, detail)
+
+    def _step_discord_heartbeat(self):
+        # v3.1.0: heartbeat card builds non-empty and carries the ts_header footer.
+        import discord_cards as dc
+        try:
+            c = dc.card_heartbeat(50000.0, 50010.0, 0, 0, 'A1', 'startup')
+            ok = (bool(c.get('title')) and bool(c.get('fields'))
+                  and bool(c.get('footer', {}).get('text')))
+            detail = f"title={c.get('title')!r} footer={c['footer']['text']!r}"
+        except Exception as e:
+            self._record(22, FAIL, f"raised: {e!r}")
+            return
+        self._record(22, PASS if ok else FAIL, detail)
+
+    def _step_discord_connect(self):
+        # v3.1.0: gateway/reachability is environment-dependent -> WARN (never
+        # FAIL) when Discord isn't configured or the network is unavailable. Also
+        # reports that the intent self-check + connect-card logic is wired.
+        import discord_client as dcl
+        cfg = dcl.config_from_env()
+        intent_wired = hasattr(dcl.DiscordClient, 'start_gateway')
+        if cfg is None:
+            self._record(23, WARN, "Discord not configured (set DISCORD_BOT_TOKEN/"
+                         f"CHANNEL_ID); intent self-check wired={intent_wired}")
+            return
+        # configured: try a single reachability post of the connect card.
+        try:
+            client = dcl.DiscordClient(cfg)
+            import discord_cards as dc
+            reached = client.post_card(dc.card_connect())
+            if reached:
+                self._record(23, PASS, f"connect card posted; intent-check wired="
+                             f"{intent_wired}")
+            else:
+                self._record(23, WARN, "Discord unreachable (network) — alerts will "
+                             f"retry/queue; intent-check wired={intent_wired}")
+        except Exception as e:
+            self._record(23, WARN, f"connect attempt raised (network): {e!r}")
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -833,6 +960,10 @@ class SelfTest:
             self._step_hold_gate()
             self._step_tg_pin()
             self._step_boost_sl()
+            self._step_discord_cards()
+            self._step_discord_dedup()
+            self._step_discord_heartbeat()
+            self._step_discord_connect()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -845,26 +976,30 @@ class SelfTest:
 
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
-        n_pass = n_fail = n_skip = 0
-        for n in range(1, 20):
+        n_pass = n_fail = n_skip = n_warn = 0
+        for n in range(1, 24):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
             elif status == SKIP:
                 n_skip += 1
+            elif status == WARN:
+                n_warn += 1          # v3.1.0: network/reachability WARN is NOT a fail
             elif status == FAIL:
                 n_fail += 1
             lines.append(f"{n} {STEP_NAMES[n]:<14} {status}  ({detail})")
         # "fleet ready" only when the placement + boost path actually passed.
         fleet_steps = (4, 5, 6, 8)
         fleet_ready = all(self.results.get(s, ("", ""))[0] == PASS for s in fleet_steps)
+        warn_tag = f", {n_warn} WARN" if n_warn else ""
+        # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/19 PASS — fleet ready"
+            verdict = f"RESULT: {n_pass}/23 PASS{warn_tag} — READY"
         elif n_fail == 0:
-            ready = "fleet ready" if fleet_ready else "fleet UNVERIFIED (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/19 PASS, {n_skip} SKIP — {ready}"
+            ready = "READY" if fleet_ready else "READY (market steps skipped)"
+            verdict = f"RESULT: {n_pass}/23 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/19 PASS, {n_fail} FAIL — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/23 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)
