@@ -409,9 +409,37 @@ History (one line per behavioral change):
          STANDING RULE: every new strategy feature must land in BOTH live modules
          AND be exercised by the backtest -- a feature is not "done" until backtest
          reflects it. backtest == live.
+  3.2.0  CRITICAL boost-trigger fix — lone-leg boosts NO LONGER fire at the leg's
+         fill price. The A3 bug (Jun 18): the old fire-at-fill path placed 2
+         boosts at 4266.30 (= the lone leg's fill), in the sibling's direction,
+         always labelled "RESCUE" even when the leg had WON; a reversal then
+         killed them (~-$900). FIX: one canonical TRIGGER decision,
+         boosts.plan_boost_event(leg_side, leg_fill_price, current_price, cfg) ->
+         BoostPlan|None, is the SINGLE source of truth. The rule: boosts never
+         fire at/near the fill -- only once price moves a full $10 from the fill.
+         Leg WINNING by +$10 -> RALLY (2 boosts SAME direction, event_type
+         RALLY_BOOST, a winning pyramid); leg LOSING by -$10 -> RESCUE (2 boosts
+         OPPOSITE, RESCUE_BOOST, hedging the breakout); <$10 -> None (no boosts).
+         A HARD GUARD blocks any returned plan whose entry is < $10 from the fill
+         (>= $10 entry guard) -- the fire-at-fill bug is now structurally
+         impossible. The SAME function is called by LIVE (fills.py per-tick in
+         _check_boost_triggers, never at fill), by the BACKTEST (backtest.py walks
+         post-sibling bars and fires on the first $10 move; old sibling-fire-at-
+         fill logic retired), AND by the SELFTEST (import-path parity asserts
+         fills.boosts.plan_boost_event IS boosts.plan_boost_event IS
+         backtest.plan_boost_event -- a future test/live divergence is caught).
+         The -$700 combined-boost loss cap hard-closes the boosts (clamp on
+         breach; isolation -- never pulls in the original leg). rescuestats logs
+         the canonical event_type (RALLY_BOOST / RESCUE_BOOST) instead of FLEET/
+         LONE_RESCUE for boost events. backtest boost-summary now reports
+         RALLY_BOOST/RESCUE_BOOST counts + branch (CRASH_WIN/WHIPSAW_LOSS/SCRATCH)
+         + the no-boost counterfactual. selftest gains step 28 "boost trigger"
+         (no-fire-at-fill, >=$10 entry, RALLY/RESCUE direction, cap clamp, import-
+         path parity) and extends "backtest parity" with the boost parity check ->
+         28 steps.
 """
 
-__version__ = "3.1.8"
+__version__ = "3.2.0"
 CODENAME = "Astra Hawk"
 
 

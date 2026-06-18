@@ -267,6 +267,14 @@ class LiveTrader:
             "YYYY-MM` (imports live strategy/anchors/rescue rules). STANDING RULE: "
             "every new feature must land in BOTH live AND backtest."
         )
+        # v3.2.0 module receipt: lone-leg boosts NEVER fire at fill — per-tick
+        # trigger fires RALLY (+$10 same dir) / RESCUE (-$10 opposite) via the
+        # single canonical boosts.plan_boost_event; -$700 hard cap.
+        self.tele.info(
+            "v3.2.0: boost trigger FIXED — boosts fire only on a $10 move from the "
+            "leg fill (RALLY/RESCUE), never at fill; per-tick; $10 SL + $3.50 trail; "
+            "-$700 hard cap. One function for live/backtest/tests."
+        )
         # TEST MODE banner: surface any active test-scope toggle loudly so a
         # forced code path is never mistaken for production behavior. Defaults OFF.
         if os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
@@ -904,6 +912,10 @@ class LiveTrader:
         # 3. Reconcile broker state
         self._reconcile_with_broker()
 
+        # 3b. v3.2.0 PER-TICK boost trigger: fire RALLY/RESCUE boosts only
+        # once price is >= $10 from a lone leg's fill (never at fill); cap.
+        self._check_boost_triggers()
+
         # 4. Handle inbound commands
         self._handle_commands()
 
@@ -1035,6 +1047,9 @@ LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
 LiveTrader._await_fresh_tick_for_placement = _anchors_mod._await_fresh_tick_for_placement
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)
 LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
+LiveTrader._check_boost_triggers    = _fills_mod._check_boost_triggers
+LiveTrader._fire_boost_event        = _fills_mod._fire_boost_event
+LiveTrader._enforce_boost_cap       = _fills_mod._enforce_boost_cap
 LiveTrader._anchor_evt_block        = _fills_mod._anchor_evt_block
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close
 LiveTrader._write_journal           = _journal_mod._write_journal
