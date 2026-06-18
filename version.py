@@ -389,9 +389,29 @@ History (one line per behavioral change):
          future sim/live divergence is caught. selftest -> 26 steps. NOTE: the
          specific 2026-06-18 event's in-flight state was lost (pre-fix, in-memory)
          so it cannot be auto-recovered; backfill needs the operator's MT5/journal.
+  3.1.8  TICK-RESOLUTION MONTHLY BACKTESTER in backtest/ (no live-behavior change;
+         read-only against live logic). backtest/backtest.py REUSES the live rules
+         by IMPORT -- strategy.update_position_on_bar / realize_pnl_usd / Position
+         (45m hold, gated BE, ladder, breath-gap $3.50 boost trail + $10 backstop +
+         $8 floor, isolation), utils.initial_sl/tp + anchor/eod time, anchors.
+         resolved_anchor_hm (Monday A1 @ 03:30 cushion -- newly EXPOSED as a pure
+         function the live method now delegates to), fills.is_rescue_fill (lone-leg
+         rescue rule), rescue_log._branch_for (CRASH_WIN/WHIPSAW_LOSS/SCRATCH). It
+         replays cached MT5 ticks (backtest/fetcher.py, copy_ticks_range chunked +
+         parquet cache) through these functions with realistic spread/fills/
+         slippage/stop-through, modeling No-OCO straddle, lone-leg rescue + boosts,
+         -3% kill switch, EOD flatten. `python backtest/back_main.py YYYY-MM` prints
+         a day-by-day table (Monday A1 tagged @03:30), per-anchor + boost-branch
+         summaries, RAW vs REALISM-ADJUSTED net (RAW - realism_haircut_dollars,
+         default $1000), max DD, kill-switch days. selftest gains a "backtest
+         parity" step asserting the backtester IMPORTS the live functions (identity,
+         not copies) so a reimplementation that could drift is caught.
+         STANDING RULE: every new strategy feature must land in BOTH live modules
+         AND be exercised by the backtest -- a feature is not "done" until backtest
+         reflects it. backtest == live.
 """
 
-__version__ = "3.1.7"
+__version__ = "3.1.8"
 CODENAME = "Astra Hawk"
 
 

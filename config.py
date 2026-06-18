@@ -126,6 +126,10 @@ class Config:
     # Operational
     log_level: str = "INFO"
     state_file: str = "aureon_v2_state.json"
+    # v3.1.8: month-level realism haircut for the backtester's REALISM-ADJUSTED
+    # net (RAW - this). Approximates live drag not modeled in backtest (late
+    # fills, partial fills, requote slippage, weekend gaps). Month-level only.
+    realism_haircut_dollars: float = 1000.0
 
     # Alerting/control channel (v3.1.0). Discord (discord.com) is the sole alert +
     # command channel, using rich embed CARDS. Override with env

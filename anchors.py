@@ -22,6 +22,19 @@ from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
 log = logging.getLogger("AUREON")
 
 
+def resolved_anchor_hm(label, broker_date, hour, minute, cfg):
+    """Pure (config-only) Monday-A1 cushion resolver — the SINGLE source of truth
+    for A1 time resolution, shared by the live anchor loop AND the backtester so
+    backtest == live for scheduling. See _resolved_anchor_hm for the rationale."""
+    ovr = getattr(cfg, 'monday_a1_override', None)
+    if ovr is not None and label.startswith('A1'):
+        force = os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
+            in ('1', 'true', 'yes', 'on')
+        if force or broker_date.weekday() == 0:
+            return int(ovr[0]), int(ovr[1])
+    return hour, minute
+
+
 def _resolved_anchor_hm(self, label, broker_date, hour, minute):
     """Resolve an anchor's (broker_hour, broker_minute), applying the Monday-only
     A1 cold-start cushion. Forex opens Mon 00:00 broker; A1 at 02:30 is only 2.5h
@@ -36,14 +49,11 @@ def _resolved_anchor_hm(self, label, broker_date, hour, minute):
     Test hook: AUREON_TEST_FORCE_MONDAY_A1=1 forces the override on ANY weekday so
     the 03:30 resolution can be verified mid-week (combine with the quiet-feed /
     offset-revalidate test toggles to reproduce the full Monday scenario). TEST
-    ONLY, defaults OFF, surfaced in the 'TEST MODE ACTIVE' banner line."""
-    ovr = getattr(self.cfg, 'monday_a1_override', None)
-    if ovr is not None and label.startswith('A1'):
-        force = os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
-            in ('1', 'true', 'yes', 'on')
-        if force or broker_date.weekday() == 0:
-            return int(ovr[0]), int(ovr[1])
-    return hour, minute
+    ONLY, defaults OFF, surfaced in the 'TEST MODE ACTIVE' banner line.
+
+    v3.1.8: delegates to the pure module-level resolved_anchor_hm so the backtester
+    can reuse the EXACT same resolution without a LiveTrader instance."""
+    return resolved_anchor_hm(label, broker_date, hour, minute, self.cfg)
 
 def _anchor_sched_utc(self, label):
     """Resolve the scheduled UTC instant for an anchor label on the current broker

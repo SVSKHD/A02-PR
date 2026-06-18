@@ -54,3 +54,14 @@ Thumbs.db
 data/
 results/
 monthly_output/
+
+# Tick-resolution monthly backtester (backtest/) — cached ticks + results
+backtest/ticks/*.parquet
+backtest/ticks/*.csv
+backtest/results/*.csv
+# ...but keep the directory placeholders tracked (the bare `results/` rule above
+# would otherwise swallow backtest/results/.gitkeep).
+!backtest/ticks/
+!backtest/results/
+!backtest/ticks/.gitkeep
+!backtest/results/.gitkeep

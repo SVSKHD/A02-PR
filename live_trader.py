@@ -260,6 +260,13 @@ class LiveTrader:
             "orig/boost P&L logged (rescue_events.csv + Firestore; "
             "`python bot.py rescuestats`)."
         )
+        # v3.1.8 module receipt: tick-resolution backtester reuses these LIVE
+        # rules by import (backtest == live). No live-behavior change.
+        self.tele.info(
+            "v3.1.8: tick backtester online — `python backtest/back_main.py "
+            "YYYY-MM` (imports live strategy/anchors/rescue rules). STANDING RULE: "
+            "every new feature must land in BOTH live AND backtest."
+        )
         # TEST MODE banner: surface any active test-scope toggle loudly so a
         # forced code path is never mistaken for production behavior. Defaults OFF.
         if os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
