@@ -50,6 +50,10 @@ class Config:
     # +$8. The $10 stop is now the boost's HARD BACKSTOP only -- v3.1.6 adds a
     # tight breath-gap TRAIL on top (below), so a reversing boost exits at ~-(gap)
     # not -$10. Per-pair whipsaw worst case stays 2 x $10 x 0.35 x 100 = -$700.
+    boost_trigger_dollars: float = 10.0  # v3.2.0: a lone leg must move this
+    # far from its FILL before any boost fires -- +$10 => RALLY (same dir,
+    # winning), -$10 => RESCUE (opposite, losing). Boosts NEVER fire at fill
+    # (the A3 -$900 bug). The single source boosts.plan_boost_event enforces it.
     boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
     # armed from the instant the boost fills, alongside the $10 hard SL backstop
     # (both live; whichever hits first closes the boost). One-way ratchet; once a

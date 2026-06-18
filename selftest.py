@@ -67,6 +67,7 @@ STEP_NAMES = {
     25: "boost isol",
     26: "lone live-log",
     27: "backtest parity",
+    28: "boost trigger",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1162,20 +1163,25 @@ class SelfTest:
         # repo-root backtest.py.
         import importlib.util as _ilu
         import strategy as _strat
+        import boosts as _boosts
         try:
             _root = os.path.dirname(os.path.abspath(__file__))
             _path = os.path.join(_root, 'backtest', 'backtest.py')
             spec = _ilu.spec_from_file_location('aureon_bt_engine', _path)
             bt = _ilu.module_from_spec(spec)
             spec.loader.exec_module(bt)
-            # (a) identity: the backtester's engine IS the live engine
+            # (a) identity: the backtester's engine IS the live engine, AND its
+            # boost trigger IS the canonical boosts.plan_boost_event (v3.2.0:
+            # import-path parity so the backtest can't drift from live/tests).
             id_ok = (bt.update_position_on_bar is _strat.update_position_on_bar
                      and bt.realize_pnl_usd is _strat.realize_pnl_usd
-                     and bt.Position is _strat.Position)
+                     and bt.Position is _strat.Position
+                     and bt.plan_boost_event is _boosts.plan_boost_event)
             srcs = list(bt.rule_sources())
             srcs_ok = all(s in srcs for s in (
                 'strategy.update_position_on_bar', 'anchors.resolved_anchor_hm',
-                'fills.is_rescue_fill', 'rescue_log._branch_for'))
+                'fills.is_rescue_fill', 'rescue_log._branch_for',
+                'boosts.plan_boost_event'))
             # (b) fixture: a BUY entered at 100 with the live $30 TP exits at TP for
             #     +$1050 @ lot 0.35 -- proving the backtest replays via live logic.
             cfg = self.cfg
@@ -1198,6 +1204,68 @@ class SelfTest:
             self._record(27, FAIL, f"raised: {e!r}")
             return
         self._record(27, PASS if ok else FAIL, detail)
+
+    def _step_boost_trigger(self):
+        # v3.2.0 BOOST TRIGGER (the A3 fire-at-fill fix). The lone-leg boost
+        # decision is now ONE canonical function (boosts.plan_boost_event) called
+        # by LIVE (fills per-tick), BACKTEST, and this test -- import-path parity
+        # so they can never diverge. Asserts, using the LIVE module path (no
+        # stubs): (1) live + backtest call the SAME fn; (2) NEVER fires at the
+        # leg's fill (or <$10 move); (3) a fired plan's entry is always >= $10
+        # from the fill; (4) RALLY when the leg WINS +$10 (same dir); (5) RESCUE
+        # when the leg LOSES -$10 (opposite dir); (6) the -$700 cap clamps -715.
+        import importlib.util as _ilu
+        import fills as _fills
+        import boosts as _boosts
+        try:
+            cfg = self.cfg
+            # (1) IMPORT-PATH PARITY: live calls the canonical fn; backtest too.
+            live_parity = (_fills.boosts.plan_boost_event
+                           is _boosts.plan_boost_event)
+            _root = os.path.dirname(os.path.abspath(__file__))
+            _path = os.path.join(_root, 'backtest', 'backtest.py')
+            spec = _ilu.spec_from_file_location('aureon_bt_engine_bt', _path)
+            bt = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(bt)
+            bt_parity = (bt.plan_boost_event is _boosts.plan_boost_event)
+
+            fill = 4266.3
+            # (2) NO-FIRE-AT-FILL: at the fill, and at +$3, returns None.
+            at_fill = _boosts.plan_boost_event('SELL', fill, fill, cfg)
+            at_3 = _boosts.plan_boost_event('SELL', fill, fill - 3.0, cfg)
+            no_fire = (at_fill is None and at_3 is None)
+
+            # (4) RALLY: a lone leg WINNING by +$10 -> RALLY_BOOST, SAME side.
+            #     BUY winning means price up $10.
+            rally = _boosts.plan_boost_event('BUY', fill, fill + 10.0, cfg)
+            rally_ok = (rally is not None
+                        and rally.event_type == 'RALLY_BOOST'
+                        and rally.boost_side == 'BUY')
+
+            # (5) RESCUE: a lone leg LOSING by -$10 -> RESCUE_BOOST, OPPOSITE side.
+            #     BUY losing means price down $10.
+            rescue = _boosts.plan_boost_event('BUY', fill, fill - 10.0, cfg)
+            rescue_ok = (rescue is not None
+                         and rescue.event_type == 'RESCUE_BOOST'
+                         and rescue.boost_side == 'SELL')
+
+            # (3) ENTRY >= $10 from fill (use the -$10 RESCUE plan above).
+            entry_ok = (rescue is not None
+                        and abs(rescue.entry_ref - fill) >= 10.0 - 1e-6)
+
+            # (6) CAP: A3 -715.05 clamps (breached); -650 does not.
+            cap_breach = (_boosts.cap_breached(-715.05, cfg) is True
+                          and _boosts.cap_breached(-650, cfg) is False)
+
+            ok = (live_parity and bt_parity and no_fire and rally_ok
+                  and rescue_ok and entry_ok and cap_breach)
+            detail = (f"live_parity={live_parity} bt_parity={bt_parity} "
+                      f"no_fire@fill/+3={no_fire} rally={rally_ok} "
+                      f"rescue={rescue_ok} entry>=10={entry_ok} cap={cap_breach}")
+        except Exception as e:
+            self._record(28, FAIL, f"raised: {e!r}")
+            return
+        self._record(28, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # Orchestration
@@ -1267,6 +1335,7 @@ class SelfTest:
             self._step_boost_isolation()
             self._step_lone_live_logging()
             self._step_backtest_parity()
+            self._step_boost_trigger()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1280,7 +1349,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 28):
+        for n in range(1, 29):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1297,12 +1366,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/27 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/28 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/27 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/28 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/27 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/28 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)

@@ -36,14 +36,18 @@ from utils import initial_sl, initial_tp, anchor_datetime_utc, eod_datetime_utc
 from anchors import resolved_anchor_hm
 from fills import is_rescue_fill
 from rescue_log import _branch_for
+import boosts  # v3.2.0: the SINGLE canonical lone-leg boost-trigger decision
 
 # Exposed at module level so a selftest can assert IDENTITY:
 #   backtest.update_position_on_bar IS strategy.update_position_on_bar
+#   backtest.plan_boost_event       IS boosts.plan_boost_event   (v3.2.0)
+plan_boost_event = boosts.plan_boost_event
+
 __all__ = [
     'run_month', 'rule_sources', 'LIVE_RULE_SOURCES',
     'Position', 'update_position_on_bar', 'realize_pnl_usd',
     'initial_sl', 'initial_tp', 'anchor_datetime_utc', 'eod_datetime_utc',
-    'resolved_anchor_hm', 'is_rescue_fill', '_branch_for',
+    'resolved_anchor_hm', 'is_rescue_fill', '_branch_for', 'plan_boost_event',
 ]
 
 LIVE_RULE_SOURCES = [
@@ -57,6 +61,7 @@ LIVE_RULE_SOURCES = [
     'anchors.resolved_anchor_hm',
     'fills.is_rescue_fill',
     'rescue_log._branch_for',
+    'boosts.plan_boost_event',
 ]
 
 
@@ -175,6 +180,8 @@ def run_month(ticks_df: pd.DataFrame, year: int, month: int, cfg: Config) -> Dic
     # per-anchor accumulators (keyed by LABEL)
     anchor_tot: Dict[str, Dict] = {}
     branch_counts = {'CRASH_WIN': 0, 'WHIPSAW_LOSS': 0, 'SCRATCH': 0}
+    # v3.2.0: count boost events by the canonical event_type (RALLY vs RESCUE).
+    event_counts = {'RALLY_BOOST': 0, 'RESCUE_BOOST': 0}
     no_boost_counterfactual = 0.0
     raw_net = 0.0
     worst_day = {'date': None, 'net': None}
@@ -275,74 +282,91 @@ def run_month(ticks_df: pd.DataFrame, year: int, month: int, cfg: Config) -> Dic
             rescue_legs: List[Position] = []
             boost_legs: List[Position] = []
 
-            # --- SIBLING / LONE-LEG RESCUE handling ---
+            # --- SIBLING / LONE-LEG handling (v3.2.0 canonical trigger) ---
+            # The sibling leg is treated as the lone leg: its fill price is the
+            # reference. Boosts NEVER fire at that fill. We walk the post-sibling
+            # bars and ask the SAME canonical decision the live path uses
+            # (boosts.plan_boost_event) on each bar's high/low; the FIRST bar that
+            # returns a plan is the fire point. RALLY (leg +$10, same dir) or
+            # RESCUE (leg -$10, opposite). If the sibling never moves $10 -> None,
+            # no boosts (event_type stays None).
             if sib_fill_i is not None and cfg.no_oco:
                 sib_ts = window.index[sib_fill_i]
-                # twin still open at sibling-fill time?
-                twin_open = (first_pos.exit_time is None) or (first_pos.exit_time > sib_ts)
-                # the first leg set rescue_on_fill on the sibling -> flag True
-                is_rescue = is_rescue_fill(flag_hint=True, twin_open=twin_open)
+                sib_half = float(window['spread'].iloc[sib_fill_i]) / 2.0
+                if not (sib_half == sib_half):
+                    sib_half = half_sp_default
+                if sib_side == 'BUY':
+                    sib_entry = round(sib_stop + sib_half, 2)
+                else:
+                    sib_entry = round(sib_stop - sib_half, 2)
 
-                if is_rescue and cfg.rescue_boost_enabled:
-                    event_type = 'FLEET' if twin_open else 'LONE_RESCUE'
-                    sib_half = float(window['spread'].iloc[sib_fill_i]) / 2.0
-                    if not (sib_half == sib_half):
-                        sib_half = half_sp_default
-                    if sib_side == 'BUY':
-                        sib_entry = round(sib_stop + sib_half, 2)
-                    else:
-                        sib_entry = round(sib_stop - sib_half, 2)
+                # The sibling runs as a leg (managed below by _manage_leg). Its
+                # role is 'rescue' (a No-OCO 2nd fill) -- recorded as such.
+                rescue_pos = Position(
+                    anchor_label=label, side=sib_side, entry_price=sib_entry,
+                    entry_time=sib_ts,
+                    current_sl=initial_sl(sib_side, sib_entry, cfg),
+                    tp_level=initial_tp(sib_side, sib_entry, cfg),
+                    max_fav=sib_entry, lot=cfg.lot_size, role='rescue', boost=False)
+                _manage_leg(rescue_pos, window.iloc[sib_fill_i + 1:], eod_ts, cfg)
+                rescue_legs.append(rescue_pos)
 
-                    rescue_pos = Position(
-                        anchor_label=label, side=sib_side, entry_price=sib_entry,
-                        entry_time=sib_ts,
-                        current_sl=initial_sl(sib_side, sib_entry, cfg),
-                        tp_level=initial_tp(sib_side, sib_entry, cfg),
-                        max_fav=sib_entry, lot=cfg.lot_size, role='rescue', boost=False)
-                    _manage_leg(rescue_pos, window.iloc[sib_fill_i + 1:], eod_ts, cfg)
-                    rescue_legs.append(rescue_pos)
+                # --- TRIGGER SCAN: walk post-sibling bars; fire on the FIRST $10 ---
+                fire_i = None
+                plan = None
+                if cfg.rescue_boost_enabled:
+                    post = window.iloc[sib_fill_i + 1:]
+                    for k, (ts_k, bar_k) in enumerate(post.iterrows()):
+                        if ts_k > eod_ts:
+                            break
+                        # test BOTH extremes of the bar (high then low); the first
+                        # to clear $10 from the sibling fill wins.
+                        for px in (float(bar_k.high), float(bar_k.low)):
+                            cand = boosts.plan_boost_event(sib_side, sib_entry, px, cfg)
+                            if cand is not None:
+                                plan = cand
+                                fire_i = sib_fill_i + 1 + k
+                                break
+                        if plan is not None:
+                            break
 
-                    # --- BOOSTS in the rescue direction at market (ISOLATED) ---
-                    sgn = 1.0 if sib_side == 'BUY' else -1.0
-                    # small market slippage on the boost entry
-                    boost_entry = round(sib_entry + sgn * sib_half, 2)
-                    for _b in range(int(cfg.rescue_boost_count)):
+                if plan is not None:
+                    # A boost EVENT fires. event_type from the plan:
+                    # RALLY_BOOST (leg winning) / RESCUE_BOOST (leg losing).
+                    event_type = plan.event_type
+                    b_sgn = 1.0 if plan.boost_side == 'BUY' else -1.0
+                    fire_half = float(window['spread'].iloc[fire_i]) / 2.0
+                    if not (fire_half == fire_half):
+                        fire_half = half_sp_default
+                    boost_entry = round(plan.entry_ref + b_sgn * fire_half, 2)
+                    boost_bars = window.iloc[fire_i + 1:]
+                    for _b in range(int(plan.n)):
                         bpos = Position(
-                            anchor_label=label, side=sib_side, entry_price=boost_entry,
-                            entry_time=sib_ts,
-                            current_sl=round(boost_entry - sgn * cfg.boost_sl_dollars, 2),
-                            tp_level=round(boost_entry + sgn * cfg.tp_dist, 2),
+                            anchor_label=label, side=plan.boost_side,
+                            entry_price=boost_entry, entry_time=window.index[fire_i],
+                            current_sl=round(boost_entry - b_sgn * plan.sl_dollars, 2),
+                            tp_level=round(boost_entry + b_sgn * plan.tp_dollars, 2),
                             max_fav=boost_entry, lot=cfg.lot_size,
                             role='rescue', boost=True)
-                        _manage_leg(bpos, window.iloc[sib_fill_i + 1:], eod_ts, cfg)
+                        _manage_leg(bpos, boost_bars, eod_ts, cfg)
                         boost_legs.append(bpos)
 
-                    # classify the rescue EVENT on net of rescue leg + boosts
+                    # classify the boost EVENT on the boosts' combined P&L
                     orig_pnl = realize_pnl_usd(first_pos, cfg) + \
                         sum(realize_pnl_usd(p, cfg) for p in rescue_legs)
                     boost_pnl = sum(realize_pnl_usd(p, cfg) for p in boost_legs)
+                    # -$700 cap (clamp): model the live hard-close of the boosts'
+                    # combined loss BEFORE classifying the branch.
+                    _cap = boosts.boost_whipsaw_cap(cfg)
+                    if boost_pnl < -_cap:
+                        boost_pnl = -_cap
                     branch = _branch_for(boost_pnl)
                     branch_counts[branch] += 1
+                    event_counts[event_type] += 1
                     # no-boost counterfactual = orig legs alone (rescue+original)
                     no_boost_counterfactual += orig_pnl
-                else:
-                    # sibling crossed but not a rescue -> normal breakout leg, no
-                    # boosts (guard path; shouldn't happen for a real sibling)
-                    sib_half = float(window['spread'].iloc[sib_fill_i]) / 2.0
-                    if not (sib_half == sib_half):
-                        sib_half = half_sp_default
-                    if sib_side == 'BUY':
-                        sib_entry = round(sib_stop + sib_half, 2)
-                    else:
-                        sib_entry = round(sib_stop - sib_half, 2)
-                    npos = Position(
-                        anchor_label=label, side=sib_side, entry_price=sib_entry,
-                        entry_time=sib_ts,
-                        current_sl=initial_sl(sib_side, sib_entry, cfg),
-                        tp_level=initial_tp(sib_side, sib_entry, cfg),
-                        max_fav=sib_entry, lot=cfg.lot_size, role='normal', boost=False)
-                    _manage_leg(npos, window.iloc[sib_fill_i + 1:], eod_ts, cfg)
-                    rescue_legs.append(npos)  # recorded as a normal leg below
+                # else: sibling never moved $10 from its fill -> NO boosts; the
+                # sibling just runs as a (rescue-role) leg. event_type stays None.
 
             # --- record every leg ---
             def _push(pos, role):
@@ -436,6 +460,7 @@ def run_month(ticks_df: pd.DataFrame, year: int, month: int, cfg: Config) -> Dic
         'monday_a1_fired': monday_a1_fired,
         'anchor_totals': anchor_tot,
         'branch_counts': branch_counts,
+        'event_counts': event_counts,
         'no_boost_counterfactual': round(no_boost_counterfactual, 2),
         'final_equity': round(equity, 2),
         'rule_sources': rule_sources(),

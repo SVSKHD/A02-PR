@@ -19,6 +19,7 @@ import pandas as pd
 from telemetry import telemetry_from_env, Severity, md_escape, anchor_time_block
 from mt5_adapter import _MT5_RETCODE_MAP
 import discord_cards as dc  # v3.1.0: rich embed cards (pure; safe to import)
+import boosts  # v3.2.0: the SINGLE canonical lone-leg boost-trigger decision
 
 log = logging.getLogger("AUREON")
 
@@ -280,164 +281,26 @@ def _reconcile_with_broker(self):
                 'fill_time':    fill_time_utc.isoformat(),  # v2.3: persisted, restart-safe
                 'role':         'rescue' if is_rescue else 'normal',  # v2.9 / v2.9.8 structural
                 'sched_utc':    info.get('sched_utc'),  # v3.0.5: for close-msg times
+                # v3.2.0: boosts fire from the PER-TICK trigger once price moves a
+                # full $10 from THIS fill -- never at fill (the A3 -$900 bug).
+                'leg_fill_price': float(broker_p.price_open),
+                'boost_eligible': bool(is_rescue),
+                'boost_fired':    False,
+                'sibling_ticket': info.get('sibling_ticket'),
             }
             if is_rescue:
-                self.tele.info(f"\U0001F691 RESCUE leg active (ticket {ticket}): no early locks, "
-                               f"free to run until +$10 covers the twin's loss.")
-                # v3.0.6 OBSERVER (zero engine effect): identify the trigger (twin)
-                # leg and prepare to collect boost records so the whole fleet event
-                # can be logged on close. Pure reads; never alters rescue/boost.
-                _fleet_boosts = []
-                _trig_tk = info.get('sibling_ticket')
-                if not (_trig_tk in self.shadow_positions and _trig_tk in broker_pos_tickets):
-                    _trig_tk = next((tk for tk, sp in self.shadow_positions.items()
-                                     if tk in broker_pos_tickets
-                                     and sp.get('anchor_label') == info['anchor_label']
-                                     and not sp.get('boost') and tk != ticket), None)
-                _trig_sp = self.shadow_positions.get(_trig_tk, {})
-                _trig_pnl = None
-                try:
-                    if _trig_sp.get('entry_price') and _trig_sp.get('side'):
-                        _s = 1.0 if _trig_sp['side'] == 'BUY' else -1.0
-                        _trig_pnl = round(
-                            _s * (float(info['entry_price']) - float(_trig_sp['entry_price']))
-                            * self.cfg.lot_size * 100, 2)
-                except Exception:
-                    _trig_pnl = None
-                # v2.9.5 SL-RESCUE BOOST (Hithesh): at this exact moment the
-                # first leg is -$10; open extra trades in the rescue
-                # direction with a tight $6 SL each, so the remaining $8 to
-                # the first leg's SL is harvested (~+$560 @ 2x0.35).
-                if getattr(self.cfg, 'rescue_boost_enabled', False):
-                    b_side = info['side']
-                    b_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
-                    # v3.0.9: boost SL $6 -> $10 (config boost_sl_dollars), legacy
-                    # rescue_boost_sl honored as a fallback for old configs.
-                    b_sld = float(getattr(self.cfg, 'boost_sl_dollars',
-                                          getattr(self.cfg, 'rescue_boost_sl', 10.0)))
-                    b_ep = float(info['entry_price'])
-                    sgn = 1.0 if b_side == 'BUY' else -1.0
-                    b_sl = round(b_ep - sgn * b_sld, 2)
-                    b_tp = round(b_ep + sgn * self.cfg.tp_dist, 2)
-                    self.tele.send(
-                        f"\u26A1 SL-RESCUE BOOST: opening {b_n}x{self.cfg.lot_size} "
-                        f"{b_side} @ market | SL ${b_sl} (${b_sld:.0f} SL each) | TP ${b_tp}\n"
-                        f"Goal: +${b_n * 8 * self.cfg.lot_size * 100:.0f} covers the twin "
-                        f"if its SL hits; capped -${b_n * b_sld * self.cfg.lot_size * 100:.0f} on whipsaw.",
-                        Severity.WARN, important=True, critical=True,
-                        card=dc.card_rescue(info['anchor_label'],
-                                            trapped_leg=f"twin (sibling of {ticket})",
-                                            rescue_leg=f"{b_side} @ ${b_ep:.2f}",
-                                            twin_pnl=None),
-                        event_key=f"rescue:{ticket}",
-                    )
-                    for bi in range(b_n):
-                        # v3.0.0 Fix B (boost-fill diagnostics): boosts are
-                        # 0-for-6 lifetime -- announced (⚡) but NO success/
-                        # reject follow-up ever appears and no boost shows in
-                        # the broker; the failure bypasses all current logging.
-                        # We do NOT yet know the cause, so instrument EVERY
-                        # possible exit of this path: no boost is announced
-                        # without a subsequent Telegram line naming its fate.
-                        self.tele.info(
-                            f"… attempting BOOST{bi+1} {b_side} {self.cfg.lot_size} "
-                            f"@ market | SL ${b_sl} TP ${b_tp}")
-                        b_cmt_used = f"AUR_{info['anchor_label'][:2]}_{b_side[0]}_B{bi+1}"
-                        try:
-                            b_res = self.adapter.place_market_order(
-                                self.cfg.symbol, b_side, self.cfg.lot_size,
-                                sl=b_sl, tp=b_tp,
-                                comment=b_cmt_used,
-                                dry_run=self.paper)
-                        except Exception as e:
-                            log.warning(f"BOOST{bi+1} order error: {e!r}")
-                            # v2.9.8: Jun-11 A4 mystery -- exceptions here were
-                            # log-only, so Telegram showed the announce and then
-                            # NOTHING. Every boost now reports fate to Telegram.
-                            self.tele.error(f"❌ BOOST{bi+1} EXCEPTION: {md_escape(repr(e))} -- order NOT placed")
-                            _fleet_boosts.append({'ticket': None, 'fill': None,
-                                                  'rc': None, 'comment': b_cmt_used})
-                            continue
-                        if b_res is None:
-                            # v3.0.0: broker returned no result object at all --
-                            # surface mt5.last_error() so the next event tells us why.
-                            _le = ''
-                            try:
-                                _le = f" last_error={md_escape(self.adapter.mt5.last_error())}"
-                            except Exception:
-                                pass
-                            self.tele.error(
-                                f"❌ BOOST{bi+1} result=None -- order NOT placed{_le}")
-                            _fleet_boosts.append({'ticket': None, 'fill': None,
-                                                  'rc': None, 'comment': b_cmt_used})
-                            continue
-                        b_rc = getattr(b_res, 'retcode', None)
-                        b_rc_name = _MT5_RETCODE_MAP.get(b_rc, f"UNKNOWN_{b_rc}")
-                        b_cmt = getattr(b_res, 'comment', '') or ''
-                        if b_rc == 10009:
-                            b_tk = getattr(b_res, 'order', None) or getattr(b_res, 'deal', None)
-                            b_fp = float(getattr(b_res, 'price', b_ep) or b_ep)
-                            if b_tk:
-                                self.shadow_positions[int(b_tk)] = {
-                                    'anchor_label': info['anchor_label'],
-                                    'side':         b_side,
-                                    'entry_price':  b_fp,
-                                    'current_sl':   b_sl,
-                                    'tp_level':     b_tp,
-                                    'max_fav':      b_fp,
-                                    'fill_time':    pd.Timestamp.now(tz='UTC').isoformat(),
-                                    'role':         'rescue',
-                                    'boost':        True,
-                                }
-                            self.tele.send(
-                                f"\u2705\u26A1 BOOST{bi+1} {b_side} FILLED @ ${b_fp} "
-                                f"(ticket {b_tk}) rc={b_rc} ({b_rc_name})",
-                                Severity.SUCCESS, important=True, critical=True,
-                                card=dc.card_boost(bi + 1, b_side, b_fp, b_sl, b_tp,
-                                                   f"{b_rc} ({b_rc_name})"),
-                                event_key=f"boost:{b_tk}")
-                            _fleet_boosts.append({'ticket': int(b_tk) if b_tk else None,
-                                                  'fill': b_fp, 'rc': b_rc,
-                                                  'comment': b_cmt_used})
-                        else:
-                            # v3.0.0: non-success retcode -- name it + show comment
-                            self.tele.error(
-                                f"\u274C BOOST{bi+1} rejected rc={b_rc} ({md_escape(b_rc_name)}) "
-                                f"comment={md_escape(repr(b_cmt))}")
-                            _fleet_boosts.append({'ticket': None, 'fill': None,
-                                                  'rc': b_rc, 'comment': b_cmt_used})
-
-                # v3.0.6 OBSERVER: register the complete fleet event so it can be
-                # finalized on close (CSV + Firestore + tally). Wrapped so a
-                # logging error can NEVER reach the rescue/boost engine. Runs even
-                # if rescue_boost is disabled (_fleet_boosts stays []).
-                try:
-                    _members = set()
-                    if _trig_tk is not None:
-                        _members.add(int(_trig_tk))
-                    _members.add(int(ticket))
-                    for _b in _fleet_boosts:
-                        if _b.get('ticket'):
-                            _members.add(int(_b['ticket']))
-                    _bn = len(_fleet_boosts)
-                    _boosts_ok = (_bn > 0 and all(b.get('rc') == 10009 for b in _fleet_boosts))
-                    self._rescue_event_open({
-                        'event_id': f"{self.state.get('last_broker_date','?')}_"
-                                    f"{info['anchor_label'][:2]}_{ticket}",
-                        'date_ist': self.state.get('last_broker_date'),
-                        'anchor': info['anchor_label'],
-                        'sched_iso': info.get('sched_utc'),
-                        'open_iso': pd.Timestamp.now(tz='UTC').isoformat(),
-                        'trigger': {'ticket': int(_trig_tk) if _trig_tk is not None else None,
-                                    'side': _trig_sp.get('side'), 'trigger_pnl': _trig_pnl},
-                        'rescue': {'ticket': int(ticket), 'side': info['side'],
-                                   'fill': float(info['entry_price'])},
-                        'boosts': _fleet_boosts,
-                        'boosts_placed_ok': _boosts_ok,
-                        'members': _members,
-                    })
-                except Exception as _e:
-                    log.warning(f"rescue_event_open failed (non-fatal): {_e!r}")
+                # v3.2.0 BUG FIX: the OLD path fired boosts HERE, AT THE LEG'S
+                # FILL PRICE, in the sibling's direction, always labelled
+                # "RESCUE" -- even when the leg had WON. On A3 (Jun 18) that
+                # placed boosts at 4266.30 (= the fill) which died on a reversal
+                # (~-$900). RETIRED. Boosts now fire ONLY from the per-tick
+                # trigger (_check_boost_triggers) once price moves a full $10
+                # from leg_fill_price: RALLY (+$10 same dir, winning) or RESCUE
+                # (-$10 opposite, losing) -- NEVER at fill. Marked eligible above.
+                self.tele.info(
+                    f"\U0001F691 LONE leg armed (ticket {ticket}) — boosts fire "
+                    f"on a $10 move from ${float(broker_p.price_open):.2f} "
+                    f"(RALLY if it runs, RESCUE if it reverses). No fire-at-fill.")
 
     # Detect closures
     for ticket in list(self.shadow_positions):
@@ -574,3 +437,150 @@ def _reconcile_with_broker(self):
                             f"history yet -- alerted degraded")
         except Exception as e:
             self.tele.warn(f"Could not fetch close deal for {ticket}: {e}")
+
+
+# ============================================================================
+# v3.2.0 — lone-leg boost firing (PER-TICK; never at fill). Bound on LiveTrader.
+# The DECISION is boosts.plan_boost_event (shared with tests + backtest); only the
+# live order PLACEMENT lives here. ISOLATION: boosts are their own tickets and
+# never close/modify/net against the original leg.
+# ============================================================================
+def _fire_boost_event(self, leg_ticket, leg_shadow, plan):
+    """Place the lone leg's boost event at MARKET in plan.boost_side (RALLY same
+    dir / RESCUE opposite) -- only ever called once price is >= $10 from the leg's
+    fill. Opens the rescue event (event_type RALLY_BOOST/RESCUE_BOOST) for
+    rescuestats. Reuses the proven place_market_order loop."""
+    anchor = leg_shadow.get('anchor_label', '?')
+    side = plan.boost_side
+    sgn = 1.0 if side == 'BUY' else -1.0
+    n = int(plan.n)
+    sl_d = float(plan.sl_dollars)
+    tp_d = float(plan.tp_dollars)
+    ref = float(plan.entry_ref)
+    leg_fill = float(leg_shadow.get('leg_fill_price', ref))
+    event_id = f"{self.state.get('last_broker_date', '?')}_{anchor[:2]}_{leg_ticket}"
+    self.tele.send(
+        f"{'🚀' if plan.kind == 'RALLY' else '🚑'}⚡ {plan.kind} BOOST: "
+        f"{n}x{self.cfg.lot_size} {side} @ market | $10 SL + $3.50 trail | leg "
+        f"moved ${plan.move_dollars:+.0f} from fill ${leg_fill:.2f}",
+        Severity.WARN, important=True, critical=True,
+        card=dc.card_rescue(anchor,
+                            trapped_leg=f"lone {leg_shadow.get('side')} (ticket {leg_ticket})",
+                            rescue_leg=f"{plan.kind} {side} @ ~${ref:.2f}", twin_pnl=None),
+        event_key=f"{plan.event_type}:{leg_ticket}")
+    fleet = []
+    for bi in range(n):
+        b_sl = round(ref - sgn * sl_d, 2)
+        b_tp = round(ref + sgn * tp_d, 2)
+        cmt = f"AUR_{anchor[:2]}_{side[0]}_B{bi + 1}"
+        try:
+            res = self.adapter.place_market_order(
+                self.cfg.symbol, side, self.cfg.lot_size,
+                sl=b_sl, tp=b_tp, comment=cmt, dry_run=self.paper)
+        except Exception as e:
+            self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} EXCEPTION: {md_escape(repr(e))}")
+            fleet.append({'ticket': None, 'fill': None, 'rc': None, 'comment': cmt})
+            continue
+        rc = getattr(res, 'retcode', None) if res is not None else None
+        rcn = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
+        if rc == 10009:
+            b_tk = getattr(res, 'order', None) or getattr(res, 'deal', None)
+            b_fp = float(getattr(res, 'price', ref) or ref)
+            if b_tk:
+                self.shadow_positions[int(b_tk)] = {
+                    'anchor_label': anchor, 'side': side, 'entry_price': b_fp,
+                    'current_sl': round(b_fp - sgn * sl_d, 2),
+                    'tp_level': round(b_fp + sgn * tp_d, 2), 'max_fav': b_fp,
+                    'fill_time': pd.Timestamp.now(tz='UTC').isoformat(),
+                    'role': 'rescue', 'boost': True, 'boost_event': event_id,
+                }
+            self.tele.send(
+                f"✅⚡ {plan.kind} BOOST{bi + 1} {side} FILLED @ ${b_fp} (ticket {b_tk})",
+                Severity.SUCCESS, important=True, critical=True,
+                card=dc.card_boost(bi + 1, side, b_fp, round(b_fp - sgn * sl_d, 2),
+                                   round(b_fp + sgn * tp_d, 2), f"{rc}"),
+                event_key=f"boost:{b_tk}")
+            fleet.append({'ticket': int(b_tk) if b_tk else None, 'fill': b_fp,
+                          'rc': rc, 'comment': cmt})
+        else:
+            self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} rejected rc={rc} ({md_escape(rcn)})")
+            fleet.append({'ticket': None, 'fill': None, 'rc': rc, 'comment': cmt})
+    # Open the rescue event (RALLY_BOOST / RESCUE_BOOST) so it logs to rescuestats.
+    try:
+        members = {int(leg_ticket)} | {int(b['ticket']) for b in fleet if b.get('ticket')}
+        self._rescue_event_open({
+            'event_id': event_id, 'event_type': plan.event_type,
+            'date_ist': self.state.get('last_broker_date'),
+            'anchor': anchor, 'sched_iso': leg_shadow.get('sched_utc'),
+            'open_iso': pd.Timestamp.now(tz='UTC').isoformat(),
+            'trigger': {'ticket': None, 'side': None, 'trigger_pnl': None},
+            'rescue': {'ticket': int(leg_ticket), 'side': leg_shadow.get('side'),
+                       'fill': leg_fill},
+            'boosts': fleet,
+            'boosts_placed_ok': bool(fleet) and all(b.get('rc') == 10009 for b in fleet),
+            'members': members,
+        })
+    except Exception as e:
+        log.warning(f"rescue_event_open ({plan.event_type}) failed: {e!r}")
+
+
+def _enforce_boost_cap(self, mid):
+    """v3.2.0: hard-close a boost EVENT's boosts once their COMBINED open P&L
+    breaches the -$700 cap (A3 slipped to -715.05). Boosts only -- the original
+    leg is outside the cap (isolation)."""
+    try:
+        cap = boosts.boost_whipsaw_cap(self.cfg)
+    except Exception:
+        return
+    by_event = {}
+    for tk, sp in self.shadow_positions.items():
+        if not sp.get('boost'):
+            continue
+        sgn = 1.0 if sp.get('side') == 'BUY' else -1.0
+        pnl = sgn * (mid - float(sp.get('entry_price', mid))) * self.cfg.lot_size \
+            * float(getattr(self.cfg, 'contract_size', 100.0))
+        by_event.setdefault(sp.get('boost_event'), []).append((tk, pnl))
+    for eid, legs in by_event.items():
+        if sum(p for _, p in legs) <= -cap + 1e-6:
+            for tk, _ in legs:
+                try:
+                    self.adapter.close_position(tk, dry_run=self.paper)
+                    self.tele.warn(f"🛑 BOOST CAP -${cap:.0f} breached on {eid} — "
+                                   f"closing boost {tk} at market.")
+                except Exception as e:
+                    log.warning(f"boost cap close {tk} failed: {e!r}")
+
+
+def _check_boost_triggers(self):
+    """v3.2.0 PER-TICK trigger: fire a lone leg's boost event the instant price is
+    >= $10 from its fill (RALLY winning / RESCUE losing, via the canonical
+    boosts.plan_boost_event) -- NEVER at fill -- then enforce the -$700 cap. Live
+    only; never raises onto the tick loop."""
+    if self.paper:
+        return
+    try:
+        tk = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+        mid = (float(tk.bid) + float(tk.ask)) / 2.0
+    except Exception:
+        return
+    for ticket, shadow in list(self.shadow_positions.items()):
+        if shadow.get('boost') or shadow.get('boost_fired') \
+                or not shadow.get('boost_eligible'):
+            continue
+        try:
+            plan = boosts.plan_boost_event(
+                shadow['side'], shadow.get('leg_fill_price', shadow['entry_price']),
+                mid, self.cfg)
+        except Exception:
+            plan = None
+        if plan is None:
+            continue
+        shadow['boost_fired'] = True   # one event per leg (set before placing)
+        try:
+            self._fire_boost_event(ticket, shadow, plan)
+        except Exception as e:
+            log.warning(f"_fire_boost_event({ticket}) failed: {e!r}")
+    try:
+        self._enforce_boost_cap(mid)
+    except Exception as e:
+        log.warning(f"_enforce_boost_cap failed: {e!r}")

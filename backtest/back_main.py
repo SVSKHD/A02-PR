@@ -120,10 +120,13 @@ def main(argv):
             f"win_rate {a.get('win_rate', 0.0):>5.1f}%   "
             f"legs {a.get('legs', 0):>3}   anchor-days {a.get('anchor_days', 0):>3}")
 
-    # Boost summary
+    # Boost summary (v3.2.0: canonical event_type counts + branch + counterfactual)
     out()
     bc = s['branch_counts']
-    out(f"BOOST summary:  CRASH_WIN {bc['CRASH_WIN']}   "
+    ec = s.get('event_counts', {'RALLY_BOOST': 0, 'RESCUE_BOOST': 0})
+    out(f"BOOST summary:  RALLY_BOOST {ec.get('RALLY_BOOST', 0)}   "
+        f"RESCUE_BOOST {ec.get('RESCUE_BOOST', 0)}")
+    out(f"  branch:  CRASH_WIN {bc['CRASH_WIN']}   "
         f"WHIPSAW_LOSS {bc['WHIPSAW_LOSS']}   SCRATCH {bc['SCRATCH']}")
     out(f"  no-boost counterfactual (orig+rescue legs alone): "
         f"{_money(s['no_boost_counterfactual'])}")
