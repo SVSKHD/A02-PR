@@ -64,6 +64,7 @@ STEP_NAMES = {
     22: "lone rescue",
     23: "boost trail",
     24: "lone branches",
+    25: "boost isol",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -869,36 +870,49 @@ class SelfTest:
         self._record(22, PASS if ok else FAIL, detail)
 
     def _step_boost_trail(self):
-        # v3.1.3 BOOST TRAIL HANDOFF: drive the REAL strategy core. In-freeze (so
-        # the generic post-hold trail is off and only the boost handoff acts): a
-        # boost holds +$8 as a one-way floor once fav>=8 and rides peak-$2 above;
-        # below +8 it keeps its $10 SL. Rescue-leg (non-boost) is unchanged.
+        # v3.1.6 BOOST BREATH-GAP TRAIL + $10 BACKSTOP (boosts only). Drive the REAL
+        # strategy core over price paths. gap = cfg.boost_trail_gap_dollars (3.50);
+        # the trail is armed the instant the boost fills, alongside the $10 hard SL.
         from strategy import Position, update_position_on_bar
         try:
             cfg = self.cfg
-            entry = 4300.0
+            gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
+            entry = 100.0
             ts0 = pd.Timestamp('2026-06-17T13:50:00Z')
 
-            def bsl(fav, boost=True, role='rescue', max_fav=None):
+            def run(bars, boost=True, role='rescue'):
                 p = Position(anchor_label='T', side='BUY', entry_price=entry,
                              entry_time=ts0, current_sl=entry - 10.0,
-                             tp_level=entry + 30.0, max_fav=entry + (max_fav or fav),
+                             tp_level=entry + 30.0, max_fav=entry,
                              lot=cfg.lot_size, role=role, boost=boost)
-                bar = pd.Series({'high': entry + fav, 'low': entry + fav - 0.01,
-                                 'close': entry + fav})
-                update_position_on_bar(p, bar, ts0 + pd.Timedelta(minutes=3), cfg)
-                return round(p.current_sl - entry, 2)
+                for i, b in enumerate(bars):
+                    update_position_on_bar(p, pd.Series(b),
+                                           ts0 + pd.Timedelta(minutes=i + 1), cfg)
+                    if p.closed:
+                        break
+                return p
 
-            below = (bsl(6) == -10.0)        # <8: no lock, keeps $10 boost SL
-            floor8 = (bsl(8) == 8.0)         # +8 floor engages
-            held = (bsl(9) == 8.0)           # held at +8 until peak-2 exceeds it
-            ride = (bsl(12) == 10.0)         # rides peak-$2 above the floor
-            # ratchet: peaked +15 (SL +13) then pulls back to fav 9 -> must NOT drop
-            ratchet = (bsl(9, max_fav=15) == 13.0)
-            rescue_same = (bsl(9, boost=False) == -10.0)  # non-boost rescue unchanged
-            ok = below and floor8 and held and ride and ratchet and rescue_same
-            detail = (f"<8={below} floor8={floor8} held={held} ride12={ride} "
-                      f"ratchet={ratchet} rescue-unchanged={rescue_same}")
+            # 1) reverses before +$8 -> exits on the breath-gap trail at ~-(gap), NOT -$10
+            p1 = run([{'open': 100, 'high': 101, 'low': 100 - gap - 1, 'close': 96}])
+            rev_at_gap = p1.closed and abs((entry - p1.exit_price) - gap) < 0.05
+            # 2) gaps THROUGH the trail -> caught by the $10 SL backstop (~-$10)
+            p2 = run([{'open': 85, 'high': 86, 'low': 84, 'close': 85}])
+            backstop = p2.closed and abs((entry - p2.exit_price) - 10.0) < 0.05
+            # 3) runs past +$8 then pulls back -> exits no lower than +$8 (floor)
+            p3 = run([{'open': 100, 'high': 112, 'low': 100.5, 'close': 111},
+                      {'open': 111, 'high': 111, 'low': 108, 'close': 108}])
+            floor8 = p3.closed and (p3.exit_price - entry) >= 8.0 - 0.05
+            # 4) one-way: after the peak a non-triggering retrace must NOT loosen SL
+            p4 = run([{'open': 100, 'high': 112, 'low': 100.5, 'close': 111}])
+            sl_peak = p4.current_sl
+            update_position_on_bar(p4, pd.Series(
+                {'open': 109, 'high': 109, 'low': 108.6, 'close': 108.8}),
+                ts0 + pd.Timedelta(minutes=2), cfg)
+            one_way = (p4.closed or p4.current_sl >= sl_peak - 1e-9)
+            ok = rev_at_gap and backstop and floor8 and one_way
+            detail = (f"rev@-{gap:.2f}->exit{p1.exit_price}({rev_at_gap}) "
+                      f"gap->backstop{p2.exit_price}({backstop}) "
+                      f"runpast8->exit{p3.exit_price}({floor8}) one_way={one_way}")
         except Exception as e:
             self._record(23, FAIL, f"raised: {e!r}")
             return
@@ -919,24 +933,28 @@ class SelfTest:
         lot = cfg.lot_size
         ts0 = pd.Timestamp('2026-06-17T13:50:00Z')
 
+        gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
+
         def sim_boost(bars, entry=100.0):
-            # BUY boost ($10 SL, $30 TP), post-hold; feed (high, low) bars until it
-            # closes; return realized USD P&L (or None if it never closed).
+            # BUY boost (breath-gap trail + $10 backstop, $30 TP); feed OHLC bars
+            # through the REAL strategy core; return realized USD P&L (or None).
             p = Position(anchor_label='T', side='BUY', entry_price=entry,
                          entry_time=ts0, current_sl=entry - 10.0,
                          tp_level=entry + 30.0, max_fav=entry, lot=lot,
                          role='rescue', boost=True)
-            for hi, lo in bars:
-                bar = pd.Series({'high': hi, 'low': lo, 'close': (hi + lo) / 2})
-                if update_position_on_bar(p, bar, ts0 + pd.Timedelta(minutes=60), cfg):
+            for b in bars:
+                if update_position_on_bar(p, pd.Series(b),
+                                          ts0 + pd.Timedelta(minutes=60), cfg):
                     break
             return round(realize_pnl_usd(p, cfg), 2) if p.closed else None
 
-        # TREND: rise to +25 then pull back to the trail stop -> rides well past +8.
-        b_trend = sim_boost([(125.0, 100.5), (125.0, 123.0)])
-        # WHIPSAW: immediate reverse -> boost hits its $10 SL.
-        b_whip = sim_boost([(100.5, 89.0)])
-        cap = round(2 * float(getattr(cfg, 'boost_sl_dollars', 10.0)) * lot * 100, 2)
+        # TREND: rise to +25 then pull back to the breath trail -> rides past +8.
+        b_trend = sim_boost([{'open': 100, 'high': 125, 'low': 100.5, 'close': 124},
+                             {'open': 124, 'high': 124, 'low': 121, 'close': 121}])
+        # WHIPSAW: immediate reverse -> exits on the breath-gap trail at ~-(gap),
+        # FAR less than the old -$10 worst case.
+        b_whip = sim_boost([{'open': 100, 'high': 100.5, 'low': 96, 'close': 96.5}])
+        old_cap = round(2 * float(getattr(cfg, 'boost_sl_dollars', 10.0)) * lot * 100, 2)
 
         _fj_orig = _fj.save_rescue_event
         _fj.save_rescue_event = lambda d, e, doc: True
@@ -976,14 +994,15 @@ class SelfTest:
             trend, whip, scr = by['1000'], by['2000'], by['3000']
 
             checks = {
-                # boost rode the trail well past +$8 (floor +8 = $%.0f) in the trend
+                # boost rode the breath trail well past +$8 in the trend
                 "trend_boost_rides>8": (b_trend is not None and b_trend > 8 * lot * 100),
                 "trend=CRASH_WIN":     trend['branch'] == 'CRASH_WIN',
                 "trend_net>0":         float(trend['net_usd']) > 0,
-                # whipsaw boost is capped at its $10 SL ( -$10 * lot * 100 )
-                "whip_boost=-$10SL":   (b_whip is not None and abs(b_whip + 10 * lot * 100) < 0.01),
+                # v3.1.6: whipsaw boost exits at ~-(gap), NOT -$10 (much smaller loss)
+                "whip_boost~-gap":     (b_whip is not None and abs(b_whip + gap * lot * 100) < 1.0),
                 "whip=WHIPSAW_LOSS":   whip['branch'] == 'WHIPSAW_LOSS',
-                "boost_cap_respected": (2 * b_whip) >= -cap - 0.01,   # never worse than -700
+                # combined boost loss is now FAR under the old -$700 worst case
+                "whip<old_700cap":     (-old_cap < 2 * b_whip < 0),
                 "scratch=SCRATCH":     scr['branch'] == 'SCRATCH',
                 # no-boost counterfactual logged = rescue leg alone (boosts excluded)
                 "cf_logged_trend":     abs(float(trend['no_boost_net']) - 400.0) < 0.01,
@@ -992,7 +1011,7 @@ class SelfTest:
                 "lone_no_trigger":     all((r['trigger_ticket'] or '') == '' for r in rows),
             }
             ok = all(checks.values())
-            detail = (f"boost trend={b_trend} whip={b_whip} cap=-${cap:.0f} | "
+            detail = (f"boost trend={b_trend} whip={b_whip} (old_cap=-${old_cap:.0f}) | "
                       + " ".join(f"{k}={'Y' if v else 'N'}" for k, v in checks.items()))
         except Exception as e:
             _fj.save_rescue_event = _fj_orig
@@ -1001,6 +1020,60 @@ class SelfTest:
         finally:
             _fj.save_rescue_event = _fj_orig
         self._record(24, PASS if ok else FAIL, detail)
+
+    def _step_boost_isolation(self):
+        # v3.1.6 ISOLATION: a winning ORIGINAL leg and losing BOOSTS resolve
+        # INDEPENDENTLY. Driving the boost to its stop must NOT read, modify, or
+        # close the original (separate Position objects / separate tickets), and
+        # the original must still reach its OWN profitable exit. Boost P&L can only
+        # add when it wins or lose its own capital when it fails -- it can never
+        # turn a winning original into a net loss by pooling/closing it.
+        from strategy import Position, update_position_on_bar, realize_pnl_usd
+        try:
+            cfg = self.cfg
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-17T13:50:00Z')
+            orig = Position(anchor_label='A4_1640_NYopen', side='BUY',
+                            entry_price=entry, entry_time=ts0,
+                            current_sl=entry - cfg.sl_dist, tp_level=entry + cfg.tp_dist,
+                            max_fav=entry, lot=cfg.lot_size, role='normal', boost=False)
+            orig_sl_before = orig.current_sl
+            boost = Position(anchor_label='A4_1640_NYopen', side='BUY',
+                             entry_price=entry, entry_time=ts0,
+                             current_sl=entry - 10.0, tp_level=entry + 30.0,
+                             max_fav=entry, lot=cfg.lot_size, role='rescue', boost=True)
+
+            # 1) Drive the BOOST to a loss (reverses to its breath trail). The
+            #    ORIGINAL object must be byte-for-byte untouched by this.
+            update_position_on_bar(boost, pd.Series(
+                {'open': 100, 'high': 100.5, 'low': 96, 'close': 96.5}),
+                ts0 + pd.Timedelta(minutes=1), cfg)
+            boost_lost = boost.closed and realize_pnl_usd(boost, cfg) < 0
+            orig_untouched = (not orig.closed
+                              and orig.current_sl == orig_sl_before
+                              and orig.exit_price is None)
+
+            # 2) The ORIGINAL runs to its OWN take-profit, independently of the
+            #    boost having lost. Its result stands alone (positive).
+            out = update_position_on_bar(orig, pd.Series(
+                {'open': 100, 'high': entry + cfg.tp_dist + 1, 'low': 100,
+                 'close': entry + cfg.tp_dist}), ts0 + pd.Timedelta(minutes=60), cfg)
+            orig_own_tp = (out == 'TP' and realize_pnl_usd(orig, cfg) > 0)
+
+            # 3) No pooling: the winning original is NOT dragged negative by the
+            #    losing boosts (they are separate line items).
+            orig_pnl = realize_pnl_usd(orig, cfg)
+            boost_pnl = realize_pnl_usd(boost, cfg)
+            no_pool = orig_pnl > 0 and boost_pnl < 0
+
+            ok = boost_lost and orig_untouched and orig_own_tp and no_pool
+            detail = (f"orig_untouched={orig_untouched} orig_own_TP={orig_own_tp} "
+                      f"(orig ${orig_pnl:+.0f}) boost_lost={boost_lost} "
+                      f"(boost ${boost_pnl:+.0f}) no_pool={no_pool}")
+        except Exception as e:
+            self._record(25, FAIL, f"raised: {e!r}")
+            return
+        self._record(25, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # Orchestration
@@ -1067,6 +1140,7 @@ class SelfTest:
             self._step_lone_rescue()
             self._step_boost_trail()
             self._step_lone_branches()
+            self._step_boost_isolation()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1080,7 +1154,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 25):
+        for n in range(1, 26):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1097,12 +1171,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/24 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/25 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/24 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/25 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/24 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/25 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)

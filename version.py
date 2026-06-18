@@ -350,9 +350,28 @@ History (one line per behavioral change):
          rescue_events.csv column for BOTH fleet and lone events, so rescuestats
          can isolate "do the boosts help on lone legs". No live rescue/boost logic
          changed. selftest -> 24 steps.
+  3.1.6  BOOST breath-gap trail + $10 backstop + strict boost/original ISOLATION
+         (boosts only; straddle/triggers/original-leg & normal/rescue-LEG trails
+         FROZEN). (1) The instant a boost fills it gets a tight one-way breath-gap
+         trail (config boost_trail_gap_dollars=3.50) armed from entry, WITH its $10
+         hard SL as a backstop -- both live, whichever hits first closes the boost.
+         Once fav clears +$8 the trail floor never retreats below +$8. So a boost
+         that reverses early exits ~-(gap) (was -$10), a boost that gaps THROUGH
+         the trail is caught no worse than the $10 backstop, and a runner rides the
+         trail past +$8 (4334->4359 no longer left on the table). Managed by a
+         dedicated strategy._update_boost_on_bar (boosts early-return; the non-boost
+         core is byte-identical to pre-v3.1.3); trails.py market-closes the boost
+         on a software-trail hit. (2) ISOLATION: a boost is an additive upside-only
+         bet -- its stop logic reads/writes ONLY its own ticket, never the original
+         leg; no boost stop event closes/modifies the original (and vice versa);
+         the -$700 cap bounds the BOOSTS' combined loss only, never pulls in the
+         original; the journal tags each leg's role (normal vs rescue vs boost) so
+         P&L is never silently pooled. (NOTE: a future vol-adaptive "smart" gap for
+         boosts AND originals is tracked; v3.1.6 ships a fixed tunable gap only.)
+         selftest -> 25 steps (breath-trail behaviors + isolation).
 """
 
-__version__ = "3.1.4"
+__version__ = "3.1.6"
 CODENAME = "Astra Hawk"
 
 

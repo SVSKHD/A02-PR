@@ -744,6 +744,7 @@ class LiveTrader:
         _boost_sl = float(getattr(self.cfg, 'boost_sl_dollars', 10.0))
         _boost_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
         _whip_cap = _boost_n * _boost_sl * self.cfg.lot_size * 100
+        _boost_gap = float(getattr(self.cfg, 'boost_trail_gap_dollars', 3.50))
         # v3.1.0: alert-channel banner line (Discord, embed cards).
         _hb = int(getattr(self.cfg, 'discord_heartbeat_min', 60))
         _alert_line = (f"Alerts: Discord (embed cards) — commands ON, "
@@ -762,7 +763,7 @@ class LiveTrader:
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
             f"Ladder: `5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
-            f"Boost: `{_boost_n}x SL ${_boost_sl:.0f}` | whipsaw cap `-${_whip_cap:.0f}`\n"
+            f"Boost: `{_boost_n}x SL ${_boost_sl:.0f}` | breath-gap trail `${_boost_gap:.2f}` + $10 backstop | cap `-${_whip_cap:.0f}` | isolated from original\n"
             f"{_alert_line}\n"
             f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
             f"v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`\n"
@@ -775,7 +776,7 @@ class LiveTrader:
                 f"-{self.cfg.daily_loss_pct*100:.1f}%",
                 f"{self.cfg.freeze_minutes}m / fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}",
                 "5>BE | 6>+4 | 10>peak-2",
-                f"${_boost_sl:.0f} (cap -${_whip_cap:.0f})",
+                f"${_boost_sl:.0f} + ${_boost_gap:.2f} breath-trail (isolated)",
                 _alerts_val),
         )
         # v3.1.0: start the Discord heartbeat (no-op if Discord disabled).
