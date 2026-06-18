@@ -1271,19 +1271,26 @@ class SelfTest:
     # Orchestration
     # ------------------------------------------------------------------------
     def _preflight(self) -> bool:
-        """Refuse to run with any open position/pending; set the demo flag."""
+        """Refuse to run with any open position/pending; set the demo flag.
+        v3.2.1: prints the abort reason SYNCHRONOUSLY (stdout/stderr) as well as via
+        async telemetry, so a preflight bail can never look like a silent exit."""
+        import sys as _sys, traceback as _tb
         mt5 = self.adapter.mt5
         try:
             pos = mt5.positions_get(symbol=self.symbol) or []
             pend = mt5.orders_get(symbol=self.symbol) or []
         except Exception as e:
-            self.tele.error(f"🧪 self-test aborted — could not read broker state: {e!r}")
+            msg = f"🧪 self-test ABORTED — could not read broker state: {e!r}"
+            print(msg, flush=True)
+            print(_tb.format_exc(), file=_sys.stderr, flush=True)
+            self.tele.error(msg)
             return False
         if pos or pend:
-            self.tele.warn(
-                f"🧪 self-test ABORTED — live positions present "
-                f"({len(pos)} open, {len(pend)} pending). Run when FLAT so the "
-                f"harness can't interfere with a live anchor.")
+            msg = (f"🧪 self-test ABORTED — live positions present "
+                   f"({len(pos)} open, {len(pend)} pending). Run when FLAT so the "
+                   f"harness can't interfere with a live anchor.")
+            print(msg, flush=True)
+            self.tele.warn(msg)
             return False
         try:
             ai = mt5.account_info()
@@ -1294,10 +1301,34 @@ class SelfTest:
         return True
 
     def run(self) -> bool:
+        import sys as _sys, traceback as _tb
         ts = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')
+        # v3.2.1: print SYNCHRONOUSLY too -- the async telemetry worker (a daemon
+        # thread) can be killed at process exit before it drains, which made an
+        # early preflight bail look like a silent exit. stdout print + a guaranteed
+        # telemetry drain (finally) + a full-traceback catch fix that for good.
+        print(f"🧪 AUREON SELF-TEST starting ({ts})", flush=True)
         self.tele.info(f"🧪 AUREON SELF-TEST starting ({ts})")
-        if not self._preflight():
+        try:
+            if not self._preflight():
+                print("🧪 SELF-TEST ABORTED in preflight (reason above) — "
+                      "RESULT: ABORTED, 0 steps ran.", flush=True)
+                return False
+            return self._run_steps(ts)
+        except BaseException:
+            tb = _tb.format_exc()
+            print("🧪 SELF-TEST CRASHED — full traceback:\n" + tb,
+                  file=_sys.stderr, flush=True)
+            log.error("SELF-TEST CRASHED:\n%s", tb)
             return False
+        finally:
+            # ALWAYS drain the async telemetry so nothing is lost on exit.
+            try:
+                self.tele.stop(timeout=6.0)
+            except Exception:
+                pass
+
+    def _run_steps(self, ts) -> bool:
         market_ok = self.is_demo or self.force
         skip_reason = "non-demo account (pass --force to run)" if not market_ok else ""
         try:
@@ -1374,25 +1405,36 @@ class SelfTest:
             verdict = f"RESULT: {n_pass}/28 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
-        print(report)
+        print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces
         log.info(report)
         (self.tele.success if n_fail == 0 else self.tele.error)(report)
-        # Give the async telemetry worker a moment to flush before the caller
-        # shuts the adapter / process down.
-        try:
-            self.tele.stop(timeout=6.0)
-        except Exception:
-            pass
+        # v3.2.1: telemetry is drained in run()'s finally (single drain point) so
+        # the async worker isn't double-stopped here.
         return n_fail == 0
 
 
 def run_selftest(cfg, force: bool = False) -> bool:
     """Build an MT5Adapter (same pattern as run_live), run the harness, tear the
-    adapter down. Returns True only if every executed step PASSed."""
-    from mt5_adapter import MT5Adapter  # late import: only this path needs MT5
-    adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'),
-                         expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))
+    adapter down. Returns True only if every executed step PASSed.
+    v3.2.1: NEVER exit silently -- any failure building the adapter / constructing
+    the harness prints a full traceback to stderr and returns False."""
+    import sys as _sys, traceback as _tb
+    adapter = None
     try:
+        from mt5_adapter import MT5Adapter  # late import: only this path needs MT5
+        adapter = MT5Adapter(
+            getattr(cfg, 'symbol', 'XAUUSD'),
+            expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))
         return SelfTest(cfg, adapter, force=force).run()
+    except BaseException:
+        tb = _tb.format_exc()
+        print("🧪 SELF-TEST could not start — full traceback:\n" + tb,
+              file=_sys.stderr, flush=True)
+        log.error("run_selftest crashed:\n%s", tb)
+        return False
     finally:
-        adapter.shutdown()
+        if adapter is not None:
+            try:
+                adapter.shutdown()
+            except Exception:
+                pass

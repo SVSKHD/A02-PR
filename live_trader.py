@@ -217,6 +217,12 @@ class LiveTrader:
         self._rescue_events: Dict = {}            # event_id -> event record
         self._rescue_event_by_ticket: Dict = {}   # member ticket -> event_id
         self._rehydrate_rescue_events()
+        # v3.2.1: ensure rescue_events.csv exists (header) so rescuestats always
+        # reads a valid file and a path/permission issue surfaces at startup.
+        try:
+            _rescue_mod.ensure_rescue_events_csv(self.run_dir)
+        except Exception as _e:
+            log.warning(f"ensure_rescue_events_csv failed (non-fatal): {_e!r}")
 
         # Pause flag (set via /pause command)
         self.paused = False

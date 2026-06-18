@@ -437,9 +437,26 @@ History (one line per behavioral change):
          (no-fire-at-fill, >=$10 entry, RALLY/RESCUE direction, cap clamp, import-
          path parity) and extends "backtest parity" with the boost parity check ->
          28 steps.
+  3.2.1  FIX selftest silent early-exit + rescue_events.csv startup-ensure (no
+         trading change). v3.2.0 selftest printed "SELF-TEST starting" then exited
+         with no steps/error/traceback: an early return from a failed _preflight()
+         (e.g. broker-read error or positions present) returned False WITHOUT
+         draining the async telemetry worker -- the abort reason was enqueued but
+         the daemon worker was killed at process exit before printing it, and
+         nothing printed synchronously. FIX: run() now prints the start line AND
+         the abort reason SYNCHRONOUSLY (stdout), wraps the whole run in a
+         full-traceback catch to stderr (never a silent crash), drains telemetry in
+         a finally on EVERY exit path, and run_selftest catches adapter-build/
+         construction failures with a traceback too; _preflight prints its abort
+         reason + traceback synchronously. So selftest now ALWAYS ends with RESULT:
+         ... or a clear ABORTED/CRASHED reason. Also: rescue_log.ensure_rescue_
+         events_csv creates run/rescue_events.csv (header only) at startup so
+         rescuestats always reads a valid file and a path/permission problem
+         surfaces at startup, not silently at the first finalize (finalize already
+         create-with-header on first write -- this is belt-and-suspenders).
 """
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 CODENAME = "Astra Hawk"
 
 
