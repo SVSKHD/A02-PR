@@ -66,6 +66,7 @@ STEP_NAMES = {
     24: "lone branches",
     25: "boost isol",
     26: "lone live-log",
+    27: "backtest parity",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1152,6 +1153,52 @@ class SelfTest:
             _fj.save_rescue_event = _fj_orig
         self._record(26, PASS if ok else FAIL, detail)
 
+    def _step_backtest_parity(self):
+        # v3.1.8 BACKTEST PARITY: the tick backtester must REUSE the live strategy
+        # functions by IMPORT (identity), not a drifting reimplementation, and a
+        # known fixture must replay to the expected P&L. Catches anyone who
+        # copy-pastes a parallel engine instead of importing the live one. The
+        # engine is loaded by FILE PATH to dodge the name collision with the
+        # repo-root backtest.py.
+        import importlib.util as _ilu
+        import strategy as _strat
+        try:
+            _root = os.path.dirname(os.path.abspath(__file__))
+            _path = os.path.join(_root, 'backtest', 'backtest.py')
+            spec = _ilu.spec_from_file_location('aureon_bt_engine', _path)
+            bt = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(bt)
+            # (a) identity: the backtester's engine IS the live engine
+            id_ok = (bt.update_position_on_bar is _strat.update_position_on_bar
+                     and bt.realize_pnl_usd is _strat.realize_pnl_usd
+                     and bt.Position is _strat.Position)
+            srcs = list(bt.rule_sources())
+            srcs_ok = all(s in srcs for s in (
+                'strategy.update_position_on_bar', 'anchors.resolved_anchor_hm',
+                'fills.is_rescue_fill', 'rescue_log._branch_for'))
+            # (b) fixture: a BUY entered at 100 with the live $30 TP exits at TP for
+            #     +$1050 @ lot 0.35 -- proving the backtest replays via live logic.
+            cfg = self.cfg
+            entry = 100.0
+            p = bt.Position(anchor_label='FIX', side='BUY', entry_price=entry,
+                            entry_time=pd.Timestamp('2026-05-01T10:00:00Z'),
+                            current_sl=entry - cfg.sl_dist, tp_level=entry + cfg.tp_dist,
+                            max_fav=entry, lot=cfg.lot_size)
+            bar = pd.Series({'open': entry, 'high': entry + cfg.tp_dist + 1,
+                             'low': entry, 'close': entry + cfg.tp_dist})
+            out = bt.update_position_on_bar(
+                p, bar, p.entry_time + pd.Timedelta(minutes=60), cfg)
+            pnl = round(bt.realize_pnl_usd(p, cfg), 2)
+            expect = round(cfg.tp_dist * cfg.contract_size * cfg.lot_size, 2)
+            fixture_ok = (out == 'TP' and abs(pnl - expect) < 0.01)
+            ok = id_ok and srcs_ok and fixture_ok
+            detail = (f"engine_identity={id_ok} sources_ok={srcs_ok} "
+                      f"fixture_TP=${pnl:.0f}(want ${expect:.0f}){fixture_ok}")
+        except Exception as e:
+            self._record(27, FAIL, f"raised: {e!r}")
+            return
+        self._record(27, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -1219,6 +1266,7 @@ class SelfTest:
             self._step_lone_branches()
             self._step_boost_isolation()
             self._step_lone_live_logging()
+            self._step_backtest_parity()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1232,7 +1280,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 27):
+        for n in range(1, 28):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1249,12 +1297,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/26 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/27 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/26 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/27 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/26 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/27 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)
