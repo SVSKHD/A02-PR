@@ -207,6 +207,15 @@ def _rescue_event_finalize(self, ev):
     )
     log.info(f"{event_type} EVENT finalized {ev['event_id']}: net ${net:+.2f} "
              f"(orig ${orig_pnl:+.2f} / boost ${boost_pnl:+.2f}) {branch}")
+    # v3.1.9: mirror the finalized rescue event to AUREON OS (idempotent by
+    # event_id). Best-effort; never affects the rescue/logging path.
+    try:
+        import ingest as _ing
+        _em = _ing.get_emitter()
+        if _em is not None:
+            _em.emit("rescue", dict(row), event_id=f"rescue:{ev['event_id']}")
+    except Exception:
+        pass
     self._rescue_events.pop(ev["event_id"], None)
     for tk in list(ev["members"]):
         self._rescue_event_by_ticket.pop(int(tk), None)

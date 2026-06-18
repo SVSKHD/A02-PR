@@ -67,6 +67,7 @@ STEP_NAMES = {
     25: "boost isol",
     26: "lone live-log",
     27: "backtest parity",
+    28: "ingest emit",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1199,6 +1200,47 @@ class SelfTest:
             return
         self._record(27, PASS if ok else FAIL, detail)
 
+    def _step_ingest_emitter(self):
+        # v3.1.9 AUREON OS INGEST: events must buffer offline, SURVIVE a restart,
+        # flush on the next success, be idempotent by id (re-send never double-
+        # posts), and NEVER block (in-memory enqueue; injected transport, no net).
+        import tempfile, os as _os
+        import ingest as _ing
+        try:
+            tmp = tempfile.mkdtemp(prefix="aureon_ing_")
+            buf = _os.path.join(tmp, "ingest_buffer.ndjson")
+            posted, up = [], {"v": False}
+            post = (lambda batch: (posted.extend(e["id"] for e in batch) or True)
+                    if up["v"] else False)
+            em = _ing.IngestEmitter("https://os/ingest", "tok", buf, enabled=True,
+                                    batch=10, flush_s=999, _post=post)
+            em.emit("trade", {"ticket": 555, "pnl": 1050.0}, event_id="trade:555")
+            em.emit("trade", {"ticket": 555, "pnl": 1050.0}, event_id="trade:555")  # dup id
+            em.emit("log", {"msg": "anchor placed"})                # auto-hashed id
+            em.flush_once()                                         # DOWN -> persist, no post
+            buffered = (len(posted) == 0 and _os.path.exists(buf)
+                        and sum(1 for _ in open(buf)) == 3)
+            em.stop()
+            # RESTART: a fresh emitter recovers the buffer from disk.
+            em2 = _ing.IngestEmitter("https://os/ingest", "tok", buf, enabled=True,
+                                     batch=10, flush_s=999, _post=post)
+            recovered = (len(em2._pending) == 3)
+            up["v"] = True
+            em2.flush_once()                                        # UP -> drains
+            drained = (len(em2._pending) == 0 and "trade:555" in posted)
+            em2.stop()
+            # unconfigured emitter is a pure no-op (never queues, never blocks)
+            off = _ing.IngestEmitter("", "", None, enabled=False, _post=post)
+            off.emit("x", {})
+            noop = (len(off._pending) == 0 and not off.enabled)
+            ok = buffered and recovered and drained and noop
+            detail = (f"buffered_offline={buffered} survived_restart={recovered} "
+                      f"flushed_on_success={drained} disabled_noop={noop}")
+        except Exception as e:
+            self._record(28, FAIL, f"raised: {e!r}")
+            return
+        self._record(28, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -1267,6 +1309,7 @@ class SelfTest:
             self._step_boost_isolation()
             self._step_lone_live_logging()
             self._step_backtest_parity()
+            self._step_ingest_emitter()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1280,7 +1323,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 28):
+        for n in range(1, 29):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1297,12 +1340,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/27 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/28 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/27 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/28 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/27 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/28 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)

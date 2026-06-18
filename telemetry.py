@@ -63,6 +63,14 @@ try:
 except Exception:
     _DISCORD_OK = False
 
+# v3.1.9: AUREON OS ingest emitter — forwards logs (and structured events) to the
+# FastAPI/Postgres store so they're readable from the React app without SSH.
+try:
+    import ingest as _ingest_mod
+    _INGEST_OK = True
+except Exception:
+    _INGEST_OK = False
+
 
 # ============================================================================
 # Severity
@@ -225,12 +233,25 @@ class Telemetry:
                                         daemon=True)
         self._worker.start()
 
+        # v3.1.9: AUREON OS ingest — mirror INFO+ logs to the FastAPI/Postgres
+        # store (off the trading path; buffered + retried). No-op if unconfigured.
+        self._ingest = None
+        if _INGEST_OK:
+            try:
+                self._ingest = _ingest_mod.emitter_from_env(
+                    buffer_dir=os.environ.get("AUREON_RUN_DIR", "."))
+            except Exception as e:
+                self._log.warning(f"ingest emitter init failed (non-fatal): {e!r}")
+
         startup_msg = (f"Telemetry started "
                        f"(discord={'on' if self._discord else 'off'}, "
-                       f"log_file={'on' if self._fh else 'off'})")
+                       f"log_file={'on' if self._fh else 'off'}, "
+                       f"ingest={'on' if (self._ingest and self._ingest.enabled) else 'off'})")
         self.send(startup_msg, Severity.DEBUG)
         if self._discord:
             self._log.info("Alerts: Discord (embed cards)")
+        if self._ingest and self._ingest.enabled:
+            self._log.info(self._ingest.status_line())
 
     def discord_status_line(self) -> str:
         """One-line banner receipt of the alert channel state."""
@@ -344,6 +365,19 @@ class Telemetry:
                 self._fh.write(line)
             except Exception as e:
                 self._log.warning(f"File sink error: {e}")
+
+        # AUREON OS ingest (v3.1.9): mirror INFO+ log lines to the remote store so
+        # the log is readable from the React app without SSH. DEBUG stays local.
+        # Non-blocking (in-memory enqueue); never raises onto the trading path.
+        if self._ingest is not None and sev >= Severity.INFO:
+            try:
+                self._ingest.emit("log", {
+                    "component": self.component, "severity": sev.name,
+                    "msg": msg, "ts": event.get("ts"),
+                    "tags": event.get("tags") or None,
+                })
+            except Exception:
+                pass
 
         # Decide rate-limit/important ONCE so every channel agrees. important
         # events (fills/closes) bypass rate limiting so a must-see event is never

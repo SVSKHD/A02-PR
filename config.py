@@ -130,6 +130,11 @@ class Config:
     # net (RAW - this). Approximates live drag not modeled in backtest (late
     # fills, partial fills, requote slippage, weekend gaps). Month-level only.
     realism_haircut_dollars: float = 1000.0
+    # v3.1.9: keep this many days of daily-rotated price_log/journal CSVs locally
+    # (a hot cache); older ones are purged since the data lives on in AUREON OS
+    # (Postgres via the ingest emitter) + Firestore. rescue_events.csv/state/log
+    # are never purged. 0 disables local purging.
+    local_retention_days: int = 90
 
     # Alerting/control channel (v3.1.0). Discord (discord.com) is the sole alert +
     # command channel, using rich embed CARDS. Override with env

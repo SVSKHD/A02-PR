@@ -188,6 +188,24 @@ def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, tick
         w.writerow(row)
     log.info(f"journal: {shadow.get('anchor_label')} {side} {refined} "
              f"pnl=${pnl_usd:+.2f} trail_slip={trail_slip}")
+    # v3.1.9: mirror the closed trade as a structured event to AUREON OS (so the
+    # React app reads trades without SSH). event_id makes it idempotent on the
+    # server. Best-effort; never affects the journal/trading path.
+    try:
+        import ingest as _ing
+        _em = _ing.get_emitter()
+        if _em is not None:
+            _em.emit("trade", {
+                "date_ist": self.state.get('last_broker_date'),
+                "anchor": shadow.get('anchor_label'),
+                "side": side, "role": ('boost' if shadow.get('boost')
+                                       else shadow.get('role', 'normal')),
+                "entry": round(entry, 3), "exit": round(close_price, 3),
+                "exit_reason": refined, "pnl_usd": round(pnl_usd, 2),
+                "ticket": ticket,
+            }, event_id=f"trade:{ticket}")
+    except Exception:
+        pass
 
 
 def _send_daily_summary(self, day_str: str, pnl: float):

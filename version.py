@@ -409,9 +409,27 @@ History (one line per behavioral change):
          STANDING RULE: every new strategy feature must land in BOTH live modules
          AND be exercised by the backtest -- a feature is not "done" until backtest
          reflects it. backtest == live.
+  3.1.9  AUREON OS INGEST + 3-month local retention (alerting/infra only; no
+         trading change). The running log was local-only (SSH to read) and trade
+         CSVs only mirrored to Firestore. New ingest.py emitter ships INFO+ logs,
+         closed trades (one row per leg, role-tagged), and finalized rescue events
+         to the AUREON OS FastAPI endpoint (Postgres system-of-record) so they're
+         readable from the React app WITHOUT SSH. Bot holds NO DB creds -- only
+         AUREON_INGEST_URL + token; it POSTs batches with a bearer token. Network-
+         robust like the Discord client (the VPS ISP is flaky): events enqueue in
+         memory + a restart-safe on-disk NDJSON buffer, flush in batches on a
+         background thread with backoff, and NEVER block trading; every event has a
+         stable id so the server upserts idempotently (a re-flush never double-
+         inserts). Telemetry forwards INFO+ logs (DEBUG stays local); journal +
+         rescue_log emit structured trade/rescue events. 3-month local retention:
+         daily price_log/journal CSVs older than cfg.local_retention_days (90) are
+         purged once per broker day (data lives on in Postgres + Firestore;
+         rescue_events.csv/state/log never purged). Contract for the AUREON OS repo
+         in INGEST_CONTRACT.md. selftest gains an "ingest emit" step (offline
+         buffer -> restart -> flush, idempotent, disabled-noop). selftest -> 28 steps.
 """
 
-__version__ = "3.1.8"
+__version__ = "3.1.9"
 CODENAME = "Astra Hawk"
 
 

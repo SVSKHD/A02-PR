@@ -267,6 +267,13 @@ class LiveTrader:
             "YYYY-MM` (imports live strategy/anchors/rescue rules). STANDING RULE: "
             "every new feature must land in BOTH live AND backtest."
         )
+        # v3.1.9 module receipt: AUREON OS ingest (remote logs/trades) + retention.
+        _ing = getattr(self.tele, '_ingest', None)
+        self.tele.info(
+            f"v3.1.9: {(_ing.status_line() if _ing else 'AUREON OS ingest OFF')} | "
+            f"local retention {getattr(self.cfg, 'local_retention_days', 90)}d "
+            f"(logs/trades mirrored to AUREON OS + Firestore)."
+        )
         # TEST MODE banner: surface any active test-scope toggle loudly so a
         # forced code path is never mistaken for production behavior. Defaults OFF.
         if os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
@@ -361,6 +368,38 @@ class LiveTrader:
                      "outcome", "pnl_usd", "ticket"])
             # Refresh balance/equity and recompute lot for the new day
             self._refresh_from_broker(reason=f"new day {broker_date}")
+            # v3.1.9: 3-month local retention sweep (once per broker day).
+            self._purge_old_local_files()
+
+    def _purge_old_local_files(self, days=None):
+        """v3.1.9: keep only the last `days` (cfg.local_retention_days, default 90)
+        of daily-rotated price_log/journal CSVs locally — older ones are purged
+        because the data lives on in AUREON OS (Postgres via ingest) + Firestore.
+        NEVER touches rescue_events.csv, state, or the live log. Never raises."""
+        import time as _t
+        import glob as _g
+        days = int(days if days is not None else getattr(self.cfg, 'local_retention_days', 90))
+        if days <= 0:
+            return
+        cutoff = _t.time() - days * 86400
+        removed = 0
+        try:
+            for sub in ("price_log", "journal"):
+                d = os.path.join(self.run_dir, sub)
+                if not os.path.isdir(d):
+                    continue
+                for fp in _g.glob(os.path.join(d, "*.csv")):
+                    try:
+                        if os.path.getmtime(fp) < cutoff:
+                            os.remove(fp)
+                            removed += 1
+                    except OSError:
+                        pass
+            if removed:
+                log.info(f"local retention: purged {removed} file(s) older than "
+                         f"{days}d (data retained in AUREON OS / Firestore)")
+        except Exception as e:
+            log.warning(f"local retention purge failed (non-fatal): {e!r}")
 
     def _start_discord_heartbeat(self):
         """v3.1.0: post a 💓 heartbeat CARD every discord_heartbeat_min minutes on
