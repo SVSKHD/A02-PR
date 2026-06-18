@@ -172,7 +172,9 @@ def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, tick
         round(pnl_usd, 2),                           # realized_pnl_usd
         ticket,                                      # ticket
         shadow.get('nh_exit', ''),                   # v2.9.8 no-hold trail exit
-        shadow.get('role', 'normal'),                # v2.9.8 role
+        # v3.1.6 role: boosts tagged separately from the original (normal/rescue)
+        # so each leg's P&L is its own line item, never silently pooled.
+        ('boost' if shadow.get('boost') else shadow.get('role', 'normal')),
     ]
     new_file = not _os.path.exists(jpath)
     with open(jpath, "a", newline="") as f:

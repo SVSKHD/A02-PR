@@ -38,6 +38,84 @@ class Position:
         return (self.entry_price - ref)
 
 
+def _close_boost(pos, ts, fill, backstop):
+    pos.exit_price = fill
+    pos.exit_time = ts
+    pos.closed = True
+    if pos.side == 'BUY':
+        pos.outcome = 'BoostSL' if fill <= backstop + 0.01 else 'BoostTrail'
+    else:
+        pos.outcome = 'BoostSL' if fill >= backstop - 0.01 else 'BoostTrail'
+    return pos.outcome
+
+
+def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
+                         cfg: Config) -> Optional[str]:
+    """v3.1.6 BOOST stop management — boosts ONLY, fully ISOLATED from the original
+    leg (this reads/writes ONLY `pos`, never the original's ticket/stop). A boost
+    gets a tight one-way breath-gap TRAIL (gap = cfg.boost_trail_gap_dollars,
+    default $3.50) armed the instant it fills, PLUS its $10 hard SL as a BACKSTOP.
+    Both stops live; whichever is hit first closes the boost. Once fav clears +$8
+    the trail floor never retreats below +$8. So: a reverse exits ~-(gap); a
+    violent gap THROUGH the trail is caught no worse than the $10 backstop; a real
+    run rides the trail past +$8. The original leg's exit is untouched by all this.
+    """
+    if pos.closed:
+        return pos.outcome
+    sgn = 1.0 if pos.side == 'BUY' else -1.0
+    gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
+    hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+    backstop = pos.entry_price - sgn * hard          # the $10 hard SL backstop
+
+    def breath_for(fav):
+        # one-way (fav comes from the monotonic max_fav); +$8 floor once cleared.
+        d = max(8.0, fav - gap) if fav >= 8.0 else (fav - gap)
+        return pos.entry_price + sgn * d
+
+    # EXIT against the PRIOR peak's trail and the hard backstop (whichever hit).
+    fav_prior = sgn * (pos.max_fav - pos.entry_price)
+    breath_sl = breath_for(fav_prior)
+    _open = bar.get('open') if hasattr(bar, 'get') else getattr(bar, 'open', None)
+    if sgn > 0:
+        if bar.low <= breath_sl:                          # breath-gap trail hit
+            fill = breath_sl
+            if _open is not None and _open < breath_sl:   # gapped THROUGH the trail
+                fill = max(backstop, _open)               # ...$10 backstop floors it
+            return _close_boost(pos, ts, fill, backstop)
+        if bar.low <= pos.current_sl:                     # hard backstop hit directly
+            return _close_boost(pos, ts, pos.current_sl, backstop)
+    else:
+        if bar.high >= breath_sl:
+            fill = breath_sl
+            if _open is not None and _open > breath_sl:
+                fill = min(backstop, _open)
+            return _close_boost(pos, ts, fill, backstop)
+        if bar.high >= pos.current_sl:
+            return _close_boost(pos, ts, pos.current_sl, backstop)
+
+    # TP
+    if (sgn > 0 and bar.high >= pos.tp_level) or (sgn < 0 and bar.low <= pos.tp_level):
+        pos.exit_price = pos.tp_level
+        pos.exit_time = ts
+        pos.outcome = 'TP'
+        pos.closed = True
+        return 'TP'
+
+    # Update peak, then ratchet the broker SL one-way: the $10 backstop below +$8;
+    # the breath trail (floor +$8) once cleared. (The tight trail itself is the
+    # software close above; current_sl is the broker-side hard stop.)
+    px = bar.high if sgn > 0 else bar.low
+    if sgn * (px - pos.entry_price) > sgn * (pos.max_fav - pos.entry_price):
+        pos.max_fav = px
+    fav = sgn * (pos.max_fav - pos.entry_price)
+    new_sl = breath_for(fav) if fav >= 8.0 else backstop
+    if sgn > 0:
+        pos.current_sl = max(pos.current_sl, new_sl)
+    else:
+        pos.current_sl = min(pos.current_sl, new_sl)
+    return None
+
+
 def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
                            cfg: Config) -> Optional[str]:
     """
@@ -46,6 +124,12 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     """
     if pos.closed:
         return pos.outcome
+
+    # v3.1.6: BOOST legs have their own breath-gap trail + $10 backstop, managed in
+    # full isolation (see _update_boost_on_bar). The normal/rescue-leg path below
+    # is byte-identical to pre-boost behavior and never sees boost state.
+    if getattr(pos, 'boost', False):
+        return _update_boost_on_bar(pos, bar, ts, cfg)
 
     # 1. PRE-BAR SL CHECK
     if pos.side == 'BUY':
@@ -108,16 +192,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if level < pos.current_sl:
                 pos.current_sl = level
     _sgn = 1.0 if pos.side == 'BUY' else -1.0
-    if getattr(pos, 'boost', False):
-        # v3.1.3 BOOST TRAIL HANDOFF: once a boost's favorable excursion clears
-        # +$8, protect the +$8 floor AND ride the post-hold trail (peak - gap)
-        # above it, one-way ratchet (never retreats below +$8). Replaces the old
-        # hard +$8 lock so a real breakout run (e.g. 4334->4359) is not left on
-        # the table. Boosts ONLY; the normal/rescue-leg ladders below are unchanged.
-        if fav >= 8.00:
-            _ratchet(pos.entry_price + _sgn * 8.00)                     # +$8 floor
-            _ratchet(pos.entry_price + _sgn * (fav - cfg.trail_gap))    # peak - gap
-    elif fav >= 10.00:
+    if fav >= 10.00:
         # v2.9.1: above +$10 the lock FOLLOWS the peak at $2 distance (ratchet),
         # floor +$8. Captures most of a hold-period spike (peak +$12.8 -> lock
         # +$10.8 = +$540 @0.5) instead of a flat +$8, while $2 of room keeps

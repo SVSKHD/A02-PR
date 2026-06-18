@@ -46,12 +46,19 @@ class Config:
     # $10 tier, post-hold trail, TSTOP at 45m.
     rescue_boost_count: int = 2
     boost_sl_dollars: float = 10.0  # v3.0.9: boost SL $6 -> $10. First live fleet
-    # (2026-06-17 A1) whipsawed: a $6 stop (entry-$6) was tagged by a $6 dip then
-    # price ran +$8 -- the rescue leg (no tight stop) rode it while both boosts
-    # were already dead. A $10 stop sits below that dip so the boosts survive and
-    # ride too (today's replay: -$406.70 -> ~+$465). Per-pair whipsaw cap is now
-    # -$700 (2 x $10 x 0.35 x 100). Validated n=1 only -- $10 dies on dips deeper
-    # than $10 and loses more on a true crash; a tunable bet pending rescuestats.
+    # (2026-06-17 A1) whipsawed: a $6 stop was tagged by a $6 dip then price ran
+    # +$8. The $10 stop is now the boost's HARD BACKSTOP only -- v3.1.6 adds a
+    # tight breath-gap TRAIL on top (below), so a reversing boost exits at ~-(gap)
+    # not -$10. Per-pair whipsaw worst case stays 2 x $10 x 0.35 x 100 = -$700.
+    boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
+    # armed from the instant the boost fills, alongside the $10 hard SL backstop
+    # (both live; whichever hits first closes the boost). One-way ratchet; once a
+    # boost clears +$8 the trail floor never retreats below +$8. A reversing boost
+    # exits ~-(gap); a gap THROUGH the trail is caught no worse than the $10 SL; a
+    # runner rides past +$8. Boosts are upside-only -- isolated from the original
+    # leg (the original runs to its OWN exit; boosts never close/modify it). NOTE:
+    # a future "smart" adaptive gap (vol-scaled, for boosts AND originals) is a
+    # tracked item; v3.1.6 ships this as a tunable fixed gap only.
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all

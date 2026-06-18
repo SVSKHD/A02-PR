@@ -84,6 +84,27 @@ def _manage_trails_on_bar_close(self):
         shadow['current_sl'] = pos.current_sl
         shadow['max_fav'] = pos.max_fav
 
+        # v3.1.6: a BOOST manages its OWN breath-gap trail + $10 backstop in
+        # strategy (_update_boost_on_bar). When that returns a close, close THIS
+        # boost ticket at market -- both stops live, whichever hit first. ISOLATION:
+        # this only ever closes the boost's own ticket; it never reads, modifies,
+        # or closes the original leg (a different shadow position managed in its own
+        # iteration). Non-boost legs are unaffected (their pos.closed is ignored
+        # here; the broker SL still governs them, exactly as before).
+        if pos.closed and shadow.get('boost'):
+            self.tele.send(
+                f"⚡ BOOST exit {shadow['anchor_label']} {shadow['side']} "
+                f"@ ~${float(pos.exit_price):.2f} ({pos.outcome}) -- breath-gap "
+                f"trail/$10 backstop; original leg unaffected",
+                Severity.INFO, important=True)
+            try:
+                self.adapter.close_position(ticket, dry_run=self.paper)
+            except Exception as e:
+                log.warning(f"boost trail close failed for {ticket}: {e}")
+            if pos.current_sl != old_sl or pos.max_fav != old_max_fav:
+                self._save_state()
+            continue
+
         # v2.9.8 SHADOW NO-HOLD LOG (journal-only, zero behavior change):
         # where would a trail with NO 45m hold (arm $2.50, gap $2.00, from
         # fill) have exited this leg? Hithesh's hold-vs-no-hold question
