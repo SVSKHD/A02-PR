@@ -211,9 +211,12 @@ class LiveTrader:
         self._deferred_anchor: Optional[Dict] = None
         # v3.0.5: per-anchor late-retry throttle (label -> last attempt UTC ts)
         self._last_anchor_attempt: Dict = {}
-        # v3.0.6: in-flight rescue FLEET events (observer-only; lost on restart).
+        # v3.0.6: in-flight rescue FLEET/LONE events (observer-only).
+        # v3.1.7: now PERSISTED across restarts (rehydrated below) so an event
+        # opened before a restart still finalizes + writes when its members close.
         self._rescue_events: Dict = {}            # event_id -> event record
         self._rescue_event_by_ticket: Dict = {}   # member ticket -> event_id
+        self._rehydrate_rescue_events()
 
         # Pause flag (set via /pause command)
         self.paused = False
@@ -252,8 +255,10 @@ class LiveTrader:
         # v3.0.6 module receipt: rescue fleet-event logger (observer only) + EOD
         # balance capture. No change to rescue/boost mechanics.
         self.tele.info(
-            "v3.0.6: rescue fleet-event logger online (rescue_events.csv + "
-            "Firestore; `python bot.py rescuestats`) — observer only."
+            "v3.1.7: rescue event logger online — FLEET + LONE-leg, "
+            "restart-persisted (no orphaned events), event_type + separate "
+            "orig/boost P&L logged (rescue_events.csv + Firestore; "
+            "`python bot.py rescuestats`)."
         )
         # TEST MODE banner: surface any active test-scope toggle loudly so a
         # forced code path is never mistaken for production behavior. Defaults OFF.
@@ -998,6 +1003,8 @@ import rescue_log as _rescue_mod
 LiveTrader._rescue_event_open       = _rescue_mod._rescue_event_open
 LiveTrader._rescue_event_on_close   = _rescue_mod._rescue_event_on_close
 LiveTrader._rescue_event_finalize   = _rescue_mod._rescue_event_finalize
+LiveTrader._persist_rescue_events   = _rescue_mod._persist_rescue_events
+LiveTrader._rehydrate_rescue_events = _rescue_mod._rehydrate_rescue_events
 LiveTrader._load_state              = _state_mod._load_state
 LiveTrader._save_state              = _state_mod._save_state
 LiveTrader._acquire_pid_lock        = _state_mod._acquire_pid_lock

@@ -369,9 +369,29 @@ History (one line per behavioral change):
          P&L is never silently pooled. (NOTE: a future vol-adaptive "smart" gap for
          boosts AND originals is tracked; v3.1.6 ships a fixed tunable gap only.)
          selftest -> 25 steps (breath-trail behaviors + isolation).
+  3.1.7  FIX the LIVE lone-leg rescue logging gap (logging/observer only; no
+         trading change). A real lone rescue (2026-06-18 A1, +$2,079) fired but
+         rescuestats showed 0 -- the event OPENED but never FINALIZED/wrote.
+         Root cause: in-flight rescue events were in-memory ONLY (unlike shadow
+         positions/pendings, which are persisted exactly because a restart between
+         placement and fill used to orphan them); a restart between the rescue
+         OPEN and its members CLOSING dropped the event so nothing was written.
+         FIX: (1) persist _rescue_events + _rescue_event_by_ticket to state on
+         every open/finalize and REHYDRATE on startup -- an event opened before a
+         restart now finalizes + writes when its members close after. (2) The CSV/
+         Firestore row now carries event_type (FLEET vs LONE_RESCUE) and SEPARATE
+         orig_pnl + boost_pnl fields (isolation -- never pooled) alongside the
+         existing no_boost_net counterfactual. selftest gains a LIVE-PATH-PARITY
+         step (26) that drives the SAME bound open/close/finalize + persist/
+         rehydrate methods the live path uses, asserts an opened lone event that
+         closes ALWAYS writes a row, SURVIVES a restart (persist->rehydrate->close
+         ->write), has event_type + orig/boost fields, and leaves no orphan -- so a
+         future sim/live divergence is caught. selftest -> 26 steps. NOTE: the
+         specific 2026-06-18 event's in-flight state was lost (pre-fix, in-memory)
+         so it cannot be auto-recovered; backfill needs the operator's MT5/journal.
 """
 
-__version__ = "3.1.6"
+__version__ = "3.1.7"
 CODENAME = "Astra Hawk"
 
 

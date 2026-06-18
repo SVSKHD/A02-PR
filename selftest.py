@@ -65,6 +65,7 @@ STEP_NAMES = {
     23: "boost trail",
     24: "lone branches",
     25: "boost isol",
+    26: "lone live-log",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1075,6 +1076,82 @@ class SelfTest:
             return
         self._record(25, PASS if ok else FAIL, detail)
 
+    def _step_lone_live_logging(self):
+        # v3.1.7 LIVE-PATH PARITY: the 2026-06-18 A1 lone rescue fired but
+        # rescuestats showed 0 -- the live event opened but never finalized/wrote
+        # (in-flight events were in-memory only; a restart between open and close
+        # orphaned them). This drives the SAME bound methods the live path uses
+        # (_rescue_event_open/on_close/finalize + the new persist/rehydrate) and
+        # asserts: (a) an opened lone event that closes ALWAYS writes a row, (b) it
+        # SURVIVES a restart (persist -> fresh object -> rehydrate -> close ->
+        # write), (c) the row has event_type + SEPARATE orig/boost P&L fields, and
+        # (d) no opened-but-never-finalized orphan remains.
+        import tempfile, csv as _csv, os as _os, types
+        import rescue_log as _rl
+        import firebase_journal as _fj
+        _fj_orig = _fj.save_rescue_event
+        _fj.save_rescue_event = lambda d, e, doc: True
+        tmp = tempfile.mkdtemp(prefix="aureon_lonelive_")
+        try:
+            def make_bot(state):
+                b = types.SimpleNamespace(run_dir=tmp, state=state,
+                                          _rescue_events={}, _rescue_event_by_ticket={})
+                b.tele = types.SimpleNamespace(send=lambda m=None, *a, **k: None)
+                b._save_state = lambda: None      # state dict is round-tripped below
+                for m in ('_rescue_event_open', '_rescue_event_on_close',
+                          '_rescue_event_finalize', '_persist_rescue_events',
+                          '_rehydrate_rescue_events'):
+                    setattr(b, m, types.MethodType(getattr(_rl, m), b))
+                return b
+
+            # Bot #1: open a LONE event (trigger=None), then "crash" -- persisted.
+            bot1 = make_bot({'last_broker_date': '2026-06-18'})
+            bot1._rescue_event_open({
+                'event_id': '2026-06-18_A1_555', 'date_ist': '2026-06-18',
+                'anchor': 'A1_02h_Asia', 'sched_iso': None, 'open_iso': 'x',
+                'trigger': {'ticket': None, 'side': None, 'trigger_pnl': None},
+                'rescue': {'ticket': 555, 'side': 'BUY', 'fill': 4334.0},
+                'boosts': [{'ticket': 556, 'fill': 4334.0, 'rc': 10009, 'comment': 'AUR_A1_B_B1'},
+                           {'ticket': 557, 'fill': 4334.0, 'rc': 10009, 'comment': 'AUR_A1_B_B2'}],
+                'boosts_placed_ok': True, 'members': {555, 556, 557}})
+            persisted = ('rescue_events_extended' in bot1.state
+                         and bot1.state['rescue_events_extended'])
+            saved = dict(bot1.state)        # what would be on disk across a restart
+
+            # RESTART: fresh object, rehydrate, THEN the members close (the win).
+            bot2 = make_bot(dict(saved))
+            bot2._rehydrate_rescue_events()
+            rehydrated = ('2026-06-18_A1_555' in bot2._rescue_events
+                          and bot2._rescue_event_by_ticket.get(555) == '2026-06-18_A1_555')
+            bot2._rescue_event_on_close(556, 700.0)
+            bot2._rescue_event_on_close(557, 700.0)
+            opened_not_finalized = bool(bot2._rescue_events)   # still 1 orphan mid-close
+            bot2._rescue_event_on_close(555, 1050.0)           # last member -> finalize
+            no_orphan = (len(bot2._rescue_events) == 0)        # finalized, none left
+
+            path = _os.path.join(tmp, "rescue_events.csv")
+            rows = list(_csv.DictReader(open(path))) if _os.path.exists(path) else []
+            wrote = (len(rows) == 1)
+            r = rows[0] if rows else {}
+            fields_ok = (wrote and r.get('event_type') == 'LONE_RESCUE'
+                         and abs(float(r['net_usd']) - 2450.0) < 0.01
+                         and abs(float(r['orig_pnl']) - 1050.0) < 0.01     # rescue leg alone
+                         and abs(float(r['boost_pnl']) - 1400.0) < 0.01    # 2 boosts, isolated
+                         and (r.get('trigger_ticket') or '') == ''         # lone
+                         and r.get('branch') == 'CRASH_WIN')
+            ok = (persisted and rehydrated and opened_not_finalized
+                  and no_orphan and wrote and fields_ok)
+            detail = (f"persist={bool(persisted)} rehydrate={rehydrated} "
+                      f"survived_restart={wrote} no_orphan={no_orphan} "
+                      f"fields(type/orig/boost)={fields_ok}")
+        except Exception as e:
+            _fj.save_rescue_event = _fj_orig
+            self._record(26, FAIL, f"raised: {e!r}")
+            return
+        finally:
+            _fj.save_rescue_event = _fj_orig
+        self._record(26, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -1141,6 +1218,7 @@ class SelfTest:
             self._step_boost_trail()
             self._step_lone_branches()
             self._step_boost_isolation()
+            self._step_lone_live_logging()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1154,7 +1232,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 26):
+        for n in range(1, 27):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1171,12 +1249,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/25 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/26 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/25 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/26 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/25 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/26 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report)
