@@ -76,6 +76,16 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg):
     else:
         return None                                                         # < $10: never fire
 
+    # v3.2.2: INDEPENDENT on/off gating. RALLY and RESCUE each have their own
+    # toggle; a disabled kind fires ZERO boosts (return None) so the leg runs on
+    # its own SL/TP/trail. Defaults True => behavior unchanged. This is the SINGLE
+    # source -- live (_check_boost_triggers) and backtest (run_month) both call
+    # this fn, so both honor the flags with no separate copy.
+    if kind == "RALLY" and not bool(getattr(cfg, "rally_boosts_enabled", True)):
+        return None
+    if kind == "RESCUE" and not bool(getattr(cfg, "rescue_boosts_enabled", True)):
+        return None
+
     # HARD GUARD: the boost entry (≈ current market) MUST be >= trigger from the
     # leg fill in the correct direction. This is what makes the A3 fire-at-fill
     # bug structurally impossible -- a near-fill entry is blocked, not placed.

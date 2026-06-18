@@ -68,6 +68,7 @@ STEP_NAMES = {
     26: "lone live-log",
     27: "backtest parity",
     28: "boost trigger",
+    29: "boost toggles",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1267,6 +1268,77 @@ class SelfTest:
             return
         self._record(28, PASS if ok else FAIL, detail)
 
+    def _step_boost_toggles(self):
+        # v3.2.2 INDEPENDENT BOOST TOGGLES. rally_boosts_enabled /
+        # rescue_boosts_enabled gate the RALLY / RESCUE branches independently, in
+        # the SINGLE canonical boosts.plan_boost_event the LIVE per-tick path
+        # (fills._check_boost_triggers) and the BACKTEST (run_month) both import.
+        # Asserts, on the live module path (no stubs): (1) rally OFF => a +$10 move
+        # fires ZERO rally boosts (None); (2) rescue OFF => a -$10 move fires ZERO
+        # rescue boosts (None); (3) INDEPENDENCE: with one flag off the OTHER still
+        # fires normally; (4) IMPORT-PATH PARITY: live + backtest call the SAME fn
+        # (like step 27/28), so they honor the SAME flags; (5) DEFAULTS (both True)
+        # reproduce current behavior -- no silent change unless a flag is set.
+        import importlib.util as _ilu
+        import fills as _fills
+        import boosts as _boosts
+        from config import Config as _Config
+        try:
+            fill = 4266.3
+            up, down = fill + 10.0, fill - 10.0   # +$10 winning / -$10 losing (BUY leg)
+
+            # (5) DEFAULTS: both True -> RALLY on +$10, RESCUE on -$10 (unchanged).
+            cfg_def = _Config()
+            d_rally = _boosts.plan_boost_event('BUY', fill, up, cfg_def)
+            d_rescue = _boosts.plan_boost_event('BUY', fill, down, cfg_def)
+            defaults_ok = (cfg_def.rally_boosts_enabled is True
+                           and cfg_def.rescue_boosts_enabled is True
+                           and d_rally is not None and d_rally.event_type == 'RALLY_BOOST'
+                           and d_rescue is not None and d_rescue.event_type == 'RESCUE_BOOST')
+
+            # (1) RALLY OFF: +$10 fires ZERO rally boosts; (3) RESCUE still fires.
+            cfg_nr = _Config(); cfg_nr.rally_boosts_enabled = False
+            nr_rally = _boosts.plan_boost_event('BUY', fill, up, cfg_nr)
+            nr_rescue = _boosts.plan_boost_event('BUY', fill, down, cfg_nr)
+            rally_off_ok = (nr_rally is None
+                            and nr_rescue is not None
+                            and nr_rescue.event_type == 'RESCUE_BOOST')
+
+            # (2) RESCUE OFF: -$10 fires ZERO rescue boosts; (3) RALLY still fires.
+            cfg_ns = _Config(); cfg_ns.rescue_boosts_enabled = False
+            ns_rescue = _boosts.plan_boost_event('BUY', fill, down, cfg_ns)
+            ns_rally = _boosts.plan_boost_event('BUY', fill, up, cfg_ns)
+            rescue_off_ok = (ns_rescue is None
+                             and ns_rally is not None
+                             and ns_rally.event_type == 'RALLY_BOOST')
+
+            # Both OFF: neither branch fires (sanity).
+            cfg_off = _Config()
+            cfg_off.rally_boosts_enabled = False
+            cfg_off.rescue_boosts_enabled = False
+            both_off_ok = (_boosts.plan_boost_event('BUY', fill, up, cfg_off) is None
+                           and _boosts.plan_boost_event('BUY', fill, down, cfg_off) is None)
+
+            # (4) IMPORT-PATH PARITY: live + backtest call the canonical fn, so the
+            #     gating above is the SAME code both honor (cannot diverge).
+            live_parity = (_fills.boosts.plan_boost_event is _boosts.plan_boost_event)
+            _root = os.path.dirname(os.path.abspath(__file__))
+            _path = os.path.join(_root, 'backtest', 'backtest.py')
+            spec = _ilu.spec_from_file_location('aureon_bt_engine_tog', _path)
+            bt = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(bt)
+            bt_parity = (bt.plan_boost_event is _boosts.plan_boost_event)
+
+            ok = (defaults_ok and rally_off_ok and rescue_off_ok and both_off_ok
+                  and live_parity and bt_parity)
+            detail = (f"defaults={defaults_ok} rally_off={rally_off_ok} "
+                      f"rescue_off={rescue_off_ok} both_off={both_off_ok} "
+                      f"live_parity={live_parity} bt_parity={bt_parity}")
+        except Exception as e:
+            self._record(29, FAIL, f"raised: {e!r}")
+            return
+        self._record(29, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -1367,6 +1439,7 @@ class SelfTest:
             self._step_lone_live_logging()
             self._step_backtest_parity()
             self._step_boost_trigger()
+            self._step_boost_toggles()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1380,7 +1453,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 29):
+        for n in range(1, 30):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1397,12 +1470,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/28 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/29 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/28 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/29 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/28 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/29 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces
