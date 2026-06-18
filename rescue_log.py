@@ -44,6 +44,23 @@ def _rescue_csv_path_for(run_dir):
     return os.path.join(run_dir, "rescue_events.csv")
 
 
+def ensure_rescue_events_csv(run_dir):
+    """v3.2.1: create run/rescue_events.csv with its header at STARTUP if missing,
+    so `rescuestats` always reads a valid (possibly empty) file and any path /
+    permission problem surfaces loudly at startup instead of silently at the first
+    finalize. (finalize also create-with-header on first write; this is belt-and-
+    suspenders so the file exists even before the first lone/fleet event.)"""
+    path = _rescue_csv_path_for(run_dir)
+    try:
+        if not os.path.exists(path):
+            os.makedirs(run_dir, exist_ok=True)
+            with open(path, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=RESCUE_CSV_HEADER).writeheader()
+            log.info(f"rescue_events.csv created (header only) at {path}")
+    except Exception as e:
+        log.warning(f"could not create rescue_events.csv at startup: {e!r}")
+
+
 def rescue_tally(csv_path):
     """{branch: count} read from the CSV (the persistent source of truth).
     Always returns all three keys; fail-safe (zeros on any error)."""
