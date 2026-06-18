@@ -454,9 +454,27 @@ History (one line per behavioral change):
          rescuestats always reads a valid file and a path/permission problem
          surfaces at startup, not silently at the first finalize (finalize already
          create-with-header on first write -- this is belt-and-suspenders).
+  3.2.2  INDEPENDENT RALLY / RESCUE boost toggles (no other behavior change).
+         Two new config flags -- rally_boosts_enabled / rescue_boosts_enabled
+         (both default True => current behavior unchanged) -- gate the RALLY
+         (lone leg +$10, same-dir pyramid) and RESCUE (lone leg -$10, opposite
+         hedge) branches INDEPENDENTLY. The gating lives in the SINGLE canonical
+         boosts.plan_boost_event, so LIVE (fills._check_boost_triggers per-tick)
+         and BACKTEST (backtest.run_month) honor the SAME flags by import -- no
+         separate copy. A disabled branch fires ZERO boosts; the leg runs on its
+         own SL/TP/trail. Trigger threshold, >=$10 entry guard, $3.50 breath-trail,
+         $10 backstop, -$700 cap, isolation and logging are all UNCHANGED.
+         back_main.py adds run-time overrides (--no-rally / --no-rescue) so configs
+         compare without editing config, and prints the active mode in the header
+         ("boosts: RALLY=on RESCUE=off"); the boost summary (RALLY/RESCUE counts,
+         CRASH_WIN/WHIPSAW_LOSS/SCRATCH, no-boost counterfactual) is unchanged.
+         selftest gains step 29 "boost toggles": rally-off => zero rally on +$10,
+         rescue-off => zero rescue on -$10, independence (the other still fires),
+         live/backtest import-path parity, and defaults reproduce current behavior.
+         selftest -> 29 steps.
 """
 
-__version__ = "3.2.1"
+__version__ = "3.2.2"
 CODENAME = "Astra Hawk"
 
 

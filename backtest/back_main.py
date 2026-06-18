@@ -57,10 +57,26 @@ def _money(x):
 
 def main(argv):
     if len(argv) < 2:
-        print("usage: python backtest/back_main.py YYYY-MM")
+        print("usage: python backtest/back_main.py YYYY-MM [--no-rally] [--no-rescue]")
         return 2
     year, month = _parse_month(argv[1])
     cfg = Config()
+
+    # v3.2.2: optional run-time overrides for the independent RALLY/RESCUE boost
+    # toggles so configs can be compared WITHOUT editing config.py. These set the
+    # SAME flags the live path reads; backtest.run_month honors them via the
+    # shared boosts.plan_boost_event (no separate copy).
+    flags = set(argv[2:])
+    if '--no-rally' in flags:
+        cfg.rally_boosts_enabled = False
+        flags.discard('--no-rally')
+    if '--no-rescue' in flags:
+        cfg.rescue_boosts_enabled = False
+        flags.discard('--no-rescue')
+    if flags:
+        print(f"unknown option(s): {' '.join(sorted(flags))}")
+        print("usage: python backtest/back_main.py YYYY-MM [--no-rally] [--no-rescue]")
+        return 2
 
     # ----- Step 1: ticks (cache-first; synthetic fallback) -----
     ticks = fetcher.fetch_month_ticks(
@@ -93,6 +109,11 @@ def main(argv):
     out()
     tag = "  (SYNTHETIC ticks — illustrative)" if synthetic else "  (real MT5 ticks)"
     out(f"AUREON backtest  {year:04d}-{month:02d}{tag}")
+    # v3.2.2: print the ACTIVE boost config so every result is unambiguous about
+    # which mode produced it (compare --no-rally / --no-rescue runs directly).
+    _r_on = "on" if getattr(cfg, 'rally_boosts_enabled', True) else "off"
+    _s_on = "on" if getattr(cfg, 'rescue_boosts_enabled', True) else "off"
+    out(f"boosts: RALLY={_r_on} RESCUE={_s_on}")
     out("=" * 92)
 
     # DAY-BY-DAY table

@@ -54,6 +54,17 @@ class Config:
     # far from its FILL before any boost fires -- +$10 => RALLY (same dir,
     # winning), -$10 => RESCUE (opposite, losing). Boosts NEVER fire at fill
     # (the A3 -$900 bug). The single source boosts.plan_boost_event enforces it.
+    rally_boosts_enabled: bool = True  # v3.2.2: independent on/off for the RALLY
+    # branch (lone leg +$10 -> same-dir pyramid). When False, a +$10 move fires
+    # ZERO rally boosts and the leg runs on its own SL/TP/trail. Independent of
+    # rescue_boosts_enabled. Default True => current behavior unchanged. Gated in
+    # the SINGLE source boosts.plan_boost_event so live + backtest honor it.
+    rescue_boosts_enabled: bool = True  # v3.2.2: independent on/off for the
+    # RESCUE branch (lone leg -$10 -> opposite-dir hedge). When False, a -$10 move
+    # fires ZERO rescue boosts and the leg runs on its own SL/TP/trail. Independent
+    # of rally_boosts_enabled. Default True => current behavior unchanged. Gated in
+    # boosts.plan_boost_event. NOTE: distinct from the pre-existing master
+    # rescue_boost_enabled (No-OCO sibling-as-rescue scan switch) above.
     boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
     # armed from the instant the boost fills, alongside the $10 hard SL backstop
     # (both live; whichever hits first closes the boost). One-way ratchet; once a
