@@ -69,6 +69,9 @@ STEP_NAMES = {
     27: "backtest parity",
     28: "boost trigger",
     29: "boost toggles",
+    30: "underwater lock",
+    31: "trail telemetry",
+    32: "stop>=bid reject",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1165,6 +1168,7 @@ class SelfTest:
         import importlib.util as _ilu
         import strategy as _strat
         import boosts as _boosts
+        import position_telemetry as _ptel
         try:
             _root = os.path.dirname(os.path.abspath(__file__))
             _path = os.path.join(_root, 'backtest', 'backtest.py')
@@ -1174,15 +1178,21 @@ class SelfTest:
             # (a) identity: the backtester's engine IS the live engine, AND its
             # boost trigger IS the canonical boosts.plan_boost_event (v3.2.0:
             # import-path parity so the backtest can't drift from live/tests).
+            # v3.3.0: the trail-lock guards (update_max_fav/lock_level_for) and the
+            # per-position tracer are the SAME objects too -- so the fix can't drift.
             id_ok = (bt.update_position_on_bar is _strat.update_position_on_bar
                      and bt.realize_pnl_usd is _strat.realize_pnl_usd
                      and bt.Position is _strat.Position
-                     and bt.plan_boost_event is _boosts.plan_boost_event)
+                     and bt.plan_boost_event is _boosts.plan_boost_event
+                     and bt.update_max_fav is _strat.update_max_fav
+                     and bt.lock_level_for is _strat.lock_level_for
+                     and bt.PositionTracer is _ptel.PositionTracer)
             srcs = list(bt.rule_sources())
             srcs_ok = all(s in srcs for s in (
                 'strategy.update_position_on_bar', 'anchors.resolved_anchor_hm',
                 'fills.is_rescue_fill', 'rescue_log._branch_for',
-                'boosts.plan_boost_event'))
+                'boosts.plan_boost_event', 'strategy.update_max_fav',
+                'position_telemetry.PositionTracer'))
             # (b) fixture: a BUY entered at 100 with the live $30 TP exits at TP for
             #     +$1050 @ lot 0.35 -- proving the backtest replays via live logic.
             cfg = self.cfg
@@ -1339,6 +1349,138 @@ class SelfTest:
             return
         self._record(29, PASS if ok else FAIL, detail)
 
+    def _step_underwater_lock(self):
+        # v3.3.0 (a) UNDERWATER-THE-WHOLE-TIME long must NEVER advance a lock -- the
+        # 2026-06-19 A2 root cause. Drives the REAL strategy core: a BUY that prints
+        # underwater for its entire life, INCLUDING one garbage-feed spike bar
+        # (high jumps +$28, far past max_tick_jump). The confirmed-price max_fav
+        # filter must reject the spike so no lock arms; the trade then rides the
+        # real run-up to TP (non-negative). Zero TELEMETRY_VIOLATION lines.
+        from strategy import Position, update_position_on_bar, realize_pnl_usd, lock_level_for
+        from position_telemetry import PositionTracer
+        try:
+            cfg = self.cfg
+            _lines = []
+            tr = PositionTracer(sink=_lines.append)
+            entry = 4155.35
+            p = Position(anchor_label='A2_10h_London', side='BUY', entry_price=entry,
+                         entry_time=pd.Timestamp('2026-06-19T10:00:00Z'),
+                         current_sl=entry - cfg.sl_dist, tp_level=entry + cfg.tp_dist,
+                         max_fav=entry, lot=cfg.lot_size)
+            t0 = pd.Timestamp('2026-06-19T10:00:00Z')
+            spike_rejected = False
+            out = None
+            lock_during_underwater = False
+            for i in range(120):
+                if i < 46:  # underwater the whole time (low never reaches the $18 SL)
+                    bar = pd.Series({'open': entry - 9, 'high': entry - 2,
+                                     'low': entry - 10, 'close': entry - 9})
+                    if i == 25:  # garbage spike: +$28 print, below TP, above filter
+                        bar = pd.Series({'open': entry - 9, 'high': entry + 28,
+                                         'low': entry - 10, 'close': entry - 9})
+                else:          # the real run-up to TP 4185.35
+                    lvl = entry - 9 + (i - 45) * 3.0
+                    bar = pd.Series({'open': lvl - 1, 'high': lvl + 1,
+                                     'low': lvl - 2, 'close': lvl})
+                out = update_position_on_bar(p, bar, t0 + pd.Timedelta(minutes=i + 1),
+                                             cfg, tracer=tr, ticket=57163297159)
+                if i < 46 and lock_level_for(p, cfg) > 0:
+                    lock_during_underwater = True
+                if out:
+                    break
+            pnl = round(realize_pnl_usd(p, cfg), 2)
+            spike_rejected = any('accepted=False' in l for l in _lines)
+            no_lock_underwater = not lock_during_underwater
+            non_negative = pnl >= 0.0
+            no_violations = (len(tr.violations) == 0)
+            ok = (no_lock_underwater and non_negative and no_violations
+                  and out == 'TP' and spike_rejected)
+            detail = (f"underwater_no_lock={no_lock_underwater} spike_rejected="
+                      f"{spike_rejected} outcome={out} pnl=${pnl:.0f}"
+                      f"(>=0={non_negative}) violations={len(tr.violations)}")
+        except Exception as e:
+            self._record(30, FAIL, f"raised: {e!r}")
+            return
+        self._record(30, PASS if ok else FAIL, detail)
+
+    def _step_trail_telemetry(self):
+        # v3.3.0 (b) ANY trail/lock exit MUST have a preceding TRAIL_ADVANCE line.
+        # POSITIVE: a winning BUY that trails up emits TRAIL_ADVANCE and its TRAIL
+        # exit raises NO violation. NEGATIVE: a hand-built EXIT(exit_type=TRAIL)
+        # with no TRAIL_ADVANCE MUST raise exactly the assertion that would have
+        # caught the A2 silence.
+        from strategy import Position, update_position_on_bar
+        from position_telemetry import PositionTracer
+        try:
+            cfg = self.cfg
+            # POSITIVE path through the real engine.
+            tr = PositionTracer(sink=lambda l: None)
+            entry = 4300.0
+            p = Position(anchor_label='TEST', side='BUY', entry_price=entry,
+                         entry_time=pd.Timestamp('2026-06-16T10:00:00Z'),
+                         current_sl=entry - cfg.sl_dist, tp_level=entry + cfg.tp_dist,
+                         max_fav=entry, lot=cfg.lot_size)
+            t0 = pd.Timestamp('2026-06-16T10:00:00Z')
+            # run up post-hold so the trail engages, then pull back into the trail
+            for i, hi in enumerate([entry + 6, entry + 9, entry + 9, entry + 9]):
+                bar = pd.Series({'open': entry, 'high': hi, 'low': entry, 'close': hi})
+                update_position_on_bar(p, bar, t0 + pd.Timedelta(minutes=50 + i),
+                                       cfg, tracer=tr, ticket=999001)
+            had_advance = len([1 for e in tr._history.get(999001, [])
+                               if e.get('event_type') == 'TRAIL_ADVANCE']) > 0
+            tr.exit(999001, 'TEST', side='BUY', exit_type='TRAIL',
+                    position_price=entry, max_fav=p.max_fav, stop_price=p.current_sl)
+            positive_ok = had_advance and len(tr.violations) == 0
+
+            # NEGATIVE path: exit with no preceding advance must violate.
+            tr2 = PositionTracer(sink=lambda l: None)
+            tr2.fill(999002, 'TEST', side='BUY', position_price=entry)
+            tr2.exit(999002, 'TEST', side='BUY', exit_type='TRAIL',
+                     position_price=entry)
+            negative_ok = (len(tr2.violations) == 1 and
+                           'without_trail_advance' in tr2.violations[0])
+
+            ok = positive_ok and negative_ok
+            detail = (f"positive(advance+no_violation)={positive_ok} "
+                      f"negative(violation_fires)={negative_ok}")
+        except Exception as e:
+            self._record(31, FAIL, f"raised: {e!r}")
+            return
+        self._record(31, PASS if ok else FAIL, detail)
+
+    def _step_stop_reject(self):
+        # v3.3.0 (c) A long stop placed at/above bid MUST be rejected (mirror for
+        # shorts). Drives the REAL position_telemetry assertion with the EXACT A2
+        # numbers (stop 4158.31 above bid 4152.93 on a long). A valid stop below
+        # bid raises nothing.
+        from position_telemetry import PositionTracer
+        try:
+            # invalid: long stop ABOVE bid (the A2 force-close geometry)
+            tr = PositionTracer(sink=lambda l: None)
+            tr.place(57163297159, 'A2_10h_London', side='BUY',
+                     stop_price=4158.31, current_bid=4152.93, current_ask=4153.05)
+            long_rejected = (len(tr.violations) == 1 and
+                             'long_stop_at_or_above_bid' in tr.violations[0])
+            # mirror: short stop BELOW ask
+            tr2 = PositionTracer(sink=lambda l: None)
+            tr2.place(2, 'A', side='SELL', stop_price=4150.0,
+                      current_bid=4151.0, current_ask=4151.2)
+            short_rejected = (len(tr2.violations) == 1 and
+                              'short_stop_at_or_below_ask' in tr2.violations[0])
+            # valid long stop BELOW bid -> no violation
+            tr3 = PositionTracer(sink=lambda l: None)
+            tr3.place(3, 'A', side='BUY', stop_price=4150.0,
+                      current_bid=4155.0, current_ask=4155.2)
+            valid_ok = (len(tr3.violations) == 0)
+            ok = long_rejected and short_rejected and valid_ok
+            detail = (f"long>=bid_rejected={long_rejected} "
+                      f"short<=ask_rejected={short_rejected} "
+                      f"valid_below_bid_ok={valid_ok}")
+        except Exception as e:
+            self._record(32, FAIL, f"raised: {e!r}")
+            return
+        self._record(32, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -1440,6 +1582,9 @@ class SelfTest:
             self._step_backtest_parity()
             self._step_boost_trigger()
             self._step_boost_toggles()
+            self._step_underwater_lock()
+            self._step_trail_telemetry()
+            self._step_stop_reject()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1453,7 +1598,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 30):
+        for n in range(1, 33):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1470,12 +1615,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/29 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/32 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/29 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/32 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/29 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/32 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

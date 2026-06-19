@@ -37,10 +37,17 @@ from anchors import resolved_anchor_hm
 from fills import is_rescue_fill
 from rescue_log import _branch_for
 import boosts  # v3.2.0: the SINGLE canonical lone-leg boost-trigger decision
+# v3.3.0: the trail-lock root-cause guards (confirmed-price max_fav, garbage-feed
+# filter, lock ladder) live in strategy and are exercised by the SAME imported
+# update_position_on_bar -- so the backtest can never drift from the live fix. The
+# per-position tracer is imported here too so import-path identity is assertable.
+from strategy import update_max_fav, lock_level_for, lock_ladder_prices
+from position_telemetry import PositionTracer
 
 # Exposed at module level so a selftest can assert IDENTITY:
 #   backtest.update_position_on_bar IS strategy.update_position_on_bar
 #   backtest.plan_boost_event       IS boosts.plan_boost_event   (v3.2.0)
+#   backtest.PositionTracer         IS position_telemetry.PositionTracer (v3.3.0)
 plan_boost_event = boosts.plan_boost_event
 
 __all__ = [
@@ -48,12 +55,15 @@ __all__ = [
     'Position', 'update_position_on_bar', 'realize_pnl_usd',
     'initial_sl', 'initial_tp', 'anchor_datetime_utc', 'eod_datetime_utc',
     'resolved_anchor_hm', 'is_rescue_fill', '_branch_for', 'plan_boost_event',
+    'update_max_fav', 'lock_level_for', 'lock_ladder_prices', 'PositionTracer',
 ]
 
 LIVE_RULE_SOURCES = [
     'strategy.update_position_on_bar',
     'strategy.realize_pnl_usd',
     'strategy.Position',
+    'strategy.update_max_fav',
+    'strategy.lock_level_for',
     'utils.initial_sl',
     'utils.initial_tp',
     'utils.anchor_datetime_utc',
@@ -62,6 +72,7 @@ LIVE_RULE_SOURCES = [
     'fills.is_rescue_fill',
     'rescue_log._branch_for',
     'boosts.plan_boost_event',
+    'position_telemetry.PositionTracer',
 ]
 
 

@@ -80,7 +80,10 @@ def _manage_trails_on_bar_close(self):
             boost=bool(shadow.get('boost', False)),  # v3.1.3 boost trail-after-+8
         )
         old_max_fav = shadow.get('max_fav')
-        update_position_on_bar(pos, bar_series, bar_time, self.cfg)
+        # v3.3.0: pass the per-position tracer so MAXFAV_UPDATE / LOCK_ARM /
+        # TRAIL_ADVANCE are logged for THIS ticket -- the lines A2 was missing.
+        update_position_on_bar(pos, bar_series, bar_time, self.cfg,
+                               tracer=getattr(self, 'ptrace', None), ticket=ticket)
         shadow['current_sl'] = pos.current_sl
         shadow['max_fav'] = pos.max_fav
 
@@ -178,12 +181,13 @@ def _manage_trails_on_bar_close(self):
                     floor = MIN_SL_DIST
                     if csi is not None and csi.trade_stops_level > 0:
                         floor = max(floor, csi.trade_stops_level * csi.point)
-                    # v2.9.8 STOP-THROUGH: if the intended (ladder) stop is
-                    # already at/through market, the level was breached intrabar.
-                    # Pinning SL to bid/ask (old clamp) is rejection-prone and
-                    # fills at noise (Jun-12 A1 BUY: BE pinned -> -$2.20 'Trail').
-                    # Close at market and name the rule; one-way ratchet means
-                    # this is always the honest outcome.
+                    # v3.3.0 STOP-THROUGH -> RE-PLACE, do NOT market-close (spec
+                    # Part 2 #3 + #4). A computed stop at/above a long's bid (mirror
+                    # for shorts) is INVALID: it reads as "through market" and the
+                    # old code dumped at market (the A2 -5.38 slip on a trade that
+                    # was merely in normal drawdown). The correct action is to KEEP
+                    # the previous valid stop / re-derive one safely below price and
+                    # re-arm it. Market-close is reserved for genuine SL/TP/kill/EOD.
                     _through = False
                     if shadow['side'] == 'BUY':
                         max_legal = round(ctk.bid - floor, 2)
@@ -192,16 +196,37 @@ def _manage_trails_on_bar_close(self):
                         min_legal = round(ctk.ask + floor, 2)
                         _through = intended < min_legal
                     if _through:
-                        self.tele.warn(
-                            f"⚡ STOP-THROUGH: {shadow['anchor_label']} "
-                            f"{shadow['side']} intended stop ${intended:.2f} is "
-                            f"through market (bid ${ctk.bid:.2f}/ask ${ctk.ask:.2f}) "
-                            f"-- closing at market.")
+                        # Keep the PREVIOUS valid stop if it is still below market
+                        # (long) / above market (short); else clamp to the closest
+                        # legal level. Either way we re-arm a VALID stop -- never dump.
+                        if shadow['side'] == 'BUY':
+                            corrected = round(min(old_sl, max_legal), 2)
+                        else:
+                            corrected = round(max(old_sl, min_legal), 2)
                         try:
-                            self.adapter.close_position(ticket, dry_run=self.paper)
-                        except Exception as e:
-                            log.warning(f"stop-through close failed {ticket}: {e}")
-                        continue
+                            if getattr(self, 'ptrace', None) is not None:
+                                self.ptrace.stop_rejected(
+                                    ticket, shadow['anchor_label'],
+                                    side=shadow['side'], current_bid=ctk.bid,
+                                    current_ask=ctk.ask,
+                                    position_price=shadow.get('entry_price'),
+                                    max_fav=shadow.get('max_fav'),
+                                    rejected_stop=round(intended, 2),
+                                    stop_price=corrected,
+                                    reason="stop_through_replaced_not_closed")
+                        except Exception:
+                            pass
+                        self.tele.warn(
+                            f"⛔ STOP-THROUGH (re-armed, NOT closed): "
+                            f"{shadow['anchor_label']} {shadow['side']} computed "
+                            f"stop ${intended:.2f} was through market "
+                            f"(bid ${ctk.bid:.2f}/ask ${ctk.ask:.2f}); kept valid "
+                            f"stop ${corrected:.2f}. Trade rides on.")
+                        # Re-arm the corrected (valid) stop and continue managing
+                        # this leg normally on the next bars.
+                        pos.current_sl = corrected
+                        shadow['current_sl'] = corrected
+                        intended = corrected
             except Exception as e:
                 log.warning(f"SL clamp check failed for {ticket}: {e}")
 
