@@ -73,9 +73,23 @@ def main(argv):
     if '--no-rescue' in flags:
         cfg.rescue_boosts_enabled = False
         flags.discard('--no-rescue')
+    # v3.2.3 Section F: --stack-depth N controls the winning-side stack size
+    # (1 = base/no boosts, 3 = full stack = original + 2 boosts). Honored by the
+    # SHARED boosts.plan_boost_event, so live + backtest stack identically.
+    for f in list(flags):
+        if f.startswith('--stack-depth'):
+            try:
+                cfg.stack_depth = int(f.split('=', 1)[1]) if '=' in f \
+                    else int(argv[argv.index(f) + 1])
+            except (ValueError, IndexError):
+                print("usage: --stack-depth N  (1=base, 3=full stack)")
+                return 2
+            flags.discard(f)
+            flags.discard(str(cfg.stack_depth))
     if flags:
         print(f"unknown option(s): {' '.join(sorted(flags))}")
-        print("usage: python backtest/back_main.py YYYY-MM [--no-rally] [--no-rescue]")
+        print("usage: python backtest/back_main.py YYYY-MM "
+              "[--no-rally] [--no-rescue] [--stack-depth N]")
         return 2
 
     # ----- Step 1: ticks (cache-first; synthetic fallback) -----

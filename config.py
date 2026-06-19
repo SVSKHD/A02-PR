@@ -61,6 +61,11 @@ class Config:
     # anchor; measured Jun-11 A3). Boosts run as rescue legs: no small locks,
     # $10 tier, post-hold trail, TSTOP at 45m.
     rescue_boost_count: int = 2
+    stack_depth: Optional[int] = None  # v3.2.3: winning-side stack size (No-OCO +
+    # lone). None => use rescue_boost_count (2 boosts => stack of 3). 1 = base (NO
+    # boosts; leg runs alone). 3 = full stack (original + 2). Honored by the SINGLE
+    # source boosts.plan_boost_event so live + backtest stack identically. The hard
+    # cap is 3 winners; values above 3 are clamped (telemetry flags > 3 as a violation).
     boost_sl_dollars: float = 10.0  # v3.0.9: boost SL $6 -> $10. First live fleet
     # (2026-06-17 A1) whipsawed: a $6 stop was tagged by a $6 dip then price ran
     # +$8. The $10 stop is now the boost's HARD BACKSTOP only -- v3.1.6 adds a

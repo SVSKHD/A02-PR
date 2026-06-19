@@ -472,9 +472,27 @@ History (one line per behavioral change):
          rescue-off => zero rescue on -$10, independence (the other still fires),
          live/backtest import-path parity, and defaults reproduce current behavior.
          selftest -> 29 steps.
+  3.2.3  TELEMETRY OVERHAUL + No-OCO BOOST STACKING + DISCORD ALERTS. (1) Per-
+         position structured trace (position_telemetry.PositionTracer): one
+         greppable line per state change (PLAN..FILL..MAXFAV_UPDATE..LOCK_ARM..
+         TRAIL_ADVANCE..STOP_THROUGH_REARM..BOOST_ARM..BOOST_FIRE..HEARTBEAT..EXIT)
+         carrying all mandatory fields (null explicit, never omitted) + runtime
+         TELEMETRY_VIOLATION asserts (trail-exit-without-advance, lock-above-max_fav,
+         long-stop>=bid, lock-skip, boost-below-trigger, stack>3, MISSED_BOOST,
+         BOOST_ARM_ORPHANED). (2) Trail-lock root-cause fix: confirmed-price lock
+         ladder, max_fav floored at entry + garbage-tick filter (max_tick_jump),
+         arm-buffer; stop-through RE-ARMS (never market-closes). (3) No-OCO winning-
+         side STACKING (default ON): every straddle leg is RALLY-only boost-eligible
+         so the winner stacks to 3 while the loser rides to SL; stack hard-cap 3;
+         break-even economics CODED in boosts (per-position +$6 line). (4) Proactive
+         Discord on every event: 🚀 BOOST FIRED / 📦 STACK 3/3 / ⛔ STOP-THROUGH /
+         🔒 TRAIL / 🚨 VIOLATION. (5) --stack-depth backtest flag (shared source).
+         selftest -> 38 steps (Groups 1-5: trail/lock, lone boost, No-OCO stack,
+         telemetry/Discord, parity); import-path identity extended to the guards +
+         tracer + economics.
 """
 
-__version__ = "3.2.2"
+__version__ = "3.2.3"
 CODENAME = "Astra Hawk"
 
 

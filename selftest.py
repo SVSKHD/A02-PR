@@ -72,6 +72,12 @@ STEP_NAMES = {
     30: "underwater lock",
     31: "trail telemetry",
     32: "stop>=bid reject",
+    33: "lock guards",
+    34: "lone boost",
+    35: "boost watchdog",
+    36: "no-oco stack",
+    37: "stack economics",
+    38: "telemetry full",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1458,19 +1464,19 @@ class SelfTest:
             # invalid: long stop ABOVE bid (the A2 force-close geometry)
             tr = PositionTracer(sink=lambda l: None)
             tr.place(57163297159, 'A2_10h_London', side='BUY',
-                     stop_price=4158.31, current_bid=4152.93, current_ask=4153.05)
+                     stop_price=4158.31, bid=4152.93, ask=4153.05)
             long_rejected = (len(tr.violations) == 1 and
                              'long_stop_at_or_above_bid' in tr.violations[0])
             # mirror: short stop BELOW ask
             tr2 = PositionTracer(sink=lambda l: None)
             tr2.place(2, 'A', side='SELL', stop_price=4150.0,
-                      current_bid=4151.0, current_ask=4151.2)
+                      bid=4151.0, ask=4151.2)
             short_rejected = (len(tr2.violations) == 1 and
                               'short_stop_at_or_below_ask' in tr2.violations[0])
             # valid long stop BELOW bid -> no violation
             tr3 = PositionTracer(sink=lambda l: None)
             tr3.place(3, 'A', side='BUY', stop_price=4150.0,
-                      current_bid=4155.0, current_ask=4155.2)
+                      bid=4155.0, ask=4155.2)
             valid_ok = (len(tr3.violations) == 0)
             ok = long_rejected and short_rejected and valid_ok
             detail = (f"long>=bid_rejected={long_rejected} "
@@ -1480,6 +1486,268 @@ class SelfTest:
             self._record(32, FAIL, f"raised: {e!r}")
             return
         self._record(32, PASS if ok else FAIL, detail)
+
+    def _step_lock_guards(self):
+        # v3.2.3 Group 1 extras: T2 phantom-lock short, T6 garbage-tick reject,
+        # T7 max_fav init. Drives the REAL strategy core.
+        from strategy import Position, update_position_on_bar, lock_level_for
+        from position_telemetry import PositionTracer
+        try:
+            cfg = self.cfg
+            # T7: fresh fill -> max_fav initialized to entry (never 0/null).
+            entry = 4146.95
+            p7 = Position('A3', 'SELL', entry, pd.Timestamp('2026-06-19T13:50:00Z'),
+                          entry + cfg.sl_dist, entry - cfg.tp_dist, entry, cfg.lot_size)
+            t7_init = (p7.max_fav == entry)
+
+            # T2: SELL underwater whole life (price stays ABOVE entry) -> NO lock.
+            tr = PositionTracer(sink=lambda l: None)
+            p = Position('A3', 'SELL', entry, pd.Timestamp('2026-06-19T13:50:00Z'),
+                         entry + cfg.sl_dist, entry - cfg.tp_dist, entry, cfg.lot_size)
+            t0 = pd.Timestamp('2026-06-19T13:50:00Z'); lock_seen = False
+            for i in range(40):
+                bar = pd.Series({'open': entry + 3, 'high': entry + 5,
+                                 'low': entry + 1, 'close': entry + 3})
+                update_position_on_bar(p, bar, t0 + pd.Timedelta(minutes=i + 1),
+                                       cfg, tracer=tr, ticket=701)
+                if lock_level_for(p, cfg) > 0:
+                    lock_seen = True
+            t2_no_lock = (not lock_seen) and (p.max_fav == entry) \
+                and len([1 for e in tr._history.get(701, [])
+                         if e['event_type'] == 'LOCK_ARM']) == 0
+
+            # T6: a garbage tick (> max_tick_jump favorable) must not move max_fav.
+            tr6 = []; trc = PositionTracer(sink=tr6.append)
+            pe = 4300.0
+            p6 = Position('A1', 'BUY', pe, pd.Timestamp('2026-06-19T02:30:00Z'),
+                          pe - cfg.sl_dist, pe + cfg.tp_dist, pe, cfg.lot_size)
+            jump = cfg.max_tick_jump + 10.0
+            bar = pd.Series({'open': pe, 'high': pe + jump, 'low': pe - 1, 'close': pe})
+            update_position_on_bar(p6, bar, pd.Timestamp('2026-06-19T02:31:00Z'),
+                                   cfg, tracer=trc, ticket=601)
+            t6_rejected = (p6.max_fav == pe) and any('accepted=False' in l for l in tr6)
+
+            ok = t7_init and t2_no_lock and t6_rejected
+            detail = (f"T7_maxfav_init={t7_init} T2_short_no_lock={t2_no_lock} "
+                      f"T6_garbage_rejected={t6_rejected}")
+        except Exception as e:
+            self._record(33, FAIL, f"raised: {e!r}")
+            return
+        self._record(33, PASS if ok else FAIL, detail)
+
+    def _step_lone_boost(self):
+        # v3.2.3 Group 2 (L1-L5): the lone-leg boost trigger via the canonical
+        # boosts.plan_boost_event (the SINGLE source live + backtest call).
+        import boosts as _b
+        try:
+            cfg = self.cfg
+            fill = 4266.3
+            # L1: +$10 WITH a BUY -> RALLY, same side, n=2.
+            r = _b.plan_boost_event('BUY', fill, fill + 10.0, cfg)
+            l1 = (r is not None and r.kind == 'RALLY' and r.boost_side == 'BUY' and r.n == 2)
+            # L2: -$10 AGAINST a BUY -> RESCUE, opposite side.
+            r2 = _b.plan_boost_event('BUY', fill, fill - 10.0, cfg)
+            l2 = (r2 is not None and r2.kind == 'RESCUE' and r2.boost_side == 'SELL' and r2.n == 2)
+            # L3: sub-$10 either way -> None (hard guard).
+            l3 = (_b.plan_boost_event('BUY', fill, fill + 9.99, cfg) is None
+                  and _b.plan_boost_event('BUY', fill, fill - 9.99, cfg) is None)
+            # L4: at fill (move 0) -> None (fire-at-fill blocked).
+            l4 = (_b.plan_boost_event('BUY', fill, fill, cfg) is None)
+            # L5: one-shot at the same crossing -- mirrors fills' boost_fired flag.
+            fired = False
+            def _attempt(px):
+                nonlocal fired
+                if fired:
+                    return None
+                pl = _b.plan_boost_event('BUY', fill, px, cfg)
+                if pl is not None:
+                    fired = True
+                return pl
+            first = _attempt(fill + 10.0)
+            second = _attempt(fill + 10.5)   # re-cross: must NOT re-fire
+            l5 = (first is not None and second is None)
+            ok = l1 and l2 and l3 and l4 and l5
+            detail = (f"L1_rally={l1} L2_rescue={l2} L3_sub10_none={l3} "
+                      f"L4_fire_at_fill_blocked={l4} L5_one_shot={l5}")
+        except Exception as e:
+            self._record(34, FAIL, f"raised: {e!r}")
+            return
+        self._record(34, PASS if ok else FAIL, detail)
+
+    def _step_boost_watchdog(self):
+        # v3.2.3 Group 2 (L6/L7/L8) + D4: a met-but-unfired trigger and an armed-
+        # but-unexecuted boost MUST raise loud violations (never a silent drop).
+        from position_telemetry import PositionTracer
+        try:
+            # L6/L8 MISSED_BOOST: condition met, no arm/fire -> violation.
+            tr = PositionTracer(sink=lambda l: None)
+            tr.missed_boost(111, 'A2', side='BUY', move_dollars=10.5, trigger=10.0)
+            l6 = (len(tr.violations) == 1 and 'MISSED_BOOST' in tr.violations[0])
+            # L7 BOOST_ARM_ORPHANED: armed, no fire follows -> violation at check.
+            tr2 = PositionTracer(sink=lambda l: None)
+            tr2.fill(222, 'A2', side='BUY', position_price=4266.3)
+            tr2.boost_arm(222, 'A2', side='BUY', boost_kind='RALLY',
+                          stack_size=3, move_dollars=10.0, trigger=10.0)
+            orphan = tr2.check_orphan_arms(222)
+            l7 = orphan and any('BOOST_ARM_ORPHANED' in v for v in tr2.violations)
+            # clean: arm followed by fire -> no orphan.
+            tr3 = PositionTracer(sink=lambda l: None)
+            tr3.boost_arm(333, 'A2', side='BUY', boost_kind='RALLY', stack_size=3)
+            tr3.boost_fire(334, 'A2', parent_ticket=333, side='BUY',
+                           boost_kind='RALLY', stack_size=2, move_dollars=10.0, trigger=10.0)
+            no_orphan = (tr3.check_orphan_arms(333) is False)
+            # D4: a forced violation reaches the sink immediately + unrate-limited.
+            seen = []
+            tr4 = PositionTracer(sink=seen.append)
+            tr4.violation(444, 'A2', 'forced_test')
+            d4 = (len(seen) == 1 and 'TELEMETRY_VIOLATION' in seen[0])
+            # boost_fire below trigger -> violation (fire-at-fill structural assert).
+            tr5 = PositionTracer(sink=lambda l: None)
+            tr5.boost_fire(555, 'A2', side='BUY', boost_kind='RALLY',
+                           move_dollars=3.0, trigger=10.0)
+            below = any('boost_fire_below_trigger' in v for v in tr5.violations)
+            ok = l6 and l7 and no_orphan and d4 and below
+            detail = (f"L6_missed={l6} L7_orphan={l7} clean_no_orphan={no_orphan} "
+                      f"D4_violation_loud={d4} below_trigger_caught={below}")
+        except Exception as e:
+            self._record(35, FAIL, f"raised: {e!r}")
+            return
+        self._record(35, PASS if ok else FAIL, detail)
+
+    def _step_nooco_stack(self):
+        # v3.2.3 Group 3 (N1/N5/N7): No-OCO winning side stacks RALLY-only to 3;
+        # losing leg fires NOTHING (rides to SL); trail arms at +$8; hard cap 3.
+        import dataclasses
+        import boosts as _b
+        from strategy import Position, update_position_on_bar
+        from position_telemetry import PositionTracer
+        try:
+            cfg = self.cfg
+            # N1: straddle short @ X, long @ X+10. Price runs UP.
+            X = 4150.0
+            # winning = long leg (rally-only) gets a RALLY of 2 -> stack 3.
+            win = _b.plan_boost_event('BUY', X + 10.0, X + 20.0, cfg, allow_rescue=False)
+            n1_win = (win is not None and win.kind == 'RALLY' and win.n == 2)
+            # losing = short leg (rally-only): it is LOSING -> rescue blocked -> None.
+            lose = _b.plan_boost_event('SELL', X, X + 20.0, cfg, allow_rescue=False)
+            n1_lose = (lose is None)
+
+            # N7: hard cap -- stack_depth beyond 3 clamps n boosts to 2.
+            cfg5 = dataclasses.replace(cfg, stack_depth=5)
+            cap = _b.plan_boost_event('BUY', X + 10.0, X + 20.0, cfg5, allow_rescue=False)
+            n7_cap = (cap is not None and cap.n == 2)
+            # and the tracer flags stack_size > 3 as a violation.
+            trv = PositionTracer(sink=lambda l: None)
+            trv.boost_fire(9, 'A2', side='BUY', boost_kind='RALLY', stack_size=4,
+                           move_dollars=10.0, trigger=10.0)
+            n7_violation = any('stack_size_exceeds_cap' in v for v in trv.violations)
+
+            # N5: trail arms at +$8 on a boost leg (the stack's protection).
+            entry = 4150.0
+            boost = Position('A2', 'BUY', entry, pd.Timestamp('2026-06-19T10:00:00Z'),
+                             entry - 10.0, entry + cfg.tp_dist, entry, cfg.lot_size,
+                             role='rescue', boost=True)
+            # push fav to +$9 so the +$8 breath-floor engages
+            update_position_on_bar(boost, pd.Series(
+                {'open': entry, 'high': entry + 9.0, 'low': entry, 'close': entry + 9.0}),
+                pd.Timestamp('2026-06-19T10:05:00Z'), cfg)
+            n5_floor = boost.current_sl >= entry + 8.0 - 1e-6
+
+            ok = n1_win and n1_lose and n7_cap and n7_violation and n5_floor
+            detail = (f"N1_winner_stacks3={n1_win} N1_loser_rides(None)={n1_lose} "
+                      f"N7_cap_n2={n7_cap} N7_violation={n7_violation} "
+                      f"N5_trail_floor8={n5_floor}")
+        except Exception as e:
+            self._record(36, FAIL, f"raised: {e!r}")
+            return
+        self._record(36, PASS if ok else FAIL, detail)
+
+    def _step_stack_economics(self):
+        # v3.2.3 Group 3 (N2/N3/N4/N6): the break-even truth is CODED, not assumed.
+        import boosts as _b
+        from rescue_log import _branch_for
+        try:
+            cfg = self.cfg
+            be = _b.stack_breakeven_usd(cfg)          # one losing leg SL ($)
+            n = _b.stack_winners(cfg)                 # 3
+            per = _b.per_position_breakeven_usd(cfg)   # ~210
+            # N4: exact break-even -- each winner clears `per` -> net 0.
+            net0 = round(n * per - be, 2)
+            n4 = (abs(net0) < 1e-6 and abs(be - 630.0) < 1.0 and n == 3)
+            # N2: worked example -- $410 each -> +$600.
+            net_win = round(n * 410.0 - be, 2)
+            n2 = (abs(net_win - 600.0) < 1.0)
+            # N3: whipsaw -- $100 each (< per) -> net < 0, classed WHIPSAW_LOSS.
+            net_whip = round(n * 100.0 - be, 2)
+            n3 = (net_whip < 0 and _branch_for(net_whip) == 'WHIPSAW_LOSS')
+            # N6: peak exposure 3 winners + 1 open loser = 1.40 lot = $140/$1.
+            lots, usd_per_dollar = _b.stack_peak_exposure(cfg)
+            # FP 5% on $50k = $2500; at $140/$1 an $18 adverse excursion = $2520 > limit.
+            fp_limit = 0.05 * cfg.starting_balance
+            adverse_18 = usd_per_dollar * cfg.sl_dist
+            n6 = (abs(lots - 1.40) < 1e-6 and abs(usd_per_dollar - 140.0) < 1e-6
+                  and adverse_18 > fp_limit)
+            ok = n4 and n2 and n3 and n6
+            detail = (f"N4_be_exact(net0={net0},be=${be:.0f})={n4} "
+                      f"N2_410each=+${net_win:.0f}={n2} "
+                      f"N3_whipsaw(net={net_whip:.0f})={n3} "
+                      f"N6_exposure({lots}lot/${usd_per_dollar:.0f},adv18=${adverse_18:.0f}>"
+                      f"${fp_limit:.0f})={n6}")
+        except Exception as e:
+            self._record(37, FAIL, f"raised: {e!r}")
+            return
+        self._record(37, PASS if ok else FAIL, detail)
+
+    def _step_telemetry_full(self):
+        # v3.2.3 Group 4 (D1/D2/D3/D5): every line carries all mandatory fields
+        # (null explicit, never omitted); a trade's trace is gapless; the PREDICT
+        # line names every door + the break-even truth.
+        from position_telemetry import PositionTracer, MANDATORY_FIELDS, format_event_line
+        try:
+            lines = []
+            tr = PositionTracer(sink=lines.append)
+            tk = 800; anc = 'A2_10h_London'; entry = 4155.35
+            tr.plan(tk, anc, side='BUY', position_price=entry)
+            tr.place(tk, anc, side='BUY', stop_price=entry - 18, bid=entry + 1, position_price=entry)
+            tr.fill(tk, anc, side='BUY', position_price=entry, max_fav=entry, stop_price=entry - 18)
+            tr.predict(tk, anc, 'BUY', entry, entry - 18, entry + 30, -630.0, 1050.0,
+                       trigger=10.0, breakeven_per_pos=6.0)
+            tr.maxfav_update(tk, anc, side='BUY', position_price=entry, max_fav=entry + 3)
+            tr.trail_advance(tk, anc, side='BUY', position_price=entry, max_fav=entry + 3,
+                             stop_price=entry + 1, lock_level=1, bid=entry + 5)
+            tr.boost_arm(tk, anc, side='BUY', boost_kind='RALLY', stack_size=3, move_dollars=10.0, trigger=10.0)
+            tr.boost_fire(801, anc, parent_ticket=tk, side='BUY', boost_kind='RALLY',
+                          stack_size=2, move_dollars=10.0, trigger=10.0, position_price=entry + 10)
+            tr.heartbeat(tk, anc, side='BUY', bid=entry + 5, max_fav=entry + 3,
+                         stop_price=entry + 1, stack_size=3, floating_pnl=120.0)
+            tr.exit(tk, anc, side='BUY', exit_type='TP', actual_fill=entry + 30, pnl=1050.0)
+
+            # D1: every emitted line carries all mandatory field NAMES (null ok).
+            # event_type/ticket/anchor lead the line positionally (event_type is the
+            # bare token after PTRACE); the rest appear as `name=`.
+            body = [l for l in lines if l.startswith('PTRACE') and 'VIOLATION' not in l]
+            d1 = all(all(f"{m}=" in l for m in MANDATORY_FIELDS if m != 'event_type')
+                     for l in body)
+            # D2: gapless -- the key transitions all present, in order.
+            seq = [l.split()[1] for l in body]
+            need = ['PLAN', 'PLACE', 'FILL', 'PREDICT', 'MAXFAV_UPDATE',
+                    'TRAIL_ADVANCE', 'BOOST_ARM', 'BOOST_FIRE', 'POSITION_HEARTBEAT', 'EXIT']
+            d2 = all(n in seq for n in need) and seq.index('FILL') < seq.index('EXIT')
+            # D5: PREDICT names SL/TP + rally/rescue arm prices + breakeven/position.
+            pred = [l for l in lines if l.split()[1] == 'PREDICT'][0]
+            d5 = all(s in pred for s in ('rally_arms_at=', 'rescue_arms_at=',
+                                         'breakeven_per_pos=', 'max_loss=', 'tp='))
+            # D3: the Discord BOOST_FIRED string format carries kind+anchor+stack.
+            sample = (f"🚀 BOOST FIRED [RALLY] | {anc} | BUY 0.35 @~$4165.35 | "
+                      f"parent {tk} | stack now 3/3 | move +$10 from fill $4155.35")
+            d3 = ('BOOST FIRED [RALLY]' in sample and f'parent {tk}' in sample
+                  and '3/3' in sample)
+            ok = d1 and d2 and d5 and d3
+            detail = f"D1_full_fields={d1} D2_gapless={d2} D5_predict={d5} D3_discord_fmt={d3}"
+        except Exception as e:
+            self._record(38, FAIL, f"raised: {e!r}")
+            return
+        self._record(38, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # Orchestration
@@ -1585,6 +1853,12 @@ class SelfTest:
             self._step_underwater_lock()
             self._step_trail_telemetry()
             self._step_stop_reject()
+            self._step_lock_guards()
+            self._step_lone_boost()
+            self._step_boost_watchdog()
+            self._step_nooco_stack()
+            self._step_stack_economics()
+            self._step_telemetry_full()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1598,7 +1872,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 33):
+        for n in range(1, 39):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1615,12 +1889,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/32 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/38 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/32 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/38 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/32 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/38 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

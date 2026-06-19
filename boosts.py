@@ -51,17 +51,31 @@ class BoostPlan:
     move_dollars: float  # signed leg excursion at trigger (for logging)
 
 
-def plan_boost_event(leg_side, leg_fill_price, current_price, cfg):
-    """Decide whether (and how) to fire the lone leg's boost event RIGHT NOW, given
-    the leg's fill price and the CURRENT price. Returns a BoostPlan or None. Pure;
-    never raises; never fires at the fill. See module docstring for the rule."""
+def plan_boost_event(leg_side, leg_fill_price, current_price, cfg,
+                     allow_rally=True, allow_rescue=True):
+    """Decide whether (and how) to fire the leg's boost event RIGHT NOW, given the
+    leg's fill price and the CURRENT price. Returns a BoostPlan or None. Pure;
+    never raises; never fires at the fill. See module docstring for the rule.
+
+    v3.2.3: `allow_rally`/`allow_rescue` are PER-CALL gates (in addition to the
+    global cfg flags). A No-OCO straddle leg passes allow_rescue=False so only the
+    WINNING side stacks (RALLY) while the losing leg rides to its SL -- the A3
+    mechanic. Lone legs pass both True (rally OR rescue). Defaults keep every
+    existing caller unchanged."""
     try:
         leg_fill_price = float(leg_fill_price)
         current_price = float(current_price)
     except (TypeError, ValueError):
         return None
     trig = _trigger(cfg)
-    n = int(getattr(cfg, "rescue_boost_count", 2))
+    # v3.2.3: stack_depth (if set) controls the winning-side stack: depth 1 = base
+    # (0 boosts => no event), depth 3 = original + 2 boosts. #winners is hard-capped
+    # at 3, so n boosts is capped at 2. None => the legacy rescue_boost_count.
+    _depth = getattr(cfg, "stack_depth", None)
+    if _depth is not None:
+        n = max(0, min(3, int(_depth)) - 1)
+    else:
+        n = int(getattr(cfg, "rescue_boost_count", 2))
     sl_d = float(getattr(cfg, "boost_sl_dollars", 10.0))
     tp_d = float(getattr(cfg, "tp_dist", 30.0))
 
@@ -81,9 +95,14 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg):
     # its own SL/TP/trail. Defaults True => behavior unchanged. This is the SINGLE
     # source -- live (_check_boost_triggers) and backtest (run_month) both call
     # this fn, so both honor the flags with no separate copy.
-    if kind == "RALLY" and not bool(getattr(cfg, "rally_boosts_enabled", True)):
+    # v3.2.3: per-call allow_* gates layer on top (No-OCO straddle = rally-only).
+    if n <= 0:
+        return None  # stack_depth=1 (base): no boosts, the leg runs on its own
+    if kind == "RALLY" and (not allow_rally
+                            or not bool(getattr(cfg, "rally_boosts_enabled", True))):
         return None
-    if kind == "RESCUE" and not bool(getattr(cfg, "rescue_boosts_enabled", True)):
+    if kind == "RESCUE" and (not allow_rescue
+                             or not bool(getattr(cfg, "rescue_boosts_enabled", True))):
         return None
 
     # HARD GUARD: the boost entry (≈ current market) MUST be >= trigger from the
@@ -117,3 +136,55 @@ def cap_breached(combined_boost_pnl, cfg):
         return float(combined_boost_pnl) <= -boost_whipsaw_cap(cfg) + _EPS
     except (TypeError, ValueError):
         return False
+
+
+# ============================================================================
+# v3.2.3 No-OCO STACK ECONOMICS — the break-even truth, CODED (spec A3/A4, N2/N4/N6).
+# Pure; shared by live, backtest, and selftest so the +$6/position gating line is
+# enforced, never assumed.
+# ============================================================================
+def _lot(cfg):
+    return float(getattr(cfg, "lot_size", 0.35))
+
+
+def _contract(cfg):
+    return float(getattr(cfg, "contract_size", 100.0))
+
+
+def stack_breakeven_usd(cfg):
+    """The combined $ the winning stack must clear to cover the ONE losing
+    straddle leg riding to its SL: sl_dist * lot * contract (= $630 @ $18/0.35)."""
+    return float(getattr(cfg, "sl_dist", 18.0)) * _lot(cfg) * _contract(cfg)
+
+
+def stack_winners(cfg):
+    """Positions on the winning side at full stack: parent + n boosts (= 3)."""
+    return 1 + int(getattr(cfg, "rescue_boost_count", 2))
+
+
+def per_position_breakeven_usd(cfg):
+    """Break-even $ EACH winner must clear (= total / #winners, ~$210 @ 3)."""
+    return stack_breakeven_usd(cfg) / max(1, stack_winners(cfg))
+
+
+def per_position_breakeven_move(cfg):
+    """Break-even MOVE ($ of price) each winner must clear (~$6 @ 0.35/3)."""
+    return per_position_breakeven_usd(cfg) / (_lot(cfg) * _contract(cfg))
+
+
+def stack_net_usd(winner_move_each, cfg, n_winners=None, loser_loss_usd=None):
+    """Net of the full No-OCO event = (winners' P&L) - (losing leg SL). `winner_move_each`
+    is the $ price move banked by EACH winner. Positive net <=> winners cleared the
+    break-even line; negative <=> whipsaw that compounds the loss (logged honestly)."""
+    n = stack_winners(cfg) if n_winners is None else int(n_winners)
+    loss = stack_breakeven_usd(cfg) if loser_loss_usd is None else float(loser_loss_usd)
+    win = float(winner_move_each) * _lot(cfg) * _contract(cfg) * n
+    return round(win - loss, 2)
+
+
+def stack_peak_exposure(cfg):
+    """Peak live exposure at full stack: 3 winners + 1 open losing leg = 4 legs.
+    Returns (lots_live, usd_per_dollar). At 0.35 -> 1.40 lot = $140/$1 (spec A4)."""
+    legs = stack_winners(cfg) + 1
+    lots = legs * _lot(cfg)
+    return round(lots, 2), round(lots * _contract(cfg), 2)

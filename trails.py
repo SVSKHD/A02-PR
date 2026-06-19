@@ -205,10 +205,10 @@ def _manage_trails_on_bar_close(self):
                             corrected = round(max(old_sl, min_legal), 2)
                         try:
                             if getattr(self, 'ptrace', None) is not None:
-                                self.ptrace.stop_rejected(
+                                self.ptrace.stop_through_rearm(
                                     ticket, shadow['anchor_label'],
-                                    side=shadow['side'], current_bid=ctk.bid,
-                                    current_ask=ctk.ask,
+                                    side=shadow['side'], bid=ctk.bid,
+                                    ask=ctk.ask,
                                     position_price=shadow.get('entry_price'),
                                     max_fav=shadow.get('max_fav'),
                                     rejected_stop=round(intended, 2),
@@ -216,12 +216,13 @@ def _manage_trails_on_bar_close(self):
                                     reason="stop_through_replaced_not_closed")
                         except Exception:
                             pass
-                        self.tele.warn(
-                            f"⛔ STOP-THROUGH (re-armed, NOT closed): "
-                            f"{shadow['anchor_label']} {shadow['side']} computed "
-                            f"stop ${intended:.2f} was through market "
-                            f"(bid ${ctk.bid:.2f}/ask ${ctk.ask:.2f}); kept valid "
-                            f"stop ${corrected:.2f}. Trade rides on.")
+                        # Section D #4: ⛔ re-arm alert, rate-limited to 1/60s/ticket.
+                        if self._rl_ok(f"stopthru:{ticket}", 60.0):
+                            self.tele.warn(
+                                f"⛔ STOP-THROUGH re-armed, NOT closed | "
+                                f"{shadow['anchor_label']} {shadow['side']} | kept "
+                                f"stop ${corrected:.2f} | rides on (computed "
+                                f"${intended:.2f} was through bid ${ctk.bid:.2f})")
                         # Re-arm the corrected (valid) stop and continue managing
                         # this leg normally on the next bars.
                         pos.current_sl = corrected
@@ -244,6 +245,13 @@ def _manage_trails_on_bar_close(self):
                         f"Trail advance ticket={ticket} side={shadow['side']} "
                         f"SL ${old_sl:.2f} → ${intended:.2f} (max_fav=${pos.max_fav:.2f})"
                     )
+                    # Section D #5: 🔒 TRAIL LOCK ADVANCE alert (rate-limited 1/60s).
+                    _sgn = 1.0 if shadow['side'] == 'BUY' else -1.0
+                    _locked = _sgn * (intended - float(shadow['entry_price']))
+                    if self._rl_ok(f"trail:{ticket}", 60.0):
+                        self.tele.info(
+                            f"🔒 TRAIL {ticket} stop ${old_sl:.2f}→${intended:.2f} "
+                            f"| max_fav ${pos.max_fav:.2f} | locked ${_locked:+.2f}")
                 else:
                     log.warning(
                         f"SL DRIFT ticket={ticket} side={shadow['side']}: broker "

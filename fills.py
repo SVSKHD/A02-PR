@@ -238,6 +238,7 @@ def _reconcile_with_broker(self):
             # membership IS the "twin still open" test.
             _flag_hint = bool(info.get('rescue_on_fill'))
             is_rescue = False
+            is_lone = False   # v3.2.3: True only for a twin-CLOSED lone leg
             if getattr(self.cfg, 'no_oco', False):
                 # The twin must be open in BROKER-confirmed state, not merely
                 # tracked in shadow_positions: the "Detect closures" cleanup runs
@@ -259,6 +260,7 @@ def _reconcile_with_broker(self):
                         f"{info['side']} -- recovered structurally (twin still "
                         f"open). Check log for flag-loss cause.")
                 elif _flag_hint and not _twin_open:
+                    is_lone = True   # twin closed -> lone leg (rally OR rescue)
                     # v3.1.3 LONE-LEG HEDGING RESCUE: the No-OCO twin already
                     # closed, but this sibling only fills after price traveled the
                     # full $10 spread against the (now-lone) leg -- i.e. a breakout
@@ -284,7 +286,14 @@ def _reconcile_with_broker(self):
                 # v3.2.0: boosts fire from the PER-TICK trigger once price moves a
                 # full $10 from THIS fill -- never at fill (the A3 -$900 bug).
                 'leg_fill_price': float(broker_p.price_open),
-                'boost_eligible': bool(is_rescue),
+                # v3.2.3 No-OCO STACKING: in No-OCO every straddle leg is boost-
+                # eligible so the WINNING side stacks (original + 2 RALLY boosts =
+                # 3) while the losing leg rides to its SL. A straddle leg is
+                # RALLY-ONLY (a losing leg must not fire a rescue -- it just stops
+                # out). A twin-CLOSED LONE leg keeps the full rally-OR-rescue arm.
+                # In OCO mode (no_oco off) a normal leg stays non-eligible (unchanged).
+                'boost_eligible': bool(is_rescue) or bool(getattr(self.cfg, 'no_oco', False)),
+                'boost_rally_only': bool(getattr(self.cfg, 'no_oco', False)) and not is_lone,
                 'boost_fired':    False,
                 'sibling_ticket': info.get('sibling_ticket'),
             }
@@ -302,13 +311,13 @@ def _reconcile_with_broker(self):
                     _max_gain = round(_sgn * (_tp - _e) * _mult, 2)
                     tr.fill(ticket, info['anchor_label'], side=info['side'],
                             position_price=_e, stop_price=_sl,
-                            current_bid=_e, current_ask=_e, max_fav=_e,
+                            bid=_e, ask=_e, max_fav=_e,
                             tp=_tp, max_loss=_max_loss, max_gain=_max_gain,
                             lock_level=0)
-                    _ladder = [(n, round(_e + _sgn * d, 2))
-                               for n, d in ((1, 5.0), (2, 6.0), (3, 10.0))]
                     tr.predict(ticket, info['anchor_label'], info['side'],
-                               _e, _sl, _tp, _max_loss, _max_gain, _ladder)
+                               _e, _sl, _tp, _max_loss, _max_gain,
+                               trigger=float(getattr(self.cfg, 'boost_trigger_dollars', 10.0)),
+                               breakeven_per_pos=6.0)
             except Exception as _te:
                 log.warning(f"ptrace fill/predict failed for {ticket}: {_te!r}")
             if is_rescue:
@@ -507,13 +516,17 @@ def _fire_boost_event(self, leg_ticket, leg_shadow, plan):
     ref = float(plan.entry_ref)
     leg_fill = float(leg_shadow.get('leg_fill_price', ref))
     event_id = f"{self.state.get('last_broker_date', '?')}_{anchor[:2]}_{leg_ticket}"
+    _tr = getattr(self, 'ptrace', None)
+    stack_target = 1 + n  # parent leg + n boosts
+    # v3.2.3 Section D #1: proactive BOOST FIRED alert in the spec format (fires
+    # the moment the event arms, both RALLY and RESCUE, lone AND No-OCO stack).
     self.tele.send(
-        f"{'🚀' if plan.kind == 'RALLY' else '🚑'}⚡ {plan.kind} BOOST: "
-        f"{n}x{self.cfg.lot_size} {side} @ market | $10 SL + $3.50 trail | leg "
-        f"moved ${plan.move_dollars:+.0f} from fill ${leg_fill:.2f}",
+        f"🚀 BOOST FIRED [{plan.kind}] | {anchor} | {side} {self.cfg.lot_size} "
+        f"@~${ref:.2f} | parent {leg_ticket} | stack now {stack_target}/3 | "
+        f"move ${plan.move_dollars:+.0f} from fill ${leg_fill:.2f}",
         Severity.WARN, important=True, critical=True,
         card=dc.card_rescue(anchor,
-                            trapped_leg=f"lone {leg_shadow.get('side')} (ticket {leg_ticket})",
+                            trapped_leg=f"parent {leg_shadow.get('side')} (ticket {leg_ticket})",
                             rescue_leg=f"{plan.kind} {side} @ ~${ref:.2f}", twin_pnl=None),
         event_key=f"{plan.event_type}:{leg_ticket}")
     fleet = []
@@ -548,11 +561,35 @@ def _fire_boost_event(self, leg_ticket, leg_shadow, plan):
                 card=dc.card_boost(bi + 1, side, b_fp, round(b_fp - sgn * sl_d, 2),
                                    round(b_fp + sgn * tp_d, 2), f"{rc}"),
                 event_key=f"boost:{b_tk}")
+            # v3.2.3 BOOST_FIRE telemetry (per placed boost) -- the gapless trace
+            # of the stack. parent_ticket links it to the leg that triggered it.
+            if _tr is not None:
+                _stack_now = 1 + len([1 for b in fleet if b.get('ticket')]) + 1
+                _tr.boost_fire(int(b_tk) if b_tk else None, anchor,
+                               parent_ticket=leg_ticket, side=side,
+                               position_price=b_fp, boost_kind=plan.kind,
+                               stack_size=_stack_now, move_dollars=plan.move_dollars,
+                               trigger=float(getattr(self.cfg, 'boost_trigger_dollars', 10.0)),
+                               stop_price=round(b_fp - sgn * sl_d, 2))
             fleet.append({'ticket': int(b_tk) if b_tk else None, 'fill': b_fp,
                           'rc': rc, 'comment': cmt})
         else:
             self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} rejected rc={rc} ({md_escape(rcn)})")
             fleet.append({'ticket': None, 'fill': None, 'rc': rc, 'comment': cmt})
+    # v3.2.3 Section D #2: STACK COMPLETE alert when the full 3-position stack
+    # filled (parent + 2 boosts). Names the break-even truth + when the trail arms.
+    _filled = len([1 for b in fleet if b.get('ticket')])
+    if (1 + _filled) >= stack_target and stack_target >= 3:
+        # break-even = the one losing straddle leg's SL = $18 * lot * contract
+        # (= $630 @ 0.35) the 3-position winning stack must clear (~+$6/position).
+        _be = round(float(getattr(self.cfg, 'sl_dist', 18.0))
+                    * float(self.cfg.lot_size)
+                    * float(getattr(self.cfg, 'contract_size', 100.0)), 0)
+        self.tele.send(
+            f"📦 STACK 3/3 {side} | combined breakeven +${_be:.0f} | "
+            f"trail arms at +$8",
+            Severity.WARN, important=True, critical=True,
+            event_key=f"stack:{event_id}")
     # Open the rescue event (RALLY_BOOST / RESCUE_BOOST) so it logs to rescuestats.
     try:
         members = {int(leg_ticket)} | {int(b['ticket']) for b in fleet if b.get('ticket')}
@@ -611,23 +648,52 @@ def _check_boost_triggers(self):
         mid = (float(tk.bid) + float(tk.ask)) / 2.0
     except Exception:
         return
+    trig = float(getattr(self.cfg, 'boost_trigger_dollars', 10.0))
+    tr = getattr(self, 'ptrace', None)
     for ticket, shadow in list(self.shadow_positions.items()):
         if shadow.get('boost') or shadow.get('boost_fired') \
                 or not shadow.get('boost_eligible'):
             continue
+        side = shadow['side']
+        fill_px = float(shadow.get('leg_fill_price', shadow['entry_price']))
+        rally_only = bool(shadow.get('boost_rally_only', False))
+        leg_fav = (mid - fill_px) if side == 'BUY' else (fill_px - mid)
         try:
             plan = boosts.plan_boost_event(
-                shadow['side'], shadow.get('leg_fill_price', shadow['entry_price']),
-                mid, self.cfg)
+                side, fill_px, mid, self.cfg, allow_rescue=not rally_only)
         except Exception:
             plan = None
         if plan is None:
+            # v3.2.3 MISSED_BOOST watchdog: a fire was EXPECTED (the threshold was
+            # crossed AND that kind is enabled here) but none was planned -- the
+            # logic failed to detect a valid trigger. A silent no-fire is a
+            # failure, not a no-op (the lone-leg analogue of A2's silent miss).
+            rally_exp = (leg_fav >= trig
+                         and bool(getattr(self.cfg, 'rally_boosts_enabled', True)))
+            rescue_exp = (leg_fav <= -trig and not rally_only
+                          and bool(getattr(self.cfg, 'rescue_boosts_enabled', True)))
+            if (rally_exp or rescue_exp) and tr is not None:
+                tr.missed_boost(ticket, shadow.get('anchor_label'), side=side,
+                                position_price=fill_px, move_dollars=round(leg_fav, 2),
+                                trigger=trig, rally_only=rally_only)
             continue
+        # stack after this event: parent leg (1) + n boosts.
+        stack_after = 1 + int(plan.n)
+        if tr is not None:
+            tr.boost_arm(ticket, shadow.get('anchor_label'), parent_ticket=ticket,
+                         side=plan.boost_side, position_price=fill_px,
+                         boost_kind=plan.kind, stack_size=stack_after,
+                         move_dollars=plan.move_dollars, trigger=trig)
         shadow['boost_fired'] = True   # one event per leg (set before placing)
         try:
             self._fire_boost_event(ticket, shadow, plan)
         except Exception as e:
             log.warning(f"_fire_boost_event({ticket}) failed: {e!r}")
+            # v3.2.3 BOOST_ARM_ORPHANED: armed (trigger detected) but execution
+            # dropped -- channel error, retcode fail, order rejected.
+            if tr is not None:
+                tr.boost_arm_orphaned(ticket, shadow.get('anchor_label'),
+                                      side=plan.boost_side, error=repr(e))
     try:
         self._enforce_boost_cap(mid)
     except Exception as e:
