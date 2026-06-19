@@ -53,6 +53,11 @@ BOOST_ARM = "BOOST_ARM"
 BOOST_FIRE = "BOOST_FIRE"
 POSITION_HEARTBEAT = "POSITION_HEARTBEAT"
 EXIT = "EXIT"
+# v3.2.3 Monday weekend-wake offset guard (system-level events; ticket may be null)
+WEEKEND_WAKE = "WEEKEND_WAKE"
+OFFSET_DETECT = "OFFSET_DETECT"
+OFFSET_MISMATCH = "OFFSET_MISMATCH"
+ANCHOR_TIME_RESOLVED = "ANCHOR_TIME_RESOLVED"
 VIOLATION = "TELEMETRY_VIOLATION"
 
 # Mandatory fields on EVERY line (spec B2). A missing field is the failure we are
@@ -160,6 +165,11 @@ class PositionTracer:
     def boost_fire(self, ticket, anchor, **kw):   return self.emit(BOOST_FIRE, ticket, anchor, **kw)
     def heartbeat(self, ticket, anchor, **kw):    return self.emit(POSITION_HEARTBEAT, ticket, anchor, **kw)
     def exit(self, ticket, anchor, **kw):         return self.emit(EXIT, ticket, anchor, **kw)
+    # v3.2.3 Monday weekend-wake offset guard (ticket=None; anchor='A1').
+    def weekend_wake(self, anchor="A1", **kw):    return self.emit(WEEKEND_WAKE, None, anchor, **kw)
+    def offset_detect(self, anchor="A1", **kw):   return self.emit(OFFSET_DETECT, None, anchor, **kw)
+    def offset_mismatch(self, anchor="A1", **kw): return self.emit(OFFSET_MISMATCH, None, anchor, **kw)
+    def anchor_time_resolved(self, anchor="A1", **kw): return self.emit(ANCHOR_TIME_RESOLVED, None, anchor, **kw)
 
     def predict(self, ticket, anchor, side, entry, sl, tp, max_loss, max_gain,
                 trigger=10.0, breakeven_per_pos=6.0, **kw):

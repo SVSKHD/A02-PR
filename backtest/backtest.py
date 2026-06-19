@@ -44,6 +44,8 @@ import boosts  # v3.2.0: the SINGLE canonical lone-leg boost-trigger decision
 from strategy import (update_max_fav, lock_level_for, lock_ladder_prices,
                       lock_trigger_price, lock_trigger_reached)
 from position_telemetry import PositionTracer
+import offset_guard  # v3.2.3 Monday weekend-wake offset guard (shared, identity)
+resolve_offset = offset_guard.resolve_offset
 
 # Exposed at module level so a selftest can assert IDENTITY:
 #   backtest.update_position_on_bar IS strategy.update_position_on_bar
@@ -57,7 +59,7 @@ __all__ = [
     'initial_sl', 'initial_tp', 'anchor_datetime_utc', 'eod_datetime_utc',
     'resolved_anchor_hm', 'is_rescue_fill', '_branch_for', 'plan_boost_event',
     'update_max_fav', 'lock_level_for', 'lock_ladder_prices', 'PositionTracer',
-    'lock_trigger_price', 'lock_trigger_reached',
+    'lock_trigger_price', 'lock_trigger_reached', 'resolve_offset', 'offset_guard',
 ]
 
 LIVE_RULE_SOURCES = [
@@ -76,6 +78,7 @@ LIVE_RULE_SOURCES = [
     'boosts.plan_boost_event',
     'position_telemetry.PositionTracer',
     'strategy.lock_trigger_reached',
+    'offset_guard.resolve_offset',
 ]
 
 

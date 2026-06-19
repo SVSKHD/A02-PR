@@ -499,6 +499,18 @@ History (one line per behavioral change):
          tripwire VIOLATION. Discord: 👻 PHANTOM LOCK BLOCKED (rate-limited 1/60s)
          + 🔒 LOCK on real arm. selftest -> 40 steps (PL1-PL7); import-path identity
          covers lock_trigger_reached. Banner stays v3.2.3.
+         (monday-offset follow-up) Weekend-wake offset guard surfaced as ONE shared
+         module (offset_guard): re-derive the broker offset from a fresh tick on a
+         weekend wake, validate against EXPECTED_OFFSET=+3, retry up to
+         OFFSET_RETRY_MAX=3, and BLOCK A1 if unresolved -- never place on a guessed
+         0h offset (the Jun-8 silent miss). Additive only: A1 schedule /
+         monday_a1_override / trade logic UNCHANGED (backtest RAW net identical).
+         New observability: WEEKEND_WAKE, OFFSET_DETECT (CONFIRMED|RETRY|BLOCKED),
+         OFFSET_MISMATCH, ANCHOR_TIME_RESOLVED + offset_mismatch / monday_a1_drift
+         violations. Discord: 🌅 WEEKEND WAKE, ⛔ OFFSET MISMATCH A1 (before A1
+         places), 🟢 A1 RESOLVED (Monday all-clear). selftest -> 47 steps (41-47:
+         monday wake / badoffset / drift-trip / weekday-unaffected / trace / Jun-8
+         replay / offset parity); import-path identity covers offset_guard.resolve_offset.
 """
 
 __version__ = "3.2.3"
