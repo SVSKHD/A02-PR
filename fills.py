@@ -288,6 +288,29 @@ def _reconcile_with_broker(self):
                 'boost_fired':    False,
                 'sibling_ticket': info.get('sibling_ticket'),
             }
+            # v3.3.0 FILL + PREDICT telemetry (spec 1.1/1.4): log the realized fill
+            # and the full exit-door prediction up front, so a grep on the ticket
+            # reconstructs the position from its first instant. Never blocks a fill.
+            try:
+                tr = getattr(self, 'ptrace', None)
+                if tr is not None:
+                    _e = float(broker_p.price_open)
+                    _sl = float(broker_p.sl); _tp = float(broker_p.tp)
+                    _sgn = 1.0 if info['side'] == 'BUY' else -1.0
+                    _mult = self.cfg.contract_size * self.cfg.lot_size
+                    _max_loss = round(_sgn * (_sl - _e) * _mult, 2)
+                    _max_gain = round(_sgn * (_tp - _e) * _mult, 2)
+                    tr.fill(ticket, info['anchor_label'], side=info['side'],
+                            position_price=_e, stop_price=_sl,
+                            current_bid=_e, current_ask=_e, max_fav=_e,
+                            tp=_tp, max_loss=_max_loss, max_gain=_max_gain,
+                            lock_level=0)
+                    _ladder = [(n, round(_e + _sgn * d, 2))
+                               for n, d in ((1, 5.0), (2, 6.0), (3, 10.0))]
+                    tr.predict(ticket, info['anchor_label'], info['side'],
+                               _e, _sl, _tp, _max_loss, _max_gain, _ladder)
+            except Exception as _te:
+                log.warning(f"ptrace fill/predict failed for {ticket}: {_te!r}")
             if is_rescue:
                 # v3.2.0 BUG FIX: the OLD path fired boosts HERE, AT THE LEG'S
                 # FILL PRICE, in the sibling's direction, always labelled
@@ -411,6 +434,31 @@ def _reconcile_with_broker(self):
                         shadow['entry_price'], close_price,
                         outcome, round(pnl_usd, 2), ticket,
                     ])
+                # v3.3.0 EXIT telemetry (spec 1.1/1.5): close the ticket's life
+                # story and run the self-consistency assert -- a TRAIL/lock exit
+                # with NO preceding TRAIL_ADVANCE writes a TELEMETRY_VIOLATION (the
+                # exact silence that hid the A2 bug). Never blocks the close path.
+                try:
+                    tr = getattr(self, 'ptrace', None)
+                    if tr is not None:
+                        _trail_class = outcome in ('Trail', 'BE', 'LOCK4', 'TIER')
+                        _etype = 'TRAIL' if _trail_class else outcome
+                        _isl = shadow.get('current_sl')
+                        _slip = (round(close_price - float(_isl), 2)
+                                 if _isl is not None else None)
+                        tr.exit(ticket, shadow.get('anchor_label'),
+                                side=shadow.get('side'),
+                                position_price=shadow.get('entry_price'),
+                                max_fav=shadow.get('max_fav'),
+                                stop_price=_isl, exit_type=_etype,
+                                exit_reason=outcome, intended_price=_isl,
+                                actual_fill=round(close_price, 2), slip=_slip,
+                                pnl=round(pnl_usd, 2),
+                                held_minutes=(round(hold_min, 1)
+                                              if hold_min is not None else None),
+                                nohold_counterfactual=shadow.get('nh_exit'))
+                except Exception as _te:
+                    log.warning(f"ptrace exit failed for {ticket}: {_te!r}")
                 # v2.5.6: rich journal row (one per fill) for strategy evaluation
                 try:
                     self._write_journal(shadow, close_deal, close_price, outcome, pnl_usd, ticket)

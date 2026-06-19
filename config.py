@@ -29,6 +29,22 @@ class Config:
     # job, a tighter post-hold trail keeps more of the move (gap 1.0 best at every
     # freeze level in the grid). The hold protects the runner; the gap banks it.
     min_step: float = 0.10  # v2.5.5: back to 0.10 to match the 0.30 trail gap
+    # --- trail-lock root-cause guards (2026-06-19 A2 incident) -----------------
+    # A lock level advanced off a max_fav the market never produced, parking an
+    # invalid stop ABOVE a long's market and force-closing a trade that was only
+    # in normal drawdown. These three knobs make that impossible:
+    arm_buffer: float = 1.50  # price must clear entry by AT LEAST this (>= spread +
+    # noise band) before lock_1 / the trail may arm. Stops the trail engaging
+    # during entry chop. All existing arm tiers (2.5/5/6/10) already exceed this,
+    # so the default is a belt-and-suspenders floor -- no behavior change.
+    max_tick_jump: float = 25.0  # garbage-feed filter: a bar's favorable extreme
+    # that jumps more than this beyond the running max_fav is rejected (stale/
+    # garbage tick), so a phantom spike can never inflate max_fav and arm a lock
+    # off a price that never traded. $25 in one M1 bar is far beyond any normal
+    # XAUUSD move; legitimate fast markets stay well under it. 0 disables.
+    lock_confirm: bool = True  # master switch for the confirmed-price lock gate:
+    # a lock level N may advance ONLY when max_fav has truly reached level_N's
+    # price. Never on a timer, tick count, loop iteration, or default value.
     freeze_minutes: int = 45  # v2.7: was 15 (and functionally DEAD until the v2.7 timezone
     # fix in live_trader._manage_trails_on_bar_close -- see comment there). 45m = risk-
     # adjusted sweet spot of the tick grid: +$26.7k vs +$23.0k @30m, same maxDD (-$2,520),

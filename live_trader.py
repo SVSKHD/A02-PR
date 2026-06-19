@@ -169,6 +169,15 @@ class LiveTrader:
         component = f"AUREON-{'paper' if paper else 'live'}"
         self.tele = telemetry_from_env(component=component)
 
+        # v3.3.0 per-position structured trace (the trail-lock-fix overhaul). One
+        # greppable line per state change so a ticket's whole life is gapless and
+        # the middle can never be silent again. Pure; the sink mirrors to the bot
+        # log AND to telemetry at INFO so it reaches the operator's channel too.
+        from position_telemetry import PositionTracer
+        self.ptrace = PositionTracer(sink=self._ptrace_sink)
+        # throttle for POSITION_HEARTBEAT (spec 1.3): per-ticket last-emit epoch.
+        self._ptrace_hb_last: Dict = {}
+
         # Run dir for IPC files (heartbeat / status / commands)
         run_dir = os.environ.get("AUREON_RUN_DIR", "./run")
         os.makedirs(run_dir, exist_ok=True)
@@ -412,6 +421,55 @@ class LiveTrader:
     def _touch_heartbeat(self):
         with open(self.heartbeat_path, "w") as f:
             f.write(datetime.now(timezone.utc).isoformat())
+
+    def _ptrace_sink(self, line: str):
+        """Sink for the per-position structured trace: always to the bot log; and
+        for the loud lines (violations) also to the operator's alert channel. Must
+        NEVER raise -- telemetry can't be allowed to touch the trading loop."""
+        try:
+            if line.startswith("PTRACE TELEMETRY_VIOLATION"):
+                log.warning(line)
+                self.tele.warn(line)
+            else:
+                log.info(line)
+        except Exception:
+            pass
+
+    def _maybe_position_heartbeat(self):
+        """v3.3.0 spec 1.3: while any position is live, emit a low-frequency
+        POSITION_HEARTBEAT (~60s) so 'what was happening between fill and exit' is
+        always answerable even when no state changed. Reads the live tick once."""
+        if not self.shadow_positions:
+            return
+        now = time.time()
+        bid = ask = None
+        try:
+            tk = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+            if tk is not None:
+                bid, ask = float(tk.bid), float(tk.ask)
+        except Exception:
+            bid = ask = None
+        for ticket, sh in list(self.shadow_positions.items()):
+            if now - self._ptrace_hb_last.get(ticket, 0.0) < 60.0:
+                continue
+            self._ptrace_hb_last[ticket] = now
+            entry = float(sh.get('entry_price')) if sh.get('entry_price') is not None else None
+            mf = sh.get('max_fav')
+            floating = None
+            if bid is not None and entry is not None:
+                sgn = 1.0 if sh.get('side') == 'BUY' else -1.0
+                ref = bid if sh.get('side') == 'BUY' else ask
+                if ref is not None:
+                    floating = round(sgn * (ref - entry) * self.cfg.contract_size
+                                     * self.cfg.lot_size, 2)
+            try:
+                self.ptrace.heartbeat(
+                    ticket, sh.get('anchor_label'), side=sh.get('side'),
+                    current_bid=bid, current_ask=ask, position_price=entry,
+                    max_fav=mf, stop_price=sh.get('current_sl'),
+                    floating_pnl=floating)
+            except Exception:
+                pass
 
     def _log_price(self, utc_now: pd.Timestamp):
         """Write a per-tick row to today's price log. CSV per broker-date.
@@ -978,6 +1036,10 @@ class LiveTrader:
         # 7b. v2.5: Complete any deferred anchor placement (settle window or retry)
         self._complete_deferred_anchor()
 
+        # 7c. v3.3.0 POSITION_HEARTBEAT: keep the ticket trace gapless between
+        # state changes while any position is open (throttled ~60s internally).
+        self._maybe_position_heartbeat()
+
         # 8. M1 bar close → trails
         current_minute = utc_now.floor('1min')
         if current_minute != self._last_managed_minute:
@@ -1069,4 +1131,4 @@ LiveTrader._firebase_weekly_reconcile = _journal_mod._firebase_weekly_reconcile
 # is visible in Telegram).
 LOADED_MODULES = ['utils', 'config', 'strategy', 'mt5_adapter', 'backtest',
                   'state', 'risk', 'anchors', 'fills', 'trails', 'journal',
-                  'live_trader', 'bot', 'firebase_journal']
+                  'live_trader', 'bot', 'firebase_journal', 'position_telemetry']

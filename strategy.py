@@ -117,10 +117,17 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
 
 
 def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
-                           cfg: Config) -> Optional[str]:
+                           cfg: Config, tracer=None, ticket=None) -> Optional[str]:
     """
     Apply one M1 bar to an open position. Returns the outcome string if closed,
     else None. Mutates pos.
+
+    v3.3.0 (trail-lock root-cause fix): `tracer` (a position_telemetry.PositionTracer
+    or None) records MAXFAV_UPDATE / LOCK_ARM / TRAIL_ADVANCE so the middle of a
+    position's life can never be silent again. The default None keeps every
+    existing caller (and import-path identity) byte-identical. The lock ladder now
+    advances ONLY on a CONFIRMED max_fav that truly reached the rung's price, and
+    nothing arms until price clears entry by cfg.arm_buffer.
     """
     if pos.closed:
         return pos.outcome
@@ -147,12 +154,16 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             pos.closed = True
             return pos.outcome
 
-    # 2. UPDATE PEAK FAVORABLE (always, even during freeze — used for reporting & post-freeze trail snap)
+    # 2. UPDATE PEAK FAVORABLE (always, even during freeze — used for reporting &
+    # post-freeze trail snap). v3.3.0: advanced ONLY from a confirmed bar extreme,
+    # with a floor at entry and a garbage-feed jump filter, so a phantom spike can
+    # never inflate max_fav and arm a lock off a price that never traded (the A2
+    # root cause). EXIT detection above still uses the raw bar — a real move is
+    # never missed; only the lock-arming reference is filtered.
+    update_max_fav(pos, bar, cfg, tracer=tracer, ticket=ticket, ts=ts)
     if pos.side == 'BUY':
-        if bar.high > pos.max_fav: pos.max_fav = bar.high
         fav = pos.max_fav - pos.entry_price
     else:
-        if bar.low < pos.max_fav: pos.max_fav = bar.low
         fav = pos.entry_price - pos.max_fav
     fav = max(fav, 0.0)
 
@@ -192,33 +203,65 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if level < pos.current_sl:
                 pos.current_sl = level
     _sgn = 1.0 if pos.side == 'BUY' else -1.0
-    if fav >= 10.00:
-        # v2.9.1: above +$10 the lock FOLLOWS the peak at $2 distance (ratchet),
-        # floor +$8. Captures most of a hold-period spike (peak +$12.8 -> lock
-        # +$10.8 = +$540 @0.5) instead of a flat +$8, while $2 of room keeps
-        # ordinary noise from tagging it. fav here is peak favorable (max_fav).
-        _ratchet(pos.entry_price + _sgn * max(8.00, fav - 2.00))
-    elif pos.role != 'rescue':
-        if fav >= 6.00:
-            _ratchet(pos.entry_price + _sgn * 4.00)
-        elif fav >= 5.00 and not in_freeze:
-            # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
-            # inside the 45m hold. Live 2026-06-16: A2/A4 hit +$5 fav early, then
-            # pulled back and BE-scratched to $0 at 6.2m/2.8m held. Raising the arm
-            # to +$5 did not fix this -- the disease is the TIMING. The higher
-            # protective locks (+$6->+$4, +$10->peak-2 above) stay active inside
-            # the hold; ONLY this entry move waits for hold expiry.
-            _ratchet(pos.entry_price)
+    # v3.3.0 ARM-DELAY (spec Part 2.5): nothing arms until price has CLEARED entry
+    # by at least cfg.arm_buffer (>= spread + noise band). Stops the trail/lock
+    # engaging during entry chop. fav is peak favorable (from the confirmed,
+    # filtered max_fav), so this is a confirmed-price gate: a lock can fire ONLY
+    # if max_fav truly reached its level. All real arm tiers (2.5/5/6/10) exceed
+    # the $1.50 default, so behavior is unchanged when the feed is clean.
+    _sl_before = pos.current_sl
+    _level_before = lock_level_for(pos, cfg)
+    _arm_buffer = float(getattr(cfg, 'arm_buffer', 0.0) or 0.0)
+    # The whole ladder + trail is GATED on fav >= arm_buffer: nothing arms until
+    # price clears entry by the buffer. (TP check below always runs.)
+    if fav >= _arm_buffer:
+        if fav >= 10.00:
+            # v2.9.1: above +$10 the lock FOLLOWS the peak at $2 distance (ratchet),
+            # floor +$8. Captures most of a hold-period spike (peak +$12.8 -> lock
+            # +$10.8 = +$540 @0.5) instead of a flat +$8, while $2 of room keeps
+            # ordinary noise from tagging it. fav here is peak favorable (max_fav).
+            _ratchet(pos.entry_price + _sgn * max(8.00, fav - 2.00))
+        elif pos.role != 'rescue':
+            if fav >= 6.00:
+                _ratchet(pos.entry_price + _sgn * 4.00)
+            elif fav >= 5.00 and not in_freeze:
+                # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
+                # inside the 45m hold. Live 2026-06-16: A2/A4 hit +$5 fav early, then
+                # pulled back and BE-scratched to $0 at 6.2m/2.8m held. Raising the arm
+                # to +$5 did not fix this -- the disease is the TIMING. The higher
+                # protective locks (+$6->+$4, +$10->peak-2 above) stay active inside
+                # the hold; ONLY this entry move waits for hold expiry.
+                _ratchet(pos.entry_price)
 
-    if not in_freeze and fav >= cfg.be_trigger:
-        if pos.side == 'BUY':
-            candidate_sl = max(pos.entry_price, pos.max_fav - cfg.trail_gap)
-            if candidate_sl > pos.current_sl + cfg.min_step:
-                pos.current_sl = candidate_sl
-        else:
-            candidate_sl = min(pos.entry_price, pos.max_fav + cfg.trail_gap)
-            if candidate_sl < pos.current_sl - cfg.min_step:
-                pos.current_sl = candidate_sl
+        if not in_freeze and fav >= cfg.be_trigger:
+            if pos.side == 'BUY':
+                candidate_sl = max(pos.entry_price, pos.max_fav - cfg.trail_gap)
+                if candidate_sl > pos.current_sl + cfg.min_step:
+                    pos.current_sl = candidate_sl
+            else:
+                candidate_sl = min(pos.entry_price, pos.max_fav + cfg.trail_gap)
+                if candidate_sl < pos.current_sl - cfg.min_step:
+                    pos.current_sl = candidate_sl
+
+    # v3.3.0 TELEMETRY: a lock rung that armed and/or the stop that advanced this
+    # bar -- the TRAIL_ADVANCE line A2 was missing. Pure record; never alters the
+    # stop. lock_level is the confirmed rung now realized by current_sl.
+    if tracer is not None and pos.current_sl != _sl_before:
+        _level_now = lock_level_for(pos, cfg)
+        try:
+            if _level_now > _level_before:
+                tracer.lock_arm(
+                    ticket, pos.anchor_label, now_utc=ts, side=pos.side,
+                    position_price=pos.entry_price, max_fav=pos.max_fav,
+                    lock_level=_level_now,
+                    required=lock_ladder_prices(pos, cfg)[min(_level_now, 3) - 1][1])
+            tracer.trail_advance(
+                ticket, pos.anchor_label, now_utc=ts, side=pos.side,
+                position_price=pos.entry_price, max_fav=pos.max_fav,
+                lock_level=_level_now, stop_price=round(pos.current_sl, 2),
+                old_stop=round(_sl_before, 2), new_stop=round(pos.current_sl, 2))
+        except Exception:
+            pass
 
     # v2.6: $5 SECONDARY LOCK REMOVED. It pinned SL to entry+$4 above $5 fav, which is
     # TIGHTER than the peak-1.50 trail and capped runners exactly where you want them to
@@ -249,3 +292,96 @@ def realize_pnl_usd(pos: Position, cfg: Config) -> float:
     """Convert closed position to USD P&L. Returns 0 if not closed."""
     if not pos.closed: return 0.0
     return pos.pnl_dist * cfg.contract_size * pos.lot
+
+
+# ============================================================================
+# Trail-lock root-cause helpers (2026-06-19 A2 incident). Pure; shared by the
+# live path, the backtest engine, and the selftest (import-path identity).
+# ============================================================================
+def _sgn_of(side: str) -> float:
+    return 1.0 if side == 'BUY' else -1.0
+
+
+def update_max_fav(pos: Position, bar: pd.Series, cfg: Config,
+                   tracer=None, ticket=None, ts=None) -> bool:
+    """Advance pos.max_fav from a CONFIRMED bar extreme only.
+
+    Two guards make a lock off a phantom price impossible (the A2 root cause):
+      1. FLOOR: max_fav is never worse than entry (a corrupted restore that left
+         max_fav below entry can no longer arm a profit-lock off a value the
+         market never produced).
+      2. GARBAGE FILTER: a favorable extreme that jumps more than cfg.max_tick_jump
+         beyond the running max_fav is rejected as stale/garbage feed -- a single
+         spurious tick can no longer inflate max_fav and arm a lock off a price
+         that never traded. EXIT detection (SL/TP) still uses the raw bar, so a
+         real move is never missed; only the lock-arming reference is filtered.
+
+    Returns True if max_fav advanced. Emits MAXFAV_UPDATE (accepted) or records
+    the rejection through `tracer` (best-effort; telemetry never alters logic)."""
+    sgn = _sgn_of(pos.side)
+    # FLOOR at entry (sign-aware).
+    if sgn * (pos.max_fav - pos.entry_price) < 0:
+        pos.max_fav = pos.entry_price
+    cand = float(bar.high) if pos.side == 'BUY' else float(bar.low)
+    advances = sgn * (cand - pos.max_fav) > 0
+    if not advances:
+        return False
+    jump = sgn * (cand - pos.max_fav)
+    if cfg.max_tick_jump and jump > cfg.max_tick_jump:
+        # Garbage/stale extreme: do NOT let it touch max_fav.
+        if tracer is not None:
+            try:
+                tracer.maxfav_update(
+                    ticket, pos.anchor_label, now_utc=ts,
+                    position_price=pos.entry_price, max_fav=pos.max_fav,
+                    rejected_extreme=round(cand, 2), jump=round(jump, 2),
+                    reason="tick_jump_exceeds_max", accepted=False)
+            except Exception:
+                pass
+        return False
+    old = pos.max_fav
+    pos.max_fav = cand
+    if tracer is not None:
+        try:
+            tracer.maxfav_update(
+                ticket, pos.anchor_label, now_utc=ts,
+                position_price=pos.entry_price, max_fav=pos.max_fav,
+                old_max_fav=round(old, 2), tick_price=round(cand, 2),
+                accepted=True)
+        except Exception:
+            pass
+    return True
+
+
+def lock_level_for(pos: Position, cfg: Config) -> int:
+    """The lock LADDER rung currently realized by pos.current_sl (0..3), named
+    the same way fills.py classifies a close (BE / LOCK4 / TIER):
+      0 = no lock (initial SL still live)
+      1 = breakeven lock (SL at entry)
+      2 = +$4 lock
+      3 = +$8.. peak-2 tier
+    Used for telemetry lock_level and the confirmed-price gate."""
+    sgn = _sgn_of(pos.side)
+    locked = sgn * (pos.current_sl - pos.entry_price)
+    if locked >= 7.90:
+        return 3
+    if abs(locked - 4.00) <= 0.10:
+        return 2
+    if abs(locked) <= 0.10:
+        return 1
+    if locked > 0:
+        return 3  # genuine post-hold trail floor above entry
+    return 0
+
+
+def lock_ladder_prices(pos: Position, cfg: Config):
+    """The price each lock rung REQUIRES max_fav to reach before it may arm --
+    the fill-time prediction ladder (spec 1.4) and the confirmed-price gate
+    (spec Part 2.1). A rung fires ONLY if max_fav actually reaches its level."""
+    sgn = _sgn_of(pos.side)
+    e = pos.entry_price
+    return [
+        (1, round(e + sgn * 5.00, 2)),    # BE lock arms at +$5 fav (post-hold)
+        (2, round(e + sgn * 6.00, 2)),    # +$4 lock arms at +$6 fav
+        (3, round(e + sgn * 10.00, 2)),   # tier lock arms at +$10 fav
+    ]
