@@ -44,6 +44,8 @@ FILL = "FILL"
 PREDICT = "PREDICT"
 MAXFAV_UPDATE = "MAXFAV_UPDATE"
 LOCK_ARM = "LOCK_ARM"
+LOCK_CHECK = "LOCK_CHECK"
+LOCK_REJECTED_PHANTOM = "LOCK_REJECTED_PHANTOM"
 TRAIL_ADVANCE = "TRAIL_ADVANCE"
 STOP_REJECTED = "STOP_REJECTED"
 STOP_THROUGH_REARM = "STOP_THROUGH_REARM"
@@ -149,6 +151,8 @@ class PositionTracer:
     def fill(self, ticket, anchor, **kw):    return self.emit(FILL, ticket, anchor, **kw)
     def maxfav_update(self, ticket, anchor, **kw): return self.emit(MAXFAV_UPDATE, ticket, anchor, **kw)
     def lock_arm(self, ticket, anchor, **kw):     return self.emit(LOCK_ARM, ticket, anchor, **kw)
+    def lock_check(self, ticket, anchor, **kw):   return self.emit(LOCK_CHECK, ticket, anchor, **kw)
+    def lock_rejected_phantom(self, ticket, anchor, **kw): return self.emit(LOCK_REJECTED_PHANTOM, ticket, anchor, **kw)
     def trail_advance(self, ticket, anchor, **kw): return self.emit(TRAIL_ADVANCE, ticket, anchor, **kw)
     def stop_rejected(self, ticket, anchor, **kw): return self.emit(STOP_REJECTED, ticket, anchor, **kw)
     def stop_through_rearm(self, ticket, anchor, **kw): return self.emit(STOP_THROUGH_REARM, ticket, anchor, **kw)

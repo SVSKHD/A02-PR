@@ -438,17 +438,34 @@ class LiveTrader:
             return True
 
     def _ptrace_sink(self, line: str):
-        """Sink for the per-position structured trace: always to the bot log; and
-        for the loud lines (violations) also to the operator's alert channel. Must
-        NEVER raise -- telemetry can't be allowed to touch the trading loop."""
+        """Sink for the per-position structured trace: ALWAYS to the bot log (every
+        line, every occurrence -- the file record is complete). Loud lines also go
+        to Discord: a TELEMETRY_VIOLATION immediately/unrate-limited; a blocked
+        phantom lock (👻) rate-limited to 1/60s/ticket so a stuck phantom can't
+        flood. Must NEVER raise -- telemetry can't touch the trading loop."""
         try:
+            log.info(line)
             if line.startswith("PTRACE TELEMETRY_VIOLATION"):
-                log.warning(line)
-                self.tele.warn(line)
-            else:
-                log.info(line)
+                self.tele.warn(f"🚨 {line}")
+            elif line.startswith("PTRACE LOCK_REJECTED_PHANTOM"):
+                tk = self._line_ticket(line)
+                if self._rl_ok(f"phantom:{tk}", 60.0):
+                    self.tele.warn(
+                        f"👻 PHANTOM LOCK BLOCKED {tk} | {line.split('PTRACE ', 1)[-1]}")
+            elif line.startswith("PTRACE LOCK_ARM"):
+                tk = self._line_ticket(line)
+                if self._rl_ok(f"lockarm:{tk}", 60.0):
+                    self.tele.info(f"🔒 {line.split('PTRACE ', 1)[-1]}")
         except Exception:
             pass
+
+    @staticmethod
+    def _line_ticket(line: str) -> str:
+        """Pull `ticket=<id>` out of a PTRACE line for per-ticket rate-limiting."""
+        for tok in line.split():
+            if tok.startswith("ticket="):
+                return tok.split("=", 1)[1]
+        return "?"
 
     def _maybe_position_heartbeat(self):
         """v3.3.0 spec 1.3: while any position is live, emit a low-frequency

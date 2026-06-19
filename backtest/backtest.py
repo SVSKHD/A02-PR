@@ -41,7 +41,8 @@ import boosts  # v3.2.0: the SINGLE canonical lone-leg boost-trigger decision
 # filter, lock ladder) live in strategy and are exercised by the SAME imported
 # update_position_on_bar -- so the backtest can never drift from the live fix. The
 # per-position tracer is imported here too so import-path identity is assertable.
-from strategy import update_max_fav, lock_level_for, lock_ladder_prices
+from strategy import (update_max_fav, lock_level_for, lock_ladder_prices,
+                      lock_trigger_price, lock_trigger_reached)
 from position_telemetry import PositionTracer
 
 # Exposed at module level so a selftest can assert IDENTITY:
@@ -56,6 +57,7 @@ __all__ = [
     'initial_sl', 'initial_tp', 'anchor_datetime_utc', 'eod_datetime_utc',
     'resolved_anchor_hm', 'is_rescue_fill', '_branch_for', 'plan_boost_event',
     'update_max_fav', 'lock_level_for', 'lock_ladder_prices', 'PositionTracer',
+    'lock_trigger_price', 'lock_trigger_reached',
 ]
 
 LIVE_RULE_SOURCES = [
@@ -73,6 +75,7 @@ LIVE_RULE_SOURCES = [
     'rescue_log._branch_for',
     'boosts.plan_boost_event',
     'position_telemetry.PositionTracer',
+    'strategy.lock_trigger_reached',
 ]
 
 

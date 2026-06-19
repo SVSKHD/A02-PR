@@ -490,6 +490,15 @@ History (one line per behavioral change):
          selftest -> 38 steps (Groups 1-5: trail/lock, lone boost, No-OCO stack,
          telemetry/Discord, parity); import-path identity extended to the guards +
          tracer + economics.
+         (phantom-lock follow-up) EXPLICIT phantom-lock guard surfaced as a single
+         shared check (strategy.lock_trigger_reached): a lock level may apply ONLY
+         if max_fav genuinely reached its trigger price. Additive only -- lock
+         formulas / step size / rung thresholds UNCHANGED. New observability:
+         LOCK_CHECK (every evaluation, PASS|FAIL), LOCK_REJECTED_PHANTOM (a blocked
+         phantom is now countable, never silent), and a phantom_lock_applied
+         tripwire VIOLATION. Discord: 👻 PHANTOM LOCK BLOCKED (rate-limited 1/60s)
+         + 🔒 LOCK on real arm. selftest -> 40 steps (PL1-PL7); import-path identity
+         covers lock_trigger_reached. Banner stays v3.2.3.
 """
 
 __version__ = "3.2.3"
