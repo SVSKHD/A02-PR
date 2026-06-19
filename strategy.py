@@ -253,7 +253,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
                 tracer.lock_arm(
                     ticket, pos.anchor_label, now_utc=ts, side=pos.side,
                     position_price=pos.entry_price, max_fav=pos.max_fav,
-                    lock_level=_level_now,
+                    lock_level=_level_now, stop_price=round(pos.current_sl, 2),
                     required=lock_ladder_prices(pos, cfg)[min(_level_now, 3) - 1][1])
             tracer.trail_advance(
                 ticket, pos.anchor_label, now_utc=ts, side=pos.side,
@@ -363,14 +363,15 @@ def lock_level_for(pos: Position, cfg: Config) -> int:
     Used for telemetry lock_level and the confirmed-price gate."""
     sgn = _sgn_of(pos.side)
     locked = sgn * (pos.current_sl - pos.entry_price)
+    # Bucket by the PROFIT the stop locks in (a continuous post-hold trail floor
+    # maps to the nearest rung; a +$2 floor is rung 1, NOT rung 3 -- the bug that
+    # false-flagged a legitimate trail as a phantom tier-3 lock).
     if locked >= 7.90:
         return 3
-    if abs(locked - 4.00) <= 0.10:
+    if locked >= 3.90:
         return 2
-    if abs(locked) <= 0.10:
+    if locked > 0.10:
         return 1
-    if locked > 0:
-        return 3  # genuine post-hold trail floor above entry
     return 0
 
 

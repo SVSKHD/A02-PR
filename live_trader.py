@@ -177,6 +177,8 @@ class LiveTrader:
         self.ptrace = PositionTracer(sink=self._ptrace_sink)
         # throttle for POSITION_HEARTBEAT (spec 1.3): per-ticket last-emit epoch.
         self._ptrace_hb_last: Dict = {}
+        # v3.2.3: per-key Discord rate-limit clock (stop-through/trail alerts).
+        self._discord_rl: Dict = {}
 
         # Run dir for IPC files (heartbeat / status / commands)
         run_dir = os.environ.get("AUREON_RUN_DIR", "./run")
@@ -422,6 +424,19 @@ class LiveTrader:
         with open(self.heartbeat_path, "w") as f:
             f.write(datetime.now(timezone.utc).isoformat())
 
+    def _rl_ok(self, key: str, period_s: float = 60.0) -> bool:
+        """True if `key` hasn't fired within period_s (then arms it). Used to
+        rate-limit repetitive Discord alerts (stop-through re-arm, trail advance)
+        so a per-bar event can't flood the channel. Never raises."""
+        try:
+            now = time.time()
+            if now - self._discord_rl.get(key, 0.0) < period_s:
+                return False
+            self._discord_rl[key] = now
+            return True
+        except Exception:
+            return True
+
     def _ptrace_sink(self, line: str):
         """Sink for the per-position structured trace: always to the bot log; and
         for the loud lines (violations) also to the operator's alert channel. Must
@@ -462,12 +477,17 @@ class LiveTrader:
                 if ref is not None:
                     floating = round(sgn * (ref - entry) * self.cfg.contract_size
                                      * self.cfg.lot_size, 2)
+            anc = sh.get('anchor_label')
+            stack_size = sum(1 for s in self.shadow_positions.values()
+                             if s.get('anchor_label') == anc)
             try:
                 self.ptrace.heartbeat(
-                    ticket, sh.get('anchor_label'), side=sh.get('side'),
-                    current_bid=bid, current_ask=ask, position_price=entry,
+                    ticket, anc, side=sh.get('side'),
+                    bid=bid, ask=ask, position_price=entry,
                     max_fav=mf, stop_price=sh.get('current_sl'),
-                    floating_pnl=floating)
+                    boost_kind=('boost' if sh.get('boost') else None),
+                    stack_size=stack_size, floating_pnl=floating,
+                    active_lock_level=None)
             except Exception:
                 pass
 
