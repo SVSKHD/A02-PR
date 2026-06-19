@@ -203,6 +203,49 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if level < pos.current_sl:
                 pos.current_sl = level
     _sgn = 1.0 if pos.side == 'BUY' else -1.0
+
+    def _apply_lock(level, lock_price):
+        # v3.2.3 PHANTOM-LOCK GUARD (the ONE permitted logic change): a lock level
+        # may apply ONLY if max_fav has GENUINELY reached that level's trigger price
+        # (long: max_fav >= trigger; short: max_fav <= trigger). The lock-price
+        # formulas, step size, and rung thresholds are UNCHANGED -- this only adds
+        # the "max_fav reached?" guard + makes every evaluation visible. A blocked
+        # phantom leaves a LOCK_REJECTED_PHANTOM line (countable, never silent).
+        trigger = lock_trigger_price(pos.side, pos.entry_price, level)
+        reached = lock_trigger_reached(pos.side, pos.entry_price, pos.max_fav, level)
+        if tracer is not None:
+            try:
+                tracer.lock_check(
+                    ticket, pos.anchor_label, now_utc=ts, side=pos.side,
+                    position_price=pos.entry_price, max_fav=pos.max_fav,
+                    lock_level=level, lock_trigger_price=trigger,
+                    guard_result=('PASS' if reached else 'FAIL'))
+            except Exception:
+                pass
+        if not reached:
+            if tracer is not None:
+                try:
+                    tracer.lock_rejected_phantom(
+                        ticket, pos.anchor_label, now_utc=ts, side=pos.side,
+                        position_price=pos.entry_price, max_fav=pos.max_fav,
+                        lock_level=level, attempted_lock_price=round(lock_price, 2),
+                        reason="max_fav_not_reached")
+                except Exception:
+                    pass
+            return
+        # TRIPWIRE: a lock must never lock in more profit than max_fav supports.
+        # Impossible once the guard above holds; this is the loud last line.
+        if _sgn * (lock_price - pos.entry_price) > _sgn * (pos.max_fav - pos.entry_price) + 0.05:
+            if tracer is not None:
+                try:
+                    tracer.violation(ticket, pos.anchor_label, "phantom_lock_applied",
+                                     attempted_lock_price=round(lock_price, 2),
+                                     max_fav=pos.max_fav)
+                except Exception:
+                    pass
+            return
+        _ratchet(lock_price)
+
     # v3.3.0 ARM-DELAY (spec Part 2.5): nothing arms until price has CLEARED entry
     # by at least cfg.arm_buffer (>= spread + noise band). Stops the trail/lock
     # engaging during entry chop. fav is peak favorable (from the confirmed,
@@ -220,10 +263,10 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             # floor +$8. Captures most of a hold-period spike (peak +$12.8 -> lock
             # +$10.8 = +$540 @0.5) instead of a flat +$8, while $2 of room keeps
             # ordinary noise from tagging it. fav here is peak favorable (max_fav).
-            _ratchet(pos.entry_price + _sgn * max(8.00, fav - 2.00))
+            _apply_lock(3, pos.entry_price + _sgn * max(8.00, fav - 2.00))
         elif pos.role != 'rescue':
             if fav >= 6.00:
-                _ratchet(pos.entry_price + _sgn * 4.00)
+                _apply_lock(2, pos.entry_price + _sgn * 4.00)
             elif fav >= 5.00 and not in_freeze:
                 # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
                 # inside the 45m hold. Live 2026-06-16: A2/A4 hit +$5 fav early, then
@@ -231,7 +274,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
                 # to +$5 did not fix this -- the disease is the TIMING. The higher
                 # protective locks (+$6->+$4, +$10->peak-2 above) stay active inside
                 # the hold; ONLY this entry move waits for hold expiry.
-                _ratchet(pos.entry_price)
+                _apply_lock(1, pos.entry_price)
 
         if not in_freeze and fav >= cfg.be_trigger:
             if pos.side == 'BUY':
@@ -379,10 +422,25 @@ def lock_ladder_prices(pos: Position, cfg: Config):
     """The price each lock rung REQUIRES max_fav to reach before it may arm --
     the fill-time prediction ladder (spec 1.4) and the confirmed-price gate
     (spec Part 2.1). A rung fires ONLY if max_fav actually reaches its level."""
-    sgn = _sgn_of(pos.side)
     e = pos.entry_price
-    return [
-        (1, round(e + sgn * 5.00, 2)),    # BE lock arms at +$5 fav (post-hold)
-        (2, round(e + sgn * 6.00, 2)),    # +$4 lock arms at +$6 fav
-        (3, round(e + sgn * 10.00, 2)),   # tier lock arms at +$10 fav
-    ]
+    return [(L, lock_trigger_price(pos.side, e, L)) for L in (1, 2, 3)]
+
+
+# v3.2.3 PHANTOM-LOCK GUARD -- the SINGLE source of the "max_fav reached?" check,
+# imported (identity) by live, backtest, and selftest (spec PL7). The dollar fav
+# each rung requires; the lock may activate ONLY if max_fav genuinely reached it.
+_LOCK_RUNG_FAV = {1: 5.00, 2: 6.00, 3: 10.00}
+
+
+def lock_trigger_price(side: str, entry: float, level: int) -> float:
+    """The price max_fav must reach for lock `level` to be allowed to arm
+    (long: entry + fav; short: entry - fav)."""
+    return round(entry + _sgn_of(side) * _LOCK_RUNG_FAV[int(level)], 2)
+
+
+def lock_trigger_reached(side: str, entry: float, max_fav: float, level: int) -> bool:
+    """THE GUARD: True iff max_fav has GENUINELY reached lock `level`'s trigger
+    price (long: max_fav >= trigger; short: max_fav <= trigger). A lock may apply
+    ONLY when this is True -- a phantom (lock priced off a high/low that never
+    happened) is blocked here. Pure; shared everywhere."""
+    return _sgn_of(side) * (max_fav - lock_trigger_price(side, entry, level)) >= -1e-9

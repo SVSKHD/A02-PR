@@ -78,6 +78,8 @@ STEP_NAMES = {
     36: "no-oco stack",
     37: "stack economics",
     38: "telemetry full",
+    39: "phantom guard",
+    40: "phantom legit/trip",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1192,13 +1194,15 @@ class SelfTest:
                      and bt.plan_boost_event is _boosts.plan_boost_event
                      and bt.update_max_fav is _strat.update_max_fav
                      and bt.lock_level_for is _strat.lock_level_for
+                     and bt.lock_trigger_reached is _strat.lock_trigger_reached
                      and bt.PositionTracer is _ptel.PositionTracer)
             srcs = list(bt.rule_sources())
             srcs_ok = all(s in srcs for s in (
                 'strategy.update_position_on_bar', 'anchors.resolved_anchor_hm',
                 'fills.is_rescue_fill', 'rescue_log._branch_for',
                 'boosts.plan_boost_event', 'strategy.update_max_fav',
-                'position_telemetry.PositionTracer'))
+                'position_telemetry.PositionTracer',
+                'strategy.lock_trigger_reached'))
             # (b) fixture: a BUY entered at 100 with the live $30 TP exits at TP for
             #     +$1050 @ lot 0.35 -- proving the backtest replays via live logic.
             cfg = self.cfg
@@ -1749,6 +1753,121 @@ class SelfTest:
             return
         self._record(38, PASS if ok else FAIL, detail)
 
+    def _step_phantom_guard(self):
+        # v3.2.3 PHANTOM-LOCK GUARD (PL1/PL2/PL4): a lock activates ONLY if max_fav
+        # genuinely reached its trigger. PL4 max_fav init; PL1 A2 long-underwater;
+        # PL2 A3 short-underwater. The guard (strategy.lock_trigger_reached) is the
+        # SINGLE shared check; assert it would BLOCK while underwater, and that the
+        # real engine arms no lock + applies no phantom + ends non-negative.
+        from strategy import (Position, update_position_on_bar, realize_pnl_usd,
+                              lock_level_for, lock_trigger_reached)
+        from position_telemetry import PositionTracer
+        try:
+            cfg = self.cfg
+            # PL4: fresh fill -> max_fav initialized to entry (never 0/null).
+            e2 = 4155.35
+            p_init = Position('A2_10h_London', 'BUY', e2,
+                              pd.Timestamp('2026-06-19T10:00:00Z'),
+                              e2 - cfg.sl_dist, e2 + cfg.tp_dist, e2, cfg.lot_size)
+            pl4 = (p_init.max_fav == e2)
+
+            # PL1: A2 BUY underwater whole life (then the real run-up to TP). No lock
+            # may arm while underwater; the guard would BLOCK a level-1 lock there.
+            lines = []; tr = PositionTracer(sink=lines.append)
+            p = Position('A2_10h_London', 'BUY', e2, pd.Timestamp('2026-06-19T10:00:00Z'),
+                         e2 - cfg.sl_dist, e2 + cfg.tp_dist, e2, cfg.lot_size)
+            t0 = pd.Timestamp('2026-06-19T10:00:00Z'); out = None
+            lock_while_underwater = False
+            for i in range(120):
+                if i < 46:
+                    bar = pd.Series({'open': e2 - 9, 'high': e2 - 2, 'low': e2 - 10, 'close': e2 - 9})
+                else:
+                    lvl = e2 - 9 + (i - 45) * 3.0
+                    bar = pd.Series({'open': lvl - 1, 'high': lvl + 1, 'low': lvl - 2, 'close': lvl})
+                out = update_position_on_bar(p, bar, t0 + pd.Timedelta(minutes=i + 1),
+                                             cfg, tracer=tr, ticket=57163297159)
+                if i < 46 and lock_level_for(p, cfg) > 0:
+                    lock_while_underwater = True
+                if out:
+                    break
+            guard_blocks_underwater = (lock_trigger_reached('BUY', e2, e2, 1) is False)
+            no_phantom_applied = not any('phantom_lock_applied' in l for l in lines)
+            pl1 = (not lock_while_underwater and guard_blocks_underwater
+                   and no_phantom_applied and realize_pnl_usd(p, cfg) >= 0 and out == 'TP')
+
+            # PL2: A3 SELL underwater (price stays ABOVE entry). No lock; no spam.
+            e3 = 4146.95
+            tr2 = PositionTracer(sink=lambda l: None)
+            p3 = Position('A3', 'SELL', e3, pd.Timestamp('2026-06-19T13:50:00Z'),
+                          e3 + cfg.sl_dist, e3 - cfg.tp_dist, e3, cfg.lot_size)
+            t3 = pd.Timestamp('2026-06-19T13:50:00Z')
+            for i in range(40):
+                bar = pd.Series({'open': e3 + 3, 'high': e3 + 5, 'low': e3 + 1, 'close': e3 + 3})
+                update_position_on_bar(p3, bar, t3 + pd.Timedelta(minutes=i + 1),
+                                       cfg, tracer=tr2, ticket=702)
+            # the A3 attempted lock @4143.89 is below entry; a short's level-1 trigger
+            # is entry-$5 = 4141.95, which max_fav (>=entry) never reaches -> blocked.
+            pl2 = (lock_level_for(p3, cfg) == 0
+                   and lock_trigger_reached('SELL', e3, e3, 1) is False
+                   and len(tr2.violations) == 0)
+
+            ok = pl4 and pl1 and pl2
+            detail = (f"PL4_maxfav_init={pl4} PL1_A2_no_lock+result>=0={pl1} "
+                      f"PL2_A3_short_no_lock+no_spam={pl2}")
+        except Exception as e:
+            self._record(39, FAIL, f"raised: {e!r}")
+            return
+        self._record(39, PASS if ok else FAIL, detail)
+
+    def _step_phantom_legit(self):
+        # v3.2.3 PHANTOM-LOCK GUARD (PL3/PL5/PL6): the guard must NOT block a REAL
+        # lock; the tripwire must catch an applied phantom; every lock evaluation
+        # emits a full LOCK_CHECK line.
+        from strategy import (Position, update_position_on_bar, lock_trigger_reached,
+                              lock_trigger_price)
+        from position_telemetry import PositionTracer, MANDATORY_FIELDS
+        try:
+            cfg = self.cfg
+            entry = 4300.0
+            # PL3: price genuinely reaches +$10 post-hold -> guard PASS -> lock arms.
+            lines = []; tr = PositionTracer(sink=lines.append)
+            p = Position('TEST', 'BUY', entry, pd.Timestamp('2026-06-16T10:00:00Z'),
+                         entry - cfg.sl_dist, entry + cfg.tp_dist, entry, cfg.lot_size)
+            t0 = pd.Timestamp('2026-06-16T10:00:00Z')
+            for i, hi in enumerate([entry + 10, entry + 11, entry + 11]):
+                bar = pd.Series({'open': entry, 'high': hi, 'low': entry, 'close': hi})
+                update_position_on_bar(p, bar, t0 + pd.Timedelta(minutes=50 + i),
+                                       cfg, tracer=tr, ticket=900)
+            lock_checks = [l for l in lines if l.split()[1] == 'LOCK_CHECK']
+            arms = [l for l in lines if l.split()[1] == 'LOCK_ARM']
+            pass_checks = [l for l in lock_checks if 'guard_result=PASS' in l]
+            pl3 = (len(arms) >= 1 and len(pass_checks) >= 1
+                   and lock_trigger_reached('BUY', entry, entry + 10, 3) is True)
+
+            # PL6: every LOCK_CHECK carries all mandatory fields + trigger + result.
+            pl6 = (len(lock_checks) >= 1 and all(
+                all(f"{m}=" in l for m in MANDATORY_FIELDS if m != 'event_type')
+                and 'lock_trigger_price=' in l and 'guard_result=' in l
+                for l in lock_checks))
+
+            # PL5 TRIPWIRE: the guard BLOCKS a lock when max_fav < trigger (a phantom),
+            # and the tracer raises if a phantom ever APPLIES (locks > max_fav).
+            blocked = (lock_trigger_reached('BUY', 4155.35, 4155.35, 1) is False
+                       and lock_trigger_reached('BUY', 4155.35, 4157.0, 3) is False)
+            tr2 = PositionTracer(sink=lambda l: None)
+            tr2.lock_arm(7, 'A', side='BUY', position_price=4155.35, max_fav=4155.35,
+                         stop_price=4158.31, lock_level=1)   # locks +$3 off a flat peak
+            tripwire = any('lock_armed_above_max_fav' in v for v in tr2.violations)
+            pl5 = blocked and tripwire
+
+            ok = pl3 and pl6 and pl5
+            detail = (f"PL3_legit_arms(checks={len(lock_checks)},arms={len(arms)})={pl3} "
+                      f"PL6_lock_check_full={pl6} PL5_blocked+tripwire={pl5}")
+        except Exception as e:
+            self._record(40, FAIL, f"raised: {e!r}")
+            return
+        self._record(40, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -1859,6 +1978,8 @@ class SelfTest:
             self._step_nooco_stack()
             self._step_stack_economics()
             self._step_telemetry_full()
+            self._step_phantom_guard()
+            self._step_phantom_legit()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1872,7 +1993,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 39):
+        for n in range(1, 41):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -1889,12 +2010,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/38 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/40 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/38 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/40 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/38 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/40 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces
