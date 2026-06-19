@@ -91,6 +91,7 @@ except ImportError:
 
 from telemetry import telemetry_from_env, Severity
 import discord_cards as dc  # v3.1.2: startup banner as a field-grid card
+import offset_guard  # v3.2.3 Monday weekend-wake offset guard (shared, identity)
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
@@ -149,6 +150,12 @@ class LiveTrader:
     # Monday-wake + A1 hardening (eliminate the Jun-8 silent-miss)
     OFFSET_VALIDATE_RETRIES   = 10     # wake offset detect attempts
     OFFSET_VALIDATE_WAIT_S    = 30     # spacing between offset detect attempts
+    # v3.2.3 pinned weekend-wake guard constants (shared with offset_guard; these
+    # are the spec-named knobs surfaced for observability -- the existing live
+    # retry CADENCE above is unchanged, behavior-preserving).
+    WEEKEND_GAP_HOURS = 24             # first-tick gap that marks a weekend wake
+    EXPECTED_OFFSET   = 3              # MetaQuotes-Demo UTC+3
+    OFFSET_RETRY_MAX  = 3              # spec retry budget (offset_guard default)
     ANCHOR_FETCH_RETRIES      = 3      # get_m5_close attempts before giving up
     ANCHOR_FETCH_RETRY_WAIT_S = 2
     WAKE_FAILSAFE_GRACE_MIN   = 15     # alert if still asleep this long past open
@@ -695,12 +702,46 @@ class LiveTrader:
             except Exception as e:
                 ok = False
                 log.warning(f"offset detect attempt {attempt} raised: {e}")
-            if ok and off is not None and int(off) == expected:
+            # v3.2.3 additive telemetry: every detection is logged + visible.
+            confirmed = bool(ok) and off is not None and int(off) == expected
+            try:
+                self.ptrace.offset_detect(
+                    derived_offset=(int(off) if off is not None else None),
+                    expected_offset=expected,
+                    result=('CONFIRMED' if confirmed else
+                            ('BLOCKED' if attempt >= self.OFFSET_VALIDATE_RETRIES else 'RETRY')),
+                    attempt=attempt, gap_since_last_tick=None)
+            except Exception:
+                pass
+            if confirmed:
                 self.offset_validated = True
                 self.tele.success(
                     f"✅ Monday wake: broker offset confirmed +{int(off)}h "
                     f"(attempt {attempt}/{self.OFFSET_VALIDATE_RETRIES}, {reason}).")
+                # A1 RESOLVED -- Monday-morning all-clear (positive confirmation).
+                try:
+                    self.ptrace.anchor_time_resolved(
+                        scheduled_ist='0500', offset_used=int(off),
+                        result='CONFIRMED')
+                except Exception:
+                    pass
+                self.tele.success(
+                    f"🟢 A1 RESOLVED | scheduled 5:00 IST | offset +{int(off)}h "
+                    f"({reason}).")
                 return True
+            # mismatch / not-yet-confirmed: loud BEFORE A1 places.
+            try:
+                self.ptrace.offset_mismatch(
+                    derived=(int(off) if off is not None else None),
+                    expected=expected, retry_count=attempt)
+                self.ptrace.violation(None, 'A1', 'offset_mismatch',
+                                      derived=(int(off) if off is not None else None),
+                                      expected=expected, retry_count=attempt)
+            except Exception:
+                pass
+            self.tele.warn(
+                f"⛔ OFFSET MISMATCH A1 | derived {off} vs expected +{expected} "
+                f"| retry {attempt}/{self.OFFSET_VALIDATE_RETRIES}")
             log.warning(
                 f"offset validate attempt {attempt}/{self.OFFSET_VALIDATE_RETRIES}: "
                 f"got {off}h, expected {expected}h (ok={ok})")
@@ -838,6 +879,20 @@ class LiveTrader:
             # (Jun-8 cold-start: a 0h misdetect made A1 miss). Announce it so a
             # misdetect is visible immediately in Telegram on Monday wake.
             self.tele.success("📈 Market open — resuming. Week starting.")
+            # v3.2.3 WEEKEND_WAKE: log + announce the first-tick-after-gap BEFORE
+            # the offset is re-derived, so a Monday wake is always visible and the
+            # gap that triggered the re-derive is on the record.
+            try:
+                import offset_guard as _og
+                _gap_h = round(tick_age_sec / 3600.0, 1)
+                self.ptrace.weekend_wake(
+                    gap_hours=_gap_h, last_tick=None, first_tick=None,
+                    is_weekend=_og.is_weekend_wake(_gap_h, self.WEEKEND_GAP_HOURS))
+                self.tele.info(
+                    f"🌅 WEEKEND WAKE | gap {_gap_h}h | re-deriving offset "
+                    f"(expected +{self.EXPECTED_OFFSET}) | validating before A1")
+            except Exception:
+                pass
             # Guard 1: validate the broker offset BEFORE any anchor logic runs on
             # the resumed loop; Guard 5: post the readiness receipt.
             self._validate_offset_on_wake(reason=f"wake/{reason}")
@@ -1168,4 +1223,5 @@ LiveTrader._firebase_weekly_reconcile = _journal_mod._firebase_weekly_reconcile
 # is visible in Telegram).
 LOADED_MODULES = ['utils', 'config', 'strategy', 'mt5_adapter', 'backtest',
                   'state', 'risk', 'anchors', 'fills', 'trails', 'journal',
-                  'live_trader', 'bot', 'firebase_journal', 'position_telemetry']
+                  'live_trader', 'bot', 'firebase_journal', 'position_telemetry',
+                  'offset_guard']

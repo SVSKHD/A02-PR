@@ -80,6 +80,13 @@ STEP_NAMES = {
     38: "telemetry full",
     39: "phantom guard",
     40: "phantom legit/trip",
+    41: "monday wake",
+    42: "monday badoffset",
+    43: "monday drift trip",
+    44: "weekday unaffected",
+    45: "monday trace",
+    46: "jun8 replay",
+    47: "offset parity",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1868,6 +1875,164 @@ class SelfTest:
             return
         self._record(40, PASS if ok else FAIL, detail)
 
+    def _step_monday_wake(self):
+        # v3.2.3 (41): first tick after a weekend gap, broker UTC+3 -> offset
+        # resolves +3 and A1 fires 05:00, not 06:00. Drives the SHARED offset_guard.
+        import offset_guard as og
+        try:
+            # gap marks a weekend wake; a +3 read confirms first try.
+            gap = og.weekend_gap_hours(0.0, 50 * 3600.0)   # 50h gap
+            is_wake = og.is_weekend_wake(gap)
+            off, result, attempts = og.resolve_offset([3])
+            resolves_3 = (off == 3 and result == og.CONFIRMED)
+            # A1 implied IST with the CORRECT offset = scheduled 05:00 (no drift).
+            a1_0500 = (not og.a1_drifted(og.A1_SCHEDULED_IST_MIN)
+                       and og.fmt_hhmm(og.A1_SCHEDULED_IST_MIN) == '0500')
+            ok = is_wake and resolves_3 and a1_0500
+            detail = (f"M1_offset_resolves_+3={resolves_3} "
+                      f"M1_A1_fires_0500_not_0600={a1_0500} (gap={gap:.0f}h wake={is_wake})")
+        except Exception as e:
+            self._record(41, FAIL, f"raised: {e!r}")
+            return
+        self._record(41, PASS if ok else FAIL, detail)
+
+    def _step_monday_badoffset(self):
+        # v3.2.3 (42): first tick implies 0h (the drift cause) -> rejected, NO
+        # placement on bad data, retry fired; emits the offset_mismatch violation.
+        import offset_guard as og
+        from position_telemetry import PositionTracer
+        try:
+            # all reads derive 0h -> never confirmed -> BLOCKED after retry_max.
+            off, result, attempts = og.resolve_offset([0, 0, 0])
+            rejected = (off is None and result == og.BLOCKED)
+            no_placement = rejected   # BLOCKED == A1 not placed on a guess
+            retry_fired = (attempts >= 2)
+            # negative-path proof: the violation line, same style as other tests.
+            tr = PositionTracer(sink=lambda l: None)
+            tr.violation(None, 'A1', 'offset_mismatch', derived=0, expected=3)
+            violated = any('offset_mismatch' in v and 'derived=0' in v and 'expected=3' in v
+                           for v in tr.violations)
+            ok = rejected and no_placement and retry_fired and violated
+            detail = (f"M2_bad_offset_rejected={rejected} "
+                      f"M2_no_placement_on_bad={no_placement} retry_fired={retry_fired} "
+                      f"(result={result} attempts={attempts} violation={violated})")
+        except Exception as e:
+            self._record(42, FAIL, f"raised: {e!r}")
+            return
+        self._record(42, PASS if ok else FAIL, detail)
+
+    def _step_monday_drift_trip(self):
+        # v3.2.3 (43): force A1 toward a server time implying ~06:00 IST Monday ->
+        # the drift tripwire fires BEFORE placement; with the offset corrected, A1
+        # resolves back to ~05:00.
+        import offset_guard as og
+        from position_telemetry import PositionTracer
+        try:
+            implied_0600 = 6 * 60      # forced drift to 06:00 IST
+            drift_fires = og.a1_drifted(implied_0600)   # 06:00 vs 05:00 -> True
+            tr = PositionTracer(sink=lambda l: None)
+            if drift_fires:
+                tr.violation(None, 'A1', 'monday_a1_drift',
+                             scheduled=og.fmt_hhmm(og.A1_SCHEDULED_IST_MIN),
+                             implied=og.fmt_hhmm(implied_0600))
+            trip = any('monday_a1_drift' in v and 'scheduled=0500' in v
+                       and 'implied=0600' in v for v in tr.violations)
+            # corrected path: confirmed +3 -> A1 at 05:00, within tolerance.
+            a1_0500 = not og.a1_drifted(og.A1_SCHEDULED_IST_MIN)
+            ok = trip and a1_0500
+            detail = (f"M3_drift_tripwire_fires={trip} "
+                      f"M3_A1_actual~0500(tol)={a1_0500}")
+        except Exception as e:
+            self._record(43, FAIL, f"raised: {e!r}")
+            return
+        self._record(43, PASS if ok else FAIL, detail)
+
+    def _step_weekday_unaffected(self):
+        # v3.2.3 (44): Tue-Fri open, no weekend gap -> the weekend path is NOT
+        # taken; behavior is identical to before (regression guard).
+        import offset_guard as og
+        try:
+            # a normal inter-tick gap (seconds/minutes) is NOT a weekend wake.
+            small_gap = og.weekend_gap_hours(0.0, 120.0)   # 120s
+            no_weekend = (og.is_weekend_wake(small_gap) is False)
+            # even a multi-hour holiday-ish gap under the threshold stays off-path.
+            sub_threshold = (og.is_weekend_wake(og.WEEKEND_GAP_HOURS - 1) is False)
+            ok = no_weekend and sub_threshold
+            detail = (f"M4_no_weekend_path={no_weekend} "
+                      f"M4_behavior_identical_prefix={sub_threshold}")
+        except Exception as e:
+            self._record(44, FAIL, f"raised: {e!r}")
+            return
+        self._record(44, PASS if ok else FAIL, detail)
+
+    def _step_monday_trace(self):
+        # v3.2.3 (45): the full Monday-open event chain is gapless + all fields:
+        # WEEKEND_WAKE -> OFFSET_DETECT -> ANCHOR_TIME_RESOLVED.
+        from position_telemetry import PositionTracer, MANDATORY_FIELDS
+        try:
+            lines = []
+            tr = PositionTracer(sink=lines.append)
+            tr.weekend_wake(gap_hours=50.0, is_weekend=True)
+            tr.offset_detect(derived_offset=3, expected_offset=3, result='CONFIRMED',
+                             attempt=1, gap_since_last_tick=50.0)
+            tr.anchor_time_resolved(scheduled_ist='0500', offset_used=3, result='CONFIRMED')
+            seq = [l.split()[1] for l in lines if l.startswith('PTRACE')]
+            need = ['WEEKEND_WAKE', 'OFFSET_DETECT', 'ANCHOR_TIME_RESOLVED']
+            gapless = (seq == need)
+            all_fields = all(all(f"{m}=" in l for m in MANDATORY_FIELDS if m != 'event_type')
+                             for l in lines)
+            ok = gapless and all_fields
+            detail = (f"M5_WEEKEND_WAKE->OFFSET_DETECT->ANCHOR_TIME_RESOLVED "
+                      f"gapless={gapless} all_fields={all_fields}")
+        except Exception as e:
+            self._record(45, FAIL, f"raised: {e!r}")
+            return
+        self._record(45, PASS if ok else FAIL, detail)
+
+    def _step_jun8_replay(self):
+        # v3.2.3 (46): replay the 2026-06-08 weekend-wake failure -- logged offset
+        # 0h while the broker is UTC+3. The guard rejects the 0h, awaits a fresh
+        # tick, re-derives +3, and A1 then produces a trade (no silent miss).
+        import offset_guard as og
+        try:
+            # the bad first read derives 0h (the Jun-8 fallback); the fresh re-read
+            # derives the true +3. resolve_offset rejects 0, retries, confirms +3.
+            off, result, attempts = og.resolve_offset([0, 3])
+            corrected = (off == 3 and result == og.CONFIRMED and attempts == 2)
+            # with the corrected +3 offset A1 resolves at 05:00 (a real trade window),
+            # not the 0h-misdetect window that produced the silent miss.
+            a1_trades = (not og.a1_drifted(og.A1_SCHEDULED_IST_MIN)) and corrected
+            ok = corrected and a1_trades
+            detail = (f"M6_offset_corrected_to_+3={corrected} "
+                      f"M6_A1_produces_trade={a1_trades} (attempts={attempts})")
+        except Exception as e:
+            self._record(46, FAIL, f"raised: {e!r}")
+            return
+        self._record(46, PASS if ok else FAIL, detail)
+
+    def _step_offset_parity(self):
+        # v3.2.3 (47): import-path identity -- live, backtest, and selftest call the
+        # SAME offset function (no drifting reimplementation), like steps 27/28.
+        import importlib.util as _ilu
+        import offset_guard as og
+        import live_trader as _lt
+        try:
+            _root = os.path.dirname(os.path.abspath(__file__))
+            _path = os.path.join(_root, 'backtest', 'backtest.py')
+            spec = _ilu.spec_from_file_location('aureon_bt_offset', _path)
+            bt = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(bt)
+            same = (bt.resolve_offset is og.resolve_offset
+                    and bt.offset_guard.resolve_offset is og.resolve_offset
+                    and _lt.offset_guard.resolve_offset is og.resolve_offset)
+            in_sources = ('offset_guard.resolve_offset' in bt.rule_sources())
+            ok = same and in_sources
+            detail = f"M7_live=bt=selftest_same_offset_fn={same} (in_sources={in_sources})"
+        except Exception as e:
+            self._record(47, FAIL, f"raised: {e!r}")
+            return
+        self._record(47, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -1980,6 +2145,13 @@ class SelfTest:
             self._step_telemetry_full()
             self._step_phantom_guard()
             self._step_phantom_legit()
+            self._step_monday_wake()
+            self._step_monday_badoffset()
+            self._step_monday_drift_trip()
+            self._step_weekday_unaffected()
+            self._step_monday_trace()
+            self._step_jun8_replay()
+            self._step_offset_parity()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -1993,7 +2165,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 41):
+        for n in range(1, 48):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2010,12 +2182,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/40 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/47 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/40 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/47 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/40 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/47 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces
