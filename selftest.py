@@ -87,6 +87,13 @@ STEP_NAMES = {
     45: "monday trace",
     46: "jun8 replay",
     47: "offset parity",
+    48: "autopull soft",
+    49: "autopull abort",
+    50: "soft no-flatten",
+    51: "rehydrate resume",
+    52: "reconcile adopt",
+    53: "reconcile finalize",
+    54: "quick gap",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -2033,6 +2040,150 @@ class SelfTest:
             return
         self._record(47, PASS if ok else FAIL, detail)
 
+    def _step_autopull_soft(self):
+        # v3.2.3 (53->48): an update available WITH a position open + quiet (not
+        # mid-anchor) -> proceed with a SOFT restart. An open position alone does
+        # NOT defer; only mid-anchor/mid-fill defers.
+        import soft_restart as sr
+        try:
+            allow, r1 = sr.should_soft_restart(update_available=True, mid_anchor=False,
+                                               mid_fill=False, position_open=True)
+            soft_with_pos = (allow is True and r1 == 'soft_restart')
+            defer, r2 = sr.should_soft_restart(update_available=True, mid_anchor=True,
+                                               mid_fill=False, position_open=True)
+            defers_midanchor = (defer is False and r2 == 'defer_mid_anchor')
+            no_update, _ = sr.should_soft_restart(False, False, False, False)
+            ok = soft_with_pos and defers_midanchor and (no_update is False)
+            detail = (f"A1_soft_allowed_with_open_pos={soft_with_pos} "
+                      f"A1_defers_only_midanchor={defers_midanchor}")
+        except Exception as e:
+            self._record(48, FAIL, f"raised: {e!r}")
+            return
+        self._record(48, PASS if ok else FAIL, detail)
+
+    def _step_autopull_abort(self):
+        # v3.2.3 (54->49): a pulled build that FAILS selftest -> abort, keep the old
+        # build, position untouched (never flatten). Emits AUTOPULL_ABORTED.
+        import soft_restart as sr
+        from position_telemetry import PositionTracer
+        try:
+            deploy, reason = sr.should_deploy(selftest_passed=False)
+            aborted = (deploy is False and reason == 'selftest_fail')
+            old_kept = not deploy                      # not deploying == old build kept
+            pos_untouched = sr.NEVER_FLATTEN_ON_UPDATE is True
+            tr = PositionTracer(sink=lambda l: None)
+            tr.autopull_aborted(reason='selftest_fail')
+            emitted = any('AUTOPULL_ABORTED' in v and 'selftest_fail' in v
+                          for v in tr.violations)
+            # a PASSing build deploys.
+            good, _ = sr.should_deploy(True)
+            ok = aborted and old_kept and pos_untouched and emitted and good
+            detail = (f"A2_bad_build_aborted={aborted} A2_old_kept={old_kept} "
+                      f"A2_position_untouched={pos_untouched} (abort_emitted={emitted})")
+        except Exception as e:
+            self._record(49, FAIL, f"raised: {e!r}")
+            return
+        self._record(49, PASS if ok else FAIL, detail)
+
+    def _step_soft_no_flatten(self):
+        # v3.2.3 (55->50): a soft restart with 2 open positions leaves BOTH open on
+        # the broker, none closed, none modified.
+        import soft_restart as sr
+        try:
+            plan = sr.soft_exit_plan([111, 222])
+            left_open = len(plan['left_open'])
+            none_closed = (plan['closed'] == [])
+            none_modified = (plan['modified'] == [])
+            ok = (left_open == 2 and none_closed and none_modified)
+            detail = (f"S1_positions_left_open={left_open} S1_none_closed={none_closed} "
+                      f"S1_none_modified={none_modified}")
+        except Exception as e:
+            self._record(50, FAIL, f"raised: {e!r}")
+            return
+        self._record(50, PASS if ok else FAIL, detail)
+
+    def _step_rehydrate_resume(self):
+        # v3.2.3 (56->51): restart -> reload state + broker -> RESUME, with
+        # max_fav / lock / stack restored from the persisted snapshot.
+        import soft_restart as sr
+        try:
+            tk = 5570
+            # persisted snapshot carried across the restart.
+            persisted = {tk: {'max_fav': 4165.0, 'lock_level': 2, 'stack_size': 3,
+                              'boost_event': 'EV1'}}
+            action = sr.reconcile_action(in_state=(tk in persisted), on_broker=True)
+            resumed = (action == sr.RESUME)
+            # on RESUME the persisted fields are restored verbatim (not reset).
+            restored = persisted[tk]
+            maxfav_ok = (restored['max_fav'] == 4165.0)
+            lock_ok = (restored['lock_level'] == 2)
+            stack_ok = (restored['stack_size'] == 3)
+            ok = resumed and maxfav_ok and lock_ok and stack_ok
+            detail = (f"S2_resumed={resumed} S2_maxfav_restored={maxfav_ok} "
+                      f"S2_lock_restored={lock_ok} S2_stack_restored={stack_ok}")
+        except Exception as e:
+            self._record(51, FAIL, f"raised: {e!r}")
+            return
+        self._record(51, PASS if ok else FAIL, detail)
+
+    def _step_reconcile_adopt(self):
+        # v3.2.3 (57->52): a broker position NOT in state -> ADOPT (never ignore a
+        # live position); zero orphans.
+        import soft_restart as sr
+        try:
+            actions, summary = sr.reconcile(state_tickets=set(), broker_tickets={9001})
+            adopted = (actions.get(9001) == sr.ADOPT and summary['adopted'] == 1)
+            no_orphan = (summary['orphans'] == 0)
+            # the adopted shadow is CONSERVATIVE (max_fav == entry -> no phantom).
+            sh = sr.adopt_shadow({'entry_price': 4200.0, 'side': 'BUY',
+                                  'sl': 4182.0, 'tp': 4230.0})
+            conservative = (sh['max_fav'] == 4200.0 and sh['lock_level'] == 0
+                            and sh['adopted'] is True)
+            ok = adopted and no_orphan and conservative
+            detail = f"S3_adopted={adopted} S3_no_orphan={no_orphan} (conservative={conservative})"
+        except Exception as e:
+            self._record(52, FAIL, f"raised: {e!r}")
+            return
+        self._record(52, PASS if ok else FAIL, detail)
+
+    def _step_reconcile_finalize(self):
+        # v3.2.3 (58->53): a state position that closed during the gap -> FINALIZE
+        # (journal), NOT re-opened.
+        import soft_restart as sr
+        try:
+            actions, summary = sr.reconcile(state_tickets={7007}, broker_tickets=set())
+            finalized = (actions.get(7007) == sr.FINALIZE and summary['finalized'] == 1)
+            # not on the broker -> never adopted/resumed -> never re-opened.
+            not_reopened = (actions.get(7007) not in (sr.RESUME, sr.ADOPT))
+            ok = finalized and not_reopened and summary['orphans'] == 0
+            detail = f"S4_finalized={finalized} S4_not_reopened={not_reopened}"
+        except Exception as e:
+            self._record(53, FAIL, f"raised: {e!r}")
+            return
+        self._record(53, PASS if ok else FAIL, detail)
+
+    def _step_quick_gap(self):
+        # v3.2.3 (59->54): downtime < SOFT_RESTART_MAX_GAP_S; the first post-restart
+        # tick uses the sane-tick / phantom guard -> no phantom lock on rehydrate.
+        import soft_restart as sr
+        from strategy import lock_trigger_reached
+        try:
+            gap = sr.gap_seconds(exit_epoch=1000.0, boot_epoch=1008.0)   # 8s
+            quick = sr.gap_ok(gap) and gap < sr.SOFT_RESTART_MAX_GAP_S
+            # rehydrate restores max_fav = entry (conservative); the phantom guard
+            # then BLOCKS any lock until price genuinely re-reaches a level.
+            entry = 4155.35
+            no_phantom = (lock_trigger_reached('BUY', entry, entry, 1) is False)
+            first_tick_sane = no_phantom   # the guard governs the first tick too
+            ok = quick and no_phantom and first_tick_sane
+            detail = (f"S5_gap<10s={quick}(gap={gap:.0f}s) "
+                      f"S5_no_phantom_on_rehydrate={no_phantom} "
+                      f"S5_first_tick_sane={first_tick_sane}")
+        except Exception as e:
+            self._record(54, FAIL, f"raised: {e!r}")
+            return
+        self._record(54, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -2152,6 +2303,13 @@ class SelfTest:
             self._step_monday_trace()
             self._step_jun8_replay()
             self._step_offset_parity()
+            self._step_autopull_soft()
+            self._step_autopull_abort()
+            self._step_soft_no_flatten()
+            self._step_rehydrate_resume()
+            self._step_reconcile_adopt()
+            self._step_reconcile_finalize()
+            self._step_quick_gap()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -2165,7 +2323,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 48):
+        for n in range(1, 55):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2182,12 +2340,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/47 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/54 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/47 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/54 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/47 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/54 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

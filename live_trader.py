@@ -92,6 +92,7 @@ except ImportError:
 from telemetry import telemetry_from_env, Severity
 import discord_cards as dc  # v3.1.2: startup banner as a field-grid card
 import offset_guard  # v3.2.3 Monday weekend-wake offset guard (shared, identity)
+import soft_restart  # v3.2.3 soft self-update / restart-reconcile (shared, identity)
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
@@ -186,6 +187,8 @@ class LiveTrader:
         self._ptrace_hb_last: Dict = {}
         # v3.2.3: per-key Discord rate-limit clock (stop-through/trail alerts).
         self._discord_rl: Dict = {}
+        # v3.2.3: post the RESUME/ADOPT/FINALIZE reconcile summary once after boot.
+        self._reconcile_logged: bool = False
 
         # Run dir for IPC files (heartbeat / status / commands)
         run_dir = os.environ.get("AUREON_RUN_DIR", "./run")
@@ -755,6 +758,67 @@ class LiveTrader:
             f"will keep alerting; no anchor will place until the offset validates.")
         return False
 
+    def _soft_update_available(self) -> bool:
+        """True iff origin has commits ahead of HEAD (ff-only). Guarded subprocess;
+        any failure (no git, offline) -> False (never self-restart on uncertainty).
+        Pure read -- does NOT pull. The relaunch path validates before deploying."""
+        try:
+            import subprocess
+            root = os.path.dirname(os.path.abspath(__file__))
+            subprocess.run(["git", "fetch", "--quiet", "origin"], cwd=root,
+                           timeout=30, check=False)
+            local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                                   capture_output=True, text=True, timeout=10)
+            remote = subprocess.run(["git", "rev-parse", "@{u}"], cwd=root,
+                                    capture_output=True, text=True, timeout=10)
+            return (local.returncode == 0 and remote.returncode == 0
+                    and local.stdout.strip() != remote.stdout.strip())
+        except Exception as e:
+            log.warning(f"soft-update check failed (non-fatal): {e!r}")
+            return False
+
+    def _perform_soft_restart(self, reason: str = "update") -> bool:
+        """SOFT restart: persist full state + hand off to the watchdog WITHOUT
+        touching any position. Positions live on the broker and are reconciled on
+        the next boot (RESUME/ADOPT/FINALIZE). NEVER flattens (spec
+        NEVER_FLATTEN_ON_UPDATE). Writes a restart-request the watchdog relaunches
+        from; returns True once the clean handoff is recorded. Does NOT itself kill
+        the process (the watchdog owns relaunch -> measured downtime < 10s)."""
+        import soft_restart as _soft
+        try:
+            n_pos = len(self.shadow_positions)
+            n_pend = len(self.shadow_pendings)
+            snap = _soft.snapshot_summary(self.shadow_positions, self.shadow_pendings,
+                                          self._rescue_events)
+            try:
+                self.ptrace.soft_restart_snapshot(**snap)
+            except Exception:
+                pass
+            self.tele.info(
+                f"💾 SOFT RESTART | {n_pos} positions persisted | NOT flattening "
+                f"({reason})")
+            # Persist EVERYTHING before handoff (positions stay open on the broker).
+            self._save_state()
+            plan = _soft.soft_exit_plan(self.shadow_positions.keys())
+            try:
+                self.ptrace.soft_restart_exit(clean=True,
+                                              positions_left_open=len(plan["left_open"]),
+                                              gap_start_ts=time.time())
+            except Exception:
+                pass
+            # Hand off: a restart-request file the watchdog acts on (relaunch via the
+            # venv python). We deliberately do NOT close/modify any position/pending.
+            try:
+                with open(os.path.join(self.run_dir, "restart.request"), "w") as f:
+                    f.write(json.dumps({"reason": reason, "ts": time.time(),
+                                        "positions_left_open": len(plan["left_open"])}))
+            except Exception as e:
+                log.warning(f"restart.request write failed: {e!r}")
+            return True
+        except Exception as e:
+            log.warning(f"soft restart handoff failed (non-fatal): {e!r}")
+            return False
+
     def _post_readiness(self, reason: str = "startup") -> None:
         """Guard 5: one-line Telegram readiness receipt so the human can see at a
         glance the bot is correctly armed for A1. Never raises."""
@@ -1224,4 +1288,4 @@ LiveTrader._firebase_weekly_reconcile = _journal_mod._firebase_weekly_reconcile
 LOADED_MODULES = ['utils', 'config', 'strategy', 'mt5_adapter', 'backtest',
                   'state', 'risk', 'anchors', 'fills', 'trails', 'journal',
                   'live_trader', 'bot', 'firebase_journal', 'position_telemetry',
-                  'offset_guard']
+                  'offset_guard', 'soft_restart']

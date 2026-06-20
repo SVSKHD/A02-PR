@@ -58,6 +58,12 @@ WEEKEND_WAKE = "WEEKEND_WAKE"
 OFFSET_DETECT = "OFFSET_DETECT"
 OFFSET_MISMATCH = "OFFSET_MISMATCH"
 ANCHOR_TIME_RESOLVED = "ANCHOR_TIME_RESOLVED"
+# v3.2.3 soft self-update / restart-reconcile (system-level; ticket may be null)
+SOFT_RESTART_SNAPSHOT = "SOFT_RESTART_SNAPSHOT"
+SOFT_RESTART_EXIT = "SOFT_RESTART_EXIT"
+SOFT_RESTART_REHYDRATE = "SOFT_RESTART_REHYDRATE"
+RECONCILE = "RECONCILE"
+RECONCILE_SUMMARY = "RECONCILE_SUMMARY"
 VIOLATION = "TELEMETRY_VIOLATION"
 
 # Mandatory fields on EVERY line (spec B2). A missing field is the failure we are
@@ -170,6 +176,16 @@ class PositionTracer:
     def offset_detect(self, anchor="A1", **kw):   return self.emit(OFFSET_DETECT, None, anchor, **kw)
     def offset_mismatch(self, anchor="A1", **kw): return self.emit(OFFSET_MISMATCH, None, anchor, **kw)
     def anchor_time_resolved(self, anchor="A1", **kw): return self.emit(ANCHOR_TIME_RESOLVED, None, anchor, **kw)
+    # v3.2.3 soft self-update / restart-reconcile.
+    def soft_restart_snapshot(self, **kw): return self.emit(SOFT_RESTART_SNAPSHOT, None, "SYS", **kw)
+    def soft_restart_exit(self, **kw):     return self.emit(SOFT_RESTART_EXIT, None, "SYS", **kw)
+    def soft_restart_rehydrate(self, **kw): return self.emit(SOFT_RESTART_REHYDRATE, None, "SYS", **kw)
+    def reconcile(self, ticket=None, **kw): return self.emit(RECONCILE, ticket, "SYS", **kw)
+    def reconcile_summary(self, **kw):     return self.emit(RECONCILE_SUMMARY, None, "SYS", **kw)
+    def reconcile_orphan(self, ticket, **kw):
+        return self.violation(ticket, "SYS", "reconcile_orphan", **kw)
+    def autopull_aborted(self, reason="selftest_fail", **kw):
+        return self.violation(None, "SYS", "AUTOPULL_ABORTED", abort_reason=reason, **kw)
 
     def predict(self, ticket, anchor, side, entry, sl, tp, max_loss, max_gain,
                 trigger=10.0, breakeven_per_pos=6.0, **kw):
