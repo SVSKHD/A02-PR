@@ -20,6 +20,7 @@ from telemetry import telemetry_from_env, Severity, md_escape, anchor_time_block
 from mt5_adapter import _MT5_RETCODE_MAP
 import discord_cards as dc  # v3.1.0: rich embed cards (pure; safe to import)
 import boosts  # v3.2.0: the SINGLE canonical lone-leg boost-trigger decision
+import soft_restart as _soft  # v3.2.3: restart-reconcile classifier (pure, shared)
 
 log = logging.getLogger("AUREON")
 
@@ -118,6 +119,35 @@ def _reconcile_with_broker(self):
 
     broker_pos_tickets  = {int(p.ticket) for p in broker_positions}
     broker_pend_tickets = {int(o.ticket) for o in broker_pendings}
+
+    # v3.2.3 SOFT-RESTART RECONCILE (observability; first reconcile after boot):
+    # classify every ticket across persisted-state ∪ live-broker as RESUME / ADOPT
+    # / FINALIZE and post a one-line summary. A live broker position is NEVER left
+    # unmanaged -- a non-zero orphan count trips a loud violation. Pure classifier
+    # (soft_restart); this only LOGS, the existing rehydrate/promote/close paths
+    # below do the actual work (behavior unchanged).
+    if not getattr(self, '_reconcile_logged', False):
+        try:
+            _state_tk = set(int(k) for k in (self._pending_shadow_rehydrate or {}).keys()) \
+                | set(self.shadow_positions.keys())
+            _actions, _summary = _soft.reconcile(_state_tk, broker_pos_tickets)
+            tr = getattr(self, 'ptrace', None)
+            if tr is not None:
+                for _tk, _act in _actions.items():
+                    tr.reconcile(ticket=_tk, in_state=(_tk in _state_tk),
+                                 on_broker=(_tk in broker_pos_tickets), action=_act)
+                tr.reconcile_summary(**_summary)
+                for _tk in broker_pos_tickets:
+                    if _actions.get(_tk) not in (_soft.RESUME, _soft.ADOPT):
+                        tr.reconcile_orphan(_tk)  # tripwire (must never fire)
+            if _summary['adopted'] or _summary['resumed'] or _summary['finalized']:
+                self.tele.info(
+                    f"⚡ REHYDRATED | resumed {_summary['resumed']} adopted "
+                    f"{_summary['adopted']} finalized {_summary['finalized']} | "
+                    f"orphans {_summary['orphans']}")
+        except Exception as _re:
+            log.warning(f"reconcile telemetry failed (non-fatal): {_re!r}")
+        self._reconcile_logged = True
 
     # v2.5: REHYDRATE from persisted state for any broker position we don't
     # already track in-memory. This handles bot restart mid-trade so we

@@ -511,6 +511,21 @@ History (one line per behavioral change):
          places), 🟢 A1 RESOLVED (Monday all-clear). selftest -> 47 steps (41-47:
          monday wake / badoffset / drift-trip / weekday-unaffected / trace / Jun-8
          replay / offset parity); import-path identity covers offset_guard.resolve_offset.
+         (soft-restart follow-up) SOFT self-update + restart-reconcile. Positions
+         live on the BROKER, so a restart never closes them; the risk is returning
+         BLIND. Pure shared decision module (soft_restart): the auto-pull gate
+         (an open position does NOT defer; only mid-anchor/mid-fill defers), the
+         deploy gate (selftest must ALL-PASS or abort + keep old build), and the
+         RESUME/ADOPT/FINALIZE reconcile classifier (a live broker position is
+         NEVER orphaned). Constants SOFT_RESTART, SOFT_RESTART_MAX_GAP_S=10,
+         PERSIST_OPEN_POSITIONS, RECONCILE_ON_BOOT, NEVER_FLATTEN_ON_UPDATE. The
+         soft restart persists full state + hands off to the watchdog WITHOUT
+         touching any position/pending. New observability: SOFT_RESTART_SNAPSHOT /
+         _EXIT / _REHYDRATE, RECONCILE (per ticket) + RECONCILE_SUMMARY + the
+         reconcile_orphan / AUTOPULL_ABORTED tripwires; Discord 💾/⚡/🚨/🚀.
+         Additive only -- trade logic UNCHANGED (backtest RAW net identical).
+         selftest -> 54 steps (soft-restart 48-54: autopull-soft / abort / no-flatten
+         / rehydrate-resume / reconcile-adopt / -finalize / quick-gap).
 """
 
 __version__ = "3.2.3"
