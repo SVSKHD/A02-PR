@@ -45,7 +45,11 @@ from strategy import (update_max_fav, lock_level_for, lock_ladder_prices,
                       lock_trigger_price, lock_trigger_reached)
 from position_telemetry import PositionTracer
 import offset_guard  # v3.2.3 Monday weekend-wake offset guard (shared, identity)
+import break_hold    # v3.2.3 Feature D: break-and-hold filter (shared, identity)
+import fp_guard      # v3.2.3 Feature E: FP exposure guard (shared, identity)
 resolve_offset = offset_guard.resolve_offset
+evaluate_break = break_hold.evaluate_break
+fp_guard_check = fp_guard.fp_guard
 
 # Exposed at module level so a selftest can assert IDENTITY:
 #   backtest.update_position_on_bar IS strategy.update_position_on_bar
@@ -60,6 +64,7 @@ __all__ = [
     'resolved_anchor_hm', 'is_rescue_fill', '_branch_for', 'plan_boost_event',
     'update_max_fav', 'lock_level_for', 'lock_ladder_prices', 'PositionTracer',
     'lock_trigger_price', 'lock_trigger_reached', 'resolve_offset', 'offset_guard',
+    'break_hold', 'evaluate_break', 'fp_guard', 'fp_guard_check',
 ]
 
 LIVE_RULE_SOURCES = [
@@ -79,6 +84,8 @@ LIVE_RULE_SOURCES = [
     'position_telemetry.PositionTracer',
     'strategy.lock_trigger_reached',
     'offset_guard.resolve_offset',
+    'break_hold.evaluate_break',
+    'fp_guard.fp_guard',
 ]
 
 

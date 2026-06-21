@@ -526,6 +526,19 @@ History (one line per behavioral change):
          Additive only -- trade logic UNCHANGED (backtest RAW net identical).
          selftest -> 54 steps (soft-restart 48-54: autopull-soft / abort / no-flatten
          / rehydrate-resume / reconcile-adopt / -finalize / quick-gap).
+         (build-list follow-up) Feature D break-and-hold filter (break_hold): do NOT
+         stack on the first break -- only on a CONFIRMED break (clears edge by
+         break_dist_x, holds hold_candles_n candles, retrace < max_retrace_y); a
+         spike that reverses = FAILED -> fire nothing (kills 14:30/15:30 fake-outs).
+         Feature E lot config + FP guard (fp_guard): pre-trade worst-case-stack
+         check vs the account FP rule (STANDARD_5PCT $2,500 / FPZERO_1PCT $500) at
+         the chosen lot -> OK / REDUCE / BLOCK. Feature C 5-long No-OCO stack behind
+         allow_5_long (DEFAULT OFF; cap stays 3 = test-36 unchanged): when on, the
+         winning side caps at 5 (original + 2 RALLY + 2 RESCUE-converts), FP-gated.
+         Both gates wired as additive preconditions in the live boost trigger;
+         BREAK_EVAL / FP_GUARD telemetry + Discord 🚦/🛡️. Trade core UNCHANGED
+         (backtest RAW net identical). selftest -> 68 steps (D 55-59, E 60-63,
+         C 64-68); import-path identity covers break_hold + fp_guard. Banner v3.2.3.
 """
 
 __version__ = "3.2.3"

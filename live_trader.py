@@ -93,6 +93,8 @@ from telemetry import telemetry_from_env, Severity
 import discord_cards as dc  # v3.1.2: startup banner as a field-grid card
 import offset_guard  # v3.2.3 Monday weekend-wake offset guard (shared, identity)
 import soft_restart  # v3.2.3 soft self-update / restart-reconcile (shared, identity)
+import break_hold    # v3.2.3 Feature D: break-and-hold filter (shared, identity)
+import fp_guard      # v3.2.3 Feature E: FP exposure guard (shared, identity)
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
@@ -1274,6 +1276,8 @@ LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
 LiveTrader._check_boost_triggers    = _fills_mod._check_boost_triggers
 LiveTrader._fire_boost_event        = _fills_mod._fire_boost_event
 LiveTrader._enforce_boost_cap       = _fills_mod._enforce_boost_cap
+LiveTrader._break_and_hold_ok       = _fills_mod._break_and_hold_ok
+LiveTrader._fp_guard_ok             = _fills_mod._fp_guard_ok
 LiveTrader._anchor_evt_block        = _fills_mod._anchor_evt_block
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close
 LiveTrader._write_journal           = _journal_mod._write_journal
@@ -1288,4 +1292,4 @@ LiveTrader._firebase_weekly_reconcile = _journal_mod._firebase_weekly_reconcile
 LOADED_MODULES = ['utils', 'config', 'strategy', 'mt5_adapter', 'backtest',
                   'state', 'risk', 'anchors', 'fills', 'trails', 'journal',
                   'live_trader', 'bot', 'firebase_journal', 'position_telemetry',
-                  'offset_guard', 'soft_restart']
+                  'offset_guard', 'soft_restart', 'break_hold', 'fp_guard']

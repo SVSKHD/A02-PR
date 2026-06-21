@@ -94,6 +94,20 @@ STEP_NAMES = {
     52: "reconcile adopt",
     53: "reconcile finalize",
     54: "quick gap",
+    55: "break fakespike",
+    56: "break holds",
+    57: "break continuation",
+    58: "break retrace",
+    59: "break holdshort",
+    60: "fp 0.15 ok",
+    61: "fp 0.35 breach",
+    62: "fp zero blocks",
+    63: "fp lot config",
+    64: "stack5 cap",
+    65: "stack5 loser out",
+    66: "stack5 fp gate",
+    67: "stack5 whipsaw",
+    68: "stack5 cap viol",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -2184,6 +2198,230 @@ class SelfTest:
             return
         self._record(54, PASS if ok else FAIL, detail)
 
+    # ---- Feature D: break-and-hold filter (the profit decider) -----------
+    def _step_break_fakespike(self):
+        # 55: a spike that clears the edge then reverses back through it = FAILED
+        # break -> fire NOTHING (the 14:30/15:30 fake-out).
+        import break_hold as bh
+        try:
+            cfg = self.cfg; edge = 100.0
+            candles = [{'high': edge + 3, 'low': edge + 0.5, 'close': edge + 2},
+                       {'high': edge + 1, 'low': edge - 1.0, 'close': edge - 0.5}]
+            res = bh.evaluate_break('BUY', edge, candles, cfg)
+            no_fire = (res == bh.FAILED) and (bh.may_stack('BUY', edge, candles, cfg) is False)
+            ok = no_fire
+            detail = f"fake_spike->no_fire={no_fire} (result={res})"
+        except Exception as e:
+            self._record(55, FAIL, f"raised: {e!r}"); return
+        self._record(55, PASS if ok else FAIL, detail)
+
+    def _step_break_holds(self):
+        # 56: a real break that clears X, holds N candles, retraces < Y -> CONFIRMED
+        # -> stack allowed (proves the filter doesn't block real breaks).
+        import break_hold as bh
+        try:
+            cfg = self.cfg; edge = 100.0
+            candles = [{'high': edge + 4, 'low': edge + 2.5, 'close': edge + 3.5},
+                       {'high': edge + 4, 'low': edge + 3.0, 'close': edge + 3.8}]
+            res = bh.evaluate_break('BUY', edge, candles, cfg)
+            ok = (res == bh.CONFIRMED) and (bh.may_stack('BUY', edge, candles, cfg) is True)
+            detail = f"real_break_holds->stack={ok} (result={res})"
+        except Exception as e:
+            self._record(56, FAIL, f"raised: {e!r}"); return
+        self._record(56, PASS if ok else FAIL, detail)
+
+    def _step_break_continuation(self):
+        # 57: after a FAILED up-spike, a DOWN break that holds -> CONFIRMED (the
+        # post-spike continuation is caught on the other side).
+        import break_hold as bh
+        try:
+            cfg = self.cfg
+            up_edge = 100.0
+            up = [{'high': up_edge + 3, 'low': up_edge + 0.5, 'close': up_edge + 2},
+                  {'high': up_edge + 1, 'low': up_edge - 1.0, 'close': up_edge - 0.5}]
+            up_failed = (bh.evaluate_break('BUY', up_edge, up, cfg) == bh.FAILED)
+            dn_edge = 98.0
+            dn = [{'low': dn_edge - 3, 'high': dn_edge - 0.5, 'close': dn_edge - 2},
+                  {'low': dn_edge - 4, 'high': dn_edge - 2.5, 'close': dn_edge - 3.5}]
+            # tighten so retrace stays < Y
+            dn = [{'low': 95.0, 'high': 95.5, 'close': 95.2},
+                  {'low': 94.0, 'high': 94.5, 'close': 94.2}]
+            dn_ok = (bh.evaluate_break('SELL', dn_edge, dn, cfg) == bh.CONFIRMED)
+            ok = up_failed and dn_ok
+            detail = f"up_spike_failed={up_failed} down_continuation_caught={dn_ok}"
+        except Exception as e:
+            self._record(57, FAIL, f"raised: {e!r}"); return
+        self._record(57, PASS if ok else FAIL, detail)
+
+    def _step_break_retrace(self):
+        # 58: cleared + held but retraced >= Y of the break distance -> FAILED.
+        import break_hold as bh
+        try:
+            cfg = self.cfg; edge = 100.0
+            candles = [{'high': edge + 4, 'low': edge + 0.5, 'close': edge + 1},
+                       {'high': edge + 3, 'low': edge + 1.0, 'close': edge + 2}]
+            res = bh.evaluate_break('BUY', edge, candles, cfg)
+            ok = (res == bh.FAILED) and (bh.may_stack('BUY', edge, candles, cfg) is False)
+            detail = f"retrace>Y->no_fire={ok} (result={res})"
+        except Exception as e:
+            self._record(58, FAIL, f"raised: {e!r}"); return
+        self._record(58, PASS if ok else FAIL, detail)
+
+    def _step_break_holdshort(self):
+        # 59: cleared but only held < N candles -> PENDING -> no fire (yet).
+        import break_hold as bh
+        try:
+            cfg = self.cfg; edge = 100.0
+            candles = [{'high': edge + 3, 'low': edge + 1, 'close': edge + 2}]  # 1 < N=2
+            res = bh.evaluate_break('BUY', edge, candles, cfg)
+            ok = (res == bh.PENDING) and (bh.may_stack('BUY', edge, candles, cfg) is False)
+            detail = f"hold<N->no_fire={ok} (result={res})"
+        except Exception as e:
+            self._record(59, FAIL, f"raised: {e!r}"); return
+        self._record(59, PASS if ok else FAIL, detail)
+
+    # ---- Feature E: lot config + FP-rule guard ---------------------------
+    def _step_fp_015_ok(self):
+        # 60: a 5-long stack at 0.15 floats < 5% ($2,500) -> OK, all 5 allowed.
+        import fp_guard as fp
+        try:
+            action, wc, lim, allowed = fp.fp_guard(5, 0.15, 18.0, 'STANDARD_5PCT', 50000.0)
+            ok = (action == fp.OK and wc <= lim and allowed == 5 and abs(wc - 1350.0) < 1)
+            detail = f"0.15_under_5pct={ok} (wc=${wc:.0f} lim=${lim:.0f} allowed={allowed})"
+        except Exception as e:
+            self._record(60, FAIL, f"raised: {e!r}"); return
+        self._record(60, PASS if ok else FAIL, detail)
+
+    def _step_fp_035_breach(self):
+        # 61: a 5-long stack at 0.35 floats > 5% -> REDUCE to the largest that fits.
+        import fp_guard as fp
+        try:
+            action, wc, lim, allowed = fp.fp_guard(5, 0.35, 18.0, 'STANDARD_5PCT', 50000.0)
+            ok = (action == fp.REDUCE and wc > lim and allowed == 3 and abs(wc - 3150.0) < 1)
+            detail = f"0.35_flags_breach={ok} (action={action} wc=${wc:.0f} allowed={allowed})"
+        except Exception as e:
+            self._record(61, FAIL, f"raised: {e!r}"); return
+        self._record(61, PASS if ok else FAIL, detail)
+
+    def _step_fp_zero_blocks(self):
+        # 62: FP-Zero (1% = $500) blocks a 5-long at the demo lot (can't fit 5).
+        import fp_guard as fp
+        try:
+            action, wc, lim, allowed = fp.fp_guard(5, 0.35, 18.0, 'FPZERO_1PCT', 50000.0)
+            blocked = (action != fp.OK and allowed < 5 and lim == 500.0)
+            # even at FP-safe 0.15, 5-long doesn't fit 1% -> still reduced below 5.
+            a2, _, _, allowed2 = fp.fp_guard(5, 0.15, 18.0, 'FPZERO_1PCT', 50000.0)
+            ok = blocked and allowed2 < 5
+            detail = f"FPZero_blocks_5long={ok} (action={action} allowed={allowed}/{allowed2})"
+        except Exception as e:
+            self._record(62, FAIL, f"raised: {e!r}"); return
+        self._record(62, PASS if ok else FAIL, detail)
+
+    def _step_fp_lot_config(self):
+        # 63: the FP guard reads the lot from cfg everywhere (guard_cfg) -- changing
+        # the configured lot changes the worst-case exposure.
+        import dataclasses, fp_guard as fp
+        try:
+            cfg = self.cfg
+            a1, wc1, _, _ = fp.guard_cfg(5, dataclasses.replace(cfg, lot_size=0.15,
+                                          account_profile='STANDARD_5PCT'), 50000.0)
+            a2, wc2, _, _ = fp.guard_cfg(5, dataclasses.replace(cfg, lot_size=0.35,
+                                          account_profile='STANDARD_5PCT'), 50000.0)
+            applies = (wc1 < wc2 and abs(wc1 - 1350.0) < 1 and abs(wc2 - 3150.0) < 1)
+            ok = applies
+            detail = f"lot_config_applies_everywhere={applies} (0.15->${wc1:.0f} 0.35->${wc2:.0f})"
+        except Exception as e:
+            self._record(63, FAIL, f"raised: {e!r}"); return
+        self._record(63, PASS if ok else FAIL, detail)
+
+    # ---- Feature C: 5-long No-OCO stack (DEFAULT OFF, flag-gated) ---------
+    def _step_stack5_cap(self):
+        # 64: allow_5_long raises the winning-side cap 3 -> 5; default stays 3
+        # (test-36 cap-at-3 invariant unchanged).
+        import dataclasses, boosts as b
+        try:
+            cfg = self.cfg
+            cfg5 = dataclasses.replace(cfg, allow_5_long=True)
+            default_3 = (b.stack_cap(cfg) == 3 and b.stack_winners(cfg) == 3)
+            five = (b.stack_cap(cfg5) == 5 and b.stack_winners(cfg5) == 5)
+            ok = default_3 and five
+            detail = f"default_cap3={default_3} allow_5_long->cap5={five}"
+        except Exception as e:
+            self._record(64, FAIL, f"raised: {e!r}"); return
+        self._record(64, PASS if ok else FAIL, detail)
+
+    def _step_stack5_loser_out(self):
+        # 65: at full 5-long the peak is 5 winners + 1 losing leg (6 legs); once the
+        # loser SLs and is CLOSED it leaves exposure (5 winners remain).
+        import dataclasses, boosts as b
+        try:
+            cfg5 = dataclasses.replace(self.cfg, allow_5_long=True)
+            lots_peak, usd_peak = b.stack_peak_exposure(cfg5)   # (5+1)*0.35 = 2.10
+            lot = float(cfg5.lot_size)
+            winners_only = round(b.stack_winners(cfg5) * lot, 2)  # 5*0.35 = 1.75
+            ok = (abs(lots_peak - 2.10) < 1e-6 and abs(winners_only - 1.75) < 1e-6
+                  and winners_only < lots_peak)
+            detail = (f"peak_6legs={lots_peak}lot loser_closed->{winners_only}lot "
+                      f"(loser_out={winners_only < lots_peak})")
+        except Exception as e:
+            self._record(65, FAIL, f"raised: {e!r}"); return
+        self._record(65, PASS if ok else FAIL, detail)
+
+    def _step_stack5_fp_gate(self):
+        # 66: a 5-long at 0.35 BREACHES 5% and must be reduced/blocked; at 0.15 it
+        # fits -> the 5-long is only allowed when the FP guard passes.
+        import fp_guard as fp
+        try:
+            a035, _, _, n035 = fp.fp_guard(5, 0.35, 18.0, 'STANDARD_5PCT', 50000.0)
+            a015, _, _, n015 = fp.fp_guard(5, 0.15, 18.0, 'STANDARD_5PCT', 50000.0)
+            ok = (a035 != fp.OK and n035 < 5 and a015 == fp.OK and n015 == 5)
+            detail = f"5long@0.35_gated={a035}(n={n035}) 5long@0.15_ok={a015}(n={n015})"
+        except Exception as e:
+            self._record(66, FAIL, f"raised: {e!r}"); return
+        self._record(66, PASS if ok else FAIL, detail)
+
+    def _step_stack5_whipsaw(self):
+        # 67: 5 winners stalling below break-even (~$126/pos) then reversing, with
+        # the losing leg -$630, must net NEGATIVE and class WHIPSAW (logged honestly).
+        import dataclasses, boosts as b
+        from rescue_log import _branch_for
+        try:
+            cfg5 = dataclasses.replace(self.cfg, allow_5_long=True)
+            per_be = b.per_position_breakeven_usd(cfg5)          # 630/5 = 126
+            net_whip = round(b.stack_winners(cfg5) * 100.0 - b.stack_breakeven_usd(cfg5), 2)
+            whip = (net_whip < 0 and _branch_for(net_whip) == 'WHIPSAW_LOSS')
+            net_win = round(b.stack_winners(cfg5) * 200.0 - b.stack_breakeven_usd(cfg5), 2)
+            be_ok = abs(per_be - 126.0) < 1.0 and net_win > 0
+            ok = whip and be_ok
+            detail = (f"whipsaw(net={net_whip:.0f})={whip} per_be=${per_be:.0f} "
+                      f"win(net={net_win:.0f})>0={net_win>0}")
+        except Exception as e:
+            self._record(67, FAIL, f"raised: {e!r}"); return
+        self._record(67, PASS if ok else FAIL, detail)
+
+    def _step_stack5_cap_viol(self):
+        # 68: stack_size beyond the active cap trips a violation -- 6>5 (5-long on),
+        # 4>3 (default off). 5 at cap 5 and 3 at cap 3 do NOT trip.
+        from position_telemetry import PositionTracer
+        try:
+            tr = PositionTracer(sink=lambda l: None)
+            tr.boost_fire(1, 'A', side='BUY', boost_kind='RALLY', stack_size=6,
+                          stack_cap=5, move_dollars=10.0, trigger=10.0)
+            six_over5 = any('stack_size_exceeds_cap' in v for v in tr.violations)
+            tr2 = PositionTracer(sink=lambda l: None)
+            tr2.boost_fire(2, 'A', side='BUY', boost_kind='RALLY', stack_size=5,
+                           stack_cap=5, move_dollars=10.0, trigger=10.0)
+            five_ok = (len(tr2.violations) == 0)
+            tr3 = PositionTracer(sink=lambda l: None)   # default cap 3 (no stack_cap field)
+            tr3.boost_fire(3, 'A', side='BUY', boost_kind='RALLY', stack_size=4,
+                           move_dollars=10.0, trigger=10.0)
+            four_over3 = any('stack_size_exceeds_cap' in v for v in tr3.violations)
+            ok = six_over5 and five_ok and four_over3
+            detail = f"6>cap5_viol={six_over5} 5@cap5_ok={five_ok} 4>cap3_viol={four_over3}"
+        except Exception as e:
+            self._record(68, FAIL, f"raised: {e!r}"); return
+        self._record(68, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -2310,6 +2548,23 @@ class SelfTest:
             self._step_reconcile_adopt()
             self._step_reconcile_finalize()
             self._step_quick_gap()
+            # Feature D — break-and-hold filter
+            self._step_break_fakespike()
+            self._step_break_holds()
+            self._step_break_continuation()
+            self._step_break_retrace()
+            self._step_break_holdshort()
+            # Feature E — lot config + FP guard
+            self._step_fp_015_ok()
+            self._step_fp_035_breach()
+            self._step_fp_zero_blocks()
+            self._step_fp_lot_config()
+            # Feature C — 5-long stack (flag-gated, default OFF)
+            self._step_stack5_cap()
+            self._step_stack5_loser_out()
+            self._step_stack5_fp_gate()
+            self._step_stack5_whipsaw()
+            self._step_stack5_cap_viol()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -2323,7 +2578,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 55):
+        for n in range(1, 69):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2340,12 +2595,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/54 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/68 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/54 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/68 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/54 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/68 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

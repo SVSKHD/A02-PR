@@ -64,6 +64,9 @@ SOFT_RESTART_EXIT = "SOFT_RESTART_EXIT"
 SOFT_RESTART_REHYDRATE = "SOFT_RESTART_REHYDRATE"
 RECONCILE = "RECONCILE"
 RECONCILE_SUMMARY = "RECONCILE_SUMMARY"
+# v3.2.3 Feature D/E: break-and-hold filter + FP exposure guard
+BREAK_EVAL = "BREAK_EVAL"
+FP_GUARD = "FP_GUARD"
 VIOLATION = "TELEMETRY_VIOLATION"
 
 # Mandatory fields on EVERY line (spec B2). A missing field is the failure we are
@@ -182,6 +185,8 @@ class PositionTracer:
     def soft_restart_rehydrate(self, **kw): return self.emit(SOFT_RESTART_REHYDRATE, None, "SYS", **kw)
     def reconcile(self, ticket=None, **kw): return self.emit(RECONCILE, ticket, "SYS", **kw)
     def reconcile_summary(self, **kw):     return self.emit(RECONCILE_SUMMARY, None, "SYS", **kw)
+    def break_eval(self, anchor, **kw):    return self.emit(BREAK_EVAL, None, anchor, **kw)
+    def fp_guard(self, anchor="SYS", **kw): return self.emit(FP_GUARD, None, anchor, **kw)
     def reconcile_orphan(self, ticket, **kw):
         return self.violation(ticket, "SYS", "reconcile_orphan", **kw)
     def autopull_aborted(self, reason="selftest_fail", **kw):
@@ -339,12 +344,15 @@ class PositionTracer:
                 self.violation(ticket, anchor, "boost_fire_below_trigger",
                                move=move, trigger=trig)
 
-        # (6) stack_size > 3 without an explicit deeper-trigger rule.
+        # (6) stack_size beyond the hard cap (3 by default; 5 only when the 5-long
+        #     feature is enabled, passed as stack_cap on the record). A record
+        #     without an explicit cap uses 3 -- so test-36's cap-at-3 is unchanged.
         ss = record.get("stack_size")
         if ss is not None:
             try:
-                if int(ss) > 3:
+                cap = int(record.get("stack_cap") or 3)
+                if int(ss) > cap:
                     self.violation(ticket, anchor, "stack_size_exceeds_cap",
-                                   stack_size=ss)
+                                   stack_size=ss, stack_cap=cap)
             except (TypeError, ValueError):
                 pass
