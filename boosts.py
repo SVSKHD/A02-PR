@@ -190,8 +190,45 @@ def stack_net_usd(winner_move_each, cfg, n_winners=None, loser_loss_usd=None):
 
 
 def stack_peak_exposure(cfg):
-    """Peak live exposure at full stack: 3 winners + 1 open losing leg = 4 legs.
-    Returns (lots_live, usd_per_dollar). At 0.35 -> 1.40 lot = $140/$1 (spec A4)."""
+    """Peak live exposure at full stack: N winners + 1 open losing leg.
+    Returns (lots_live, usd_per_dollar). At 5x0.35 -> 6 legs = 2.10 lot = $210/$1."""
     legs = stack_winners(cfg) + 1
     lots = legs * _lot(cfg)
     return round(lots, 2), round(lots * _contract(cfg), 2)
+
+
+def stack_trail_exits(longs, max_fav, cfg):
+    """v3.2.4 trail-lock co-close (the expected Wednesday behaviour). Each ARMED
+    long (reached +trail_arm_profit) closes TOGETHER on the reversal at the SHARED
+    high-water mark minus the gap (max_fav - trail_gap). A long that never armed
+    falls to its OWN $10 boost SL (entry - boost_trigger), not the trail. max_fav
+    must be the REAL peak (the phantom-lock guard from tests 39/40 still applies).
+
+    `longs` = list of {'entry': px, 'armed': bool|None}. armed=None -> inferred from
+    whether max_fav put it at least +trail_arm_profit in profit. Returns
+    (co_close_price, [ {entry, armed, exit, pnl} ... ]) for BUY longs."""
+    gap = float(getattr(cfg, "trail_gap", 1.50))
+    arm = float(getattr(cfg, "trail_arm_profit", 8.0))
+    boost_sl = float(getattr(cfg, "boost_trigger_dollars", 10.0))
+    lot = _lot(cfg); contract = _contract(cfg)
+    co_close = round(float(max_fav) - gap, 2)
+    rows = []
+    for lg in longs:
+        entry = float(lg["entry"])
+        armed = lg.get("armed")
+        if armed is None:
+            armed = (float(max_fav) - entry) >= arm
+        exit_px = co_close if armed else round(entry - boost_sl, 2)
+        rows.append({
+            "entry": round(entry, 2), "armed": bool(armed),
+            "exit": round(exit_px, 2),
+            "pnl": round((exit_px - entry) * lot * contract, 2),
+        })
+    return co_close, rows
+
+
+def stack_scenario_net(longs_profit_usd, loser_loss_usd):
+    """Net of a No-OCO 5-long event = winners' aggregate P&L - the losing leg's SL.
+    Fixtures (0.15, loser -$270): least +285 -> +$15, modest +585 -> +$315, bigger
+    +1185 -> +$915. (0.35, loser -$630): modest +1365 -> +$735."""
+    return round(float(longs_profit_usd) - float(loser_loss_usd), 2)

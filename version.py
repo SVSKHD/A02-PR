@@ -539,9 +539,23 @@ History (one line per behavioral change):
          BREAK_EVAL / FP_GUARD telemetry + Discord 🚦/🛡️. Trade core UNCHANGED
          (backtest RAW net identical). selftest -> 68 steps (D 55-59, E 60-63,
          C 64-68); import-path identity covers break_hold + fp_guard. Banner v3.2.3.
+  3.2.4  BREAK-AND-HOLD + FP GUARD + 5-LONG hardening (evolves the v3.2.3 build).
+         Break-and-hold now measures the hold on M5 candles, clears >= $3, retrace
+         < 40%, with states CANDIDATE/CONFIRMED/FAILED(reason) and events
+         BREAK_CANDIDATE / BREAK_CONFIRMED / BREAK_FAILED / CONTINUATION_STACK
+         (📈/🚫 Discord). FP guard worst-case uses SL + spread buffer (18.6 eff):
+         5x0.35 -> -$3,255, 5x0.15 -> -$1,395; FPZERO_1PCT caps the 5-long to 3
+         (profile_stack_cap); FP_GUARD_EVAL event + 🛡️ Discord. 5-long is now
+         DEFAULT ON (allow_5_long=True, still disableable): test-36 cap 3->5 (the
+         only sanctioned existing-test change), test-37 pins the 3-profile to keep
+         its 3-stack economics. New: stack_trail_exits (armed longs co-close at
+         max_fav - trail_gap; unarmed -> own $10 SL) + STACK_COMPLETE/LEG_SL/
+         TRAIL_LOCK/STACK_CLOSE events; P&L fixtures (0.15: +15/+315/+915; 0.35
+         modest +735). selftest -> 73 steps (new 69-73: trail co-close / P&L 0.15 /
+         P&L 0.35 / FPZERO profile cap / 5-long default-on). Banner v3.2.4.
 """
 
-__version__ = "3.2.3"
+__version__ = "3.2.4"
 CODENAME = "Astra Hawk"
 
 

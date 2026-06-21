@@ -1,88 +1,95 @@
-"""AUREON — break-and-hold filter (v3.2.3 Feature D: the profit decider).
+"""AUREON — break-and-hold filter (v3.2.4 Feature D: the profit decider).
 
 WHY THIS EXISTS
 ---------------
-Boosts fired on the FIRST break got chopped up by fake-outs (the 14:30 / 15:30
-spike-and-reverse). The decider: do NOT stack on the first break. Stack ONLY if
-price (a) clears the range edge by >= break_dist_x, (b) HOLDS hold_candles_n M1
-candles past the edge, and (c) retraces less than max_retrace_y of the break
-distance. A spike that reverses back through the edge inside the window is a
-FAILED break -> fire nothing. After a failed up-spike the caller re-evaluates the
-DOWN side and stacks on THAT if it holds.
+Boosts fired on the FIRST/weak break got chopped up by fake-outs (the 14:30 /
+15:30 spike-and-reverse) -- the -$700 least case. The decider: do NOT stack on the
+first break. A break QUALIFIES to stack only if ALL hold:
+  (a) price clears the range edge by >= break_dist_x,
+  (b) price HOLDS beyond the edge for >= hold_candles_n M5 candles,
+  (c) retrace during the hold < max_retrace_y of the break distance.
+A spike that reverses inside the window is a FAILED break -> fire nothing. After a
+failed up-spike the caller re-evaluates the DOWN side and stacks on THAT if it
+passes the same hold test (continuation).
 
-PURE: no MT5, no state. `evaluate_break` takes the post-break M1 candles and
-returns CONFIRMED / FAILED / PENDING. Shared by live + selftest (identity).
+States:  CANDIDATE (edge cleared, still watching) / CONFIRMED (held -> stack) /
+         FAILED (reversed | retrace>Y | hold<N after window).
+
+PURE: no MT5, no state. Shared by live + backtest (import-path identity).
 """
 from __future__ import annotations
 
-from typing import Dict, List, Sequence
+from typing import Dict, Sequence, Tuple
 
 CONFIRMED = "CONFIRMED"   # cleared + held + retrace ok -> boosts may stack
-FAILED = "FAILED"         # reversed through the edge or retraced too far -> fire nothing
-PENDING = "PENDING"       # not enough candles yet / edge not cleared -> wait
+FAILED = "FAILED"         # reversed through the edge / retraced too far -> fire nothing
+CANDIDATE = "CANDIDATE"   # edge cleared but not yet held N candles -> keep watching
+# v3.2.3 alias (PENDING) kept so nothing importing the old name breaks.
+PENDING = CANDIDATE
 
 
 def _sgn(side: str) -> float:
     return 1.0 if side == "BUY" else -1.0
 
 
-def evaluate_break(side: str, break_level: float,
-                   candles: Sequence[Dict], cfg) -> str:
-    """Classify a break given the M1 candles AFTER it. `candles` = list of
-    {'high','low','close'} in order. Returns CONFIRMED / FAILED / PENDING.
+def classify(side: str, break_level: float,
+             candles: Sequence[Dict], cfg) -> Tuple[str, str]:
+    """Classify a break given the M5 candles AFTER it. `candles` = list of
+    {'high','low','close'} in order. Returns (state, reason).
 
-      CONFIRMED: the favorable extreme cleared the edge by >= break_dist_x, at
-                 least hold_candles_n candles have printed, no candle's extreme
-                 fell back THROUGH the edge during the hold, and the worst pullback
-                 from the peak stayed < max_retrace_y of the break distance.
-      FAILED:    cleared but then reversed back through the edge within the window,
-                 OR retraced >= max_retrace_y (a fake-out).
-      PENDING:   edge not yet cleared, or fewer than hold_candles_n candles.
+      CONFIRMED: favorable extreme cleared the edge by >= break_dist_x, at least
+                 hold_candles_n candles printed, no candle fell back THROUGH the
+                 edge, and the worst pullback stayed < max_retrace_y of the break.
+      FAILED:    reason 'reversed' (fell back through the edge), 'retrace' (pulled
+                 back >= max_retrace_y), or 'hold<N' (cleared then faded before N).
+      CANDIDATE: edge not yet cleared, or cleared with fewer than N candles so far.
     """
-    X = float(getattr(cfg, "break_dist_x", 2.0))
+    X = float(getattr(cfg, "break_dist_x", 3.0))
     N = int(getattr(cfg, "hold_candles_n", 2))
-    Y = float(getattr(cfg, "max_retrace_y", 0.50))
+    Y = float(getattr(cfg, "max_retrace_y", 0.40))
     s = _sgn(side)
     cs = list(candles)
     if not cs:
-        return PENDING
+        return CANDIDATE, "no_candles"
 
-    # favorable extreme of each candle (BUY: high, SELL: low) and the peak so far.
     fav_extremes = [(float(c["high"]) if s > 0 else float(c["low"])) for c in cs]
     peak = max(fav_extremes) if s > 0 else min(fav_extremes)
     cleared = s * (peak - break_level) >= X
     if not cleared:
-        # never cleared the edge by X -> still pending until the window is up, then
-        # it simply never broke (treat as PENDING -> caller fires nothing either way).
-        return PENDING
+        return CANDIDATE, "edge_not_cleared"
 
-    if len(cs) < N:
-        return PENDING
-
-    # reversal: any candle's ADVERSE extreme fell back through the edge during the
-    # hold window -> a fake-out break.
+    # reversal: any candle's ADVERSE extreme fell back THROUGH the edge -> fake-out.
     for c in cs:
         adverse = float(c["low"]) if s > 0 else float(c["high"])
         if s * (adverse - break_level) < 0:
-            return FAILED
+            return FAILED, "reversed"
+
+    if len(cs) < N:
+        return CANDIDATE, "watching"   # cleared, holding, but window not yet up
 
     # retrace: worst pullback from the peak vs the break distance.
     break_dist = abs(peak - break_level)
     if break_dist <= 0:
-        return PENDING
+        return CANDIDATE, "edge_not_cleared"
     worst_pullback = 0.0
     for c in cs:
         adverse = float(c["low"]) if s > 0 else float(c["high"])
         worst_pullback = max(worst_pullback, s * (peak - adverse))
     if worst_pullback / break_dist >= Y:
-        return FAILED
+        return FAILED, "retrace"
 
-    return CONFIRMED
+    return CONFIRMED, "held"
+
+
+def evaluate_break(side: str, break_level: float,
+                   candles: Sequence[Dict], cfg) -> str:
+    """State only (CANDIDATE / CONFIRMED / FAILED) -- back-compat wrapper."""
+    return classify(side, break_level, candles, cfg)[0]
 
 
 def may_stack(side: str, break_level: float, candles: Sequence[Dict], cfg) -> bool:
-    """Convenience gate for the boost trigger: True ONLY on a CONFIRMED break (and
-    only when the filter is enabled; disabled -> always True, legacy behavior)."""
+    """Boost-trigger gate: True ONLY on a CONFIRMED break (filter disabled ->
+    always True = legacy behavior)."""
     if not bool(getattr(cfg, "break_and_hold_enabled", True)):
         return True
     return evaluate_break(side, break_level, candles, cfg) == CONFIRMED

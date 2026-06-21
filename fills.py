@@ -741,34 +741,57 @@ def _check_boost_triggers(self):
 
 
 def _break_and_hold_ok(self, shadow, plan):
-    """v3.2.3 Feature D gate (live): True if the break is CONFIRMED (cleared edge +
-    held N candles + retrace < Y), via the shared break_hold.evaluate_break on the
-    recent M1 bars. Disabled / no data / any error -> True (legacy: don't block).
-    The decision is the pure shared fn; this only feeds it live candles."""
+    """v3.2.4 Feature D gate (live): stack ONLY on a CONFIRMED break (cleared edge +
+    held N M5 candles + retrace < Y), via the shared break_hold.classify on the
+    recent M5 bars. Disabled / no data / any error -> True (legacy: don't block).
+    Emits BREAK_CONFIRMED / BREAK_CANDIDATE / BREAK_FAILED(reason). The decision is
+    the pure shared fn; this only feeds it live candles."""
     import break_hold as _bh
     if not bool(getattr(self.cfg, 'break_and_hold_enabled', True)):
         return True
     try:
-        bars = self.adapter.get_latest_m1(self.cfg.symbol,
-                                          int(getattr(self.cfg, 'hold_candles_n', 2)) + 2)
-        if bars is None or len(bars) < int(getattr(self.cfg, 'hold_candles_n', 2)):
+        n = int(getattr(self.cfg, 'hold_candles_n', 2))
+        tf = str(getattr(self.cfg, 'break_timeframe', 'M5'))
+        bars = None
+        for fn in ('get_latest_m5', 'get_latest_bars', 'get_latest_m1'):
+            getter = getattr(self.adapter, fn, None)
+            if getter is not None:
+                try:
+                    bars = getter(self.cfg.symbol, n + 2)
+                    if bars:
+                        break
+                except TypeError:
+                    bars = getter(self.cfg.symbol, n + 2, tf)
+                    if bars:
+                        break
+        if not bars or len(bars) < n:
             return True   # not enough data -> don't block (legacy)
         candles = [{'high': float(b['high']), 'low': float(b['low']),
                     'close': float(b['close'])} for b in bars]
-        # break level = the leg's fill (the edge it broke from).
         edge = float(shadow.get('leg_fill_price', shadow['entry_price']))
-        result = _bh.evaluate_break(plan.boost_side, edge, candles, self.cfg)
+        result, reason = _bh.classify(plan.boost_side, edge, candles, self.cfg)
         tr = getattr(self, 'ptrace', None)
+        anchor = shadow.get('anchor_label')
         if tr is not None:
-            tr.break_eval(shadow.get('anchor_label'), side=plan.boost_side,
-                          break_level=round(edge, 2), result=result,
-                          n_candles=len(candles))
-        if result != _bh.CONFIRMED:
-            self.tele.info(
-                f"🚦 BREAK {result} {shadow.get('anchor_label')} {plan.boost_side} "
-                f"@edge ${edge:.2f} — not stacking (fake-break filter)")
-            return False
-        return True
+            if result == _bh.CONFIRMED:
+                tr.break_confirmed(anchor, side=plan.boost_side,
+                                   break_level=round(edge, 2), reason=reason,
+                                   n_candles=len(candles), timeframe=tf)
+            elif result == _bh.FAILED:
+                tr.break_failed(anchor, side=plan.boost_side,
+                                break_level=round(edge, 2), reason=reason,
+                                n_candles=len(candles), timeframe=tf)
+            else:
+                tr.break_candidate(anchor, side=plan.boost_side,
+                                   break_level=round(edge, 2), reason=reason,
+                                   n_candles=len(candles), timeframe=tf)
+        if result == _bh.CONFIRMED:
+            self.tele.info(f"📈 BREAK CONFIRMED {plan.boost_side} {anchor} "
+                           f"@edge ${edge:.2f} — stacking")
+            return True
+        self.tele.info(f"🚫 BREAK {result} ({reason}) {anchor} {plan.boost_side} "
+                       f"@edge ${edge:.2f} — no fire")
+        return False
     except Exception as e:
         log.warning(f"break-and-hold check failed (non-fatal, allowing): {e!r}")
         return True
@@ -778,7 +801,7 @@ def _fp_guard_ok(self, shadow, stack_after):
     """v3.2.3 Feature E gate (live): block/reduce a stack that would breach the
     account FP rule at the chosen lot. Returns True if the full stack fits; False
     (suppress this event) if it would breach. Guarded -> True on any error."""
-    import fp_guard as _fp
+    import fp_guard as _fp, boosts as _b
     try:
         bal = None
         try:
@@ -787,18 +810,23 @@ def _fp_guard_ok(self, shadow, stack_after):
         except Exception:
             bal = None
         bal = float(bal or getattr(self.cfg, 'starting_balance', 50000.0))
+        profile = getattr(self.cfg, 'account_profile', 'STANDARD_5PCT')
+        lot = getattr(self.cfg, 'lot_size', 0.35)
+        # FPZERO disallows the 5-long entirely -> profile caps the stack to 3.
+        prof_cap = _fp.profile_stack_cap(profile, _b.stack_cap(self.cfg))
         action, wc, lim, allowed = _fp.guard_cfg(stack_after, self.cfg, bal)
+        if stack_after > prof_cap and action == _fp.OK:
+            action, allowed = _fp.REDUCE, prof_cap
         tr = getattr(self, 'ptrace', None)
+        anchor = shadow.get('anchor_label')
         if tr is not None:
-            tr.fp_guard(shadow.get('anchor_label'), action=action, worst_case=wc,
-                        limit=lim, allowed_n=allowed, requested_n=stack_after,
-                        profile=getattr(self.cfg, 'account_profile', 'STANDARD_5PCT'),
-                        lot=getattr(self.cfg, 'lot_size', 0.35))
-        if action != _fp.OK:
+            tr.fp_guard(anchor, action=action, worst_case=wc, limit=lim,
+                        allowed_n=allowed, requested_n=stack_after,
+                        profile=profile, lot=lot, profile_cap=prof_cap)
+        if action != _fp.OK or stack_after > prof_cap:
             self.tele.warn(
-                f"🛡️ FP GUARD {action} {shadow.get('anchor_label')} | stack "
-                f"{stack_after} worst-case ${wc:.0f} > limit ${lim:.0f} "
-                f"({getattr(self.cfg,'account_profile','?')}) — not stacking")
+                f"🛡️ FP GUARD | {lot} x {stack_after} = worst -${wc:.0f} vs "
+                f"limit ${lim:.0f} ({profile}) — {action} to {allowed}, not stacking")
             return False
         return True
     except Exception as e:
