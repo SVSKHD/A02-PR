@@ -45,6 +45,29 @@ class Config:
     lock_confirm: bool = True  # master switch for the confirmed-price lock gate:
     # a lock level N may advance ONLY when max_fav has truly reached level_N's
     # price. Never on a timer, tick count, loop iteration, or default value.
+    # --- v3.2.3 Feature D: break-and-hold filter (the profit decider) -----------
+    # Do NOT fire boosts on the FIRST break; stack ONLY if price clears the range
+    # edge by >= break_dist_x AND holds hold_candles_n M1 candles AND retraces
+    # less than max_retrace_y of the break distance. A spike that reverses inside
+    # the window is a FAILED break -> fire nothing (kills the 14:30/15:30 fake-outs).
+    break_and_hold_enabled: bool = True
+    break_dist_x: float = 2.0     # must clear the edge by >= this ($)
+    hold_candles_n: int = 2       # must hold this many M1 candles past the edge
+    max_retrace_y: float = 0.50   # retrace must stay < this fraction of break dist
+    # --- v3.2.3 Feature E: lot config + FP-rule guard --------------------------
+    # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
+    # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose
+    # worst-case floating loss breaches the limit at the chosen lot is reduced or
+    # blocked. lot_size (above) is the chosen lot: 0.35 demo / 0.15 FP-safe / 0.27 Zero.
+    account_profile: str = "STANDARD_5PCT"   # or "FPZERO_1PCT"
+    fp_standard_pct: float = 0.05
+    fp_zero_pct: float = 0.01
+    # --- v3.2.3 Feature C: 5-long No-OCO stack (DEFAULT OFF) --------------------
+    # When False the winning side hard-caps at 3 (original + 2 RALLY) -- unchanged,
+    # test-36 cap-at-3 stays the invariant. When True the cap rises to 5 (original
+    # + 2 RALLY + 2 RESCUE-converts once the losing leg SLs out), FP-gated by the
+    # guard above. Flip ONLY after backtesting the higher exposure on the VPS.
+    allow_5_long: bool = False
     freeze_minutes: int = 45  # v2.7: was 15 (and functionally DEAD until the v2.7 timezone
     # fix in live_trader._manage_trails_on_bar_close -- see comment there). 45m = risk-
     # adjusted sweet spot of the tick grid: +$26.7k vs +$23.0k @30m, same maxDD (-$2,520),

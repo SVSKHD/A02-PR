@@ -157,9 +157,16 @@ def stack_breakeven_usd(cfg):
     return float(getattr(cfg, "sl_dist", 18.0)) * _lot(cfg) * _contract(cfg)
 
 
+def stack_cap(cfg):
+    """The hard cap on winners on the winning side. 3 by default (original + 2
+    RALLY); 5 when cfg.allow_5_long (original + 2 RALLY + 2 RESCUE-converts once
+    the losing leg SLs out). Default OFF keeps the proven 3-cap (test-36)."""
+    return 5 if bool(getattr(cfg, "allow_5_long", False)) else 3
+
+
 def stack_winners(cfg):
-    """Positions on the winning side at full stack: parent + n boosts (= 3)."""
-    return 1 + int(getattr(cfg, "rescue_boost_count", 2))
+    """Positions on the winning side at full stack (== the hard cap)."""
+    return stack_cap(cfg)
 
 
 def per_position_breakeven_usd(cfg):
