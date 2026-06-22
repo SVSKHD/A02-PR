@@ -205,15 +205,29 @@ def _process_anchor(self, label: str, anchor_utc: pd.Timestamp):
         if _attempt < _fetch_retries:
             time.sleep(getattr(self, "ANCHOR_FETCH_RETRY_WAIT_S", 2))
     if anchor_price is None:
-        self.tele.warn(
-            f"⚠️ *{label} anchor fetch returned no bars — investigate*\n"
-            f"get_m5_close found no M5 bar ending {anchor_utc} after "
-            f"{_fetch_retries} attempts "
-            f"(offset {getattr(self.adapter, 'tick_time_offset_hours', None)}h). "
-            f"NOT placing — no silent miss."
-        )
-        log.warning(f"⚠️ {label}: anchor fetch returned no bars after retries — skipping")
-        return
+        _tr = getattr(self, 'ptrace', None)
+        if _tr is not None:
+            _tr.a1_bar_missing(label, attempts=_fetch_retries,
+                               offset=getattr(self.adapter, 'tick_time_offset_hours', None),
+                               anchor_utc=str(anchor_utc))
+        # v3.2.5 Feature 1: at the Monday/post-weekend open the M5 bar can lag while
+        # ticks are live. A1 (and only A1, only here on the open path) falls back to
+        # a SANE, SETTLED live tick so we never lose another Monday A1. A2/A3/A4 and
+        # A1-with-a-bar are unaffected (they never reach this branch with no bar).
+        if (label.startswith('A1')
+                and bool(getattr(self.cfg, 'a1_tick_fallback_enabled', True))
+                and not self.paper):
+            anchor_price = self._capture_a1_anchor_from_tick(label, anchor_utc)
+        if anchor_price is None:
+            self.tele.warn(
+                f"⚠️ *{label} anchor fetch returned no bars — investigate*\n"
+                f"get_m5_close found no M5 bar ending {anchor_utc} after "
+                f"{_fetch_retries} attempts "
+                f"(offset {getattr(self.adapter, 'tick_time_offset_hours', None)}h). "
+                f"NOT placing — no silent miss."
+            )
+            log.warning(f"⚠️ {label}: anchor fetch returned no bars after retries — skipping")
+            return
 
     # v2.5.2: Per-anchor deferred wait. A2 (London open) and A4 (NY open) need
     # longer than calm sessions for broker comm to stabilize past the volume spike.
@@ -238,6 +252,51 @@ def _process_anchor(self, label: str, anchor_utc: pd.Timestamp):
         f"{label}: anchor captured @ ${anchor_price:.2f}, deferring placement to "
         f"{defer_until.strftime('%H:%M:%S')} UTC ({defer_seconds}s settle wait — non-blocking)"
     )
+
+def _capture_a1_anchor_from_tick(self, label, anchor_utc):
+    """v3.2.5 Feature 1: the M5 bar is still missing at the open -> capture the A1
+    anchor from a SANE, SETTLED live tick instead of losing the anchor. Reads up to
+    a1_tick_fallback_samples ticks (tick_refresh_s apart), drops stale/garbage ones,
+    and hands the run to the SHARED tick_hold.settle_anchor_tick, which requires
+    hold_ticks of settled ticks -- so the wild first reopen spike is rejected and the
+    anchor is taken only once the feed has settled. Returns the anchor price or None.
+    Heartbeat kept alive throughout. Live-only; pure decision lives in tick_hold."""
+    import tick_hold as _th
+    n_samples = int(getattr(self.cfg, 'a1_tick_fallback_samples', 6))
+    poll = float(getattr(self.cfg, 'tick_refresh_s', 0.3))
+    thr = float(getattr(self.cfg, 'stale_tick_threshold_s', 60.0))
+    prices = []
+    for _ in range(max(n_samples, _th.hold_ticks(self.cfg))):
+        try:
+            tk = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+        except Exception:
+            tk = None
+        if tk is not None:
+            off = (getattr(self.adapter, 'tick_time_offset_hours', 0) or 0) * 3600
+            age = abs(pd.Timestamp.now(tz='UTC').timestamp() - (tk.time - off))
+            if age <= thr:
+                prices.append((float(tk.bid) + float(tk.ask)) / 2.0)
+        self._touch_heartbeat()
+        time.sleep(poll)
+    ok, price, held, reason = _th.settle_anchor_tick(prices, self.cfg)
+    tr = getattr(self, 'ptrace', None)
+    if tr is not None:
+        tr.a1_tick_fallback(label, ok=ok, tick_price=price, held_ticks=held,
+                            reason=reason, samples=len(prices), source='tick')
+    if not ok:
+        log.warning(f"{label}: tick-fallback could not settle a sane tick "
+                    f"({reason}, {len(prices)} samples) — not placing from tick")
+        return None
+    buy_stop = round(price + self.cfg.trigger_dist, 2)
+    sell_stop = round(price - self.cfg.trigger_dist, 2)
+    if tr is not None:
+        tr.a1_placed_from_tick(label, anchor_price=price, buy_stop=buy_stop,
+                               sell_stop=sell_stop, held_ticks=held, source='tick')
+    log.info(f"{label}: A1 anchor from TICK ${price:.2f} (held {held} ticks, bar lagging)")
+    self.tele.success(
+        f"🟢 *A1 placed from TICK* (bar lagging at open) | anchor ${price:.2f} "
+        f"(held {held} ticks) — buy ${buy_stop:.2f} / sell ${sell_stop:.2f}")
+    return price
 
 def _await_fresh_tick_for_placement(self, label):
     """Fix 1 (2026-06-15 missed-anchor incident): at placement, a tick older than

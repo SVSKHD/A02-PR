@@ -553,9 +553,27 @@ History (one line per behavioral change):
          TRAIL_LOCK/STACK_CLOSE events; P&L fixtures (0.15: +15/+315/+915; 0.35
          modest +735). selftest -> 73 steps (new 69-73: trail co-close / P&L 0.15 /
          P&L 0.35 / FPZERO profile cap / 5-long default-on). Banner v3.2.4.
+  3.2.5  A1 TICK-FALLBACK + TICK-HOLD CONFIRM (Mon Jun-22 A1 miss). ADDITIVE, scoped
+         -- tests 1-73 and A2/A3/A4 bar-capture UNCHANGED. (1) A1 open-path tick
+         fallback: when get_m5_close still finds NO M5 bar after the existing retries
+         (the bar lags at the Monday/post-weekend open while ticks are live), A1
+         falls back to a SANE, SETTLED live tick (passes max_tick_jump AND held >=
+         hold_ticks via the shared tick_hold.settle_anchor_tick) and PLACES off it
+         instead of missing. A1 only, open path only; A2/A3/A4 and A1-with-a-bar
+         untouched. Events A1_BAR_MISSING / A1_TICK_FALLBACK / A1_PLACED_FROM_TICK +
+         🟢 Discord. (2) Tick-hold confirm: a +/-$10 boost cross fires ONLY after it
+         HOLDS >= hold_ticks (default 3, ~1s) consecutive ticks; a cross that reverts
+         within the window is a blip -> no fire (TICK_CROSS_CANDIDATE /
+         TICK_HOLD_CONFIRMED / TICK_BLIP_REJECTED, blips to file not Discord). A trail
+         lock advances only on a held max_fav (tick_hold.trail_advance_ok), reinforcing
+         the existing phantom-lock guard. Levels / stack / cap / existing boost+trail
+         logic UNCHANGED -- only WHEN a boost/lock acts. New module tick_hold.py (pure,
+         import-path identity). selftest -> 78 steps (new 74-78: A1 places-from-tick /
+         A1 rejects-spike / tick-hold fires / blip-rejected / trail-advance). Banner
+         v3.2.5.
 """
 
-__version__ = "3.2.4"
+__version__ = "3.2.5"
 CODENAME = "Astra Hawk"
 
 

@@ -1271,6 +1271,7 @@ LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
 LiveTrader._confirm_a1_placement    = _anchors_mod._confirm_a1_placement
 LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
 LiveTrader._await_fresh_tick_for_placement = _anchors_mod._await_fresh_tick_for_placement
+LiveTrader._capture_a1_anchor_from_tick = _anchors_mod._capture_a1_anchor_from_tick
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)
 LiveTrader._reconcile_with_broker   = _fills_mod._reconcile_with_broker
 LiveTrader._check_boost_triggers    = _fills_mod._check_boost_triggers
