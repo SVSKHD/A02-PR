@@ -64,13 +64,28 @@ def fp_guard(n_positions: int, lot: float, sl_dist: float, profile: str,
     return BLOCK, round(wc, 2), round(lim, 2), 0
 
 
+def profile_stack_cap(profile: str, base_cap: int) -> int:
+    """The 5-long is disallowed on a 1% floating rule -- FPZERO_1PCT caps the stack
+    back to 3 regardless of the configured cap. STANDARD_5PCT keeps the base cap."""
+    if str(profile) == "FPZERO_1PCT":
+        return min(int(base_cap), 3)
+    return int(base_cap)
+
+
+def effective_sl_dist(cfg) -> float:
+    """Adverse distance used for worst-case floating = SL + spread buffer (18 + 0.6
+    = 18.6 effective), so the guard matches live floating, not the bare SL."""
+    return float(getattr(cfg, "sl_dist", 18.0)) + float(getattr(cfg, "fp_spread_buffer", 0.60))
+
+
 def guard_cfg(n_positions: int, cfg, balance: float) -> Tuple[str, float, float, int]:
-    """fp_guard wired from cfg (lot_size, sl_dist, account_profile, contract_size)
-    so the SAME lot/profile drive every call -- 'lot config applies everywhere'."""
+    """fp_guard wired from cfg (lot_size, effective SL, account_profile, contract)
+    so the SAME lot/profile drive every call -- 'lot config applies everywhere'.
+    Worst-case uses SL + fp_spread_buffer: 5x0.35 -> -$3,255, 5x0.15 -> -$1,395."""
     return fp_guard(
         n_positions,
         float(getattr(cfg, "lot_size", 0.35)),
-        float(getattr(cfg, "sl_dist", 18.0)),
+        effective_sl_dist(cfg),
         str(getattr(cfg, "account_profile", "STANDARD_5PCT")),
         float(balance),
         float(getattr(cfg, "contract_size", 100.0)),

@@ -66,7 +66,17 @@ RECONCILE = "RECONCILE"
 RECONCILE_SUMMARY = "RECONCILE_SUMMARY"
 # v3.2.3 Feature D/E: break-and-hold filter + FP exposure guard
 BREAK_EVAL = "BREAK_EVAL"
+# v3.2.4 break-and-hold + 5-long stack lifecycle
+BREAK_CANDIDATE = "BREAK_CANDIDATE"
+BREAK_CONFIRMED = "BREAK_CONFIRMED"
+BREAK_FAILED = "BREAK_FAILED"
+CONTINUATION_STACK = "CONTINUATION_STACK"
 FP_GUARD = "FP_GUARD"
+FP_GUARD_EVAL = "FP_GUARD_EVAL"
+STACK_COMPLETE = "STACK_COMPLETE"
+LEG_SL = "LEG_SL"
+TRAIL_LOCK = "TRAIL_LOCK"
+STACK_CLOSE = "STACK_CLOSE"
 VIOLATION = "TELEMETRY_VIOLATION"
 
 # Mandatory fields on EVERY line (spec B2). A missing field is the failure we are
@@ -186,7 +196,15 @@ class PositionTracer:
     def reconcile(self, ticket=None, **kw): return self.emit(RECONCILE, ticket, "SYS", **kw)
     def reconcile_summary(self, **kw):     return self.emit(RECONCILE_SUMMARY, None, "SYS", **kw)
     def break_eval(self, anchor, **kw):    return self.emit(BREAK_EVAL, None, anchor, **kw)
-    def fp_guard(self, anchor="SYS", **kw): return self.emit(FP_GUARD, None, anchor, **kw)
+    def break_candidate(self, anchor, **kw): return self.emit(BREAK_CANDIDATE, None, anchor, **kw)
+    def break_confirmed(self, anchor, **kw): return self.emit(BREAK_CONFIRMED, None, anchor, **kw)
+    def break_failed(self, anchor, **kw):  return self.emit(BREAK_FAILED, None, anchor, **kw)
+    def continuation_stack(self, anchor, **kw): return self.emit(CONTINUATION_STACK, None, anchor, **kw)
+    def fp_guard(self, anchor="SYS", **kw): return self.emit(FP_GUARD_EVAL, None, anchor, **kw)
+    def stack_complete(self, ticket, anchor, **kw): return self.emit(STACK_COMPLETE, ticket, anchor, **kw)
+    def leg_sl(self, ticket, anchor, **kw): return self.emit(LEG_SL, ticket, anchor, **kw)
+    def trail_lock(self, ticket, anchor, **kw): return self.emit(TRAIL_LOCK, ticket, anchor, **kw)
+    def stack_close(self, anchor, **kw):   return self.emit(STACK_CLOSE, None, anchor, **kw)
     def reconcile_orphan(self, ticket, **kw):
         return self.violation(ticket, "SYS", "reconcile_orphan", **kw)
     def autopull_aborted(self, reason="selftest_fail", **kw):

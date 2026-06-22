@@ -45,29 +45,37 @@ class Config:
     lock_confirm: bool = True  # master switch for the confirmed-price lock gate:
     # a lock level N may advance ONLY when max_fav has truly reached level_N's
     # price. Never on a timer, tick count, loop iteration, or default value.
-    # --- v3.2.3 Feature D: break-and-hold filter (the profit decider) -----------
-    # Do NOT fire boosts on the FIRST break; stack ONLY if price clears the range
-    # edge by >= break_dist_x AND holds hold_candles_n M1 candles AND retraces
-    # less than max_retrace_y of the break distance. A spike that reverses inside
-    # the window is a FAILED break -> fire nothing (kills the 14:30/15:30 fake-outs).
+    # --- v3.2.4 Feature D: break-and-hold filter (the profit decider) -----------
+    # Do NOT fire boosts on the FIRST/weak break. Stack ONLY if price clears the
+    # range edge by >= break_dist_x AND holds hold_candles_n M5 candles AND retraces
+    # less than max_retrace_y of the break distance. A spike that reverses inside the
+    # window is a FAILED break -> fire nothing (kills the 14:30/15:30 fake-outs).
     break_and_hold_enabled: bool = True
-    break_dist_x: float = 2.0     # must clear the edge by >= this ($)
-    hold_candles_n: int = 2       # must hold this many M1 candles past the edge
-    max_retrace_y: float = 0.50   # retrace must stay < this fraction of break dist
-    # --- v3.2.3 Feature E: lot config + FP-rule guard --------------------------
+    break_timeframe: str = "M5"   # hold is measured on M5 candles (v3.2.4)
+    break_dist_x: float = 3.0     # must clear the edge by >= this ($)
+    hold_candles_n: int = 2       # must hold this many M5 candles past the edge
+    max_retrace_y: float = 0.40   # retrace must stay < this fraction of break dist
+    # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose
     # worst-case floating loss breaches the limit at the chosen lot is reduced or
     # blocked. lot_size (above) is the chosen lot: 0.35 demo / 0.15 FP-safe / 0.27 Zero.
+    # fp_spread_buffer widens the per-leg adverse distance (18 SL + ~0.6 spread =
+    # 18.6 effective) so the worst-case matches live floating: 5x0.35 -> -$3,255,
+    # 5x0.15 -> -$1,395. FPZERO caps the 5-long back to 3 (no 5-stack on a 1% rule).
     account_profile: str = "STANDARD_5PCT"   # or "FPZERO_1PCT"
     fp_standard_pct: float = 0.05
     fp_zero_pct: float = 0.01
-    # --- v3.2.3 Feature C: 5-long No-OCO stack (DEFAULT OFF) --------------------
-    # When False the winning side hard-caps at 3 (original + 2 RALLY) -- unchanged,
-    # test-36 cap-at-3 stays the invariant. When True the cap rises to 5 (original
-    # + 2 RALLY + 2 RESCUE-converts once the losing leg SLs out), FP-gated by the
-    # guard above. Flip ONLY after backtesting the higher exposure on the VPS.
-    allow_5_long: bool = False
+    fp_spread_buffer: float = 0.60
+    # --- v3.2.4 Feature C: 5-long No-OCO stack (DEFAULT ON, disableable) --------
+    # When True (default) the winning side caps at 5 (original + 2 RALLY + 2 RESCUE-
+    # converts once the losing leg SLs out), FP-gated by the guard above and only
+    # after a BREAK_CONFIRMED. Set False to fall back to the proven 3-cap. On the
+    # FPZERO_1PCT profile the 5-long is disallowed regardless (capped to 3).
+    allow_5_long: bool = True
+    # NOTE: the 5-long co-close reuses the EXISTING tuned trail_gap (line ~26),
+    # it does NOT redefine it. Only the arm threshold is new here.
+    trail_arm_profit: float = 8.0  # a long arms its trail once +$8 in profit
     freeze_minutes: int = 45  # v2.7: was 15 (and functionally DEAD until the v2.7 timezone
     # fix in live_trader._manage_trails_on_bar_close -- see comment there). 45m = risk-
     # adjusted sweet spot of the tick grid: +$26.7k vs +$23.0k @30m, same maxDD (-$2,520),

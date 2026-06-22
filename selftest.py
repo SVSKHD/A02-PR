@@ -108,6 +108,11 @@ STEP_NAMES = {
     66: "stack5 fp gate",
     67: "stack5 whipsaw",
     68: "stack5 cap viol",
+    69: "stack5 trail coclose",
+    70: "stack5 pnl 0.15",
+    71: "stack5 pnl 0.35",
+    72: "fp zero profile cap",
+    73: "stack5 default on",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1647,8 +1652,9 @@ class SelfTest:
         self._record(35, PASS if ok else FAIL, detail)
 
     def _step_nooco_stack(self):
-        # v3.2.3 Group 3 (N1/N5/N7): No-OCO winning side stacks RALLY-only to 3;
-        # losing leg fires NOTHING (rides to SL); trail arms at +$8; hard cap 3.
+        # v3.2.4 Group 3 (N1/N5/N7): No-OCO winning side stacks; losing leg fires
+        # NOTHING (rides to SL); trail arms at +$8. CAP UPDATED 3 -> 5 (the only
+        # sanctioned existing-test change; 5-long default ON) -- violation if > 5.
         import dataclasses
         import boosts as _b
         from strategy import Position, update_position_on_bar
@@ -1657,22 +1663,23 @@ class SelfTest:
             cfg = self.cfg
             # N1: straddle short @ X, long @ X+10. Price runs UP.
             X = 4150.0
-            # winning = long leg (rally-only) gets a RALLY of 2 -> stack 3.
+            # winning = long leg (rally-only) gets a RALLY of 2 (one event).
             win = _b.plan_boost_event('BUY', X + 10.0, X + 20.0, cfg, allow_rescue=False)
             n1_win = (win is not None and win.kind == 'RALLY' and win.n == 2)
             # losing = short leg (rally-only): it is LOSING -> rescue blocked -> None.
             lose = _b.plan_boost_event('SELL', X, X + 20.0, cfg, allow_rescue=False)
             n1_lose = (lose is None)
 
-            # N7: hard cap -- stack_depth beyond 3 clamps n boosts to 2.
-            cfg5 = dataclasses.replace(cfg, stack_depth=5)
-            cap = _b.plan_boost_event('BUY', X + 10.0, X + 20.0, cfg5, allow_rescue=False)
-            n7_cap = (cap is not None and cap.n == 2)
-            # and the tracer flags stack_size > 3 as a violation.
+            # N7: hard cap is now 5 (5-long). The tracer flags stack_size > 5 as a
+            # violation; a full 5-stack is allowed.
+            n7_cap = (_b.stack_cap(cfg) == 5)
             trv = PositionTracer(sink=lambda l: None)
-            trv.boost_fire(9, 'A2', side='BUY', boost_kind='RALLY', stack_size=4,
-                           move_dollars=10.0, trigger=10.0)
-            n7_violation = any('stack_size_exceeds_cap' in v for v in trv.violations)
+            trv.boost_fire(9, 'A2', side='BUY', boost_kind='RALLY', stack_size=6,
+                           stack_cap=5, move_dollars=10.0, trigger=10.0)
+            trv.boost_fire(10, 'A2', side='BUY', boost_kind='RESCUE', stack_size=5,
+                           stack_cap=5, move_dollars=10.0, trigger=10.0)
+            viols = [v for v in trv.violations if 'stack_size_exceeds_cap' in v]
+            n7_violation = (len(viols) == 1)   # only the 6>5 trips, the 5 is fine
 
             # N5: trail arms at +$8 on a boost leg (the stack's protection).
             entry = 4150.0
@@ -1686,8 +1693,8 @@ class SelfTest:
             n5_floor = boost.current_sl >= entry + 8.0 - 1e-6
 
             ok = n1_win and n1_lose and n7_cap and n7_violation and n5_floor
-            detail = (f"N1_winner_stacks3={n1_win} N1_loser_rides(None)={n1_lose} "
-                      f"N7_cap_n2={n7_cap} N7_violation={n7_violation} "
+            detail = (f"N1_winner_rally2={n1_win} N1_loser_rides(None)={n1_lose} "
+                      f"N7_cap5={n7_cap} N7_violation(>5)={n7_violation} "
                       f"N5_trail_floor8={n5_floor}")
         except Exception as e:
             self._record(36, FAIL, f"raised: {e!r}")
@@ -1696,10 +1703,14 @@ class SelfTest:
 
     def _step_stack_economics(self):
         # v3.2.3 Group 3 (N2/N3/N4/N6): the break-even truth is CODED, not assumed.
+        # NOTE: the global 5-long default is now ON, so this pins the 3-profile
+        # (allow_5_long=False) to keep asserting the proven 3-stack economics --
+        # the assertions/logic are unchanged, only the cfg is made explicit.
+        import dataclasses
         import boosts as _b
         from rescue_log import _branch_for
         try:
-            cfg = self.cfg
+            cfg = dataclasses.replace(self.cfg, allow_5_long=False)
             be = _b.stack_breakeven_usd(cfg)          # one losing leg SL ($)
             n = _b.stack_winners(cfg)                 # 3
             per = _b.per_position_breakeven_usd(cfg)   # ~210
@@ -2323,29 +2334,30 @@ class SelfTest:
         import dataclasses, fp_guard as fp
         try:
             cfg = self.cfg
+            # guard_cfg uses SL + spread buffer (18.6) -> reference math:
+            # 5x0.15 -> -$1,395, 5x0.35 -> -$3,255.
             a1, wc1, _, _ = fp.guard_cfg(5, dataclasses.replace(cfg, lot_size=0.15,
                                           account_profile='STANDARD_5PCT'), 50000.0)
             a2, wc2, _, _ = fp.guard_cfg(5, dataclasses.replace(cfg, lot_size=0.35,
                                           account_profile='STANDARD_5PCT'), 50000.0)
-            applies = (wc1 < wc2 and abs(wc1 - 1350.0) < 1 and abs(wc2 - 3150.0) < 1)
+            applies = (wc1 < wc2 and abs(wc1 - 1395.0) < 1 and abs(wc2 - 3255.0) < 1)
             ok = applies
             detail = f"lot_config_applies_everywhere={applies} (0.15->${wc1:.0f} 0.35->${wc2:.0f})"
         except Exception as e:
             self._record(63, FAIL, f"raised: {e!r}"); return
         self._record(63, PASS if ok else FAIL, detail)
 
-    # ---- Feature C: 5-long No-OCO stack (DEFAULT OFF, flag-gated) ---------
+    # ---- Feature C: 5-long No-OCO stack (DEFAULT ON, disableable) ---------
     def _step_stack5_cap(self):
-        # 64: allow_5_long raises the winning-side cap 3 -> 5; default stays 3
-        # (test-36 cap-at-3 invariant unchanged).
+        # 64: 5-long default ON -> cap 5; disabling the flag falls back to cap 3.
         import dataclasses, boosts as b
         try:
-            cfg = self.cfg
-            cfg5 = dataclasses.replace(cfg, allow_5_long=True)
-            default_3 = (b.stack_cap(cfg) == 3 and b.stack_winners(cfg) == 3)
-            five = (b.stack_cap(cfg5) == 5 and b.stack_winners(cfg5) == 5)
-            ok = default_3 and five
-            detail = f"default_cap3={default_3} allow_5_long->cap5={five}"
+            cfg = self.cfg   # default allow_5_long=True
+            cfg3 = dataclasses.replace(cfg, allow_5_long=False)
+            default_5 = (b.stack_cap(cfg) == 5 and b.stack_winners(cfg) == 5)
+            off_3 = (b.stack_cap(cfg3) == 3 and b.stack_winners(cfg3) == 3)
+            ok = default_5 and off_3
+            detail = f"default_cap5={default_5} flag_off->cap3={off_3}"
         except Exception as e:
             self._record(64, FAIL, f"raised: {e!r}"); return
         self._record(64, PASS if ok else FAIL, detail)
@@ -2421,6 +2433,97 @@ class SelfTest:
         except Exception as e:
             self._record(68, FAIL, f"raised: {e!r}"); return
         self._record(68, PASS if ok else FAIL, detail)
+
+    # ---- v3.2.4 additions: trail co-close, P&L fixtures, profile cap, default --
+    def _step_stack5_trail_coclose(self):
+        # 69: TRAIL-LOCK (the expected Wednesday behaviour). All ARMED longs (+$8)
+        # close TOGETHER at peak - trail_gap; an UNARMED long falls to its own $10
+        # boost SL (not the trail). max_fav is the real peak.
+        import boosts as b
+        try:
+            cfg = self.cfg
+            max_fav = 4017.0   # shared high-water mark (the real peak)
+            longs = [
+                {'entry': 4005.0},   # +12 -> armed
+                {'entry': 4007.0},   # +10 -> armed
+                {'entry': 4013.0},   # +4  -> NOT armed (< +8) -> own $10 SL
+            ]
+            co, rows = b.stack_trail_exits(longs, max_fav, cfg)
+            gap = cfg.trail_gap
+            armed = [r for r in rows if r['armed']]
+            unarmed = [r for r in rows if not r['armed']]
+            co_ok = abs(co - (max_fav - gap)) < 1e-6
+            all_armed_together = all(abs(r['exit'] - co) < 1e-6 for r in armed) and len(armed) == 2
+            unarmed_sl = (len(unarmed) == 1
+                          and abs(unarmed[0]['exit'] - (4013.0 - cfg.boost_trigger_dollars)) < 1e-6)
+            ok = co_ok and all_armed_together and unarmed_sl
+            detail = (f"co_close=${co:.2f}(peak-${gap}) armed_together={all_armed_together} "
+                      f"unarmed->${unarmed[0]['exit']:.2f}_own_SL={unarmed_sl}")
+        except Exception as e:
+            self._record(69, FAIL, f"raised: {e!r}"); return
+        self._record(69, PASS if ok else FAIL, detail)
+
+    def _step_stack5_pnl_015(self):
+        # 70: 5-long P&L fixtures @0.15 (from the drawing: sell -$270 + 5 longs).
+        # least +285 -> +$15 ; modest +585 -> +$315 ; bigger +1185 -> +$915.
+        import dataclasses, boosts as b
+        try:
+            cfg015 = dataclasses.replace(self.cfg, lot_size=0.15)
+            loser = b.stack_breakeven_usd(cfg015)   # 0.15*18*100 = 270
+            least = b.stack_scenario_net(285.0, loser)
+            modest = b.stack_scenario_net(585.0, loser)
+            bigger = b.stack_scenario_net(1185.0, loser)
+            ok = (abs(loser - 270.0) < 1.0 and abs(least - 15.0) < 1.0
+                  and abs(modest - 315.0) < 1.0 and abs(bigger - 915.0) < 1.0)
+            detail = (f"loser=-${loser:.0f} least=+${least:.0f} modest=+${modest:.0f} "
+                      f"bigger=+${bigger:.0f}")
+        except Exception as e:
+            self._record(70, FAIL, f"raised: {e!r}"); return
+        self._record(70, PASS if ok else FAIL, detail)
+
+    def _step_stack5_pnl_035(self):
+        # 71: 5-long P&L @0.35 -- modest +1365 longs -> +$735 net; the larger lot's
+        # worst-case exposure is FLAGGED by the FP guard (REDUCE).
+        import dataclasses, boosts as b, fp_guard as fp
+        try:
+            cfg035 = dataclasses.replace(self.cfg, lot_size=0.35)
+            loser = b.stack_breakeven_usd(cfg035)   # 0.35*18*100 = 630
+            modest = b.stack_scenario_net(1365.0, loser)
+            net_ok = (abs(loser - 630.0) < 1.0 and abs(modest - 735.0) < 1.0)
+            action, wc, lim, allowed = fp.guard_cfg(5, cfg035, 50000.0)
+            flagged = (action != fp.OK and allowed < 5 and wc > lim)
+            ok = net_ok and flagged
+            detail = (f"loser=-${loser:.0f} modest=+${modest:.0f} "
+                      f"fp_flag={action}(wc=${wc:.0f}>lim${lim:.0f},n={allowed})")
+        except Exception as e:
+            self._record(71, FAIL, f"raised: {e!r}"); return
+        self._record(71, PASS if ok else FAIL, detail)
+
+    def _step_fp_zero_profile_cap(self):
+        # 72: FPZERO_1PCT disallows the 5-long entirely -> the stack is capped to 3
+        # (no 5-stack on a 1% floating rule), independent of the worst-case math.
+        import fp_guard as fp
+        try:
+            std = fp.profile_stack_cap('STANDARD_5PCT', 5)
+            zero = fp.profile_stack_cap('FPZERO_1PCT', 5)
+            ok = (std == 5 and zero == 3)
+            detail = f"STANDARD_5PCT->cap{std} FPZERO_1PCT->cap{zero}(5long_blocked)"
+        except Exception as e:
+            self._record(72, FAIL, f"raised: {e!r}"); return
+        self._record(72, PASS if ok else FAIL, detail)
+
+    def _step_stack5_default_on(self):
+        # 73: 5-long is ON by default (config) yet remains disableable -- the flag
+        # exists, default True; FP guard still caps exposure at the chosen lot.
+        import dataclasses, boosts as b
+        try:
+            on = bool(getattr(self.cfg, 'allow_5_long', False)) and b.stack_cap(self.cfg) == 5
+            off = b.stack_cap(dataclasses.replace(self.cfg, allow_5_long=False)) == 3
+            ok = on and off
+            detail = f"default_ON={on} disableable->cap3={off}"
+        except Exception as e:
+            self._record(73, FAIL, f"raised: {e!r}"); return
+        self._record(73, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # Orchestration
@@ -2565,6 +2668,12 @@ class SelfTest:
             self._step_stack5_fp_gate()
             self._step_stack5_whipsaw()
             self._step_stack5_cap_viol()
+            # v3.2.4 additions
+            self._step_stack5_trail_coclose()
+            self._step_stack5_pnl_015()
+            self._step_stack5_pnl_035()
+            self._step_fp_zero_profile_cap()
+            self._step_stack5_default_on()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -2578,7 +2687,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 69):
+        for n in range(1, 74):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2595,12 +2704,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/68 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/73 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/68 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/73 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/68 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/73 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces
