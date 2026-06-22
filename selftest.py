@@ -113,6 +113,11 @@ STEP_NAMES = {
     71: "stack5 pnl 0.35",
     72: "fp zero profile cap",
     73: "stack5 default on",
+    74: "a1 tick fallback places",
+    75: "a1 tick fallback rejects spike",
+    76: "tick hold fires",
+    77: "tick hold blip rejected",
+    78: "tick hold trail advance",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -2525,6 +2530,122 @@ class SelfTest:
             self._record(73, FAIL, f"raised: {e!r}"); return
         self._record(73, PASS if ok else FAIL, detail)
 
+    # ---- v3.2.5 Feature 1: A1 tick-fallback anchor capture (open path) -------
+    def _step_a1_tick_fallback_places(self):
+        # 74: A1 open, no M5 bar -> SANE-tick fallback -> straddle PLACED (NOT
+        # missed). Drives the live _capture_a1_anchor_from_tick with a settled tick
+        # feed; asserts placed=True, source=tick (telemetry), buy/sell geometry.
+        import types, dataclasses
+        from anchors import _capture_a1_anchor_from_tick
+        from position_telemetry import PositionTracer
+        try:
+            cfg = dataclasses.replace(self.cfg, tick_refresh_s=0.0,
+                                      a1_tick_fallback_samples=4, hold_ticks=3,
+                                      a1_tick_fallback_enabled=True)
+            anchor = 4321.50
+            feed = iter([anchor, anchor, anchor, anchor, anchor])   # settled, held
+            def _tick(sym):
+                try: p = next(feed)
+                except StopIteration: p = anchor
+                return types.SimpleNamespace(
+                    time=int(pd.Timestamp.now(tz='UTC').timestamp()), bid=p, ask=p)
+            lines = []
+            stub = types.SimpleNamespace(
+                cfg=cfg, paper=False,
+                adapter=types.SimpleNamespace(tick_time_offset_hours=0,
+                    mt5=types.SimpleNamespace(symbol_info_tick=_tick)),
+                ptrace=PositionTracer(sink=lines.append),
+                tele=types.SimpleNamespace(success=lambda *a, **k: None),
+                _touch_heartbeat=lambda: None)
+            price = _capture_a1_anchor_from_tick(stub, 'A1_02h_Asia',
+                                                 pd.Timestamp('2026-06-22T00:30:00Z'))
+            placed = price is not None and abs(price - anchor) < 1e-6
+            src_tick = any('A1_PLACED_FROM_TICK' in l and 'tick' in l for l in lines)
+            buy = round(price + cfg.trigger_dist, 2) if placed else None
+            sell = round(price - cfg.trigger_dist, 2) if placed else None
+            geom = placed and abs(buy - (anchor + cfg.trigger_dist)) < 1e-6 \
+                and abs(sell - (anchor - cfg.trigger_dist)) < 1e-6
+            ok = placed and src_tick and geom
+            detail = (f"placed={placed} source=tick={src_tick} "
+                      f"anchor=${price if placed else float('nan'):.2f} buy/sell=${buy}/${sell}")
+        except Exception as e:
+            self._record(74, FAIL, f"raised: {e!r}"); return
+        self._record(74, PASS if ok else FAIL, detail)
+
+    def _step_a1_tick_fallback_rejects_spike(self):
+        # 75: the fallback rejects the WILD first reopen tick and waits for a
+        # settled/held run -> the anchor is NOT set on the spike. Also: a feed that
+        # never settles (insufficient held ticks) -> no capture (waits).
+        import tick_hold as th
+        try:
+            cfg = self.cfg
+            settled = 4000.0
+            spike = settled + 60.0   # > max_tick_jump (25) from the settled run
+            ticks = [spike, settled, settled + 0.1, settled - 0.1, settled + 0.05]
+            ok1, price, held, reason = th.settle_anchor_tick(ticks, cfg)
+            anchor_sane = (ok1 and abs(price - settled) < 1.0
+                           and abs(price - spike) > cfg.max_tick_jump)
+            held_ok = held >= th.hold_ticks(cfg)
+            # spike alone (not enough settled ticks) -> waits, no capture.
+            ok2, _, _, r2 = th.settle_anchor_tick([spike, settled], cfg)
+            waits = (not ok2)
+            ok = anchor_sane and held_ok and waits
+            detail = (f"anchor_in_sane_range={anchor_sane}(${price if ok1 else float('nan'):.2f}) "
+                      f"held={held}>=3={held_ok} spike_only->waits={waits}")
+        except Exception as e:
+            self._record(75, FAIL, f"raised: {e!r}"); return
+        self._record(75, PASS if ok else FAIL, detail)
+
+    # ---- v3.2.5 Feature 2: tick-hold confirm on boost + trail ----------------
+    def _step_tick_hold_fires(self):
+        # 76: a +/-$10 cross that HOLDS 3 ticks -> boost fires (rally AND rescue;
+        # the hold logic is direction-agnostic so both confirm identically).
+        import tick_hold as th
+        try:
+            cfg = self.cfg
+            fired_rally, sr, st_r = th.confirm_cross([True, True, True], cfg)
+            fired_rescue, _, st_s = th.confirm_cross([True, True, True], cfg)
+            # a longer run still fires (first CONFIRMED at exactly hold_ticks)
+            fired_more, _, _ = th.confirm_cross([True, True, True, True, True], cfg)
+            ok = fired_rally and fired_rescue and fired_more and st_r == th.CONFIRMED
+            detail = (f"rally_fires={fired_rally} rescue_fires={fired_rescue} "
+                      f"streak={sr}>=hold{th.hold_ticks(cfg)} state={st_r}")
+        except Exception as e:
+            self._record(76, FAIL, f"raised: {e!r}"); return
+        self._record(76, PASS if ok else FAIL, detail)
+
+    def _step_tick_hold_blip_rejected(self):
+        # 77: a +/-$10 cross that REVERTS within 3 ticks -> NO fire (blip rejected).
+        import tick_hold as th
+        try:
+            cfg = self.cfg
+            # T,T then reverts -> BLIP, never CONFIRMED.
+            fired1, _, state1 = th.confirm_cross([True, True, False], cfg)
+            # flapping cross never holds 3 in a row -> never fires.
+            fired2, _, _ = th.confirm_cross([True, False, True, False, True, False], cfg)
+            ok = (not fired1) and state1 == th.BLIP and (not fired2)
+            detail = f"blip_no_fire={not fired1}(state={state1}) flap_no_fire={not fired2}"
+        except Exception as e:
+            self._record(77, FAIL, f"raised: {e!r}"); return
+        self._record(77, PASS if ok else FAIL, detail)
+
+    def _step_tick_hold_trail_advance(self):
+        # 78: a trail lock advances only on a HELD max_fav (>= hold_ticks); a single
+        # spike tick -> no advance. Ties to the phantom-lock guard (lock off a held
+        # real move, never a ghost).
+        import tick_hold as th
+        try:
+            cfg = self.cfg
+            spike_no = not th.trail_advance_ok(1, cfg)     # single spike tick
+            two_no = not th.trail_advance_ok(2, cfg)       # 2 < hold_ticks
+            held_yes = th.trail_advance_ok(th.hold_ticks(cfg), cfg)  # held -> advance
+            ok = spike_no and two_no and held_yes
+            detail = (f"spike(1)->no_advance={spike_no} two->no={two_no} "
+                      f"held({th.hold_ticks(cfg)})->advance={held_yes}")
+        except Exception as e:
+            self._record(78, FAIL, f"raised: {e!r}"); return
+        self._record(78, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -2674,6 +2795,12 @@ class SelfTest:
             self._step_stack5_pnl_035()
             self._step_fp_zero_profile_cap()
             self._step_stack5_default_on()
+            # v3.2.5 A1 tick-fallback + tick-hold confirm
+            self._step_a1_tick_fallback_places()
+            self._step_a1_tick_fallback_rejects_spike()
+            self._step_tick_hold_fires()
+            self._step_tick_hold_blip_rejected()
+            self._step_tick_hold_trail_advance()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -2687,7 +2814,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 74):
+        for n in range(1, 79):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2704,12 +2831,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/73 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/78 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/73 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/78 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/73 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/78 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

@@ -77,6 +77,13 @@ STACK_COMPLETE = "STACK_COMPLETE"
 LEG_SL = "LEG_SL"
 TRAIL_LOCK = "TRAIL_LOCK"
 STACK_CLOSE = "STACK_CLOSE"
+# v3.2.5 A1 tick-fallback + tick-hold confirm
+A1_BAR_MISSING = "A1_BAR_MISSING"
+A1_TICK_FALLBACK = "A1_TICK_FALLBACK"
+A1_PLACED_FROM_TICK = "A1_PLACED_FROM_TICK"
+TICK_CROSS_CANDIDATE = "TICK_CROSS_CANDIDATE"
+TICK_HOLD_CONFIRMED = "TICK_HOLD_CONFIRMED"
+TICK_BLIP_REJECTED = "TICK_BLIP_REJECTED"
 VIOLATION = "TELEMETRY_VIOLATION"
 
 # Mandatory fields on EVERY line (spec B2). A missing field is the failure we are
@@ -205,6 +212,12 @@ class PositionTracer:
     def leg_sl(self, ticket, anchor, **kw): return self.emit(LEG_SL, ticket, anchor, **kw)
     def trail_lock(self, ticket, anchor, **kw): return self.emit(TRAIL_LOCK, ticket, anchor, **kw)
     def stack_close(self, anchor, **kw):   return self.emit(STACK_CLOSE, None, anchor, **kw)
+    def a1_bar_missing(self, anchor, **kw): return self.emit(A1_BAR_MISSING, None, anchor, **kw)
+    def a1_tick_fallback(self, anchor, **kw): return self.emit(A1_TICK_FALLBACK, None, anchor, **kw)
+    def a1_placed_from_tick(self, anchor, **kw): return self.emit(A1_PLACED_FROM_TICK, None, anchor, **kw)
+    def tick_cross_candidate(self, ticket, anchor, **kw): return self.emit(TICK_CROSS_CANDIDATE, ticket, anchor, **kw)
+    def tick_hold_confirmed(self, ticket, anchor, **kw): return self.emit(TICK_HOLD_CONFIRMED, ticket, anchor, **kw)
+    def tick_blip_rejected(self, ticket, anchor, **kw): return self.emit(TICK_BLIP_REJECTED, ticket, anchor, **kw)
     def reconcile_orphan(self, ticket, **kw):
         return self.violation(ticket, "SYS", "reconcile_orphan", **kw)
     def autopull_aborted(self, reason="selftest_fail", **kw):

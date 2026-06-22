@@ -76,6 +76,25 @@ class Config:
     # NOTE: the 5-long co-close reuses the EXISTING tuned trail_gap (line ~26),
     # it does NOT redefine it. Only the arm threshold is new here.
     trail_arm_profit: float = 8.0  # a long arms its trail once +$8 in profit
+    # --- v3.2.5 Feature 1: A1 tick-fallback anchor capture (open path ONLY) ----
+    # At the Monday/post-weekend open the M5 bar can lag (not yet published) while
+    # ticks are live. If A1's get_m5_close finds NO bar after the existing retries,
+    # fall back to a SANE, SETTLED live tick (passes max_tick_jump AND held >=
+    # hold_ticks) and place off it -- A1 only, open path only. A2/A3/A4 and A1 on a
+    # normal day with a present bar are UNCHANGED (always bar-capture). False = the
+    # old behavior (skip on no-bar). a1_tick_fallback_samples = how many recent ticks
+    # to read when settling.
+    a1_tick_fallback_enabled: bool = True
+    a1_tick_fallback_samples: int = 6
+    # --- v3.2.5 Feature 2: tick-hold confirm on boost + trail ------------------
+    # Boost/trail run on tick refresh (~tick_refresh_s). A +/-$10 cross fires ONLY
+    # after it HOLDS >= hold_ticks consecutive sane ticks (~1s); a cross that reverts
+    # within the window is a blip -> NO fire. A trail lock advances only on a held,
+    # sane max_fav (reinforces the phantom-lock guard). Tightens WHEN a boost/lock
+    # acts; does NOT change the +/-$10 levels, the stack rules, the cap, or any
+    # existing boost/trail logic. tick_hold_band reuses max_tick_jump by default.
+    hold_ticks: int = 3
+    tick_refresh_s: float = 0.3
     freeze_minutes: int = 45  # v2.7: was 15 (and functionally DEAD until the v2.7 timezone
     # fix in live_trader._manage_trails_on_bar_close -- see comment there). 45m = risk-
     # adjusted sweet spot of the tick grid: +$26.7k vs +$23.0k @30m, same maxDD (-$2,520),

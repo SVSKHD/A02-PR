@@ -678,6 +678,7 @@ def _check_boost_triggers(self):
         mid = (float(tk.bid) + float(tk.ask)) / 2.0
     except Exception:
         return
+    import tick_hold as _th
     trig = float(getattr(self.cfg, 'boost_trigger_dollars', 10.0))
     tr = getattr(self, 'ptrace', None)
     for ticket, shadow in list(self.shadow_positions.items()):
@@ -688,12 +689,21 @@ def _check_boost_triggers(self):
         fill_px = float(shadow.get('leg_fill_price', shadow['entry_price']))
         rally_only = bool(shadow.get('boost_rally_only', False))
         leg_fav = (mid - fill_px) if side == 'BUY' else (fill_px - mid)
+        crossed = abs(leg_fav) >= trig
         try:
             plan = boosts.plan_boost_event(
                 side, fill_px, mid, self.cfg, allow_rescue=not rally_only)
         except Exception:
             plan = None
         if plan is None:
+            # v3.2.5 tick-hold: a cross that reverts BACK inside +/-$10 before it
+            # held hold_ticks is a blip -- reset the streak (logged, not fired).
+            if not crossed and int(shadow.get('boost_cross_streak', 0)) > 0:
+                if tr is not None:
+                    tr.tick_blip_rejected(ticket, shadow.get('anchor_label'),
+                                          side=side, reverted_from=shadow['boost_cross_streak'],
+                                          move_dollars=round(leg_fav, 2))
+                shadow['boost_cross_streak'] = 0
             # v3.2.3 MISSED_BOOST watchdog: a fire was EXPECTED (the threshold was
             # crossed AND that kind is enabled here) but none was planned -- the
             # logic failed to detect a valid trigger. A silent no-fire is a
@@ -707,6 +717,23 @@ def _check_boost_triggers(self):
                                 position_price=fill_px, move_dollars=round(leg_fav, 2),
                                 trigger=trig, rally_only=rally_only)
             continue
+        # v3.2.5 tick-hold confirm: the cross must HOLD >= hold_ticks consecutive
+        # ticks before it fires; a blip that reverts within the window never gets
+        # here (reset above). Levels/stack/cap unchanged -- this only gates WHEN.
+        streak, tstate = _th.step_cross(
+            int(shadow.get('boost_cross_streak', 0)), True, self.cfg)
+        shadow['boost_cross_streak'] = streak
+        if tstate != _th.CONFIRMED:
+            if tr is not None:
+                tr.tick_cross_candidate(ticket, shadow.get('anchor_label'),
+                                        side=plan.boost_side, held_ticks=streak,
+                                        hold_ticks=_th.hold_ticks(self.cfg),
+                                        move_dollars=plan.move_dollars, trigger=trig)
+            continue   # crossed but not yet held -> keep watching
+        if tr is not None:
+            tr.tick_hold_confirmed(ticket, shadow.get('anchor_label'),
+                                   side=plan.boost_side, held_ticks=streak,
+                                   move_dollars=plan.move_dollars)
         # stack after this event: parent leg (1) + n boosts.
         stack_after = 1 + int(plan.n)
         # v3.2.3 Feature D — BREAK-AND-HOLD gate: do NOT stack on a fake break.
