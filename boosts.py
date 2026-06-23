@@ -158,10 +158,11 @@ def stack_breakeven_usd(cfg):
 
 
 def stack_cap(cfg):
-    """The hard cap on winners on the winning side. 3 by default (original + 2
-    RALLY); 5 when cfg.allow_5_long (original + 2 RALLY + 2 RESCUE-converts once
-    the losing leg SLs out). Default OFF keeps the proven 3-cap (test-36)."""
-    return 5 if bool(getattr(cfg, "allow_5_long", False)) else 3
+    """The hard cap on winners on the winning side: max_boost_stack (default 5) when
+    cfg.allow_5_long (original + 2 RALLY + 2 RESCUE-converts once the losing leg SLs
+    out), else the proven 3-cap (test-36). v3.2.6: the 5-value is the config knob
+    cfg.max_boost_stack so the cap is tunable, not hard-coded."""
+    return int(getattr(cfg, "max_boost_stack", 5)) if bool(getattr(cfg, "allow_5_long", False)) else 3
 
 
 def stack_winners(cfg):

@@ -205,6 +205,24 @@ def _reconcile_with_broker(self):
         if ticket not in broker_pend_tickets and ticket in broker_pos_tickets:
             info = self.shadow_pendings.pop(ticket)
             sibling = info['sibling_ticket']
+            # v3.2.6 A3-type DOUBLE-FILL log (LOG-ONLY, no gate): both original legs
+            # of the same anchor have now filled (price whipsawed through both
+            # anchor+/-$5 stops -- the A3 straddle whipsaw). The sibling still runs
+            # exactly as before (No-OCO rescue); we only make the event VISIBLE so an
+            # A3-type double-fill is never silent. NO behavior change, no gating.
+            if sibling is not None and sibling in self.shadow_positions:
+                _sib_sh = self.shadow_positions.get(sibling, {}) or {}
+                self.tele.warn(
+                    f"⚠️ A3 DOUBLE-FILL {info.get('anchor_label')}: both original "
+                    f"legs filled ({_sib_sh.get('side')} #{sibling} + "
+                    f"{info.get('side')} #{ticket}) — straddle whipsaw; sibling runs "
+                    f"as rescue (log-only, no gate)")
+                _tr0 = getattr(self, 'ptrace', None)
+                if _tr0 is not None:
+                    _tr0.double_fill(ticket, info.get('anchor_label'),
+                                     side=info.get('side'), sibling_ticket=sibling,
+                                     sibling_side=_sib_sh.get('side'),
+                                     entry_price=info.get('entry_price'))
             # v3.0.7: build via the never-raising formatter and send important=True
             # so the fill alert can never be dropped by a formatter throw or by
             # INFO rate limiting (a fill often lands seconds after placement).

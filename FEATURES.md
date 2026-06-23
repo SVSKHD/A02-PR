@@ -19,6 +19,7 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
   weekend sleep + wake failsafe, auto-pull + soft restart.  (frozen baseline: 54/54)
 - **v3.2.4** — break-and-hold filter, lot 0.15/0.35 + FP guard, 5-long No-OCO stack. (merged PR #39/#40)
 - **v3.2.5** — A1 tick-fallback anchor capture, tick-hold boost/trail (0.3s refresh, 3-tick hold). (merged PR #41)
+- **v3.2.6** — boost breath-gap +$8 ARM GATE (incident 2026-06-23 fix); A3 double-fill log. (this build)
 
 ---
 
@@ -41,7 +42,12 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
 | v3.2.4 | 5-long additions (trail co-close, P&L 0.15/0.35, FPZERO profile cap, default-on) | 5 | 69–73 | 73 |
 | v3.2.5 | A1 tick-fallback anchor capture | 2 | 74–75 | 75 |
 | v3.2.5 | tick-hold boost/trail | 3 | 76–78 | 78 |
-| **TOTAL** | | **78** | **1–78** | **78/78** |
+| v3.2.6 | boost breath-gap +$8 arm-gate incident regression | 1 | 79 | 79 |
+| **TOTAL** | | **79** | **1–79** | **79/79** |
+
+> v3.2.6 also RE-SPEC'd frozen tests 23/24/25 (boost breath-trail) to the new arm-gate
+> behaviour — same indices, updated assertions (reverse<8 → $10 backstop; reach +8 →
+> lock floor; run past +8 → $3.50 trail). Not new tests; existing ones corrected.
 
 > Note: earlier planning docs used a provisional numbering (e.g. "frozen 59/59", break-and-hold
 > at 65–69). The features all shipped; the live indices above are the ground truth. The v3.2.3
@@ -108,6 +114,30 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
   >=3 ticks (blips rejected); trail lock advances only on held max_fav. Speed of tick + noise filter.
   Events TICK_CROSS_CANDIDATE / TICK_HOLD_CONFIRMED / TICK_BLIP_REJECTED.
 
+### ✅ BUILT & MERGED — v3.2.6 (incident 2026-06-23 fix — boost-path only)
+
+- **Boost breath-gap +$8 ARM GATE** (selftest 23/24/25 re-spec + new 79) — the breath-gap software
+  trail was armed at fav=0 (only $3.50 adverse of entry), so reversing boosts were cut underwater.
+  Incident: SELL boosts #56860793855/#...813 entered ~4185.92, cut at ~4191.32 (−188.65 each), price
+  then dropped ~$35. FIX (`strategy.py:_update_boost_on_bar`): breath-gap trail INACTIVE below
+  +$8 peak → boost protected ONLY by the $10 backstop (rides adverse or recovers); at +$8 a one-way
+  LOCK FLOOR engages; above +$8 the $3.50 trail follows, floor never < +$8. Config knobs
+  `boost_trail_arm_fav` / `boost_lock_floor` / `max_boost_stack`. Original-leg ladder/BE/trail UNTOUCHED.
+  - **Tradeoff (intentional):** below +$8 a failing boost now rides to the −$10 backstop (−$350 @0.35;
+    −$1,750 worst-case at 5-long/0.35) instead of the old −$3.50 stop. Trades small frequent losers for
+    held winners; bounded by break-and-hold on boosts and the −$700 pair cap. **Judge by the ratio**
+    (boosts reaching +$8 and holding vs. riding to backstop), not the running balance — first ~20 boosts.
+    Backtest impact (2026-05 demo): RAW net $40,787.42 → $39,241.65 (chop month; the cost of the tradeoff).
+- **A3-type DOUBLE_FILL log** (`fills.py`) — both original legs of an anchor filling (straddle whipsaw)
+  is now LOGGED (DOUBLE_FILL event + ⚠️ Discord). **LOG-ONLY, no gate** — the sibling still runs as a
+  No-OCO rescue exactly as before.
+
+### DECISION LOG (v3.2.6)
+- **Originals UNGATED** — break-and-hold gates boost/rescue arming only; original straddle legs stay
+  unconditional stop orders at anchor±$5. A3-type double-fills are accepted and logged, not blocked.
+- **A4 original-leg early-cut on rescue-confirm: REJECTED** — it would close the original before
+  direction is known; the original is *meant* to lose when the other side wins. Not a build item.
+
 ---
 
 ## KEY BEHAVIOURS (the rules that matter)
@@ -118,6 +148,9 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
 - **Stack cap:** 3 (legacy) -> 5 with 5-long (v3.2.4, DEFAULT ON), FP-gated; FPZERO_1PCT caps back to 3.
 - **Trail:** arm at +$8, lock behind real shared max_fav (~$2.00 gap), all armed close together on reversal;
   unarmed -> own $10 SL. Never a phantom lock.
+- **Boost stop (v3.2.6):** breath-gap trail INACTIVE below +$8 -> protected by the $10 backstop only
+  (rides adverse or recovers, NOT cut at -$3.50); at +$8 a one-way lock floor engages; above +$8 the
+  $3.50 trail follows, floor never < +$8. Boost-path only; original leg untouched.
 - **Loser leg:** rides to $18 SL (-$630 @0.35 / -$270 @0.15), then closed and out of exposure.
 - **Stop-through:** re-arm + keep valid stop, NEVER market-close.
 - **Lot/FP:** 0.35 = demo (breaches 5%); 0.15 = fundable (~2.5% DD); FP Zero 1% needs 3-cap not 5.
