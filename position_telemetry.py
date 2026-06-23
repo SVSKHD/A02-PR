@@ -84,6 +84,8 @@ A1_PLACED_FROM_TICK = "A1_PLACED_FROM_TICK"
 TICK_CROSS_CANDIDATE = "TICK_CROSS_CANDIDATE"
 TICK_HOLD_CONFIRMED = "TICK_HOLD_CONFIRMED"
 TICK_BLIP_REJECTED = "TICK_BLIP_REJECTED"
+# v3.2.6 A3-type straddle double-fill (both original legs filled) — log only
+DOUBLE_FILL = "DOUBLE_FILL"
 VIOLATION = "TELEMETRY_VIOLATION"
 
 # Mandatory fields on EVERY line (spec B2). A missing field is the failure we are
@@ -218,6 +220,7 @@ class PositionTracer:
     def tick_cross_candidate(self, ticket, anchor, **kw): return self.emit(TICK_CROSS_CANDIDATE, ticket, anchor, **kw)
     def tick_hold_confirmed(self, ticket, anchor, **kw): return self.emit(TICK_HOLD_CONFIRMED, ticket, anchor, **kw)
     def tick_blip_rejected(self, ticket, anchor, **kw): return self.emit(TICK_BLIP_REJECTED, ticket, anchor, **kw)
+    def double_fill(self, ticket, anchor, **kw): return self.emit(DOUBLE_FILL, ticket, anchor, **kw)
     def reconcile_orphan(self, ticket, **kw):
         return self.violation(ticket, "SYS", "reconcile_orphan", **kw)
     def autopull_aborted(self, reason="selftest_fail", **kw):

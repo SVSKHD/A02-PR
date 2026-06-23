@@ -118,6 +118,7 @@ STEP_NAMES = {
     76: "tick hold fires",
     77: "tick hold blip rejected",
     78: "tick hold trail advance",
+    79: "boost incident regression",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -923,19 +924,24 @@ class SelfTest:
         self._record(22, PASS if ok else FAIL, detail)
 
     def _step_boost_trail(self):
-        # v3.1.6 BOOST BREATH-GAP TRAIL + $10 BACKSTOP (boosts only). Drive the REAL
-        # strategy core over price paths. gap = cfg.boost_trail_gap_dollars (3.50);
-        # the trail is armed the instant the boost fills, alongside the $10 hard SL.
+        # v3.2.6 BOOST BREATH-GAP +$8 ARM GATE + $10 BACKSTOP (boosts only). Drive the
+        # REAL strategy core over price paths. The breath-gap trail is INACTIVE until
+        # the boost peaks >= +arm (boost_trail_arm_fav=$8); below that ONLY the $10
+        # backstop protects (incident 2026-06-23 fix). At +arm a +floor lock engages;
+        # above it the $gap trail follows, floor never < +floor.
         from strategy import Position, update_position_on_bar
         try:
             cfg = self.cfg
             gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
+            hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+            arm = float(getattr(cfg, 'boost_trail_arm_fav', 8.0))
+            floor = float(getattr(cfg, 'boost_lock_floor', 8.0))
             entry = 100.0
             ts0 = pd.Timestamp('2026-06-17T13:50:00Z')
 
             def run(bars, boost=True, role='rescue'):
                 p = Position(anchor_label='T', side='BUY', entry_price=entry,
-                             entry_time=ts0, current_sl=entry - 10.0,
+                             entry_time=ts0, current_sl=entry - hard,
                              tp_level=entry + 30.0, max_fav=entry,
                              lot=cfg.lot_size, role=role, boost=boost)
                 for i, b in enumerate(bars):
@@ -945,16 +951,24 @@ class SelfTest:
                         break
                 return p
 
-            # 1) reverses before +$8 -> exits on the breath-gap trail at ~-(gap), NOT -$10
-            p1 = run([{'open': 100, 'high': 101, 'low': 100 - gap - 1, 'close': 96}])
-            rev_at_gap = p1.closed and abs((entry - p1.exit_price) - gap) < 0.05
-            # 2) gaps THROUGH the trail -> caught by the $10 SL backstop (~-$10)
-            p2 = run([{'open': 85, 'high': 86, 'low': 84, 'close': 85}])
-            backstop = p2.closed and abs((entry - p2.exit_price) - 10.0) < 0.05
-            # 3) runs past +$8 then pulls back -> exits no lower than +$8 (floor)
+            # 1) reverses BEFORE +$8 -> trail INACTIVE -> rides to the $10 BACKSTOP,
+            #    NOT -gap (this is the incident fix).
+            p1 = run([{'open': 100, 'high': 101, 'low': entry - hard - 1, 'close': 92}])
+            backstop_below8 = p1.closed and abs((entry - p1.exit_price) - hard) < 0.05
+            # 1b) a shallow reverse before +$8 (does NOT reach the backstop) -> the
+            #     boost is NOT cut; it rides (the old code would have cut it at -gap).
+            p1b = run([{'open': 100, 'high': 101, 'low': entry - gap - 1, 'close': 96}])
+            rides_not_cut = (not p1b.closed)
+            # 2) reaches +$8 then reverses -> closes at the +$8 LOCK FLOOR (not -gap,
+            #    not BE).
+            p2 = run([{'open': 100, 'high': entry + arm + 0.5, 'low': 100.2, 'close': entry + arm},
+                      {'open': entry + arm, 'high': entry + arm, 'low': entry + floor - 3, 'close': entry + floor - 3}])
+            lock_floor = p2.closed and abs((p2.exit_price - entry) - floor) < 0.05
+            # 3) runs PAST +$8 -> trail follows $gap (exit ~ peak-gap), floor >= +$8.
             p3 = run([{'open': 100, 'high': 112, 'low': 100.5, 'close': 111},
                       {'open': 111, 'high': 111, 'low': 108, 'close': 108}])
-            floor8 = p3.closed and (p3.exit_price - entry) >= 8.0 - 0.05
+            trail_gap = (p3.closed and abs((p3.exit_price - entry) - (12.0 - gap)) < 0.05
+                         and (p3.exit_price - entry) >= floor - 0.05)
             # 4) one-way: after the peak a non-triggering retrace must NOT loosen SL
             p4 = run([{'open': 100, 'high': 112, 'low': 100.5, 'close': 111}])
             sl_peak = p4.current_sl
@@ -962,10 +976,11 @@ class SelfTest:
                 {'open': 109, 'high': 109, 'low': 108.6, 'close': 108.8}),
                 ts0 + pd.Timedelta(minutes=2), cfg)
             one_way = (p4.closed or p4.current_sl >= sl_peak - 1e-9)
-            ok = rev_at_gap and backstop and floor8 and one_way
-            detail = (f"rev@-{gap:.2f}->exit{p1.exit_price}({rev_at_gap}) "
-                      f"gap->backstop{p2.exit_price}({backstop}) "
-                      f"runpast8->exit{p3.exit_price}({floor8}) one_way={one_way}")
+            ok = backstop_below8 and rides_not_cut and lock_floor and trail_gap and one_way
+            detail = (f"rev<8->backstop{p1.exit_price}({backstop_below8}) "
+                      f"shallow_rides={rides_not_cut} "
+                      f"reach8_rev->floor{p2.exit_price}({lock_floor}) "
+                      f"runpast8->trail{p3.exit_price}({trail_gap}) one_way={one_way}")
         except Exception as e:
             self._record(23, FAIL, f"raised: {e!r}")
             return
@@ -1001,13 +1016,14 @@ class SelfTest:
                     break
             return round(realize_pnl_usd(p, cfg), 2) if p.closed else None
 
+        hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
         # TREND: rise to +25 then pull back to the breath trail -> rides past +8.
         b_trend = sim_boost([{'open': 100, 'high': 125, 'low': 100.5, 'close': 124},
                              {'open': 124, 'high': 124, 'low': 121, 'close': 121}])
-        # WHIPSAW: immediate reverse -> exits on the breath-gap trail at ~-(gap),
-        # FAR less than the old -$10 worst case.
-        b_whip = sim_boost([{'open': 100, 'high': 100.5, 'low': 96, 'close': 96.5}])
-        old_cap = round(2 * float(getattr(cfg, 'boost_sl_dollars', 10.0)) * lot * 100, 2)
+        # WHIPSAW: v3.2.6 a boost that reverses BEFORE +$8 now rides to the $10
+        # BACKSTOP (the arm-gate fix) -- the worst-case is -$10/boost, the cap.
+        b_whip = sim_boost([{'open': 100, 'high': 100.5, 'low': 89, 'close': 90}])
+        old_cap = round(2 * hard * lot * 100, 2)
 
         _fj_orig = _fj.save_rescue_event
         _fj.save_rescue_event = lambda d, e, doc: True
@@ -1051,11 +1067,11 @@ class SelfTest:
                 "trend_boost_rides>8": (b_trend is not None and b_trend > 8 * lot * 100),
                 "trend=CRASH_WIN":     trend['branch'] == 'CRASH_WIN',
                 "trend_net>0":         float(trend['net_usd']) > 0,
-                # v3.1.6: whipsaw boost exits at ~-(gap), NOT -$10 (much smaller loss)
-                "whip_boost~-gap":     (b_whip is not None and abs(b_whip + gap * lot * 100) < 1.0),
+                # v3.2.6: a reverse before +$8 rides to the $10 backstop (the fix)
+                "whip_boost~-backstop": (b_whip is not None and abs(b_whip + hard * lot * 100) < 1.0),
                 "whip=WHIPSAW_LOSS":   whip['branch'] == 'WHIPSAW_LOSS',
-                # combined boost loss is now FAR under the old -$700 worst case
-                "whip<old_700cap":     (-old_cap < 2 * b_whip < 0),
+                # combined boost loss is bounded BY the -$700 cap (== 2x the backstop)
+                "whip<=old_700cap":    (-old_cap - 0.5 <= 2 * b_whip < 0),
                 "scratch=SCRATCH":     scr['branch'] == 'SCRATCH',
                 # no-boost counterfactual logged = rescue leg alone (boosts excluded)
                 "cf_logged_trend":     abs(float(trend['no_boost_net']) - 400.0) < 0.01,
@@ -1096,10 +1112,11 @@ class SelfTest:
                              current_sl=entry - 10.0, tp_level=entry + 30.0,
                              max_fav=entry, lot=cfg.lot_size, role='rescue', boost=True)
 
-            # 1) Drive the BOOST to a loss (reverses to its breath trail). The
-            #    ORIGINAL object must be byte-for-byte untouched by this.
+            # 1) Drive the BOOST to a loss. v3.2.6: a reverse before +$8 rides to the
+            #    $10 backstop (arm-gate fix), so drop through the backstop to realize
+            #    the loss. The ORIGINAL object must be byte-for-byte untouched by this.
             update_position_on_bar(boost, pd.Series(
-                {'open': 100, 'high': 100.5, 'low': 96, 'close': 96.5}),
+                {'open': 100, 'high': 100.5, 'low': 89, 'close': 90}),
                 ts0 + pd.Timedelta(minutes=1), cfg)
             boost_lost = boost.closed and realize_pnl_usd(boost, cfg) < 0
             orig_untouched = (not orig.closed
@@ -2646,6 +2663,42 @@ class SelfTest:
             self._record(78, FAIL, f"raised: {e!r}"); return
         self._record(78, PASS if ok else FAIL, detail)
 
+    def _step_boost_incident_regression(self):
+        # 79: 2026-06-23 INCIDENT regression. The SELL boost (#56860793855) entered
+        # ~4185.92 and was CUT underwater at ~4191.32 (+$5.4 adverse) by the breath
+        # trail armed at fav=0; price then dropped ~$35. v3.2.6 arm-gate: below +$8
+        # the trail is INACTIVE, so an adverse bar to 4191.32 must NOT close it (the
+        # $10 backstop 4195.92 is not hit); on the favorable drop it rides/profits.
+        from strategy import Position, update_position_on_bar, realize_pnl_usd
+        try:
+            cfg = self.cfg
+            entry = 4185.92
+            hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+            backstop = entry + hard      # SELL backstop sits ABOVE entry (4195.92)
+            ts0 = pd.Timestamp('2026-06-23T04:06:34Z')
+            p = Position(anchor_label='A1_02h_Asia', side='SELL', entry_price=entry,
+                         entry_time=ts0, current_sl=backstop, tp_level=entry - 30.0,
+                         max_fav=entry, lot=cfg.lot_size, role='rescue', boost=True)
+            # the exact incident adverse bar: high 4191.6, the close 4191.32 -- inside
+            # the OLD $3.50 trail but well below the $10 backstop. Must NOT close.
+            update_position_on_bar(p, pd.Series(
+                {'open': 4191.32, 'high': 4191.60, 'low': 4189.00, 'close': 4191.32}),
+                ts0 + pd.Timedelta(minutes=1), cfg)
+            not_cut_underwater = (not p.closed)
+            backstop_not_hit = p.current_sl >= backstop - 1e-6   # SL held at full $10
+            # then price drops ~$35 in AUREON's favor -> the boost rides into profit.
+            update_position_on_bar(p, pd.Series(
+                {'open': 4191.00, 'high': 4191.00, 'low': 4156.00, 'close': 4158.00}),
+                ts0 + pd.Timedelta(minutes=2), cfg)
+            held_or_profit = (not p.closed) or realize_pnl_usd(p, cfg) > 0
+            ok = not_cut_underwater and backstop_not_hit and held_or_profit
+            detail = (f"adverse_4191.32_not_cut={not_cut_underwater} "
+                      f"backstop_${backstop:.2f}_held={backstop_not_hit} "
+                      f"after_$35_drop_held/profit={held_or_profit}")
+        except Exception as e:
+            self._record(79, FAIL, f"raised: {e!r}"); return
+        self._record(79, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -2801,6 +2854,8 @@ class SelfTest:
             self._step_tick_hold_fires()
             self._step_tick_hold_blip_rejected()
             self._step_tick_hold_trail_advance()
+            # v3.2.6 boost breath-gap +$8 arm-gate incident regression
+            self._step_boost_incident_regression()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -2814,7 +2869,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 79):
+        for n in range(1, 80):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2831,12 +2886,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/78 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/79 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/78 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/79 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/78 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/79 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

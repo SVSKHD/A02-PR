@@ -145,6 +145,23 @@ class Config:
     # leg (the original runs to its OWN exit; boosts never close/modify it). NOTE:
     # a future "smart" adaptive gap (vol-scaled, for boosts AND originals) is a
     # tracked item; v3.1.6 ships this as a tunable fixed gap only.
+    # --- v3.2.6 BOOST breath-gap +$8 ARM GATE (incident 2026-06-23 fix) --------
+    # The 2026-06-23 SELL boosts (#56860793855/#...813) entered ~4185.92 and were
+    # CUT underwater at ~4191.32 (-188.65 each) by the breath-gap software stop that
+    # was armed at fav=0; price then dropped ~$35. ROOT CAUSE: the breath trail was
+    # live below profit, sitting only $gap adverse of entry. FIX: the breath-gap
+    # software trail is INACTIVE until the boost has been at least +boost_trail_arm_fav
+    # favorable (peak). Below the arm, ONLY the $10 hard backstop protects -> a
+    # reversing boost rides to the backstop (or recovers) instead of being cut at
+    # ~-gap. AT the arm, a one-way LOCK FLOOR at +boost_lock_floor engages (locked
+    # profit never falls below it); ABOVE it the $gap trail follows the favorable peak,
+    # floor never retreating. Boost-path ONLY; original-leg ladder/BE/trail untouched.
+    boost_trail_arm_fav: float = 8.0  # BOOST_TRAIL_ARM_FAV: peak fav ($) before the
+    #   breath-gap trail/lock arms; below it the boost runs on the $10 backstop only.
+    boost_lock_floor: float = 8.0     # BOOST_LOCK_FLOOR: once armed, locked profit ($)
+    #   never falls below this (one-way ratchet). == arm by default.
+    max_boost_stack: int = 5          # MAX_BOOST_STACK: hard cap on winning-side stack
+    #   when allow_5_long (orig + 2 RALLY + 2 RESCUE); 3 when allow_5_long is False.
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all

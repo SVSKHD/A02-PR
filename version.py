@@ -571,9 +571,26 @@ History (one line per behavioral change):
          import-path identity). selftest -> 78 steps (new 74-78: A1 places-from-tick /
          A1 rejects-spike / tick-hold fires / blip-rejected / trail-advance). Banner
          v3.2.5.
+  3.2.6  BOOST breath-gap +$8 ARM GATE (incident 2026-06-23). The breath-gap software
+         trail was armed at fav=0, sitting only $gap ($3.50) adverse of entry, so two
+         SELL boosts (#56860793855/#...813) were CUT underwater at +$5.4 adverse
+         (-188.65 each) right before price dropped ~$35. FIX (boost-path only,
+         strategy.py _update_boost_on_bar): the breath-gap trail is now INACTIVE until
+         the boost has peaked >= +boost_trail_arm_fav ($8). Below the arm ONLY the $10
+         hard backstop protects (a reversing boost rides to the backstop or recovers).
+         At +arm a one-way LOCK FLOOR engages at +boost_lock_floor ($8); above it the
+         $gap trail follows the favorable peak, floor never retreating. New config
+         knobs boost_trail_arm_fav / boost_lock_floor / max_boost_stack (no hard-codes).
+         Original-leg ladder/BE/trail UNTOUCHED. Added A3-type DOUBLE_FILL log (both
+         original legs filled -> log-only, no gate). Re-spec'd selftests 23/24/25 to the
+         arm-gate behaviour (reverse<8 -> backstop; reach+8 -> lock floor; run past +8
+         -> $gap trail) + NEW incident regression test 79 (SELL 4185.92 -> adverse
+         4191.32 NOT cut -> $35 drop -> held/profit). selftest -> 79 steps. Tradeoff:
+         a failing boost now rides to -$10 (vs old -$3.50) -- intentional, bounded by
+         break-and-hold + the -$700 pair cap. Banner v3.2.6.
 """
 
-__version__ = "3.2.5"
+__version__ = "3.2.6"
 CODENAME = "Astra Hawk"
 
 
