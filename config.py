@@ -51,6 +51,14 @@ class Config:
     # less than max_retrace_y of the break distance. A spike that reverses inside the
     # window is a FAILED break -> fire nothing (kills the 14:30/15:30 fake-outs).
     break_and_hold_enabled: bool = True
+    # v3.2.7: break-and-hold gates RALLY boosts only (must confirm the break before
+    # pyramiding the winner). RESCUE boosts fire FREELY on direction commit -- a
+    # rescue is the opposite-side sibling that becomes the winner after a whipsaw;
+    # gating it on a confirmed break wrongly suppressed winning-side recovery legs
+    # (the 3-leg model). RESCUE is still subject to the +/-$10 trigger, tick-hold
+    # >=3, and the FP guard -- ONLY break-and-hold is bypassed. Set False to fall
+    # back to gating BOTH kinds (legacy v3.2.6 behavior) without a rebuild.
+    rescue_bypass_break_and_hold: bool = True
     break_timeframe: str = "M5"   # hold is measured on M5 candles (v3.2.4)
     break_dist_x: float = 3.0     # must clear the edge by >= this ($)
     hold_candles_n: int = 2       # must hold this many M5 candles past the edge

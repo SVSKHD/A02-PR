@@ -119,6 +119,7 @@ STEP_NAMES = {
     77: "tick hold blip rejected",
     78: "tick hold trail advance",
     79: "boost incident regression",
+    80: "rescue bypass break-and-hold",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -2699,6 +2700,60 @@ class SelfTest:
             self._record(79, FAIL, f"raised: {e!r}"); return
         self._record(79, PASS if ok else FAIL, detail)
 
+    def _step_rescue_bypass_break_and_hold(self):
+        # 80: v3.2.7 — break-and-hold gates RALLY only; RESCUE fires FREELY on
+        # direction commit. Drives the REAL fills._check_boost_triggers with an
+        # UNCONFIRMED break (_break_and_hold_ok stubbed False) and asserts: RALLY
+        # suppressed, RESCUE fires, RESCUE still blocked by FP guard, toggle-off
+        # re-gates RESCUE, RALLY fires on a CONFIRMED break. tick-hold streak is
+        # pre-seeded to hold-1 so a single tick confirms.
+        import types, dataclasses
+        import fills as _fills
+        try:
+            base = self.cfg
+            def make_stub(mid, rally_only, bh_ok, fp_ok, bypass=True):
+                s = types.SimpleNamespace()
+                s.paper = False
+                s.cfg = dataclasses.replace(base, rescue_bypass_break_and_hold=bypass,
+                                            hold_ticks=3)
+                s.ptrace = None
+                s.adapter = types.SimpleNamespace(mt5=types.SimpleNamespace(
+                    symbol_info_tick=lambda sym, _m=mid: types.SimpleNamespace(bid=_m, ask=_m)))
+                s.shadow_positions = {501: {
+                    'boost': False, 'boost_fired': False, 'boost_eligible': True,
+                    'side': 'BUY', 'entry_price': 100.0, 'leg_fill_price': 100.0,
+                    'anchor_label': 'A1_02h_Asia', 'boost_rally_only': rally_only,
+                    'boost_cross_streak': 2}}   # hold_ticks-1 -> ONE tick confirms
+                s.fires = []
+                s._break_and_hold_ok = lambda shadow, plan: bh_ok
+                s._fp_guard_ok = lambda shadow, n: fp_ok
+                s._fire_boost_event = lambda t, sh, pl: s.fires.append(pl.kind)
+                s._enforce_boost_cap = lambda mid_: None
+                return s
+            # RALLY (+11, winning), unconfirmed break -> GATED -> no fire
+            r = make_stub(111.0, rally_only=True, bh_ok=False, fp_ok=True)
+            _fills._check_boost_triggers(r); rally_gated = (r.fires == [])
+            # RESCUE (-11, losing), unconfirmed break -> BYPASS -> fires
+            s = make_stub(89.0, rally_only=False, bh_ok=False, fp_ok=True)
+            _fills._check_boost_triggers(s); rescue_fires = (s.fires == ['RESCUE'])
+            # RESCUE still blocked if FP guard fails
+            s2 = make_stub(89.0, rally_only=False, bh_ok=False, fp_ok=False)
+            _fills._check_boost_triggers(s2); rescue_fp_blocks = (s2.fires == [])
+            # toggle OFF -> RESCUE gated again (legacy v3.2.6)
+            s3 = make_stub(89.0, rally_only=False, bh_ok=False, fp_ok=True, bypass=False)
+            _fills._check_boost_triggers(s3); rescue_gated_off = (s3.fires == [])
+            # RALLY with CONFIRMED break -> fires
+            r2 = make_stub(111.0, rally_only=True, bh_ok=True, fp_ok=True)
+            _fills._check_boost_triggers(r2); rally_fires_confirmed = (r2.fires == ['RALLY'])
+            ok = (rally_gated and rescue_fires and rescue_fp_blocks
+                  and rescue_gated_off and rally_fires_confirmed)
+            detail = (f"rally_gated={rally_gated} rescue_fires_free={rescue_fires} "
+                      f"rescue_fp_blocks={rescue_fp_blocks} toggle_off_regates={rescue_gated_off} "
+                      f"rally_confirmed_fires={rally_fires_confirmed}")
+        except Exception as e:
+            self._record(80, FAIL, f"raised: {e!r}"); return
+        self._record(80, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -2856,6 +2911,8 @@ class SelfTest:
             self._step_tick_hold_trail_advance()
             # v3.2.6 boost breath-gap +$8 arm-gate incident regression
             self._step_boost_incident_regression()
+            # v3.2.7 rally-only break-and-hold gate (rescue fires free)
+            self._step_rescue_bypass_break_and_hold()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -2869,7 +2926,7 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 80):
+        for n in range(1, 81):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2886,12 +2943,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/79 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/80 PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/79 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/80 PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/79 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/80 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

@@ -19,7 +19,8 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
   weekend sleep + wake failsafe, auto-pull + soft restart.  (frozen baseline: 54/54)
 - **v3.2.4** — break-and-hold filter, lot 0.15/0.35 + FP guard, 5-long No-OCO stack. (merged PR #39/#40)
 - **v3.2.5** — A1 tick-fallback anchor capture, tick-hold boost/trail (0.3s refresh, 3-tick hold). (merged PR #41)
-- **v3.2.6** — boost breath-gap +$8 ARM GATE (incident 2026-06-23 fix); A3 double-fill log. (this build)
+- **v3.2.6** — boost breath-gap +$8 ARM GATE (incident 2026-06-23 fix); A3 double-fill log. (merged PR #43)
+- **v3.2.7** — rally-only break-and-hold gate (RESCUE fires free on commit). (this build)
 
 ---
 
@@ -43,7 +44,8 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
 | v3.2.5 | A1 tick-fallback anchor capture | 2 | 74–75 | 75 |
 | v3.2.5 | tick-hold boost/trail | 3 | 76–78 | 78 |
 | v3.2.6 | boost breath-gap +$8 arm-gate incident regression | 1 | 79 | 79 |
-| **TOTAL** | | **79** | **1–79** | **79/79** |
+| v3.2.7 | rally-only break-and-hold gate (rescue fires free) | 1 | 80 | 80 |
+| **TOTAL** | | **80** | **1–80** | **80/80** |
 
 > v3.2.6 also RE-SPEC'd frozen tests 23/24/25 (boost breath-trail) to the new arm-gate
 > behaviour — same indices, updated assertions (reverse<8 → $10 backstop; reach +8 →
@@ -144,7 +146,8 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
 
 - **Anchor capture:** A2/A3/A4 from M5 bar. A1 from bar, tick-fallback at open if bar lags (v3.2.5).
 - **Boost trigger:** +/-$10 from fill; +$10 = rally (amplify), -$10 = rescue (hedge); 2 positions/fire;
-  must hold >=3 ticks (v3.2.5); only after break confirmed (v3.2.4).
+  must hold >=3 ticks (v3.2.5). RALLY only fires after a confirmed break (v3.2.4); RESCUE fires FREELY
+  on direction commit (v3.2.7) -- still bounded by trigger + tick-hold + FP guard.
 - **Stack cap:** 3 (legacy) -> 5 with 5-long (v3.2.4, DEFAULT ON), FP-gated; FPZERO_1PCT caps back to 3.
 - **Trail:** arm at +$8, lock behind real shared max_fav (~$2.00 gap), all armed close together on reversal;
   unarmed -> own $10 SL. Never a phantom lock.

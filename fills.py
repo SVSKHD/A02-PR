@@ -757,8 +757,21 @@ def _check_boost_triggers(self):
         # v3.2.3 Feature D — BREAK-AND-HOLD gate: do NOT stack on a fake break.
         # Only stack on a CONFIRMED break (cleared edge + held N candles + retrace
         # < Y). Guarded: any error / disabled -> allow (legacy). Live-only data.
-        if not self._break_and_hold_ok(shadow, plan):
-            continue
+        # v3.2.7: gate RALLY boosts ONLY. A RESCUE boost (the opposite-side sibling
+        # that becomes the winner after a whipsaw) fires FREELY on direction commit
+        # -- gating it on a confirmed break wrongly suppressed winning-side recovery
+        # legs. RESCUE is still bounded by the +/-$10 trigger, tick-hold >=3 (above)
+        # and the FP guard (below); ONLY break-and-hold is bypassed. Toggle:
+        # cfg.rescue_bypass_break_and_hold (default True) -> False restores gating both.
+        _gate_this = (plan.kind == 'RALLY'
+                      or not bool(getattr(self.cfg, 'rescue_bypass_break_and_hold', True)))
+        if _gate_this:
+            if not self._break_and_hold_ok(shadow, plan):
+                continue
+        elif tr is not None:
+            tr.break_eval(shadow.get('anchor_label'), side=plan.boost_side,
+                          kind=plan.kind, result='BYPASS_RESCUE',
+                          reason='rescue_fires_free_on_commit')
         # v3.2.3 Feature E — FP GUARD: block/reduce a stack that would breach the
         # account's FP rule at the chosen lot BEFORE placing it.
         if not self._fp_guard_ok(shadow, stack_after):
