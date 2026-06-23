@@ -588,9 +588,22 @@ History (one line per behavioral change):
          4191.32 NOT cut -> $35 drop -> held/profit). selftest -> 79 steps. Tradeoff:
          a failing boost now rides to -$10 (vs old -$3.50) -- intentional, bounded by
          break-and-hold + the -$700 pair cap. Banner v3.2.6.
+  3.2.7  RALLY-ONLY break-and-hold gate (rescue fires free). Audit found break-and-hold
+         (fills.py:760) gated ALL boosts incl. RESCUE -- it never branched on plan.kind,
+         so a rescue boost (the opposite-side sibling that becomes the winner after a
+         whipsaw) was suppressed when the break wasn't confirmed, losing winning-side
+         recovery legs (the 3-leg model). FIX (additive): gate break-and-hold on
+         plan.kind == 'RALLY' only; a RESCUE plan bypasses it and fires on direction
+         commit -- still bounded by the +/-$10 trigger, tick-hold >=3, and the FP guard
+         (ONLY break-and-hold is bypassed). New toggle cfg.rescue_bypass_break_and_hold
+         (default True; False restores gating both). RALLY still requires a CONFIRMED
+         break. The v3.2.6 backstop/+8-arm/lock/trail and the FP guard are UNCHANGED for
+         both kinds. selftest -> 80 steps (new 80: rally gated / rescue fires free /
+         rescue still FP-blocked / toggle-off re-gates / rally-confirmed fires). Banner
+         v3.2.7.
 """
 
-__version__ = "3.2.6"
+__version__ = "3.2.7"
 CODENAME = "Astra Hawk"
 
 
