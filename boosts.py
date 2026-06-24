@@ -67,7 +67,12 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg,
         current_price = float(current_price)
     except (TypeError, ValueError):
         return None
-    trig = _trigger(cfg)
+    # v3.2.8 Phase 1: the arm is now ASYMMETRIC by direction. A WINNING leg arms
+    # the RALLY pyramid at +rally_arm_fav ($5); a LOSING leg arms the RESCUE hedge
+    # at -rescue_arm ($10, the unchanged boost_trigger_dollars). Rescue keeps the
+    # v3.2.7 $10 arm exactly -> the RESCUE branch below is byte-identical.
+    rescue_arm = _trigger(cfg)                                  # losing-side: $10 (unchanged)
+    rally_arm = float(getattr(cfg, 'rally_arm_fav', 5.0))       # winning-side: $5 (Phase 1)
     # v3.2.3: stack_depth (if set) controls the winning-side stack: depth 1 = base
     # (0 boosts => no event), depth 3 = original + 2 boosts. #winners is hard-capped
     # at 3, so n boosts is capped at 2. None => the legacy rescue_boost_count.
@@ -83,12 +88,14 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg,
     leg_fav = (current_price - leg_fill_price) if leg_side == "BUY" \
         else (leg_fill_price - current_price)
 
-    if leg_fav >= trig - _EPS:
-        kind, etype, side = "RALLY", "RALLY_BOOST", leg_side               # winning -> pyramid
-    elif leg_fav <= -(trig - _EPS):
-        kind, etype, side = "RESCUE", "RESCUE_BOOST", _opposite(leg_side)  # losing -> hedge
+    if leg_fav >= rally_arm - _EPS:
+        kind, etype, side = "RALLY", "RALLY_BOOST", leg_side               # winning +$5 -> pyramid
+        arm_used = rally_arm
+    elif leg_fav <= -(rescue_arm - _EPS):
+        kind, etype, side = "RESCUE", "RESCUE_BOOST", _opposite(leg_side)  # losing -$10 -> hedge
+        arm_used = rescue_arm
     else:
-        return None                                                         # < $10: never fire
+        return None                                                         # in the dead band: never fire
 
     # v3.2.2: INDEPENDENT on/off gating. RALLY and RESCUE each have their own
     # toggle; a disabled kind fires ZERO boosts (return None) so the leg runs on
@@ -105,14 +112,15 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg,
                              or not bool(getattr(cfg, "rescue_boosts_enabled", True))):
         return None
 
-    # HARD GUARD: the boost entry (≈ current market) MUST be >= trigger from the
-    # leg fill in the correct direction. This is what makes the A3 fire-at-fill
-    # bug structurally impossible -- a near-fill entry is blocked, not placed.
-    if abs(current_price - leg_fill_price) < trig - _EPS:
+    # HARD GUARD: the boost entry (≈ current market) MUST be >= this kind's arm from
+    # the leg fill in the correct direction. This is what makes the A3 fire-at-fill
+    # bug structurally impossible -- a near-fill entry is blocked, not placed. The arm
+    # is per-kind (RALLY $5 / RESCUE $10) so a valid +$5 rally is not wrongly blocked.
+    if abs(current_price - leg_fill_price) < arm_used - _EPS:
         log.error(
             f"BOOST BLOCKED: {kind} entry {current_price:.2f} is only "
             f"${abs(current_price - leg_fill_price):.2f} from leg fill "
-            f"{leg_fill_price:.2f} (need >= ${trig:.0f}) -- refusing to fire at fill.")
+            f"{leg_fill_price:.2f} (need >= ${arm_used:.0f}) -- refusing to fire at fill.")
         return None
 
     return BoostPlan(kind=kind, event_type=etype, boost_side=side,

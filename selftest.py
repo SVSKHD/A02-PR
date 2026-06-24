@@ -120,6 +120,11 @@ STEP_NAMES = {
     78: "tick hold trail advance",
     79: "boost incident regression",
     80: "rescue bypass break-and-hold",
+    # v3.2.8 Phase 1 — rally +$5 arm / +$4 lock / $1.50 gap (rescue untouched)
+    81: "rally arm +5",
+    82: "rally trail 4/1.5",
+    # v3.2.8 Phase 2/3 — rally/rescue/common file split + dispatcher isolation
+    83: "boost split isolation",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1608,9 +1613,12 @@ class SelfTest:
             # L2: -$10 AGAINST a BUY -> RESCUE, opposite side.
             r2 = _b.plan_boost_event('BUY', fill, fill - 10.0, cfg)
             l2 = (r2 is not None and r2.kind == 'RESCUE' and r2.boost_side == 'SELL' and r2.n == 2)
-            # L3: sub-$10 either way -> None (hard guard).
-            l3 = (_b.plan_boost_event('BUY', fill, fill + 9.99, cfg) is None
-                  and _b.plan_boost_event('BUY', fill, fill - 9.99, cfg) is None)
+            # L3 (v3.2.8 Phase 1): each kind has its OWN arm now -- RALLY $5, RESCUE
+            # $10. Below the arm -> None; at the arm -> fires. (Was: sub-$10 both ways.)
+            l3 = (_b.plan_boost_event('BUY', fill, fill + 4.99, cfg) is None        # rally < $5 -> none
+                  and _b.plan_boost_event('BUY', fill, fill + 5.00, cfg) is not None  # rally @ +$5 -> fires
+                  and _b.plan_boost_event('BUY', fill, fill - 9.99, cfg) is None      # rescue < $10 -> none
+                  and _b.plan_boost_event('BUY', fill, fill - 10.0, cfg) is not None)  # rescue @ -$10 -> fires
             # L4: at fill (move 0) -> None (fire-at-fill blocked).
             l4 = (_b.plan_boost_event('BUY', fill, fill, cfg) is None)
             # L5: one-shot at the same crossing -- mirrors fills' boost_fired flag.
@@ -1627,7 +1635,7 @@ class SelfTest:
             second = _attempt(fill + 10.5)   # re-cross: must NOT re-fire
             l5 = (first is not None and second is None)
             ok = l1 and l2 and l3 and l4 and l5
-            detail = (f"L1_rally={l1} L2_rescue={l2} L3_sub10_none={l3} "
+            detail = (f"L1_rally={l1} L2_rescue={l2} L3_arms_5/10={l3} "
                       f"L4_fire_at_fill_blocked={l4} L5_one_shot={l5}")
         except Exception as e:
             self._record(34, FAIL, f"raised: {e!r}")
@@ -2755,6 +2763,112 @@ class SelfTest:
         self._record(80, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
+    # v3.2.8 Phase 1 — RALLY +$5 arm / +$4 lock / $1.50 gap (RESCUE untouched)
+    # ------------------------------------------------------------------------
+    def _step_rally_arm_5(self):
+        # v3.2.8 Phase 1: the WINNING-side RALLY arm drops $10 -> $5, via DEDICATED
+        # keys (rally_arm_fav), while the LOSING-side RESCUE arm stays $10
+        # (boost_trigger_dollars). Asserts on the LIVE canonical boosts.plan_boost_event
+        # (the single source live + backtest + tests call): (1) rally fires AT +$5;
+        # (2) rally does NOT fire below +$5 (+$4.99 -> None); (3) the whole +$5..+$9.99
+        # winning band that USED to be dead now fires RALLY (the behaviour change);
+        # (4) rescue is UNCHANGED -- needs the full -$10 (-$9.99 -> None, -$10 fires);
+        # (5) the config exposes rally_arm_fav=5.0 as its own key (not a BOOST_* reuse).
+        import boosts as _b
+        from config import Config as _Config
+        try:
+            cfg = _Config()
+            fill = 4266.3
+            # (5) dedicated key present + default.
+            key_ok = (abs(float(getattr(cfg, 'rally_arm_fav')) - 5.0) < 1e-9)
+            # (1) rally fires exactly at +$5 (BUY price up $5), SAME side.
+            at5 = _b.plan_boost_event('BUY', fill, fill + 5.0, cfg)
+            fires_at_5 = (at5 is not None and at5.kind == 'RALLY' and at5.boost_side == 'BUY')
+            # (2) below +$5 -> None.
+            below5 = (_b.plan_boost_event('BUY', fill, fill + 4.99, cfg) is None)
+            # (3) the +$5..+$9.99 band (old dead zone) now fires RALLY.
+            band = all(_b.plan_boost_event('BUY', fill, fill + d, cfg) is not None
+                       and _b.plan_boost_event('BUY', fill, fill + d, cfg).kind == 'RALLY'
+                       for d in (5.0, 6.0, 7.5, 9.99))
+            # (4) RESCUE arm untouched: -$9.99 -> None, -$10 -> RESCUE (opposite side).
+            r999 = _b.plan_boost_event('BUY', fill, fill - 9.99, cfg)
+            r10 = _b.plan_boost_event('BUY', fill, fill - 10.0, cfg)
+            rescue_unchanged = (r999 is None and r10 is not None
+                                and r10.kind == 'RESCUE' and r10.boost_side == 'SELL')
+            # a SELL leg winning by +$5 (price DOWN $5) -> RALLY same side (SELL).
+            s5 = _b.plan_boost_event('SELL', fill, fill - 5.0, cfg)
+            sell_rally = (s5 is not None and s5.kind == 'RALLY' and s5.boost_side == 'SELL')
+            ok = (key_ok and fires_at_5 and below5 and band and rescue_unchanged and sell_rally)
+            detail = (f"rally_arm_fav={getattr(cfg, 'rally_arm_fav')} fires@+5={fires_at_5} "
+                      f"none<+5={below5} band5-9.99=RALLY={band} "
+                      f"rescue_still_10={rescue_unchanged} sell_rally={sell_rally}")
+        except Exception as e:
+            self._record(81, FAIL, f"raised: {e!r}"); return
+        self._record(81, PASS if ok else FAIL, detail)
+
+    def _step_rally_trail_4_15(self):
+        # v3.2.8 Phase 1: a RALLY boost's breath-gap trail tightens -- arms + locks at
+        # +$4 (was +$8) and trails by $1.50 (was $3.50), off DEDICATED keys
+        # (rally_lock_floor / rally_trail_gap). A RESCUE boost (Position.boost_kind
+        # defaults 'RESCUE') is BYTE-IDENTICAL to v3.2.7 ($8 arm / $8 lock / $3.50 gap).
+        # Drives the REAL strategy core (update_position_on_bar) -- the same engine the
+        # live trail and the backtest use -- so the numbers cannot diverge. The $10
+        # hard backstop is shared/unchanged. Closes with a KIND-ISOLATION proof: the
+        # SAME +$5-then-reverse path locks +$4 on a RALLY boost but rides uncut on a
+        # RESCUE boost (whose $8 arm is never reached).
+        from strategy import Position, update_position_on_bar
+        try:
+            cfg = self.cfg
+            hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+            r_gap = float(getattr(cfg, 'rally_trail_gap', 1.50))
+            r_floor = float(getattr(cfg, 'rally_lock_floor', 4.0))
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+
+            def run(bars, kind):
+                p = Position(anchor_label='T', side='BUY', entry_price=entry,
+                             entry_time=ts0, current_sl=entry - hard,
+                             tp_level=entry + 30.0, max_fav=entry,
+                             lot=cfg.lot_size, role='rescue', boost=True, boost_kind=kind)
+                for i, b in enumerate(bars):
+                    update_position_on_bar(p, pd.Series(b),
+                                           ts0 + pd.Timedelta(minutes=i + 1), cfg)
+                    if p.closed:
+                        break
+                return p
+
+            # (1) RALLY reverses BEFORE +$4 -> trail INACTIVE -> rides to $10 backstop.
+            p1 = run([{'open': 100, 'high': 101, 'low': entry - hard - 1, 'close': 92}], 'RALLY')
+            backstop_below4 = p1.closed and abs((entry - p1.exit_price) - hard) < 0.05
+            # (2) RALLY reaches +$4 then reverses -> closes at the +$4 LOCK FLOOR.
+            p2 = run([{'open': 100, 'high': entry + r_floor + 0.5, 'low': 100.2, 'close': entry + r_floor},
+                      {'open': entry + r_floor, 'high': entry + r_floor, 'low': entry + r_floor - 3,
+                       'close': entry + r_floor - 3}], 'RALLY')
+            rally_floor = p2.closed and abs((p2.exit_price - entry) - r_floor) < 0.05
+            # (3) RALLY runs PAST +$4 -> trails by $1.50 (exit ~ peak-gap), floor >= +$4.
+            p3 = run([{'open': 100, 'high': 108, 'low': 100.5, 'close': 107},
+                      {'open': 107, 'high': 107, 'low': 105, 'close': 105}], 'RALLY')
+            rally_trail = (p3.closed and abs((p3.exit_price - entry) - (8.0 - r_gap)) < 0.05
+                           and (p3.exit_price - entry) >= r_floor - 0.05)
+            # (4) KIND ISOLATION: the SAME +$5-then-reverse path. RALLY (arm $4) locks
+            #     +$4; RESCUE (arm $8, never reached) rides uncut on the backstop only.
+            path5 = [{'open': 100, 'high': 105, 'low': 100.2, 'close': 104.8},
+                     {'open': 104.8, 'high': 104.8, 'low': 100.0, 'close': 100.0}]
+            pr = run(path5, 'RALLY')
+            ps = run(path5, 'RESCUE')
+            isolation = (pr.closed and abs((pr.exit_price - entry) - r_floor) < 0.05
+                         and (not ps.closed))
+            ok = (backstop_below4 and rally_floor and rally_trail and isolation)
+            detail = (f"rev<4->backstop{p1.exit_price}({backstop_below4}) "
+                      f"reach4->floor{p2.exit_price}({rally_floor}) "
+                      f"past4->trail{p3.exit_price}({rally_trail}) "
+                      f"kind_isol rally_exit={getattr(pr, 'exit_price', None)} "
+                      f"rescue_open={not ps.closed}({isolation})")
+        except Exception as e:
+            self._record(82, FAIL, f"raised: {e!r}"); return
+        self._record(82, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
     def _preflight(self) -> bool:
@@ -2913,6 +3027,9 @@ class SelfTest:
             self._step_boost_incident_regression()
             # v3.2.7 rally-only break-and-hold gate (rescue fires free)
             self._step_rescue_bypass_break_and_hold()
+            # v3.2.8 Phase 1 — rally +$5 arm / +$4 lock / $1.50 gap (rescue untouched)
+            self._step_rally_arm_5()
+            self._step_rally_trail_4_15()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -2926,7 +3043,8 @@ class SelfTest:
     def _report(self, ts: str) -> bool:
         lines = [f"🧪 AUREON SELF-TEST ({ts})"]
         n_pass = n_fail = n_skip = n_warn = 0
-        for n in range(1, 81):
+        total = len(STEP_NAMES)   # v3.2.8: dynamic count (was hard-coded 80)
+        for n in range(1, total + 1):
             status, detail = self.results.get(n, (FAIL, "did not run"))
             if status == PASS:
                 n_pass += 1
@@ -2943,12 +3061,12 @@ class SelfTest:
         warn_tag = f", {n_warn} WARN" if n_warn else ""
         # v3.1.0: READY when no real code FAIL (network/reachability = WARN).
         if n_fail == 0 and n_skip == 0:
-            verdict = f"RESULT: {n_pass}/80 PASS{warn_tag} — READY"
+            verdict = f"RESULT: {n_pass}/{total} PASS{warn_tag} — READY"
         elif n_fail == 0:
             ready = "READY" if fleet_ready else "READY (market steps skipped)"
-            verdict = f"RESULT: {n_pass}/80 PASS, {n_skip} SKIP{warn_tag} — {ready}"
+            verdict = f"RESULT: {n_pass}/{total} PASS, {n_skip} SKIP{warn_tag} — {ready}"
         else:
-            verdict = f"RESULT: {n_pass}/80 PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
+            verdict = f"RESULT: {n_pass}/{total} PASS, {n_fail} FAIL{warn_tag} — NOT ready (see failures)"
         lines.append(verdict)
         report = "\n".join(lines)
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces

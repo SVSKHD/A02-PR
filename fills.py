@@ -565,6 +565,11 @@ def _fire_boost_event(self, leg_ticket, leg_shadow, plan):
     leg_fill = float(leg_shadow.get('leg_fill_price', ref))
     event_id = f"{self.state.get('last_broker_date', '?')}_{anchor[:2]}_{leg_ticket}"
     _tr = getattr(self, 'ptrace', None)
+    # v3.2.8 Phase 1: the per-kind arm ($5 RALLY / $10 RESCUE) is the trigger this
+    # fire honored. Report it to telemetry so a legit +$5 rally fire is NOT flagged
+    # boost_fire_below_trigger (which would fire if we reported the rescue $10 arm).
+    trig_used = (float(getattr(self.cfg, 'rally_arm_fav', 5.0)) if plan.kind == 'RALLY'
+                 else float(getattr(self.cfg, 'boost_trigger_dollars', 10.0)))
     stack_target = 1 + n  # parent leg + n boosts
     # v3.2.3 Section D #1: proactive BOOST FIRED alert in the spec format (fires
     # the moment the event arms, both RALLY and RESCUE, lone AND No-OCO stack).
@@ -602,6 +607,7 @@ def _fire_boost_event(self, leg_ticket, leg_shadow, plan):
                     'tp_level': round(b_fp + sgn * tp_d, 2), 'max_fav': b_fp,
                     'fill_time': pd.Timestamp.now(tz='UTC').isoformat(),
                     'role': 'rescue', 'boost': True, 'boost_event': event_id,
+                    'boost_kind': plan.kind,  # v3.2.8: RALLY -> tighter trail; RESCUE default
                 }
             self.tele.send(
                 f"✅⚡ {plan.kind} BOOST{bi + 1} {side} FILLED @ ${b_fp} (ticket {b_tk})",
@@ -617,7 +623,7 @@ def _fire_boost_event(self, leg_ticket, leg_shadow, plan):
                                parent_ticket=leg_ticket, side=side,
                                position_price=b_fp, boost_kind=plan.kind,
                                stack_size=_stack_now, move_dollars=plan.move_dollars,
-                               trigger=float(getattr(self.cfg, 'boost_trigger_dollars', 10.0)),
+                               trigger=trig_used,
                                stop_price=round(b_fp - sgn * sl_d, 2))
             fleet.append({'ticket': int(b_tk) if b_tk else None, 'fill': b_fp,
                           'rc': rc, 'comment': cmt})
@@ -697,7 +703,10 @@ def _check_boost_triggers(self):
     except Exception:
         return
     import tick_hold as _th
-    trig = float(getattr(self.cfg, 'boost_trigger_dollars', 10.0))
+    # v3.2.8 Phase 1: ASYMMETRIC arm. A WINNING leg arms RALLY at +rally_arm_fav ($5);
+    # a LOSING leg arms RESCUE at -rescue_arm ($10, unchanged boost_trigger_dollars).
+    rescue_arm = float(getattr(self.cfg, 'boost_trigger_dollars', 10.0))
+    rally_arm = float(getattr(self.cfg, 'rally_arm_fav', 5.0))
     tr = getattr(self, 'ptrace', None)
     for ticket, shadow in list(self.shadow_positions.items()):
         if shadow.get('boost') or shadow.get('boost_fired') \
@@ -707,7 +716,8 @@ def _check_boost_triggers(self):
         fill_px = float(shadow.get('leg_fill_price', shadow['entry_price']))
         rally_only = bool(shadow.get('boost_rally_only', False))
         leg_fav = (mid - fill_px) if side == 'BUY' else (fill_px - mid)
-        crossed = abs(leg_fav) >= trig
+        # winning side arms at the rally arm ($5); losing side at the rescue arm ($10).
+        crossed = (leg_fav >= rally_arm) or (leg_fav <= -rescue_arm)
         try:
             plan = boosts.plan_boost_event(
                 side, fill_px, mid, self.cfg, allow_rescue=not rally_only)
@@ -726,14 +736,15 @@ def _check_boost_triggers(self):
             # crossed AND that kind is enabled here) but none was planned -- the
             # logic failed to detect a valid trigger. A silent no-fire is a
             # failure, not a no-op (the lone-leg analogue of A2's silent miss).
-            rally_exp = (leg_fav >= trig
+            rally_exp = (leg_fav >= rally_arm
                          and bool(getattr(self.cfg, 'rally_boosts_enabled', True)))
-            rescue_exp = (leg_fav <= -trig and not rally_only
+            rescue_exp = (leg_fav <= -rescue_arm and not rally_only
                           and bool(getattr(self.cfg, 'rescue_boosts_enabled', True)))
             if (rally_exp or rescue_exp) and tr is not None:
+                _missed_trig = rally_arm if rally_exp else rescue_arm
                 tr.missed_boost(ticket, shadow.get('anchor_label'), side=side,
                                 position_price=fill_px, move_dollars=round(leg_fav, 2),
-                                trigger=trig, rally_only=rally_only)
+                                trigger=_missed_trig, rally_only=rally_only)
             continue
         # v3.2.5 tick-hold confirm: the cross must HOLD >= hold_ticks consecutive
         # ticks before it fires; a blip that reverts within the window never gets
@@ -741,12 +752,14 @@ def _check_boost_triggers(self):
         streak, tstate = _th.step_cross(
             int(shadow.get('boost_cross_streak', 0)), True, self.cfg)
         shadow['boost_cross_streak'] = streak
+        # the arm this plan honored (RALLY $5 / RESCUE $10) -- for honest telemetry.
+        plan_arm = rally_arm if plan.kind == 'RALLY' else rescue_arm
         if tstate != _th.CONFIRMED:
             if tr is not None:
                 tr.tick_cross_candidate(ticket, shadow.get('anchor_label'),
                                         side=plan.boost_side, held_ticks=streak,
                                         hold_ticks=_th.hold_ticks(self.cfg),
-                                        move_dollars=plan.move_dollars, trigger=trig)
+                                        move_dollars=plan.move_dollars, trigger=plan_arm)
             continue   # crossed but not yet held -> keep watching
         if tr is not None:
             tr.tick_hold_confirmed(ticket, shadow.get('anchor_label'),
@@ -781,7 +794,7 @@ def _check_boost_triggers(self):
                          side=plan.boost_side, position_price=fill_px,
                          boost_kind=plan.kind, stack_size=stack_after,
                          stack_cap=boosts.stack_cap(self.cfg),
-                         move_dollars=plan.move_dollars, trigger=trig)
+                         move_dollars=plan.move_dollars, trigger=plan_arm)
         shadow['boost_fired'] = True   # one event per leg (set before placing)
         try:
             self._fire_boost_event(ticket, shadow, plan)

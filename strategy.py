@@ -24,6 +24,11 @@ class Position:
     lot: float
     role: str = 'normal'  # v2.9: 'normal' (1st leg) | 'rescue' (No-OCO 2nd leg)
     boost: bool = False   # v3.1.3: SL-rescue BOOST leg (trail-after-+8 handoff)
+    boost_kind: str = 'RESCUE'  # v3.2.8: 'RALLY' | 'RESCUE'. ONLY consulted when
+    # boost is True; selects the breath-gap trail's arm/lock/gap. Defaults to
+    # 'RESCUE' so every existing boost Position (and the v3.2.7 rescue path) keeps
+    # the $8 arm / $8 lock / $3.50 gap byte-identical; a RALLY boost uses the
+    # tighter Phase-1 rally_lock_floor ($4) / rally_trail_gap ($1.50).
     closed: bool = False
     exit_price: Optional[float] = None
     exit_time: Optional[pd.Timestamp] = None
@@ -70,10 +75,19 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     if pos.closed:
         return pos.outcome
     sgn = 1.0 if pos.side == 'BUY' else -1.0
-    gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
     hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
-    arm = float(getattr(cfg, 'boost_trail_arm_fav', 8.0))
-    floor = float(getattr(cfg, 'boost_lock_floor', 8.0))
+    # v3.2.8 Phase 1: RALLY boosts run a tighter breath-gap (arm/lock $4, gap $1.50)
+    # off their OWN dedicated keys; RESCUE boosts (and every legacy boost Position,
+    # which defaults boost_kind='RESCUE') keep the v3.2.7 $8 arm / $8 lock / $3.50 gap
+    # byte-identical. The $10 hard backstop is shared and unchanged for both.
+    if getattr(pos, 'boost_kind', 'RESCUE') == 'RALLY':
+        gap = float(getattr(cfg, 'rally_trail_gap', 1.50))
+        arm = float(getattr(cfg, 'rally_lock_floor', 4.0))
+        floor = float(getattr(cfg, 'rally_lock_floor', 4.0))
+    else:
+        gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
+        arm = float(getattr(cfg, 'boost_trail_arm_fav', 8.0))
+        floor = float(getattr(cfg, 'boost_lock_floor', 8.0))
     backstop = pos.entry_price - sgn * hard          # the $10 hard SL backstop
 
     def trail_for(fav):

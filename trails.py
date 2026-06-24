@@ -78,6 +78,9 @@ def _manage_trails_on_bar_close(self):
             lot=self.cfg.lot_size,
             role=shadow.get('role', 'normal'),  # v2.9 role-aware ladder
             boost=bool(shadow.get('boost', False)),  # v3.1.3 boost trail-after-+8
+            # v3.2.8 Phase 1: thread the boost kind so a RALLY boost trails on the
+            # tighter rally arm/lock/gap; defaults to RESCUE (byte-identical v3.2.7).
+            boost_kind=shadow.get('boost_kind', 'RESCUE'),
         )
         old_max_fav = shadow.get('max_fav')
         # v3.3.0: pass the per-position tracer so MAXFAV_UPDATE / LOCK_ARM /

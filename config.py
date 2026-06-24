@@ -170,6 +170,25 @@ class Config:
     #   never falls below this (one-way ratchet). == arm by default.
     max_boost_stack: int = 5          # MAX_BOOST_STACK: hard cap on winning-side stack
     #   when allow_5_long (orig + 2 RALLY + 2 RESCUE); 3 when allow_5_long is False.
+    # --- v3.2.8 Phase 1 RALLY-ONLY breath-gap tightening -----------------------
+    # The RALLY path (winning leg -> same-direction pyramid) gets its OWN tighter
+    # arm/lock/gap so a winning leg arms sooner and locks profit earlier, while the
+    # RESCUE path (losing leg -> opposite-direction hedge) is LEFT EXACTLY as v3.2.7
+    # (arm $10 via boost_trigger_dollars, lock/arm $8 via boost_trail_arm_fav /
+    # boost_lock_floor, gap $3.50 via boost_trail_gap_dollars). Rally gets DEDICATED
+    # keys -- it does NOT reuse the BOOST_* keys rescue depends on. The trail gap is
+    # kept PROPORTIONAL: $3.50 under an $8 floor scales to $1.50 under a $4 floor so
+    # the one-way ratchet keeps the same shape, just tighter. Used only when a boost
+    # position's kind is RALLY (Position.boost_kind == 'RALLY'); RESCUE boosts and
+    # every existing caller are byte-identical.
+    rally_arm_fav: float = 5.0        # RALLY_ARM_FAV: a WINNING leg arms the rally
+    #   pyramid once it is +$5 favorable (was +$10, the shared boost_trigger_dollars).
+    #   Rescue's losing-side -$10 arm (boost_trigger_dollars) is untouched.
+    rally_lock_floor: float = 4.0     # RALLY_LOCK_FLOOR: a rally boost's breath-gap
+    #   trail arms + its one-way lock floor engages once +$4 in profit (was +$8, the
+    #   shared boost_trail_arm_fav / boost_lock_floor). == arm by default, same shape.
+    rally_trail_gap: float = 1.50     # RALLY_TRAIL_GAP: rally breath-gap trail gap
+    #   (was $3.50). Proportional to the tighter $4 floor (3.50/8 -> ~1.50/4).
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all
