@@ -138,6 +138,9 @@ STEP_NAMES = {
     91: "break gate np-safe",
     92: "break gate failclosed",
     93: "rally sl13 cap910",
+    # v3.3.4 rally pullback detector (hold within T / cut beyond T / time bound)
+    94: "rally pullback band",
+    95: "rally pullback recover/time",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3369,6 +3372,113 @@ class SelfTest:
         self._record(93, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
+    # v3.3.4 — rally pullback detector (rally boosts only, above the $13 backstop)
+    # ------------------------------------------------------------------------
+    def _rally_boost(self, cfg, entry=100.0, ts0=None, kind='RALLY'):
+        from strategy import Position
+        ts0 = ts0 or pd.Timestamp('2026-06-24T02:30:00Z')
+        hard = float(getattr(cfg, 'rally_boost_sl', 13.0)) if kind == 'RALLY' \
+            else float(getattr(cfg, 'boost_sl_dollars', 10.0))
+        return Position(anchor_label='T', side='BUY', entry_price=entry, entry_time=ts0,
+                        current_sl=entry - hard, tp_level=entry + 30.0, max_fav=entry,
+                        lot=cfg.lot_size, role='rescue', boost=True, boost_kind=kind)
+
+    def _step_rally_pullback_band(self):
+        # 94: the pullback DISTANCE band (tol override $8 to prove the mechanism above
+        # the $13 backstop). Within T -> HOLD (pullback); cross T -> cut early at the T
+        # threshold (above backstop); a gap THROUGH T floors at the $13 backstop; a
+        # RESCUE boost is NOT governed by the detector (rally-only).
+        import dataclasses
+        from strategy import update_position_on_bar
+        try:
+            cfg = dataclasses.replace(self.cfg, rally_pullback_enabled=True,
+                                      rally_pullback_tol_dollars=8.0,
+                                      rally_pullback_time_bound_min=30.0)
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            cut_level = entry - 8.0      # 92
+            backstop = entry - float(getattr(cfg, 'rally_boost_sl', 13.0))  # 87
+            # (a) within T (-$6, no recovery) -> HOLD, pullback armed, NOT closed.
+            ph = self._rally_boost(cfg, entry, ts0)
+            update_position_on_bar(ph, pd.Series({'open': 99, 'high': 99, 'low': 94, 'close': 95}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            hold_ok = (not ph.closed and ph.pullback_since is not None)
+            # (b) cross T (-$9) -> cut early at the +$8 threshold (92), above backstop.
+            pc = self._rally_boost(cfg, entry, ts0)
+            update_position_on_bar(pc, pd.Series({'open': 99, 'high': 99, 'low': 91, 'close': 92}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            cut_ok = (pc.closed and abs(pc.exit_price - cut_level) < 0.05
+                      and pc.exit_price > backstop + 1e-9)
+            # (c) gap straight THROUGH T -> filled no better than the $13 backstop.
+            pg = self._rally_boost(cfg, entry, ts0)
+            update_position_on_bar(pg, pd.Series({'open': 80, 'high': 80, 'low': 78, 'close': 79}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            backstop_ok = (pg.closed and abs(pg.exit_price - backstop) < 0.05)
+            # (d) RESCUE boost on the SAME -$9 path -> detector skipped (rally-only),
+            #     rides on its own $10 backstop (low 91 > entry-10=90 -> not closed).
+            pr = self._rally_boost(cfg, entry, ts0, kind='RESCUE')
+            update_position_on_bar(pr, pd.Series({'open': 99, 'high': 99, 'low': 91, 'close': 92}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            rescue_ok = (not pr.closed and pr.pullback_since is None)
+            ok = hold_ok and cut_ok and backstop_ok and rescue_ok
+            detail = (f"within_T_holds={hold_ok} cross_T_cuts@{pc.exit_price:.0f}(>{backstop:.0f})={cut_ok} "
+                      f"gap_floored_at_backstop{pg.exit_price:.0f}={backstop_ok} rescue_unaffected={rescue_ok}")
+        except Exception as e:
+            self._record(94, FAIL, f"raised: {e!r}"); return
+        self._record(94, PASS if ok else FAIL, detail)
+
+    def _step_rally_pullback_recover_time(self):
+        # 95: RECOVERY to entry ends the pullback (reset, resume normal trail, no cut);
+        # B minutes adverse WITHOUT returning to entry cuts at market (slow reversal);
+        # and the feature SHIPS DEFAULT OFF (rally_pullback_enabled=False, T=$7.50) so
+        # the detector is INERT on the default config -- a bar that WOULD cross T if
+        # enabled does NOT cut; only the $13 backstop governs. Live exits unchanged.
+        import dataclasses
+        from strategy import update_position_on_bar
+        try:
+            cfg = dataclasses.replace(self.cfg, rally_pullback_enabled=True,
+                                      rally_pullback_tol_dollars=8.0,
+                                      rally_pullback_time_bound_min=30.0)
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            backstop = entry - float(getattr(cfg, 'rally_boost_sl', 13.0))  # 87
+            # (a) RECOVERY: adverse -$5 then a bar returns to entry -> reset, NOT closed.
+            pr = self._rally_boost(cfg, entry, ts0)
+            update_position_on_bar(pr, pd.Series({'open': 99, 'high': 99, 'low': 95, 'close': 96}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            armed_pb = pr.pullback_since is not None
+            update_position_on_bar(pr, pd.Series({'open': 96, 'high': 101, 'low': 98, 'close': 100}),
+                                   ts0 + pd.Timedelta(minutes=2), cfg)
+            recover_ok = (armed_pb and not pr.closed and pr.pullback_since is None)
+            # (b) TIME BOUND: adverse -$5 within T, held >30 min, no recovery -> cut at
+            #     market (close ~95), floored by the $13 backstop.
+            pt = self._rally_boost(cfg, entry, ts0)
+            update_position_on_bar(pt, pd.Series({'open': 99, 'high': 99, 'low': 95, 'close': 96}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            held_open = not pt.closed
+            update_position_on_bar(pt, pd.Series({'open': 96, 'high': 99, 'low': 95, 'close': 95}),
+                                   ts0 + pd.Timedelta(minutes=32), cfg)
+            time_ok = (held_open and pt.closed and pt.exit_price >= backstop - 1e-9
+                       and abs(pt.exit_price - 95.0) < 0.05)
+            # (c) SHIPS DEFAULT OFF + T=$7.50: on the default config the detector is
+            #     INERT -- a -$9 adverse bar (which WOULD cross T=$7.50 if enabled) is
+            #     NOT cut; only the $13 backstop governs (low 91 > entry-13=87 -> open).
+            cfgd = self.cfg  # defaults: enabled=False, tol=7.50
+            ships_off = (bool(getattr(cfgd, 'rally_pullback_enabled', False)) is False
+                         and abs(float(getattr(cfgd, 'rally_pullback_tol_dollars', 7.50)) - 7.50) < 1e-9)
+            pinert = self._rally_boost(cfgd, entry, ts0)
+            update_position_on_bar(pinert, pd.Series({'open': 99, 'high': 99, 'low': 91, 'close': 92}),
+                                   ts0 + pd.Timedelta(minutes=1), cfgd)
+            inert_ok = (not pinert.closed and pinert.pullback_since is None)
+            default_off_ok = (ships_off and inert_ok)
+            ok = recover_ok and time_ok and default_off_ok
+            detail = (f"recovery_resets={recover_ok} time_bound_cut@{pt.exit_price:.0f}={time_ok} "
+                      f"ships_off_T7.5={ships_off} default_inert={inert_ok}")
+        except Exception as e:
+            self._record(95, FAIL, f"raised: {e!r}"); return
+        self._record(95, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
     def _preflight(self) -> bool:
@@ -3546,6 +3656,9 @@ class SelfTest:
             self._step_break_gate_npsafe()
             self._step_break_gate_failclosed()
             self._step_rally_sl13_cap910()
+            # v3.3.4 — rally pullback detector (hold within T / cut beyond T / time bound)
+            self._step_rally_pullback_band()
+            self._step_rally_pullback_recover_time()
         finally:
             self._cleanup()
         return self._report(ts)
