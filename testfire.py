@@ -13,7 +13,7 @@ It REUSES the live placement path — it does NOT fork a parallel copy:
   rescue(-10) boost logic — all identical to a scheduled anchor. The ONLY
   differences are the trigger source (manual) and the timestamp.
 
-SAFETY (fail-closed; every rail mandatory, no --force):
+SAFETY (fail-closed; rails 1/2/3/5 mandatory, no override):
   1. DEMO ONLY     — account_info.trade_mode must be ACCOUNT_TRADE_MODE_DEMO.
   2. NOT FP/funded — account_profile must be STANDARD_5PCT (FPZERO_1PCT and any
                      other profile are refused even on demo).
@@ -21,6 +21,9 @@ SAFETY (fail-closed; every rail mandatory, no --force):
                      (same flatness guard selftest uses); a real anchor in-flight
                      blocks the test.
   4. NO COLLISION  — no scheduled anchor active or within testfire_collision_min.
+                     v3.3.1: this is the ONLY bypassable rail — `--force-window`
+                     skips it (loud warning, never silent) so the owner can test
+                     off-schedule. Rails 1/2/3/5 are NEVER bypassable.
   5. ONE AT A TIME — refuse if a prior test-fire event is still open.
 
 The trade IS real, so it counts toward the 30-trade validation; it is tagged in
@@ -55,10 +58,18 @@ def minutes_to_nearest_anchor(cfg, now_utc):
     return best
 
 
-def testfire_preflight(trader, now_utc=None, collision_min=None):
+def testfire_preflight(trader, now_utc=None, collision_min=None, force_window=False):
     """Fail-closed safety gate. Returns (ok: bool, reason: str). ANY error reading
     the broker is treated as a refusal (never assume safe). The reason string is the
-    block reason to print on refusal, or the clear-to-fire summary on pass."""
+    block reason to print on refusal, or the clear-to-fire summary on pass.
+
+    force_window (v3.3.1): bypasses ONLY rail 4 (the 30-min scheduled-anchor
+    collision guard) so the owner can test off-schedule without waiting for the
+    window to clear. Rails 1/2/3/5 stay HARD and are unaffected — there is no
+    override for DEMO-ONLY, NO-FP, FLAT-BOOK, or ONE-AT-A-TIME. When the bypass
+    actually fires (a scheduled anchor is within the guard) the returned reason is
+    a LOUD warning naming how many minutes the nearest anchor is away; the bypass
+    is never silent."""
     cfg = trader.cfg
     sym = getattr(cfg, 'symbol', 'XAUUSD')
     try:
@@ -109,14 +120,28 @@ def testfire_preflight(trader, now_utc=None, collision_min=None):
                        "still open. Wait for it to resolve before firing another.")
 
     # Rail 4: never collide with a scheduled anchor (active or within N minutes).
+    # This is the ONLY bypassable rail. With --force-window the owner can fire
+    # off-schedule even inside the guard; rails 1/2/3/5 above already ran and still
+    # refuse their cases. The bypass is LOUD (warning names minutes-away) and safe:
+    # the scheduler is SUPPRESSED for the whole testfire session (_testfire_mode
+    # gates _process_anchor_if_due), so the test event owns the book — the real
+    # scheduled anchor will NOT also place alongside it while the test is live.
     n = int(collision_min if collision_min is not None
             else getattr(cfg, 'testfire_collision_min', 30))
     now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
     near = minutes_to_nearest_anchor(cfg, now)
     if near is not None and near <= n:
+        if force_window:
+            return True, (f"⚠️⚠️ CLEARED [rail 4 NO-COLLISION BYPASSED via --force-window]: "
+                          f"a scheduled anchor is {near:.0f} min away (<= {n} min guard) — "
+                          f"firing OFF-SCHEDULE anyway by owner override. The scheduler is "
+                          f"SUPPRESSED for this testfire session, so the real anchor will "
+                          f"NOT also fire while the test event is live (the test owns the "
+                          f"book). Rails 1/2/3 (DEMO-ONLY, NO-FP, FLAT-BOOK) stay HARD.")
         return False, (f"REFUSED [rail 4 NO-COLLISION]: a scheduled anchor is "
                        f"{near:.0f} min away (<= {n} min guard). Never let a test-fire "
-                       f"collide with a real anchor — wait until the window is clear.")
+                       f"collide with a real anchor — wait until the window is clear, or "
+                       f"pass --force-window to fire off-schedule (rails 1/2/3 still apply).")
 
     return True, (f"CLEARED: demo account, STANDARD_5PCT profile, flat book, no "
                   f"scheduled anchor within {n} min "
@@ -158,11 +183,14 @@ def arm_testfire(trader, label='A2', now_utc=None):
     return trader._deferred_anchor
 
 
-def run_testfire(cfg, anchor='A2'):
+def run_testfire(cfg, anchor='A2', force_window=False):
     """Build the live adapter + trader (same as run_live), run the fail-closed
     preflight, arm ONE manual entry, and hand off to the SAME live management loop.
     Returns True if the test-fire was armed and the loop ran; False (exit non-zero)
-    if any safety rail refused. Mirrors run_selftest's adapter lifecycle."""
+    if any safety rail refused. Mirrors run_selftest's adapter lifecycle.
+
+    force_window (v3.3.1): bypasses ONLY rail 4 (the 30-min scheduled-anchor
+    collision guard); rails 1/2/3/5 stay HARD. The bypass is announced loudly."""
     import sys as _sys, traceback as _tb
     adapter = None
     try:
@@ -173,8 +201,21 @@ def run_testfire(cfg, anchor='A2'):
         from live_trader import LiveTrader
         trader = LiveTrader(cfg, adapter, paper=False)
 
-        ok, reason = testfire_preflight(trader)
+        ok, reason = testfire_preflight(trader, force_window=force_window)
         print(f"🧪🔥 TESTFIRE preflight: {reason}", flush=True)
+        # The rail-4 bypass is never silent: re-surface it as a standalone loud
+        # banner (the reason string carries 'BYPASSED' only when it actually fired).
+        if ok and force_window and 'BYPASSED' in reason:
+            banner = ("⚠️⚠️ TESTFIRE --force-window: rail 4 (scheduled-anchor collision "
+                      "guard) was BYPASSED by owner override. Rails 1/2/3 stayed HARD. "
+                      "Scheduler is SUPPRESSED this session — no real anchor fires "
+                      "alongside the test.")
+            print(banner, flush=True)
+            log.warning(banner)
+            try:
+                trader.tele.warn(banner)
+            except Exception:
+                pass
         try:
             (trader.tele.success if ok else trader.tele.error)(f"🧪🔥 TESTFIRE {reason}")
         except Exception:

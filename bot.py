@@ -62,6 +62,11 @@ def main():
     parser.add_argument('--anchor', default='A2',
                         help="testfire: anchor label for journal tagging / defer-window "
                              "(price is current market, NOT the scheduled anchor price)")
+    parser.add_argument('--force-window', action='store_true',
+                        help="testfire: bypass ONLY rail 4 (the 30-min scheduled-anchor "
+                             "collision guard) to fire off-schedule. Rails 1/2/3/5 "
+                             "(DEMO-only, NO-FP, FLAT-BOOK, ONE-AT-A-TIME) stay HARD. "
+                             "Loud warning is printed; scheduler stays suppressed.")
     parser.add_argument('--backfill', metavar='YYYY-MM-DD', default=None,
                         help="verifyfb: re-write ONE day's Firestore doc from the journal CSV")
     parser.add_argument('--m1csv', default=None,
@@ -134,7 +139,7 @@ def main():
         # loop. Fail-closed safety rails (DEMO only, no FP profile, flat book, no
         # scheduled-anchor collision, one at a time) — see testfire.py. Real orders.
         from testfire import run_testfire
-        ok = run_testfire(cfg, anchor=args.anchor)
+        ok = run_testfire(cfg, anchor=args.anchor, force_window=args.force_window)
         sys.exit(0 if ok else 1)
 
     elif args.mode == 'verifyfb':

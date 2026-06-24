@@ -3050,23 +3050,48 @@ class SelfTest:
         self._record(86, PASS if ok else FAIL, detail)
 
     def _step_testfire_anchor_window(self):
-        # 87: rail 4 NO-COLLISION — testfire REFUSES when a scheduled anchor is active
-        # or within testfire_collision_min; clears when the window is far. Uses the
-        # pure minutes_to_nearest_anchor helper (broker UTC+3).
+        # 87: rail 4 NO-COLLISION — by DEFAULT testfire REFUSES when a scheduled anchor
+        # is active or within testfire_collision_min, and clears when far. v3.3.1:
+        # --force-window bypasses ONLY rail 4 (the in-window refusal CLEARS with a loud
+        # warning naming minutes-away + scheduler suppression) while rails 1/2/3 STAY
+        # HARD even with --force-window set. Uses the pure minutes_to_nearest_anchor
+        # helper (broker UTC+3).
         import testfire as _tf
         try:
             A = [('A2', 10, 0)]  # 10:00 broker == 07:00 UTC
             at_anchor = pd.Timestamp('2026-06-24T07:00:00Z')           # 0 min away
             edge_in = pd.Timestamp('2026-06-24T06:45:00Z')             # 15 min (<=30) away
             far = pd.Timestamp('2026-06-24T00:00:00Z')                 # 420 min away
+            # default (no override): refuses in-window, clears far.
             at_ok, at_r = _tf.testfire_preflight(self._testfire_stub(anchors=A), at_anchor)
             edge_ok, _ = _tf.testfire_preflight(self._testfire_stub(anchors=A), edge_in)
             far_ok, _ = _tf.testfire_preflight(self._testfire_stub(anchors=A), far)
             mins0 = _tf.minutes_to_nearest_anchor(self._testfire_stub(anchors=A).cfg, at_anchor)
-            ok = (at_ok is False and edge_ok is False and far_ok is True
-                  and 'NO-COLLISION' in at_r and abs(mins0) < 1e-6)
-            detail = (f"at_anchor_refused={not at_ok} within15_refused={not edge_ok} "
-                      f"far_clears={far_ok} nearest_min@anchor={mins0:.1f}")
+            default_block = (at_ok is False and edge_ok is False and far_ok is True
+                             and 'NO-COLLISION' in at_r and abs(mins0) < 1e-6)
+            # --force-window: rail 4 SKIPPED — the in-window refusal now CLEARS, and the
+            # warning is LOUD (names minutes-away + scheduler suppression, never silent).
+            fw_at_ok, fw_at_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A), at_anchor, force_window=True)
+            fw_edge_ok, _ = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A), edge_in, force_window=True)
+            warn_loud = ('BYPASS' in fw_at_r.upper() and 'SUPPRESS' in fw_at_r.upper()
+                         and '0 min' in fw_at_r)
+            forcewin_clears = (fw_at_ok is True and fw_edge_ok is True and warn_loud)
+            # rails 1/2/3 STAY HARD even with --force-window (only rail 4 is bypassable).
+            r1_ok, r1_r = _tf.testfire_preflight(
+                self._testfire_stub(trade_mode=2, anchors=A), at_anchor, force_window=True)
+            r2_ok, r2_r = _tf.testfire_preflight(
+                self._testfire_stub(profile='FPZERO_1PCT', anchors=A), at_anchor, force_window=True)
+            r3_ok, r3_r = _tf.testfire_preflight(
+                self._testfire_stub(pos=[object()], anchors=A), at_anchor, force_window=True)
+            rails_hard = (r1_ok is False and r2_ok is False and r3_ok is False
+                          and 'DEMO-ONLY' in r1_r and 'NO-FP' in r2_r and 'FLAT' in r3_r)
+            ok = default_block and forcewin_clears and rails_hard
+            detail = (f"default_at_refused={not at_ok} default_within15_refused={not edge_ok} "
+                      f"far_clears={far_ok} forcewin_at_clears={fw_at_ok} "
+                      f"forcewin_edge_clears={fw_edge_ok} warn_loud={warn_loud} "
+                      f"rails_1_2_3_still_hard={rails_hard} nearest_min@anchor={mins0:.1f}")
         except Exception as e:
             self._record(87, FAIL, f"raised: {e!r}"); return
         self._record(87, PASS if ok else FAIL, detail)

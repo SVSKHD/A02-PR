@@ -654,9 +654,21 @@ History (one line per behavioral change):
          9 rescue/shared selftest outputs diffed vs v3.2.9 -> identical. selftest -> 90
          steps (82 rewritten to the ride model; new 89 rides-not-bails, 90 no-subfloor-
          clip + trail-advance traced). Banner v3.3.0.
+  3.3.1  TESTFIRE --force-window: bypass ONLY rail 4 (the 30-min scheduled-anchor
+         collision guard) so the owner can test off-schedule without waiting for the
+         window to clear. `python bot.py testfire --anchor A2 --force-window` skips
+         rail 4's in-window refusal and prints a LOUD warning (never silent) naming
+         how many minutes the nearest scheduled anchor is away and confirming the
+         scheduler stays SUPPRESSED for the session (_testfire_mode gates _process_
+         anchor_if_due) -- the test event owns the book, so no real anchor places
+         alongside it while the test is live. Rails 1/2/3/5 (DEMO-ONLY, NO-FP,
+         FLAT-BOOK, ONE-AT-A-TIME) STAY HARD and have NO override, even with
+         --force-window. No boost/rally/rescue number changed. selftest -> 90 steps
+         (87 rewritten: default still refuses within 30 min, --force-window clears the
+         rail-4 refusal while rails 1/2/3 still refuse their cases). Banner v3.3.1.
 """
 
-__version__ = "3.3.0"
+__version__ = "3.3.1"
 CODENAME = "Astra Hawk"
 
 
