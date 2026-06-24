@@ -441,7 +441,7 @@ def run_month(ticks_df: pd.DataFrame, year: int, month: int, cfg: Config) -> Dic
             'mon_a1_time': mon_tag,
             'A1': round(a_net.get('A1_02h_Asia', 0.0), 2),
             'A2': round(a_net.get('A2_10h_London', 0.0), 2),
-            'A3': round(a_net.get('A3_1340_Overlap', 0.0), 2),
+            'A3': round(a_net.get('A3_1430_Overlap', 0.0), 2),  # v3.3.6: A3 17:00 IST label
             'A4': round(a_net.get('A4_1640_NYopen', 0.0), 2),
             'day_net': round(daily_pnl, 2),
             'cumulative': round(equity - cfg.starting_balance, 2),

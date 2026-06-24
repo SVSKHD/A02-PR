@@ -23,8 +23,9 @@ sibling stays live after the first fill, so a reversal can second-fill.
 - **SL $18 · TP $30.** First fill starts a **45-minute hold** (no trail exits
   inside the hold; SL / TP / ladder stay live).
 - **Anchors (broker = UTC+3 / IST):** A1 02:30 / 5:00 AM · A2 10:00 / 12:30 PM ·
-  A3 13:50 / 4:20 PM · A4 16:40 / 7:10 PM. On **Mondays only**, A1 fires at 03:00
-  broker (cold-start cushion; `cfg.monday_a1_override`).
+  A3 14:30 / 5:00 PM · A4 16:40 / 7:10 PM. On **Mondays only**, A1 fires at 03:30
+  broker / 6:00 AM IST (cold-start cushion; `cfg.monday_a1_override`). _(v3.3.6: A3
+  retimed 16:20 → 17:00 IST; label `A3_1430_Overlap` isolates the trial in the journal.)_
 - **Ladder (one-way ratchet).** NORMAL leg: +$2.5 → BE · +$6 → lock +$4 · +$10 →
   trail peak−$2 (floor +$8). RESCUE leg: only the +$10 tier.
 - **$10 fleet trigger.** When a leg is −$10, the sibling fill becomes a RESCUE leg
@@ -304,8 +305,10 @@ returns last-trading-day per-anchor P&L + week-to-date.
   silently rejects order comments > 31 chars); the next genuine rescue must show
   boosts placing at `rc=10009` to confirm the crash-branch upside.
 - **Multi-week green demo record** required before any funded-account money.
-- **A1 Monday time** — the readiness line has shown 03:00 broker on a deployed
-  build vs the intended 02:30; reconcile which is desired (`monday_a1_override`).
+- **A1 Monday time** — RESOLVED (v3.3.6): placement was audit-confirmed correct
+  (Monday A1 = 03:30 broker / 6:00 AM IST via `monday_a1_override`; weekdays 02:30 /
+  5:00 AM). The defect was display-only — readiness/status/banner now derive A1's
+  time from the resolver (`_resolved_anchor_hm`) instead of stale hardcoded strings.
 
 ---
 

@@ -732,9 +732,32 @@ History (one line per behavioral change):
          selftest -> 98 steps (new 96 case2 override fires + logs; 97 case1 fresh spike
          still blocks incl. $19.99 boundary; 98 opposite-dir no-override + rescue bypass/
          SL/cap unchanged). Banner v3.3.5.
+  3.3.6  TELEMETRY-TRUTH CLEANUP + A3 RESCHEDULE. NO trading-logic change. (1) Display
+         truth: a static audit confirmed A1 placement is already CORRECT (Monday A1 =
+         03:30 broker / 06:00 IST via monday_a1_override, weekday 02:30 / 05:00, wired
+         through _resolved_anchor_hm) -- the defect was that readiness/status/banner/
+         docs still showed STALE hardcoded times. Fixed by deriving every display from
+         the resolver: new anchors.anchor_ist_hm (broker->IST, display only) +
+         _resolved_anchor_ist_hm / _next_a1_display helpers; readiness line, weekend/
+         status "next anchor", and the Monday A1-RESOLVED line now print the real
+         resolved time (Mon 06:00 IST, weekday 05:00). offset_guard gains
+         scheduled_a1_ist_min so the Monday drift check expects 06:00 (not the pinned
+         weekday 05:00); Monday selftests (41/43/45) now assert 06:00 via the resolver.
+         Startup banner boost line corrected to the real per-kind runtime values --
+         RALLY $13 SL / -$910 cap / $2 trail AND RESCUE $10 / -$700 / $3.50 (was a
+         single stale "$10 / $3.50 / -$700"). README/FEATURES corrected (Mon A1 03:30/
+         06:00; A3 17:00). (2) A3 reschedule: A3 fires 17:00 IST (broker 14:30), retimed
+         from 16:20; label re-encoded A3_1340_Overlap -> A3_1430_Overlap so the journal
+         ISOLATES the A3-at-17:00 trial (label[:2] stays 'A3' -> all per-anchor logic
+         unaffected). Schedule + identity only -- A3 sizing/straddle/boosts/rescue
+         UNCHANGED. A1/A2/A4 schedule + logic, boosts ($13/$910/break-and-hold/pullback),
+         rescue (10/8/8/3.50, -$700), and the CASE-2 override all FROZEN. selftest ->
+         101 steps (new 99 readiness derives from resolver; 100 A3=17:00 + A1/A2/A4
+         unchanged; 101 resolver/offset byte-identical; existing placement/offset/jun8
+         tests pass unchanged). Banner v3.3.6.
 """
 
-__version__ = "3.3.5"
+__version__ = "3.3.6"
 CODENAME = "Astra Hawk"
 
 

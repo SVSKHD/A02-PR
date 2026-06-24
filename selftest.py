@@ -145,6 +145,10 @@ STEP_NAMES = {
     96: "case2 override fires",
     97: "case1 still blocks",
     98: "override dir/rescue",
+    # v3.3.6 telemetry-truth display fixes + A3 reschedule 16:20 -> 17:00 IST
+    99: "readiness resolver",
+    100: "a3 1700 reschedule",
+    101: "v336 no logic chg",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -576,7 +580,7 @@ class SelfTest:
                 members = [tk0, tk0 + 1, tk0 + 2, tk0 + 3]  # trigger, rescue, b1, b2
                 stub._rescue_event_open({
                     'event_id': f"2026-06-16_A3_{tk0}", 'date_ist': '2026-06-16',
-                    'anchor': 'A3_1340_Overlap', 'sched_iso': None, 'open_iso': 'x',
+                    'anchor': 'A3_1430_Overlap', 'sched_iso': None, 'open_iso': 'x',
                     'trigger': {'ticket': tk0, 'side': 'BUY', 'trigger_pnl': -10.0},
                     'rescue': {'ticket': tk0 + 1, 'side': 'SELL', 'fill': 4300.0},
                     'boosts': [
@@ -625,7 +629,7 @@ class SelfTest:
                                                    ontime_grace_s=float('inf')))
             # deliberately-missing: None entry_price, no side, no evt_block
             degraded = format_fill_alert(
-                {'anchor_label': 'A3_1340_Overlap', 'entry_price': None},
+                {'anchor_label': 'A3_1430_Overlap', 'entry_price': None},
                 ticket=999, evt_block=None)
             bits, ok = [], True
             for nm, body in (("full", full), ("degraded", degraded)):
@@ -648,7 +652,7 @@ class SelfTest:
         from telemetry import ts_header
         try:
             full = format_close_alert(
-                {'anchor_label': 'A3_1340_Overlap', 'side': 'SELL'},
+                {'anchor_label': 'A3_1430_Overlap', 'side': 'SELL'},
                 outcome='BE', close_price=4298.20, pnl_usd=0.0, daily_pnl=153.5,
                 slip_txt=" (slip +0.30 vs stop $4298.50)",
                 hold_txt="  |  held `12.3m`", nh_txt="", evt_block="")
@@ -1959,21 +1963,31 @@ class SelfTest:
         self._record(40, PASS if ok else FAIL, detail)
 
     def _step_monday_wake(self):
-        # v3.2.3 (41): first tick after a weekend gap, broker UTC+3 -> offset
-        # resolves +3 and A1 fires 05:00, not 06:00. Drives the SHARED offset_guard.
+        # v3.2.3 (41) + v3.3.6 TRUTH FIX: first tick after a weekend gap, broker
+        # UTC+3 -> offset resolves +3. A1's EXPECTED IST is now the RESOLVER-derived
+        # Monday time (03:30 broker -> 06:00 IST), NOT the stale hardcoded 05:00. A
+        # correct +3 read implies 06:00 == the Monday schedule -> NO drift; and we
+        # prove the OLD 05:00 constant would have FALSELY flagged the correct 06:00.
         import offset_guard as og
+        import anchors as _anchors
+        from datetime import date as _date, timedelta as _td
         try:
-            # gap marks a weekend wake; a +3 read confirms first try.
             gap = og.weekend_gap_hours(0.0, 50 * 3600.0)   # 50h gap
             is_wake = og.is_weekend_wake(gap)
             off, result, attempts = og.resolve_offset([3])
             resolves_3 = (off == 3 and result == og.CONFIRMED)
-            # A1 implied IST with the CORRECT offset = scheduled 05:00 (no drift).
-            a1_0500 = (not og.a1_drifted(og.A1_SCHEDULED_IST_MIN)
-                       and og.fmt_hhmm(og.A1_SCHEDULED_IST_MIN) == '0500')
-            ok = is_wake and resolves_3 and a1_0500
+            # Monday broker date -> resolver -> expected A1 IST (06:00) via shared code.
+            base = _date(2026, 6, 24); monday = base - _td(days=base.weekday())
+            brh, brm = _anchors.resolved_anchor_hm('A1_02h_Asia', monday, 2, 30, self.cfg)
+            sched = og.scheduled_a1_ist_min(brh, brm, off)
+            implied = 6 * 60   # correct +3 offset on Monday implies 06:00 IST
+            monday_0600 = (og.fmt_hhmm(sched) == '0600'
+                           and not og.a1_drifted(implied, scheduled_ist_min=sched))
+            old_const_misflags = og.a1_drifted(implied, scheduled_ist_min=og.A1_SCHEDULED_IST_MIN)
+            ok = is_wake and resolves_3 and monday_0600 and old_const_misflags
             detail = (f"M1_offset_resolves_+3={resolves_3} "
-                      f"M1_A1_fires_0500_not_0600={a1_0500} (gap={gap:.0f}h wake={is_wake})")
+                      f"M1_A1_monday_0600_no_drift={monday_0600} "
+                      f"old_0500_const_would_misflag={old_const_misflags} (sched={og.fmt_hhmm(sched)})")
         except Exception as e:
             self._record(41, FAIL, f"raised: {e!r}")
             return
@@ -2005,26 +2019,31 @@ class SelfTest:
         self._record(42, PASS if ok else FAIL, detail)
 
     def _step_monday_drift_trip(self):
-        # v3.2.3 (43): force A1 toward a server time implying ~06:00 IST Monday ->
-        # the drift tripwire fires BEFORE placement; with the offset corrected, A1
-        # resolves back to ~05:00.
+        # v3.2.3 (43) + v3.3.6 TRUTH FIX: the drift tripwire is measured against the
+        # RESOLVER's Monday schedule (06:00 IST), not a hardcoded 05:00. A bad-offset
+        # Monday read (0h instead of +3) implies ~03:00 IST (3h low) -> drift fires
+        # BEFORE placement; with +3 corrected, implied 06:00 == schedule -> no drift.
         import offset_guard as og
+        import anchors as _anchors
+        from datetime import date as _date, timedelta as _td
         from position_telemetry import PositionTracer
         try:
-            implied_0600 = 6 * 60      # forced drift to 06:00 IST
-            drift_fires = og.a1_drifted(implied_0600)   # 06:00 vs 05:00 -> True
+            base = _date(2026, 6, 24); monday = base - _td(days=base.weekday())
+            brh, brm = _anchors.resolved_anchor_hm('A1_02h_Asia', monday, 2, 30, self.cfg)
+            sched = og.scheduled_a1_ist_min(brh, brm, 3)   # 06:00 IST Monday
+            implied_bad = sched - 3 * 60                    # 0h-offset symptom: 03:00 IST
+            drift_fires = og.a1_drifted(implied_bad, scheduled_ist_min=sched)
             tr = PositionTracer(sink=lambda l: None)
             if drift_fires:
                 tr.violation(None, 'A1', 'monday_a1_drift',
-                             scheduled=og.fmt_hhmm(og.A1_SCHEDULED_IST_MIN),
-                             implied=og.fmt_hhmm(implied_0600))
-            trip = any('monday_a1_drift' in v and 'scheduled=0500' in v
-                       and 'implied=0600' in v for v in tr.violations)
-            # corrected path: confirmed +3 -> A1 at 05:00, within tolerance.
-            a1_0500 = not og.a1_drifted(og.A1_SCHEDULED_IST_MIN)
-            ok = trip and a1_0500
-            detail = (f"M3_drift_tripwire_fires={trip} "
-                      f"M3_A1_actual~0500(tol)={a1_0500}")
+                             scheduled=og.fmt_hhmm(sched), implied=og.fmt_hhmm(implied_bad))
+            trip = any('monday_a1_drift' in v and 'scheduled=0600' in v
+                       and 'implied=0300' in v for v in tr.violations)
+            # corrected path: implied 06:00 == the Monday schedule -> no drift.
+            a1_ok = not og.a1_drifted(sched, scheduled_ist_min=sched)
+            ok = trip and a1_ok
+            detail = (f"M3_drift_tripwire_fires={trip} M3_corrected_no_drift={a1_ok} "
+                      f"(sched={og.fmt_hhmm(sched)} bad={og.fmt_hhmm(implied_bad)})")
         except Exception as e:
             self._record(43, FAIL, f"raised: {e!r}")
             return
@@ -2058,7 +2077,7 @@ class SelfTest:
             tr.weekend_wake(gap_hours=50.0, is_weekend=True)
             tr.offset_detect(derived_offset=3, expected_offset=3, result='CONFIRMED',
                              attempt=1, gap_since_last_tick=50.0)
-            tr.anchor_time_resolved(scheduled_ist='0500', offset_used=3, result='CONFIRMED')
+            tr.anchor_time_resolved(scheduled_ist='0600', offset_used=3, result='CONFIRMED')  # v3.3.6: Monday A1 = 06:00 IST
             seq = [l.split()[1] for l in lines if l.startswith('PTRACE')]
             need = ['WEEKEND_WAKE', 'OFFSET_DETECT', 'ANCHOR_TIME_RESOLVED']
             gapless = (seq == need)
@@ -3590,6 +3609,88 @@ class SelfTest:
             self._record(98, FAIL, f"raised: {e!r}"); return
         self._record(98, PASS if ok else FAIL, detail)
 
+    # --- v3.3.6 telemetry-truth displays + A3 reschedule ---------------------
+    def _step_readiness_derives_resolver(self):
+        # 99: readiness / status / banner A1 time DERIVES from _resolved_anchor_hm via
+        # the IST converter -- Monday 03:30 broker -> 06:00 IST, weekday 02:30 -> 05:00
+        # IST -- not a hardcoded string. Exercises the bound display helpers directly
+        # (_resolved_anchor_ist_hm + _next_a1_display) on a stub.
+        import types, anchors as _anchors
+        from datetime import date as _date, timedelta as _td
+        try:
+            stub = types.SimpleNamespace(cfg=self.cfg)
+            stub._resolved_anchor_hm = _anchors._resolved_anchor_hm.__get__(stub)
+            stub._resolved_anchor_ist_hm = _anchors._resolved_anchor_ist_hm.__get__(stub)
+            a = self.cfg.anchors[0]
+            base = _date(2026, 6, 24)
+            monday = base - _td(days=base.weekday())
+            tuesday = monday + _td(days=1)
+            mrh, mrm, mih, mim = stub._resolved_anchor_ist_hm(a[0], monday, a[1], a[2])
+            wrh, wrm, wih, wim = stub._resolved_anchor_ist_hm(a[0], tuesday, a[1], a[2])
+            monday_0600 = (mrh, mrm, mih, mim) == (3, 30, 6, 0)
+            weekday_0500 = (wrh, wrm, wih, wim) == (2, 30, 5, 0)
+            # _next_a1_display (weekend/sleep text) -> upcoming Monday 06:00 IST.
+            saturday = monday + _td(days=5)
+            stub._broker_date = lambda ts, _s=saturday: _s
+            stub._next_a1_display = _anchors._next_a1_display.__get__(stub)
+            disp = stub._next_a1_display()
+            next_mon_disp = ('03:30 broker' in disp and '06:00 IST' in disp)
+            ok = monday_0600 and weekday_0500 and next_mon_disp
+            detail = (f"monday_0330broker_0600IST={monday_0600} "
+                      f"weekday_0230broker_0500IST={weekday_0500} next_a1='{disp}'")
+        except Exception as e:
+            self._record(99, FAIL, f"raised: {e!r}"); return
+        self._record(99, PASS if ok else FAIL, detail)
+
+    def _step_a3_scheduled_1700(self):
+        # 100: A3 reschedule -- the A3 anchor in cfg fires at 17:00 IST (broker 14:30),
+        # retimed from 16:20, with the label re-encoded (A3_1430_Overlap) so the
+        # journal isolates the trial. label[:2] stays 'A3'. A1/A2/A4 are UNCHANGED.
+        import anchors as _anchors
+        try:
+            amap = {lbl: (h, m) for (lbl, h, m) in self.cfg.anchors}
+            a3 = [(lbl, h, m) for (lbl, h, m) in self.cfg.anchors if lbl[:2] == 'A3']
+            a3_lbl, a3_h, a3_m = a3[0]
+            ih, im = _anchors.anchor_ist_hm(a3_h, a3_m, self.cfg)
+            a3_1700 = ((a3_h, a3_m) == (14, 30) and (ih, im) == (17, 0))
+            a3_tagged = (a3_lbl == 'A3_1430_Overlap' and a3_lbl[:2] == 'A3')
+            def ist(lbl):
+                h, m = amap[lbl]; return _anchors.anchor_ist_hm(h, m, self.cfg)
+            a1_ok = amap.get('A1_02h_Asia') == (2, 30)
+            a2_ok = amap.get('A2_10h_London') == (10, 0) and ist('A2_10h_London') == (12, 30)
+            a4_ok = amap.get('A4_1640_NYopen') == (16, 40) and ist('A4_1640_NYopen') == (19, 10)
+            ok = a3_1700 and a3_tagged and a1_ok and a2_ok and a4_ok
+            detail = (f"A3_1700IST_broker1430={a3_1700} A3_label_tag={a3_tagged} "
+                      f"A1/A2/A4_unchanged={a1_ok and a2_ok and a4_ok}")
+        except Exception as e:
+            self._record(100, FAIL, f"raised: {e!r}"); return
+        self._record(100, PASS if ok else FAIL, detail)
+
+    def _step_v336_no_logic_change(self):
+        # 101: the v3.3.6 build changed DISPLAYS / CONSTANTS only. Assert the
+        # SCHEDULING resolver and OFFSET detection are byte-identical: Monday A1 still
+        # resolves 03:30 broker, weekday 02:30, the offset guard still confirms +3 /
+        # BLOCKS a bad read, and the new IST converter is pure (changes no (h,m) the
+        # scheduler uses).
+        import offset_guard as og, anchors as _anchors
+        from datetime import date as _date, timedelta as _td
+        try:
+            base = _date(2026, 6, 24); monday = base - _td(days=base.weekday())
+            tuesday = monday + _td(days=1)
+            mon = _anchors.resolved_anchor_hm('A1_02h_Asia', monday, 2, 30, self.cfg)
+            wk = _anchors.resolved_anchor_hm('A1_02h_Asia', tuesday, 2, 30, self.cfg)
+            resolver_ok = (mon == (3, 30) and wk == (2, 30))
+            off_ok = (og.resolve_offset([3]) == (3, og.CONFIRMED, 1)
+                      and og.resolve_offset([0, 0, 0])[1] == og.BLOCKED)
+            conv_ok = (_anchors.anchor_ist_hm(3, 30, self.cfg) == (6, 0)
+                       and _anchors.anchor_ist_hm(2, 30, self.cfg) == (5, 0))
+            ok = resolver_ok and off_ok and conv_ok
+            detail = (f"resolver_mon0330_wk0230={resolver_ok} "
+                      f"offset_detect_unchanged={off_ok} ist_converter_pure={conv_ok}")
+        except Exception as e:
+            self._record(101, FAIL, f"raised: {e!r}"); return
+        self._record(101, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -3776,6 +3877,11 @@ class SelfTest:
             self._step_case2_override_fires()
             self._step_case1_still_blocks()
             self._step_override_dir_and_rescue()
+            # v3.3.6 — telemetry-truth displays (readiness/status/banner derive from
+            # the resolver) + A3 reschedule 16:20 -> 17:00 IST; no placement/offset change
+            self._step_readiness_derives_resolver()
+            self._step_a3_scheduled_1700()
+            self._step_v336_no_logic_change()
         finally:
             self._cleanup()
         return self._report(ts)

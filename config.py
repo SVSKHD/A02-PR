@@ -260,7 +260,13 @@ class Config:
         # weeks -- persistent losers get cut based on the journal, not sims.
         ("A1_02h_Asia", 2, 30),
         ("A2_10h_London", 10, 0),
-        ("A3_1340_Overlap", 13, 50),
+        # v3.3.6: A3 rescheduled 16:20 -> 17:00 IST (broker 13:50 -> 14:30; owner
+        # trial). The label re-encodes the new broker time (1430) so the journal
+        # ISOLATES A3-at-17:00 trades from the prior A3-at-16:20 record for a clean
+        # post-trial verdict. Trade logic / sizing / straddle / boosts / rescue are
+        # all UNCHANGED -- this is a schedule + identity-tag change only. label[:2]
+        # stays 'A3' so all per-anchor logic is unaffected.
+        ("A3_1430_Overlap", 14, 30),
         ("A4_1640_NYopen", 16, 40),
     ])
     # Monday cold-start cushion. Forex opens Mon 00:00 broker; A1 at 02:30 is only
