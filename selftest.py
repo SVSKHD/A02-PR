@@ -2869,6 +2869,87 @@ class SelfTest:
         self._record(82, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
+    # v3.2.8 Phase 2/3 — rally/rescue/common file split + dispatcher isolation
+    # ------------------------------------------------------------------------
+    def _step_boost_split_isolation(self):
+        # v3.2.8 Phase 2/3: the boost logic is split into rally.py (winning pyramid +
+        # break-and-hold + Phase-1 numbers), rescue.py (losing hedge; UNCHANGED v3.2.7
+        # numbers), boosts_common.py (shared placement/FP-guard/cap/journal, mapped
+        # ONCE), and a dispatcher that routes by the sign of leg_fav. Asserts: (1) all
+        # four modules import; (2) rally OWNS $5/$4/$1.50, rescue OWNS the UNCHANGED
+        # $10/$8/$8/$3.50; (3) the dispatcher routes a RALLY plan -> rally.fire and a
+        # RESCUE plan -> rescue.fire, BOTH into boosts_common.place_fleet; (4) the
+        # fills._fire_boost_event seam delegates through that same dispatch chain;
+        # (5) rescue's RELOCATED trail is BYTE-IDENTICAL (reach +$8 -> lock at +$8).
+        import types
+        import boosts as _b
+        import rally as _rally
+        import rescue as _rescue
+        import boosts_common as _bc
+        import boosts_dispatch as _bd
+        import fills as _fills
+        from strategy import Position, update_position_on_bar
+        try:
+            cfg = self.cfg
+            # (1) modules present + the shared placement mapped ONCE.
+            modules_ok = (callable(_rally.fire) and callable(_rescue.fire)
+                          and callable(_bc.place_fleet) and callable(_bd.fire)
+                          and _rally.fire.__module__ == 'rally'
+                          and _rescue.fire.__module__ == 'rescue')
+            # (2) ownership of the numbers (rally tightened; rescue UNCHANGED).
+            rally_nums = (abs(_rally.event_arm(cfg) - 5.0) < 1e-9
+                          and abs(_rally.trail_arm(cfg) - 4.0) < 1e-9
+                          and abs(_rally.lock_floor(cfg) - 4.0) < 1e-9
+                          and abs(_rally.trail_gap(cfg) - 1.50) < 1e-9)
+            rescue_nums = (abs(_rescue.event_arm(cfg) - 10.0) < 1e-9
+                           and abs(_rescue.trail_arm(cfg) - 8.0) < 1e-9
+                           and abs(_rescue.lock_floor(cfg) - 8.0) < 1e-9
+                           and abs(_rescue.trail_gap(cfg) - 3.50) < 1e-9)
+            # (3)+(4) routing: stub the SHARED placement and prove sign-of-leg_fav
+            # routing + that the fills seam delegates through the same chain.
+            fill = 4266.3
+            rally_plan = _b.plan_boost_event('BUY', fill, fill + 5.0, cfg)    # winning -> RALLY
+            rescue_plan = _b.plan_boost_event('BUY', fill, fill - 10.0, cfg)  # losing  -> RESCUE
+            placed = []
+            orig = _bc.place_fleet
+            _bc.place_fleet = lambda self, tk, sh, pl: placed.append(pl.kind)
+            try:
+                stub = types.SimpleNamespace()
+                shadow = {'anchor_label': 'A1_02h_Asia', 'side': 'BUY',
+                          'leg_fill_price': fill, 'entry_price': fill}
+                _bd.fire(stub, 700, shadow, rally_plan)
+                _bd.fire(stub, 701, shadow, rescue_plan)
+                dispatch_routes = (placed == ['RALLY', 'RESCUE'])
+                placed.clear()
+                # the fills seam must route through the SAME dispatch -> place_fleet.
+                _fills._fire_boost_event(stub, 702, shadow, rally_plan)
+                _fills._fire_boost_event(stub, 703, shadow, rescue_plan)
+                seam_routes = (placed == ['RALLY', 'RESCUE'])
+            finally:
+                _bc.place_fleet = orig
+            # (5) rescue's RELOCATED trail engine is byte-identical: a RESCUE boost
+            # reaches +$8 then reverses -> closes at the +$8 lock floor (v3.2.7).
+            entry = 100.0; ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            p = Position(anchor_label='T', side='BUY', entry_price=entry,
+                         entry_time=ts0, current_sl=entry - 10.0, tp_level=entry + 30.0,
+                         max_fav=entry, lot=cfg.lot_size, role='rescue', boost=True,
+                         boost_kind='RESCUE')
+            for i, b in enumerate([{'open': 100, 'high': 108.5, 'low': 100.2, 'close': 108},
+                                   {'open': 108, 'high': 108, 'low': 105, 'close': 105}]):
+                update_position_on_bar(p, pd.Series(b), ts0 + pd.Timedelta(minutes=i + 1), cfg)
+                if p.closed:
+                    break
+            rescue_byte_identical = (p.closed and abs((p.exit_price - entry) - 8.0) < 0.05)
+            ok = (modules_ok and rally_nums and rescue_nums and dispatch_routes
+                  and seam_routes and rescue_byte_identical)
+            detail = (f"modules={modules_ok} rally_5/4/1.5={rally_nums} "
+                      f"rescue_10/8/8/3.5={rescue_nums} dispatch={dispatch_routes} "
+                      f"seam={seam_routes} rescue_floor8={rescue_byte_identical}")
+        except Exception as e:
+            self._record(83, FAIL, f"raised: {e!r}"); return
+        self._record(83, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
     def _preflight(self) -> bool:
@@ -3030,6 +3111,8 @@ class SelfTest:
             # v3.2.8 Phase 1 — rally +$5 arm / +$4 lock / $1.50 gap (rescue untouched)
             self._step_rally_arm_5()
             self._step_rally_trail_4_15()
+            # v3.2.8 Phase 2/3 — rally/rescue/common split + dispatcher isolation
+            self._step_boost_split_isolation()
         finally:
             self._cleanup()
         return self._report(ts)

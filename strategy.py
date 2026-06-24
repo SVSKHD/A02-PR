@@ -80,14 +80,15 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     # off their OWN dedicated keys; RESCUE boosts (and every legacy boost Position,
     # which defaults boost_kind='RESCUE') keep the v3.2.7 $8 arm / $8 lock / $3.50 gap
     # byte-identical. The $10 hard backstop is shared and unchanged for both.
-    if getattr(pos, 'boost_kind', 'RESCUE') == 'RALLY':
-        gap = float(getattr(cfg, 'rally_trail_gap', 1.50))
-        arm = float(getattr(cfg, 'rally_lock_floor', 4.0))
-        floor = float(getattr(cfg, 'rally_lock_floor', 4.0))
-    else:
-        gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
-        arm = float(getattr(cfg, 'boost_trail_arm_fav', 8.0))
-        floor = float(getattr(cfg, 'boost_lock_floor', 8.0))
+    # v3.2.8: each kind OWNS its trail numbers (rally.py / rescue.py). RALLY ->
+    # $4 arm/lock, $1.50 gap; RESCUE (the default for every legacy boost Position)
+    # -> $8 arm/lock, $3.50 gap, byte-identical to v3.2.7. Lazy import keeps this
+    # precious module free of the order-placement stack.
+    import rally as _rally, rescue as _rescue
+    _bk = _rally if getattr(pos, 'boost_kind', 'RESCUE') == 'RALLY' else _rescue
+    gap = _bk.trail_gap(cfg)
+    arm = _bk.trail_arm(cfg)
+    floor = _bk.lock_floor(cfg)
     backstop = pos.entry_price - sgn * hard          # the $10 hard SL backstop
 
     def trail_for(fav):

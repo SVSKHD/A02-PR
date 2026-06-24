@@ -601,9 +601,27 @@ History (one line per behavioral change):
          both kinds. selftest -> 80 steps (new 80: rally gated / rescue fires free /
          rescue still FP-blocked / toggle-off re-gates / rally-confirmed fires). Banner
          v3.2.7.
+  3.2.8  RALLY tightened + boost file split (rescue UNTOUCHED). Phase 1: the WINNING-
+         side rally pyramid gets its OWN dedicated keys -- arm $10->$5 (rally_arm_fav),
+         lock floor $8->$4 (rally_lock_floor, == its breath-trail arm), trail gap
+         $3.50->$1.50 (rally_trail_gap, kept proportional to the $4 floor: 3.50/8 ->
+         1.50/4, same one-way-ratchet shape, just tighter). It does NOT reuse the
+         BOOST_* keys rescue depends on. RESCUE keeps its $10 arm / $8 lock / $3.50 gap
+         EXACTLY (byte-identical; verified live A1 2026-06-24). boosts.plan_boost_event
+         arms asymmetrically (RALLY +$5 / RESCUE -$10) with a per-kind hard guard;
+         Position.boost_kind selects the trail in strategy._update_boost_on_bar.
+         Phase 2/3: the tangled boost logic (boosts.py + the rally/rescue branches in
+         fills.py) splits into rally.py (winning pyramid + break-and-hold gate + the
+         Phase-1 numbers), rescue.py (losing hedge; UNCHANGED), boosts_common.py
+         (shared placement / FP-guard / -$700 cap / journal / telemetry, mapped ONCE),
+         and boosts_dispatch.py (routes by the sign of leg_fav -> rally.fire /
+         rescue.fire). The fills LiveTrader methods become thin seams onto these. Pure
+         refactor beyond the rally numbers; rescue output byte-identical. selftest ->
+         83 steps (new 81 rally arm +5, 82 rally trail 4/1.5 + kind isolation, 83 split
+         isolation + dispatcher routing + rescue-relocated byte-identity). Banner v3.2.8.
 """
 
-__version__ = "3.2.7"
+__version__ = "3.2.8"
 CODENAME = "Astra Hawk"
 
 
