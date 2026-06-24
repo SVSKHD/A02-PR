@@ -183,12 +183,18 @@ class Config:
     # every existing caller are byte-identical.
     rally_arm_fav: float = 5.0        # RALLY_ARM_FAV: a WINNING leg arms the rally
     #   pyramid once it is +$5 favorable (was +$10, the shared boost_trigger_dollars).
-    #   Rescue's losing-side -$10 arm (boost_trigger_dollars) is untouched.
-    rally_lock_floor: float = 4.0     # RALLY_LOCK_FLOOR: a rally boost's breath-gap
-    #   trail arms + its one-way lock floor engages once +$4 in profit (was +$8, the
-    #   shared boost_trail_arm_fav / boost_lock_floor). == arm by default, same shape.
-    rally_trail_gap: float = 1.50     # RALLY_TRAIL_GAP: rally breath-gap trail gap
-    #   (was $3.50). Proportional to the tighter $4 floor (3.50/8 -> ~1.50/4).
+    #   Rescue's losing-side -$10 arm (boost_trigger_dollars) is untouched. v3.3.0:
+    #   this is ALSO the rally boost's trail-arm peak -- the breath-gap trail goes
+    #   live once the boost's OWN peak reaches +$5.
+    rally_lock_floor: float = 3.00    # RALLY_LOCK_FLOOR: v3.3.0 the break-even+ MINIMUM
+    #   an armed rally boost's trailed stop may not fall below (= arm - gap = 5 - 2 =
+    #   $3). It is a FLOOR only, NOT the governing exit: above it the boost RIDES at
+    #   peak - rally_trail_gap (one-way), exactly like the original leg, instead of
+    #   locking flat at +$4 and bailing on the first pause (v3.2.8 defect; test-fire
+    #   A2 2026-06-24: original +$425 rode 4069->4081 while boosts clipped at ~4078).
+    rally_trail_gap: float = 2.00     # RALLY_TRAIL_GAP: v3.3.0 the rally boost trails
+    #   at peak - $2.00 (was $1.50), matching the original leg's trail gap (trail_gap
+    #   / banner "gap $2.00") so a rally boost rides the move and exits ~peak-$2.
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all

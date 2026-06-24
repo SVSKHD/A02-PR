@@ -636,9 +636,27 @@ History (one line per behavioral change):
          NO v3.2.8 boost number changed; rally + rescue byte-identical. selftest -> 88
          steps (new 84 demo-only, 85 FP-refuse, 86 flat/in-flight, 87 anchor-window,
          88 same-placement call-identity). Banner v3.2.9.
+  3.3.0  RALLY boosts now RIDE like the original leg (rally path ONLY). v3.2.8's fixed
+         +$4 lock made rally boosts bail on the first pause while the original leg rode
+         the whole move (test-fire A2 2026-06-24: original +$425 ran 4069->4081, boosts
+         only +$135/+$131 clipped ~4078). FIX: drop the flat lock; once armed at +$5
+         (peak) the rally boost trails at peak - rally_trail_gap ($2.00, was $1.50),
+         one-way, above a break-even+ MINIMUM floor of +$3 (= arm - gap). It rides and
+         exits ~peak-$2 (a +$10 peak banks ~+$8) instead of locking +$4. The +$5 FIRE
+         trigger (rally_arm_fav) is UNCHANGED. Config: rally_trail_gap 1.50->2.00,
+         rally_lock_floor 4.0->3.0; rally.trail_arm now reads rally_arm_fav ($5).
+         KNOWN-DEFECT fix: an armed rally boost (a) emits LOCK_ARM/TRAIL_ADVANCE via a
+         threaded tracer so its trail exit is never flagged exit_trail_without_trail_
+         advance (the test-fire PTRACE clip), and (b) NEVER closes below its ratcheted
+         trail floor -- a bar that gaps THROUGH the trail is clamped to the floor, no
+         sub-floor clip (RALLY only; RESCUE keeps the v3.2.7 backstop-floored gap fill).
+         RESCUE is BYTE-IDENTICAL ($10 arm / $8 lock / $3.50 gap, free-fire on commit) --
+         9 rescue/shared selftest outputs diffed vs v3.2.9 -> identical. selftest -> 90
+         steps (82 rewritten to the ride model; new 89 rides-not-bails, 90 no-subfloor-
+         clip + trail-advance traced). Banner v3.3.0.
 """
 
-__version__ = "3.2.9"
+__version__ = "3.3.0"
 CODENAME = "Astra Hawk"
 
 

@@ -122,7 +122,7 @@ STEP_NAMES = {
     80: "rescue bypass break-and-hold",
     # v3.2.8 Phase 1 — rally +$5 arm / +$4 lock / $1.50 gap (rescue untouched)
     81: "rally arm +5",
-    82: "rally trail 4/1.5",
+    82: "rally trail ride",
     # v3.2.8 Phase 2/3 — rally/rescue/common file split + dispatcher isolation
     83: "boost split isolation",
     # v3.2.9 manual TESTFIRE — fail-closed safety rails + same-placement reuse
@@ -131,6 +131,9 @@ STEP_NAMES = {
     86: "testfire flat/in-flight",
     87: "testfire anchor window",
     88: "testfire same-placement",
+    # v3.3.0 rally rides (peak-gap trail, not flat lock) + no sub-floor clip
+    89: "rally rides not bails",
+    90: "rally no subfloor clip",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -2812,22 +2815,21 @@ class SelfTest:
             self._record(81, FAIL, f"raised: {e!r}"); return
         self._record(81, PASS if ok else FAIL, detail)
 
-    def _step_rally_trail_4_15(self):
-        # v3.2.8 Phase 1: a RALLY boost's breath-gap trail tightens -- arms + locks at
-        # +$4 (was +$8) and trails by $1.50 (was $3.50), off DEDICATED keys
-        # (rally_lock_floor / rally_trail_gap). A RESCUE boost (Position.boost_kind
-        # defaults 'RESCUE') is BYTE-IDENTICAL to v3.2.7 ($8 arm / $8 lock / $3.50 gap).
-        # Drives the REAL strategy core (update_position_on_bar) -- the same engine the
-        # live trail and the backtest use -- so the numbers cannot diverge. The $10
-        # hard backstop is shared/unchanged. Closes with a KIND-ISOLATION proof: the
-        # SAME +$5-then-reverse path locks +$4 on a RALLY boost but rides uncut on a
-        # RESCUE boost (whose $8 arm is never reached).
+    def _step_rally_trail_ride(self):
+        # v3.3.0: a RALLY boost RIDES like the original leg -- once armed at +$5 (peak)
+        # it trails at peak - rally_trail_gap ($2.00), one-way, above a break-even+
+        # MINIMUM floor of +$3 (= arm - gap). It NO LONGER locks flat at +$4 and bails
+        # on the first pause (the v3.2.8 defect; test-fire A2). Drives the REAL strategy
+        # core (update_position_on_bar). A RESCUE boost stays BYTE-IDENTICAL ($8 arm /
+        # $8 lock / $3.50 gap). KIND-ISOLATION proof: the SAME +$6-then-reverse path
+        # rides+exits ~peak-$2 on RALLY but is unarmed (never reaches $8) on RESCUE.
         from strategy import Position, update_position_on_bar
         try:
             cfg = self.cfg
             hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
-            r_gap = float(getattr(cfg, 'rally_trail_gap', 1.50))
-            r_floor = float(getattr(cfg, 'rally_lock_floor', 4.0))
+            r_gap = float(getattr(cfg, 'rally_trail_gap', 2.00))
+            r_floor = float(getattr(cfg, 'rally_lock_floor', 3.0))   # be+ minimum
+            r_arm = float(getattr(cfg, 'rally_arm_fav', 5.0))         # trail-arm peak
             entry = 100.0
             ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
 
@@ -2843,33 +2845,39 @@ class SelfTest:
                         break
                 return p
 
-            # (1) RALLY reverses BEFORE +$4 -> trail INACTIVE -> rides to $10 backstop.
-            p1 = run([{'open': 100, 'high': 101, 'low': entry - hard - 1, 'close': 92}], 'RALLY')
-            backstop_below4 = p1.closed and abs((entry - p1.exit_price) - hard) < 0.05
-            # (2) RALLY reaches +$4 then reverses -> closes at the +$4 LOCK FLOOR.
-            p2 = run([{'open': 100, 'high': entry + r_floor + 0.5, 'low': 100.2, 'close': entry + r_floor},
-                      {'open': entry + r_floor, 'high': entry + r_floor, 'low': entry + r_floor - 3,
-                       'close': entry + r_floor - 3}], 'RALLY')
-            rally_floor = p2.closed and abs((p2.exit_price - entry) - r_floor) < 0.05
-            # (3) RALLY runs PAST +$4 -> trails by $1.50 (exit ~ peak-gap), floor >= +$4.
-            p3 = run([{'open': 100, 'high': 108, 'low': 100.5, 'close': 107},
-                      {'open': 107, 'high': 107, 'low': 105, 'close': 105}], 'RALLY')
-            rally_trail = (p3.closed and abs((p3.exit_price - entry) - (8.0 - r_gap)) < 0.05
-                           and (p3.exit_price - entry) >= r_floor - 0.05)
-            # (4) KIND ISOLATION: the SAME +$5-then-reverse path. RALLY (arm $4) locks
-            #     +$4; RESCUE (arm $8, never reached) rides uncut on the backstop only.
-            path5 = [{'open': 100, 'high': 105, 'low': 100.2, 'close': 104.8},
-                     {'open': 104.8, 'high': 104.8, 'low': 100.0, 'close': 100.0}]
-            pr = run(path5, 'RALLY')
-            ps = run(path5, 'RESCUE')
-            isolation = (pr.closed and abs((pr.exit_price - entry) - r_floor) < 0.05
+            # (1) reverses BEFORE +$5 (unarmed) -> trail INACTIVE -> rides to $10 backstop.
+            p1 = run([{'open': 100, 'high': 104, 'low': entry - hard - 1, 'close': 92}], 'RALLY')
+            backstop_below_arm = p1.closed and abs((entry - p1.exit_price) - hard) < 0.05
+            # (2) reaches +$5 then reverses -> exits at the +$3 break-even+ FLOOR (NOT +$4).
+            p2 = run([{'open': 100, 'high': entry + r_arm, 'low': 100.2, 'close': entry + r_arm - 0.2},
+                      {'open': entry + r_arm - 0.2, 'high': entry + r_arm - 0.2,
+                       'low': entry + r_floor - 1, 'close': entry + r_floor - 1}], 'RALLY')
+            floor_be = (p2.closed and abs((p2.exit_price - entry) - r_floor) < 0.05
+                        and (p2.exit_price - entry) < 4.0 - 1e-9)   # strictly below the OLD flat +$4
+            # (3) runs to +$10 peak -> RIDES, exits ~peak-$2 = +$8 (not flat +$4).
+            p3 = run([{'open': 100, 'high': 110, 'low': 100.5, 'close': 109},
+                      {'open': 109, 'high': 109, 'low': 107, 'close': 107}], 'RALLY')
+            rides_peak_minus_2 = (p3.closed and abs((p3.exit_price - entry) - (10.0 - r_gap)) < 0.05
+                                  and (p3.exit_price - entry) >= r_floor - 0.05)
+            # (4) one-way: after the peak a non-triggering retrace must NOT loosen SL.
+            p4 = run([{'open': 100, 'high': 110, 'low': 100.5, 'close': 109}], 'RALLY')
+            sl_peak = p4.current_sl
+            update_position_on_bar(p4, pd.Series({'open': 108, 'high': 108, 'low': 107.6, 'close': 107.8}),
+                                   ts0 + pd.Timedelta(minutes=5), cfg)
+            one_way = (p4.closed or p4.current_sl >= sl_peak - 1e-9)
+            # (5) KIND ISOLATION: SAME +$6-then-reverse path. RALLY rides+exits ~peak-$2;
+            #     RESCUE (arm $8 never reached) rides uncut on the backstop only.
+            path6 = [{'open': 100, 'high': 106, 'low': 100.2, 'close': 105.5},
+                     {'open': 105.5, 'high': 105.5, 'low': 100.0, 'close': 100.0}]
+            pr = run(path6, 'RALLY')
+            ps = run(path6, 'RESCUE')
+            isolation = (pr.closed and abs((pr.exit_price - entry) - (6.0 - r_gap)) < 0.05
                          and (not ps.closed))
-            ok = (backstop_below4 and rally_floor and rally_trail and isolation)
-            detail = (f"rev<4->backstop{p1.exit_price}({backstop_below4}) "
-                      f"reach4->floor{p2.exit_price}({rally_floor}) "
-                      f"past4->trail{p3.exit_price}({rally_trail}) "
-                      f"kind_isol rally_exit={getattr(pr, 'exit_price', None)} "
-                      f"rescue_open={not ps.closed}({isolation})")
+            ok = (backstop_below_arm and floor_be and rides_peak_minus_2 and one_way and isolation)
+            detail = (f"rev<5->backstop{p1.exit_price}({backstop_below_arm}) "
+                      f"reach5->be_floor{p2.exit_price}=+{p2.exit_price - entry:.1f}(not+4)({floor_be}) "
+                      f"peak10->rides+{p3.exit_price - entry:.1f}(~+8)({rides_peak_minus_2}) "
+                      f"one_way={one_way} kind_isol rally+{pr.exit_price - entry:.1f}/rescue_open={not ps.closed}({isolation})")
         except Exception as e:
             self._record(82, FAIL, f"raised: {e!r}"); return
         self._record(82, PASS if ok else FAIL, detail)
@@ -2903,10 +2911,11 @@ class SelfTest:
                           and _rally.fire.__module__ == 'rally'
                           and _rescue.fire.__module__ == 'rescue')
             # (2) ownership of the numbers (rally tightened; rescue UNCHANGED).
+            # v3.3.0: rally event arm $5, trail arm $5, be+ floor $3, gap $2.00 (rides).
             rally_nums = (abs(_rally.event_arm(cfg) - 5.0) < 1e-9
-                          and abs(_rally.trail_arm(cfg) - 4.0) < 1e-9
-                          and abs(_rally.lock_floor(cfg) - 4.0) < 1e-9
-                          and abs(_rally.trail_gap(cfg) - 1.50) < 1e-9)
+                          and abs(_rally.trail_arm(cfg) - 5.0) < 1e-9
+                          and abs(_rally.lock_floor(cfg) - 3.0) < 1e-9
+                          and abs(_rally.trail_gap(cfg) - 2.00) < 1e-9)
             rescue_nums = (abs(_rescue.event_arm(cfg) - 10.0) < 1e-9
                            and abs(_rescue.trail_arm(cfg) - 8.0) < 1e-9
                            and abs(_rescue.lock_floor(cfg) - 8.0) < 1e-9
@@ -2948,7 +2957,7 @@ class SelfTest:
             rescue_byte_identical = (p.closed and abs((p.exit_price - entry) - 8.0) < 0.05)
             ok = (modules_ok and rally_nums and rescue_nums and dispatch_routes
                   and seam_routes and rescue_byte_identical)
-            detail = (f"modules={modules_ok} rally_5/4/1.5={rally_nums} "
+            detail = (f"modules={modules_ok} rally_5/5/3/2={rally_nums} "
                       f"rescue_10/8/8/3.5={rescue_nums} dispatch={dispatch_routes} "
                       f"seam={seam_routes} rescue_floor8={rescue_byte_identical}")
         except Exception as e:
@@ -3115,6 +3124,93 @@ class SelfTest:
         self._record(88, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
+    # v3.3.0 — rally RIDES (peak-gap trail, not a flat lock) + no sub-floor clip
+    # ------------------------------------------------------------------------
+    def _step_rally_rides_not_bails(self):
+        # 89: the v3.2.8 defect was a rally boost LOCKING flat at +$4 and bailing on
+        # the first pause. v3.3.0: an armed rally boost (peak >= +$5) trails at
+        # peak - $2 above a +$3 floor, so a SHALLOW pause that stays above the trail
+        # does NOT close it -- it RIDES and banks ~peak-$2, like the original leg.
+        from strategy import Position, update_position_on_bar
+        try:
+            cfg = self.cfg
+            hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            p = Position(anchor_label='T', side='BUY', entry_price=entry, entry_time=ts0,
+                         current_sl=entry - hard, tp_level=entry + 30.0, max_fav=entry,
+                         lot=cfg.lot_size, role='rescue', boost=True, boost_kind='RALLY')
+            # bar1: peak +$6 -> armed, trail = peak-2 = +$4 (stop 104).
+            update_position_on_bar(p, pd.Series({'open': 100, 'high': 106, 'low': 100.5, 'close': 105.5}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            armed_trail = abs((p.current_sl - entry) - 4.0) < 0.05 and not p.closed
+            # bar2: SHALLOW pause -- dips to +$4.5 (ABOVE the +$4 trail). The OLD flat
+            # +$4 lock would still be holding too, but the key is it does NOT bail; it
+            # must stay OPEN and keep riding.
+            update_position_on_bar(p, pd.Series({'open': 105.5, 'high': 105.5, 'low': 104.5, 'close': 105.0}),
+                                   ts0 + pd.Timedelta(minutes=2), cfg)
+            held_pause = (not p.closed)
+            # bar3: runs to +$9 peak -> trail rides to +$7 (peak-2).
+            update_position_on_bar(p, pd.Series({'open': 105.0, 'high': 109, 'low': 104.8, 'close': 108}),
+                                   ts0 + pd.Timedelta(minutes=3), cfg)
+            rode_up = abs((p.current_sl - entry) - 7.0) < 0.05 and not p.closed
+            # bar4: reverses -> exits at the ridden trail +$7 (NOT the flat +$4 lock).
+            update_position_on_bar(p, pd.Series({'open': 108, 'high': 108, 'low': 106.5, 'close': 106.5}),
+                                   ts0 + pd.Timedelta(minutes=4), cfg)
+            exits_ridden = (p.closed and abs((p.exit_price - entry) - 7.0) < 0.05
+                            and (p.exit_price - entry) > 4.0 + 1e-9)   # strictly beats the OLD flat +$4
+            ok = (armed_trail and held_pause and rode_up and exits_ridden)
+            detail = (f"armed_trail+4={armed_trail} held_shallow_pause={held_pause} "
+                      f"rode_to+7={rode_up} exits_at_ridden_trail+{p.exit_price - entry:.1f}(>4)={exits_ridden}")
+        except Exception as e:
+            self._record(89, FAIL, f"raised: {e!r}"); return
+        self._record(89, PASS if ok else FAIL, detail)
+
+    def _step_rally_no_subfloor_clip(self):
+        # 90: the KNOWN DEFECT — PTRACE exit_trail_without_trail_advance clipped a boost
+        # BELOW its lock (test-fire boost 2 exited +$3.74 under its floor). v3.3.0: an
+        # armed rally boost (a) emits LOCK_ARM/TRAIL_ADVANCE so its trail exit is never
+        # flagged exit_trail_without_trail_advance, and (b) NEVER closes below its
+        # ratcheted trail floor even on a bar that GAPS THROUGH it.
+        from strategy import Position, update_position_on_bar
+        from position_telemetry import PositionTracer, TRAIL_ADVANCE, LOCK_ARM, EXIT
+        try:
+            cfg = self.cfg
+            hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+            r_gap = float(getattr(cfg, 'rally_trail_gap', 2.00))
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            events = []
+            tr = PositionTracer(sink=lambda l: None)
+            p = Position(anchor_label='A1_02h_Asia', side='BUY', entry_price=entry,
+                         entry_time=ts0, current_sl=entry - hard, tp_level=entry + 30.0,
+                         max_fav=entry, lot=cfg.lot_size, role='rescue', boost=True,
+                         boost_kind='RALLY')
+            # bar1: peak +$7 -> armed; trail = peak-2 = +$5 (stop 105). With a tracer the
+            # arm emits LOCK_ARM (stop leaves the $10 backstop) -- the trail-advance path.
+            update_position_on_bar(p, pd.Series({'open': 100, 'high': 107, 'low': 100.5, 'close': 106}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg, tracer=tr, ticket=701)
+            trail_floor = entry + (7.0 - r_gap)   # +$5
+            armed_at_5 = abs((p.current_sl - trail_floor)) < 0.05 and not p.closed
+            traced = any(e.get('event_type') in (LOCK_ARM, TRAIL_ADVANCE)
+                         for e in tr._history.get(701, []))
+            no_violation = (len(tr.violations) == 0)
+            # bar2: GAPS THROUGH the trail -- opens at +$3 (below the +$5 trail) and dips
+            # to +$1. OLD code filled at the gap (_open=+3) -> sub-floor clip. v3.3.0
+            # clamps to the ratcheted trail: exit == +$5 (peak-gap), NEVER below it.
+            update_position_on_bar(p, pd.Series({'open': 103, 'high': 103, 'low': 101, 'close': 102}),
+                                   ts0 + pd.Timedelta(minutes=2), cfg, tracer=tr, ticket=701)
+            no_subfloor_clip = (p.closed and abs((p.exit_price - entry) - 5.0) < 0.05
+                                and (p.exit_price - entry) >= (7.0 - r_gap) - 1e-9)
+            ok = (armed_at_5 and traced and no_violation and no_subfloor_clip)
+            detail = (f"armed_trail+5={armed_at_5} trail_advance_traced={traced} "
+                      f"no_ptrace_violation={no_violation} "
+                      f"gap_through_exit+{p.exit_price - entry:.2f}(>=+5,not+3)={no_subfloor_clip}")
+        except Exception as e:
+            self._record(90, FAIL, f"raised: {e!r}"); return
+        self._record(90, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
     def _preflight(self) -> bool:
@@ -3273,9 +3369,10 @@ class SelfTest:
             self._step_boost_incident_regression()
             # v3.2.7 rally-only break-and-hold gate (rescue fires free)
             self._step_rescue_bypass_break_and_hold()
-            # v3.2.8 Phase 1 — rally +$5 arm / +$4 lock / $1.50 gap (rescue untouched)
+            # v3.2.8 Phase 1 — rally +$5 arm (fire trigger; rescue untouched)
             self._step_rally_arm_5()
-            self._step_rally_trail_4_15()
+            # v3.3.0 — rally RIDES (peak-$2 trail above a +$3 floor), no flat lock
+            self._step_rally_trail_ride()
             # v3.2.8 Phase 2/3 — rally/rescue/common split + dispatcher isolation
             self._step_boost_split_isolation()
             # v3.2.9 manual TESTFIRE — fail-closed safety rails + same-placement reuse
@@ -3284,6 +3381,9 @@ class SelfTest:
             self._step_testfire_flat_inflight()
             self._step_testfire_anchor_window()
             self._step_testfire_same_placement()
+            # v3.3.0 — rally rides not bails + no sub-floor clip (PTRACE defect fix)
+            self._step_rally_rides_not_bails()
+            self._step_rally_no_subfloor_clip()
         finally:
             self._cleanup()
         return self._report(ts)

@@ -55,9 +55,16 @@ def _close_boost(pos, ts, fill, backstop):
 
 
 def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
-                         cfg: Config) -> Optional[str]:
+                         cfg: Config, tracer=None, ticket=None) -> Optional[str]:
     """v3.2.6 BOOST stop management — boosts ONLY, fully ISOLATED from the original
     leg (this reads/writes ONLY `pos`, never the original's ticket/stop).
+
+    v3.3.0: `tracer` (optional) records the boost's LOCK_ARM / TRAIL_ADVANCE so a
+    boost trail exit is never flagged exit_trail_without_trail_advance (the test-fire
+    A2 PTRACE defect) -- the boost's life-story now has the same gapless trace the
+    original leg has. Default None keeps every existing caller byte-identical. For a
+    RALLY boost the ARMED trailed stop is the HARD MINIMUM exit: it can never close
+    below its ratcheted trail floor (no sub-floor clip). RESCUE is byte-identical.
 
     v3.2.6 +$8 ARM GATE (incident 2026-06-23 fix). The breath-gap software trail is
     INACTIVE until the boost has been at least +arm (boost_trail_arm_fav, default $8)
@@ -85,7 +92,8 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     # -> $8 arm/lock, $3.50 gap, byte-identical to v3.2.7. Lazy import keeps this
     # precious module free of the order-placement stack.
     import rally as _rally, rescue as _rescue
-    _bk = _rally if getattr(pos, 'boost_kind', 'RESCUE') == 'RALLY' else _rescue
+    is_rally = getattr(pos, 'boost_kind', 'RESCUE') == 'RALLY'
+    _bk = _rally if is_rally else _rescue
     gap = _bk.trail_gap(cfg)
     arm = _bk.trail_arm(cfg)
     floor = _bk.lock_floor(cfg)
@@ -109,13 +117,16 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if bar.low <= breath_sl:                      # trail hit
                 fill = breath_sl
                 if _open is not None and _open < breath_sl:   # gapped THROUGH it
-                    fill = max(backstop, _open)               # ...backstop floors it
+                    # v3.3.0: a RALLY boost's ratcheted trail is the HARD MINIMUM --
+                    # never clip below it (the test-fire sub-floor exit). RESCUE keeps
+                    # the v3.2.7 backstop-floored gap fill (byte-identical).
+                    fill = breath_sl if is_rally else max(backstop, _open)
                 return _close_boost(pos, ts, fill, backstop)
         else:
             if bar.high >= breath_sl:
                 fill = breath_sl
                 if _open is not None and _open > breath_sl:
-                    fill = min(backstop, _open)
+                    fill = breath_sl if is_rally else min(backstop, _open)
                 return _close_boost(pos, ts, fill, backstop)
 
     # (2) $10 HARD BACKSTOP — ALWAYS live (armed or not). current_sl == backstop
@@ -143,10 +154,30 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
         pos.max_fav = px
     fav = sgn * (pos.max_fav - pos.entry_price)
     new_sl = trail_for(fav) if fav >= arm else backstop
+    _prev_sl = pos.current_sl
     if sgn > 0:
         pos.current_sl = max(pos.current_sl, new_sl)
     else:
         pos.current_sl = min(pos.current_sl, new_sl)
+    # v3.3.0: trace the boost's armed trail so its EXIT is never flagged
+    # exit_trail_without_trail_advance (the test-fire PTRACE defect). The FIRST
+    # armed advance is the LOCK_ARM (the stop leaves the $10 backstop and engages
+    # the ratchet); each subsequent advance is a TRAIL_ADVANCE. Emission only when a
+    # tracer is supplied (live path) -- selftest/backtest callers pass None and stay
+    # byte-identical. The numbers (current_sl) are unchanged; this is observability.
+    if tracer is not None and fav >= arm and sgn * (pos.current_sl - _prev_sl) > 1e-9:
+        _was_backstop = sgn * (_prev_sl - backstop) <= 1e-9
+        _kw = dict(side=pos.side, position_price=round(pos.entry_price, 2),
+                   max_fav=round(pos.max_fav, 2), stop_price=round(pos.current_sl, 2),
+                   boost_kind=getattr(pos, 'boost_kind', 'RESCUE'))
+        try:
+            anchor = getattr(pos, 'anchor_label', None)
+            if _was_backstop:
+                tracer.lock_arm(ticket, anchor, **_kw)
+            else:
+                tracer.trail_advance(ticket, anchor, **_kw)
+        except Exception:
+            pass  # telemetry must never break stop management
     return None
 
 
@@ -170,7 +201,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     # full isolation (see _update_boost_on_bar). The normal/rescue-leg path below
     # is byte-identical to pre-boost behavior and never sees boost state.
     if getattr(pos, 'boost', False):
-        return _update_boost_on_bar(pos, bar, ts, cfg)
+        return _update_boost_on_bar(pos, bar, ts, cfg, tracer=tracer, ticket=ticket)
 
     # 1. PRE-BAR SL CHECK
     if pos.side == 'BUY':

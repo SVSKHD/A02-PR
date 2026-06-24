@@ -1,20 +1,26 @@
-"""AUREON v3.2.8 Phase 2 — rally: the WINNING-leg pyramid.
+"""AUREON v3.3.0 — rally: the WINNING-leg pyramid (RIDES like the original leg).
 
 A leg that runs +arm in its OWN favor pyramids in the SAME direction. Rally owns
-the Phase-1 numbers (its OWN keys, NOT the BOOST_* keys rescue depends on):
+its OWN keys (NOT the BOOST_* keys rescue depends on):
 
-  - event arm   : rally_arm_fav      = $5  (was the shared $10) -- arms the pyramid
-  - trail arm   : rally_lock_floor   = $4  (was $8) -- breath-gap trail goes live
-  - lock floor  : rally_lock_floor   = $4  (was $8) -- one-way locked-profit floor
-  - trail gap   : rally_trail_gap    = $1.50 (was $3.50) -- kept proportional to $4
+  - event arm   : rally_arm_fav   = $5   -- a winning leg arms the pyramid at +$5
+  - trail arm   : rally_arm_fav   = $5   -- the boost's OWN breath-gap trail goes
+                                            live once the BOOST peaks +$5 favorable
+  - lock floor  : rally_lock_floor = $3  -- break-even+ MINIMUM (= arm - gap); a
+                                            FLOOR only, NOT the governing exit
+  - trail gap   : rally_trail_gap  = $2.00 -- once armed the boost RIDES at
+                                            peak - $2 (one-way ratchet), matching
+                                            the original leg's trail, instead of
+                                            locking flat at +$4 and bailing.
 
-plus the break-and-hold gate (do NOT pyramid a fake break) and the fire entrypoint
-(pyramid-the-winner) the dispatcher routes a winning leg to. The shared placement /
-FP guard / cap / journal live in boosts_common; the pure trigger decision is the
-canonical boosts.plan_boost_event; the breath-gap trail engine is
-strategy._update_boost_on_bar (which reads the trail_* accessors below for RALLY
-boosts). Kept import-light (no top-level boosts_common import) so strategy can pull
-the trail accessors without dragging in the order-placement stack.
+v3.3.0 fix (test-fire A2 2026-06-24): the v3.2.8 fixed +$4 lock made rally boosts
+bail on the first pause while the original leg rode the whole move. Now a rally
+boost trails peak - $2 above a +$3 break-even floor -- it rides and exits ~peak-$2.
+The +$5 fire trigger is unchanged. RESCUE is byte-identical ($8 arm / $8 lock /
+$3.50 gap). The breath-gap trail engine is strategy._update_boost_on_bar (which
+reads the trail_* accessors below for RALLY boosts and now floor-clamps an armed
+rally exit so it can never close below its ratcheted trail -- no sub-floor clip).
+Kept import-light so strategy can pull the trail accessors without the order stack.
 """
 import logging
 
@@ -23,27 +29,31 @@ log = logging.getLogger("AUREON")
 KIND = "RALLY"
 
 
-# --- the Phase-1 numbers, owned here (read from the dedicated rally_* cfg keys) ---
+# --- the rally numbers, owned here (read from the dedicated rally_* cfg keys) ---
 def event_arm(cfg):
-    """The favorable move ($) a winning leg must make before the rally pyramid arms
-    (was the shared $10 boost_trigger_dollars; now the dedicated $5)."""
+    """The favorable move ($) a winning leg must make before the rally pyramid fires
+    (the dedicated $5; was the shared $10 boost_trigger_dollars). UNCHANGED in v3.3.0."""
     return float(getattr(cfg, 'rally_arm_fav', 5.0))
 
 
 def trail_arm(cfg):
-    """Peak fav ($) before a rally boost's breath-gap trail goes live (== lock floor;
-    $4, was $8). Below it the boost runs on the $10 hard backstop only."""
-    return float(getattr(cfg, 'rally_lock_floor', 4.0))
+    """v3.3.0: peak fav ($) before a rally boost's breath-gap trail goes live -- now
+    +$5 (== rally_arm_fav), up from $4. Below it the boost runs on the $10 hard
+    backstop only; at/above it the trail rides peak - gap with a break-even+ floor."""
+    return float(getattr(cfg, 'rally_arm_fav', 5.0))
 
 
 def lock_floor(cfg):
-    """Once armed, a rally boost's locked profit ($) never falls below this ($4)."""
-    return float(getattr(cfg, 'rally_lock_floor', 4.0))
+    """v3.3.0: the break-even+ MINIMUM ($3 = arm - gap) an armed rally boost's trailed
+    stop may not fall below. A FLOOR only -- the peak-minus-gap trail governs above it
+    (the boost rides), so this no longer caps the exit at a flat +$4."""
+    return float(getattr(cfg, 'rally_lock_floor', 3.0))
 
 
 def trail_gap(cfg):
-    """Rally breath-gap trail gap ($1.50) -- proportional to the tighter $4 floor."""
-    return float(getattr(cfg, 'rally_trail_gap', 1.50))
+    """v3.3.0: rally breath-gap trail gap ($2.00, was $1.50) -- matches the original
+    leg's trail gap so an armed rally boost rides the move and exits ~peak - $2."""
+    return float(getattr(cfg, 'rally_trail_gap', 2.00))
 
 
 # --- the break-and-hold gate (rally only, per the v3.2.7 split) -------------------
