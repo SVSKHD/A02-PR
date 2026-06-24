@@ -755,9 +755,25 @@ History (one line per behavioral change):
          101 steps (new 99 readiness derives from resolver; 100 A3=17:00 + A1/A2/A4
          unchanged; 101 resolver/offset byte-identical; existing placement/offset/jun8
          tests pass unchanged). Banner v3.3.6.
+  3.3.7  HOTFIX for v3.3.6: weekday A1 resolver foot-gun. The Monday A1 cushion is now
+         gated STRICTLY on the broker weekday. v3.3.6 left the legacy
+         AUREON_TEST_FORCE_MONDAY_A1 env hook in resolved_anchor_hm, which forced the
+         03:30 cushion on ANY weekday when set -- and because that resolver ALSO drives
+         the LIVE scheduler (_anchor_sched_utc / _process_anchor_if_due), a leaked env
+         var placed weekday A1 an hour late (03:30 broker instead of 02:30) and made the
+         readiness/status displays show 06:00 IST every day. FIX: removed the env-hook
+         short-circuit entirely -- the override applies iff broker_date.weekday() == 0.
+         Weekday A1 -> 02:30 broker / 05:00 IST; Monday A1 -> 03:30 broker / 06:00 IST,
+         for BOTH the live scheduler AND every readiness/status string. The dead
+         'TEST MODE ACTIVE' banner now warns the hook is IGNORED if the var is still
+         set. Tests verify Monday resolution by passing a real Monday broker_date.
+         No other behavior changed (boosts / rescue / CASE-2 / A3-17:00 all as v3.3.6).
+         selftest -> 102 steps (new 102 monday-gate-strict: env var SET but ignored ->
+         weekday 02:30, Monday 03:30; 99/101 now green regardless of ambient env).
+         Banner v3.3.7.
 """
 
-__version__ = "3.3.6"
+__version__ = "3.3.7"
 CODENAME = "Astra Hawk"
 
 

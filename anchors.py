@@ -25,13 +25,19 @@ log = logging.getLogger("AUREON")
 def resolved_anchor_hm(label, broker_date, hour, minute, cfg):
     """Pure (config-only) Monday-A1 cushion resolver — the SINGLE source of truth
     for A1 time resolution, shared by the live anchor loop AND the backtester so
-    backtest == live for scheduling. See _resolved_anchor_hm for the rationale."""
+    backtest == live for scheduling. See _resolved_anchor_hm for the rationale.
+
+    v3.3.6 FIX: the cushion applies ONLY on Mondays (broker_date.weekday() == 0).
+    The override is gated STRICTLY on the broker weekday -- weekday A1 ALWAYS
+    resolves to its normal time (02:30 broker / 05:00 IST), Monday A1 to the cushion
+    (03:30 broker / 06:00 IST). The old AUREON_TEST_FORCE_MONDAY_A1 env hook (which
+    forced the cushion on ANY weekday) was REMOVED: because this resolver also drives
+    the LIVE scheduler, a leaked env var would have placed weekday A1 an hour late.
+    Tests verify Monday resolution by passing a real Monday broker_date, never by
+    forcing the gate."""
     ovr = getattr(cfg, 'monday_a1_override', None)
-    if ovr is not None and label.startswith('A1'):
-        force = os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
-            in ('1', 'true', 'yes', 'on')
-        if force or broker_date.weekday() == 0:
-            return int(ovr[0]), int(ovr[1])
+    if ovr is not None and label.startswith('A1') and broker_date.weekday() == 0:
+        return int(ovr[0]), int(ovr[1])
     return hour, minute
 
 
@@ -83,10 +89,11 @@ def _resolved_anchor_hm(self, label, broker_date, hour, minute):
     stay stable). This is the SINGLE source of truth for A1 time resolution --
     both _process_anchor_if_due and the readiness line call it.
 
-    Test hook: AUREON_TEST_FORCE_MONDAY_A1=1 forces the override on ANY weekday so
-    the 03:30 resolution can be verified mid-week (combine with the quiet-feed /
-    offset-revalidate test toggles to reproduce the full Monday scenario). TEST
-    ONLY, defaults OFF, surfaced in the 'TEST MODE ACTIVE' banner line.
+    v3.3.6 FIX: the cushion is gated STRICTLY on the broker weekday (Monday only).
+    The old AUREON_TEST_FORCE_MONDAY_A1 hook -- which forced the override on ANY
+    weekday -- was REMOVED: this same resolver drives the LIVE scheduler, so a leaked
+    env var would have placed weekday A1 an hour late (03:30 instead of 02:30). Tests
+    now verify Monday resolution by passing a real Monday broker_date.
 
     v3.1.8: delegates to the pure module-level resolved_anchor_hm so the backtester
     can reuse the EXACT same resolution without a LiveTrader instance."""

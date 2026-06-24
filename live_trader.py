@@ -304,13 +304,17 @@ class LiveTrader:
             "leg fill (RALLY/RESCUE), never at fill; per-tick; $10 SL + $3.50 trail; "
             "-$700 hard cap. One function for live/backtest/tests."
         )
-        # TEST MODE banner: surface any active test-scope toggle loudly so a
-        # forced code path is never mistaken for production behavior. Defaults OFF.
+        # v3.3.6: the AUREON_TEST_FORCE_MONDAY_A1 hook was REMOVED (it forced the
+        # Monday cushion on ANY weekday in the SHARED resolver -> a leaked env var
+        # would have placed weekday A1 an hour late). If it is still set in the
+        # environment, announce loudly that it is now IGNORED so the operator knows
+        # weekday A1 resolves correctly (02:30 broker) regardless.
         if os.environ.get('AUREON_TEST_FORCE_MONDAY_A1', '').strip().lower() \
                 in ('1', 'true', 'yes', 'on'):
             self.tele.warn(
-                "🧪 TEST MODE ACTIVE — AUREON_TEST_FORCE_MONDAY_A1=1: A1 resolves "
-                "via monday_a1_override on ANY weekday (test only, not production)."
+                "🧪 AUREON_TEST_FORCE_MONDAY_A1 is set but IGNORED (removed in "
+                "v3.3.6) — the Monday A1 cushion now applies on Mondays ONLY; "
+                "weekday A1 resolves at 02:30 broker / 05:00 IST."
             )
 
 
