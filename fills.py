@@ -20,6 +20,10 @@ from telemetry import telemetry_from_env, Severity, md_escape, anchor_time_block
 from mt5_adapter import _MT5_RETCODE_MAP
 import discord_cards as dc  # v3.1.0: rich embed cards (pure; safe to import)
 import boosts  # v3.2.0: the SINGLE canonical lone-leg boost-trigger decision
+import boosts_common  # v3.2.8 Phase 2: shared boost placement / FP-guard / cap
+import boosts_dispatch  # v3.2.8 Phase 3: sign-of-leg_fav router (rally vs rescue.fire)
+import rally  # v3.2.8 Phase 2: winning-leg pyramid (break-and-hold gate + rally arm)
+import rescue  # v3.2.8 Phase 2: losing-leg hedge (rescue arm / free-fire-on-commit)
 import soft_restart as _soft  # v3.2.3: restart-reconcile classifier (pure, shared)
 
 log = logging.getLogger("AUREON")
@@ -551,137 +555,18 @@ def _reconcile_with_broker(self):
 # never close/modify/net against the original leg.
 # ============================================================================
 def _fire_boost_event(self, leg_ticket, leg_shadow, plan):
-    """Place the lone leg's boost event at MARKET in plan.boost_side (RALLY same
-    dir / RESCUE opposite) -- only ever called once price is >= $10 from the leg's
-    fill. Opens the rescue event (event_type RALLY_BOOST/RESCUE_BOOST) for
-    rescuestats. Reuses the proven place_market_order loop."""
-    anchor = leg_shadow.get('anchor_label', '?')
-    side = plan.boost_side
-    sgn = 1.0 if side == 'BUY' else -1.0
-    n = int(plan.n)
-    sl_d = float(plan.sl_dollars)
-    tp_d = float(plan.tp_dollars)
-    ref = float(plan.entry_ref)
-    leg_fill = float(leg_shadow.get('leg_fill_price', ref))
-    event_id = f"{self.state.get('last_broker_date', '?')}_{anchor[:2]}_{leg_ticket}"
-    _tr = getattr(self, 'ptrace', None)
-    stack_target = 1 + n  # parent leg + n boosts
-    # v3.2.3 Section D #1: proactive BOOST FIRED alert in the spec format (fires
-    # the moment the event arms, both RALLY and RESCUE, lone AND No-OCO stack).
-    self.tele.send(
-        f"🚀 BOOST FIRED [{plan.kind}] | {anchor} | {side} {self.cfg.lot_size} "
-        f"@~${ref:.2f} | parent {leg_ticket} | stack now {stack_target}/3 | "
-        f"move ${plan.move_dollars:+.0f} from fill ${leg_fill:.2f}",
-        Severity.WARN, important=True, critical=True,
-        card=dc.card_rescue(anchor,
-                            trapped_leg=f"parent {leg_shadow.get('side')} (ticket {leg_ticket})",
-                            rescue_leg=f"{plan.kind} {side} @ ~${ref:.2f}", twin_pnl=None),
-        event_key=f"{plan.event_type}:{leg_ticket}")
-    fleet = []
-    for bi in range(n):
-        b_sl = round(ref - sgn * sl_d, 2)
-        b_tp = round(ref + sgn * tp_d, 2)
-        cmt = f"AUR_{anchor[:2]}_{side[0]}_B{bi + 1}"
-        try:
-            res = self.adapter.place_market_order(
-                self.cfg.symbol, side, self.cfg.lot_size,
-                sl=b_sl, tp=b_tp, comment=cmt, dry_run=self.paper)
-        except Exception as e:
-            self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} EXCEPTION: {md_escape(repr(e))}")
-            fleet.append({'ticket': None, 'fill': None, 'rc': None, 'comment': cmt})
-            continue
-        rc = getattr(res, 'retcode', None) if res is not None else None
-        rcn = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
-        if rc == 10009:
-            b_tk = getattr(res, 'order', None) or getattr(res, 'deal', None)
-            b_fp = float(getattr(res, 'price', ref) or ref)
-            if b_tk:
-                self.shadow_positions[int(b_tk)] = {
-                    'anchor_label': anchor, 'side': side, 'entry_price': b_fp,
-                    'current_sl': round(b_fp - sgn * sl_d, 2),
-                    'tp_level': round(b_fp + sgn * tp_d, 2), 'max_fav': b_fp,
-                    'fill_time': pd.Timestamp.now(tz='UTC').isoformat(),
-                    'role': 'rescue', 'boost': True, 'boost_event': event_id,
-                }
-            self.tele.send(
-                f"✅⚡ {plan.kind} BOOST{bi + 1} {side} FILLED @ ${b_fp} (ticket {b_tk})",
-                Severity.SUCCESS, important=True, critical=True,
-                card=dc.card_boost(bi + 1, side, b_fp, round(b_fp - sgn * sl_d, 2),
-                                   round(b_fp + sgn * tp_d, 2), f"{rc}"),
-                event_key=f"boost:{b_tk}")
-            # v3.2.3 BOOST_FIRE telemetry (per placed boost) -- the gapless trace
-            # of the stack. parent_ticket links it to the leg that triggered it.
-            if _tr is not None:
-                _stack_now = 1 + len([1 for b in fleet if b.get('ticket')]) + 1
-                _tr.boost_fire(int(b_tk) if b_tk else None, anchor,
-                               parent_ticket=leg_ticket, side=side,
-                               position_price=b_fp, boost_kind=plan.kind,
-                               stack_size=_stack_now, move_dollars=plan.move_dollars,
-                               trigger=float(getattr(self.cfg, 'boost_trigger_dollars', 10.0)),
-                               stop_price=round(b_fp - sgn * sl_d, 2))
-            fleet.append({'ticket': int(b_tk) if b_tk else None, 'fill': b_fp,
-                          'rc': rc, 'comment': cmt})
-        else:
-            self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} rejected rc={rc} ({md_escape(rcn)})")
-            fleet.append({'ticket': None, 'fill': None, 'rc': rc, 'comment': cmt})
-    # v3.2.3 Section D #2: STACK COMPLETE alert when the full 3-position stack
-    # filled (parent + 2 boosts). Names the break-even truth + when the trail arms.
-    _filled = len([1 for b in fleet if b.get('ticket')])
-    if (1 + _filled) >= stack_target and stack_target >= 3:
-        # break-even = the one losing straddle leg's SL = $18 * lot * contract
-        # (= $630 @ 0.35) the 3-position winning stack must clear (~+$6/position).
-        _be = round(float(getattr(self.cfg, 'sl_dist', 18.0))
-                    * float(self.cfg.lot_size)
-                    * float(getattr(self.cfg, 'contract_size', 100.0)), 0)
-        self.tele.send(
-            f"📦 STACK 3/3 {side} | combined breakeven +${_be:.0f} | "
-            f"trail arms at +$8",
-            Severity.WARN, important=True, critical=True,
-            event_key=f"stack:{event_id}")
-    # Open the rescue event (RALLY_BOOST / RESCUE_BOOST) so it logs to rescuestats.
-    try:
-        members = {int(leg_ticket)} | {int(b['ticket']) for b in fleet if b.get('ticket')}
-        self._rescue_event_open({
-            'event_id': event_id, 'event_type': plan.event_type,
-            'date_ist': self.state.get('last_broker_date'),
-            'anchor': anchor, 'sched_iso': leg_shadow.get('sched_utc'),
-            'open_iso': pd.Timestamp.now(tz='UTC').isoformat(),
-            'trigger': {'ticket': None, 'side': None, 'trigger_pnl': None},
-            'rescue': {'ticket': int(leg_ticket), 'side': leg_shadow.get('side'),
-                       'fill': leg_fill},
-            'boosts': fleet,
-            'boosts_placed_ok': bool(fleet) and all(b.get('rc') == 10009 for b in fleet),
-            'members': members,
-        })
-    except Exception as e:
-        log.warning(f"rescue_event_open ({plan.event_type}) failed: {e!r}")
+    """v3.2.8 Phase 3 seam: route the CONFIRMED boost plan by the sign of leg_fav
+    (plan.kind) to rally.fire (winning -> pyramid) or rescue.fire (losing -> hedge),
+    both of which call boosts_common.place_fleet for the shared placement. Kept as a
+    bound LiveTrader method so the live scan AND the selftest stubs hit the same seam.
+    The placement body now lives in boosts_common.place_fleet (byte-identical)."""
+    return boosts_dispatch.fire(self, leg_ticket, leg_shadow, plan)
 
 
 def _enforce_boost_cap(self, mid):
-    """v3.2.0: hard-close a boost EVENT's boosts once their COMBINED open P&L
-    breaches the -$700 cap (A3 slipped to -715.05). Boosts only -- the original
-    leg is outside the cap (isolation)."""
-    try:
-        cap = boosts.boost_whipsaw_cap(self.cfg)
-    except Exception:
-        return
-    by_event = {}
-    for tk, sp in self.shadow_positions.items():
-        if not sp.get('boost'):
-            continue
-        sgn = 1.0 if sp.get('side') == 'BUY' else -1.0
-        pnl = sgn * (mid - float(sp.get('entry_price', mid))) * self.cfg.lot_size \
-            * float(getattr(self.cfg, 'contract_size', 100.0))
-        by_event.setdefault(sp.get('boost_event'), []).append((tk, pnl))
-    for eid, legs in by_event.items():
-        if sum(p for _, p in legs) <= -cap + 1e-6:
-            for tk, _ in legs:
-                try:
-                    self.adapter.close_position(tk, dry_run=self.paper)
-                    self.tele.warn(f"🛑 BOOST CAP -${cap:.0f} breached on {eid} — "
-                                   f"closing boost {tk} at market.")
-                except Exception as e:
-                    log.warning(f"boost cap close {tk} failed: {e!r}")
+    """v3.2.8 Phase 2 seam -> boosts_common.enforce_cap: the shared -$700 combined-
+    boost whipsaw cap hard-close (body byte-identical to the v3.2.7 original)."""
+    return boosts_common.enforce_cap(self, mid)
 
 
 def _check_boost_triggers(self):
@@ -697,7 +582,10 @@ def _check_boost_triggers(self):
     except Exception:
         return
     import tick_hold as _th
-    trig = float(getattr(self.cfg, 'boost_trigger_dollars', 10.0))
+    # v3.2.8 Phase 1: ASYMMETRIC arm. A WINNING leg arms RALLY at +rally_arm_fav ($5);
+    # a LOSING leg arms RESCUE at -rescue_arm ($10, unchanged boost_trigger_dollars).
+    rescue_arm = rescue.event_arm(self.cfg)   # $10 losing-side arm (unchanged)
+    rally_arm = rally.event_arm(self.cfg)     # $5 winning-side arm (Phase 1)
     tr = getattr(self, 'ptrace', None)
     for ticket, shadow in list(self.shadow_positions.items()):
         if shadow.get('boost') or shadow.get('boost_fired') \
@@ -707,7 +595,8 @@ def _check_boost_triggers(self):
         fill_px = float(shadow.get('leg_fill_price', shadow['entry_price']))
         rally_only = bool(shadow.get('boost_rally_only', False))
         leg_fav = (mid - fill_px) if side == 'BUY' else (fill_px - mid)
-        crossed = abs(leg_fav) >= trig
+        # winning side arms at the rally arm ($5); losing side at the rescue arm ($10).
+        crossed = (leg_fav >= rally_arm) or (leg_fav <= -rescue_arm)
         try:
             plan = boosts.plan_boost_event(
                 side, fill_px, mid, self.cfg, allow_rescue=not rally_only)
@@ -726,14 +615,15 @@ def _check_boost_triggers(self):
             # crossed AND that kind is enabled here) but none was planned -- the
             # logic failed to detect a valid trigger. A silent no-fire is a
             # failure, not a no-op (the lone-leg analogue of A2's silent miss).
-            rally_exp = (leg_fav >= trig
+            rally_exp = (leg_fav >= rally_arm
                          and bool(getattr(self.cfg, 'rally_boosts_enabled', True)))
-            rescue_exp = (leg_fav <= -trig and not rally_only
+            rescue_exp = (leg_fav <= -rescue_arm and not rally_only
                           and bool(getattr(self.cfg, 'rescue_boosts_enabled', True)))
             if (rally_exp or rescue_exp) and tr is not None:
+                _missed_trig = rally_arm if rally_exp else rescue_arm
                 tr.missed_boost(ticket, shadow.get('anchor_label'), side=side,
                                 position_price=fill_px, move_dollars=round(leg_fav, 2),
-                                trigger=trig, rally_only=rally_only)
+                                trigger=_missed_trig, rally_only=rally_only)
             continue
         # v3.2.5 tick-hold confirm: the cross must HOLD >= hold_ticks consecutive
         # ticks before it fires; a blip that reverts within the window never gets
@@ -741,12 +631,14 @@ def _check_boost_triggers(self):
         streak, tstate = _th.step_cross(
             int(shadow.get('boost_cross_streak', 0)), True, self.cfg)
         shadow['boost_cross_streak'] = streak
+        # the arm this plan honored (RALLY $5 / RESCUE $10) -- for honest telemetry.
+        plan_arm = rally_arm if plan.kind == 'RALLY' else rescue_arm
         if tstate != _th.CONFIRMED:
             if tr is not None:
                 tr.tick_cross_candidate(ticket, shadow.get('anchor_label'),
                                         side=plan.boost_side, held_ticks=streak,
                                         hold_ticks=_th.hold_ticks(self.cfg),
-                                        move_dollars=plan.move_dollars, trigger=trig)
+                                        move_dollars=plan.move_dollars, trigger=plan_arm)
             continue   # crossed but not yet held -> keep watching
         if tr is not None:
             tr.tick_hold_confirmed(ticket, shadow.get('anchor_label'),
@@ -781,7 +673,7 @@ def _check_boost_triggers(self):
                          side=plan.boost_side, position_price=fill_px,
                          boost_kind=plan.kind, stack_size=stack_after,
                          stack_cap=boosts.stack_cap(self.cfg),
-                         move_dollars=plan.move_dollars, trigger=trig)
+                         move_dollars=plan.move_dollars, trigger=plan_arm)
         shadow['boost_fired'] = True   # one event per leg (set before placing)
         try:
             self._fire_boost_event(ticket, shadow, plan)
@@ -799,94 +691,13 @@ def _check_boost_triggers(self):
 
 
 def _break_and_hold_ok(self, shadow, plan):
-    """v3.2.4 Feature D gate (live): stack ONLY on a CONFIRMED break (cleared edge +
-    held N M5 candles + retrace < Y), via the shared break_hold.classify on the
-    recent M5 bars. Disabled / no data / any error -> True (legacy: don't block).
-    Emits BREAK_CONFIRMED / BREAK_CANDIDATE / BREAK_FAILED(reason). The decision is
-    the pure shared fn; this only feeds it live candles."""
-    import break_hold as _bh
-    if not bool(getattr(self.cfg, 'break_and_hold_enabled', True)):
-        return True
-    try:
-        n = int(getattr(self.cfg, 'hold_candles_n', 2))
-        tf = str(getattr(self.cfg, 'break_timeframe', 'M5'))
-        bars = None
-        for fn in ('get_latest_m5', 'get_latest_bars', 'get_latest_m1'):
-            getter = getattr(self.adapter, fn, None)
-            if getter is not None:
-                try:
-                    bars = getter(self.cfg.symbol, n + 2)
-                    if bars:
-                        break
-                except TypeError:
-                    bars = getter(self.cfg.symbol, n + 2, tf)
-                    if bars:
-                        break
-        if not bars or len(bars) < n:
-            return True   # not enough data -> don't block (legacy)
-        candles = [{'high': float(b['high']), 'low': float(b['low']),
-                    'close': float(b['close'])} for b in bars]
-        edge = float(shadow.get('leg_fill_price', shadow['entry_price']))
-        result, reason = _bh.classify(plan.boost_side, edge, candles, self.cfg)
-        tr = getattr(self, 'ptrace', None)
-        anchor = shadow.get('anchor_label')
-        if tr is not None:
-            if result == _bh.CONFIRMED:
-                tr.break_confirmed(anchor, side=plan.boost_side,
-                                   break_level=round(edge, 2), reason=reason,
-                                   n_candles=len(candles), timeframe=tf)
-            elif result == _bh.FAILED:
-                tr.break_failed(anchor, side=plan.boost_side,
-                                break_level=round(edge, 2), reason=reason,
-                                n_candles=len(candles), timeframe=tf)
-            else:
-                tr.break_candidate(anchor, side=plan.boost_side,
-                                   break_level=round(edge, 2), reason=reason,
-                                   n_candles=len(candles), timeframe=tf)
-        if result == _bh.CONFIRMED:
-            self.tele.info(f"📈 BREAK CONFIRMED {plan.boost_side} {anchor} "
-                           f"@edge ${edge:.2f} — stacking")
-            return True
-        self.tele.info(f"🚫 BREAK {result} ({reason}) {anchor} {plan.boost_side} "
-                       f"@edge ${edge:.2f} — no fire")
-        return False
-    except Exception as e:
-        log.warning(f"break-and-hold check failed (non-fatal, allowing): {e!r}")
-        return True
+    """v3.2.8 Phase 2 seam -> rally.break_and_hold_ok: the RALLY-only break-and-hold
+    gate (it stays on rally, per the v3.2.7 split). Kept as a bound LiveTrader method
+    so the scan + selftest stubs hit it; body byte-identical, relocated to rally.py."""
+    return rally.break_and_hold_ok(self, shadow, plan)
 
 
 def _fp_guard_ok(self, shadow, stack_after):
-    """v3.2.3 Feature E gate (live): block/reduce a stack that would breach the
-    account FP rule at the chosen lot. Returns True if the full stack fits; False
-    (suppress this event) if it would breach. Guarded -> True on any error."""
-    import fp_guard as _fp, boosts as _b
-    try:
-        bal = None
-        try:
-            ai = self.adapter.get_account_info() or {}
-            bal = ai.get('balance') or ai.get('equity')
-        except Exception:
-            bal = None
-        bal = float(bal or getattr(self.cfg, 'starting_balance', 50000.0))
-        profile = getattr(self.cfg, 'account_profile', 'STANDARD_5PCT')
-        lot = getattr(self.cfg, 'lot_size', 0.35)
-        # FPZERO disallows the 5-long entirely -> profile caps the stack to 3.
-        prof_cap = _fp.profile_stack_cap(profile, _b.stack_cap(self.cfg))
-        action, wc, lim, allowed = _fp.guard_cfg(stack_after, self.cfg, bal)
-        if stack_after > prof_cap and action == _fp.OK:
-            action, allowed = _fp.REDUCE, prof_cap
-        tr = getattr(self, 'ptrace', None)
-        anchor = shadow.get('anchor_label')
-        if tr is not None:
-            tr.fp_guard(anchor, action=action, worst_case=wc, limit=lim,
-                        allowed_n=allowed, requested_n=stack_after,
-                        profile=profile, lot=lot, profile_cap=prof_cap)
-        if action != _fp.OK or stack_after > prof_cap:
-            self.tele.warn(
-                f"🛡️ FP GUARD | {lot} x {stack_after} = worst -${wc:.0f} vs "
-                f"limit ${lim:.0f} ({profile}) — {action} to {allowed}, not stacking")
-            return False
-        return True
-    except Exception as e:
-        log.warning(f"fp guard check failed (non-fatal, allowing): {e!r}")
-        return True
+    """v3.2.8 Phase 2 seam -> boosts_common.fp_guard_ok: the shared FP-rule + 5-long
+    stack-cap pre-trade guard (body byte-identical to the v3.2.7 original)."""
+    return boosts_common.fp_guard_ok(self, shadow, stack_after)

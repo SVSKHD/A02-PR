@@ -24,6 +24,11 @@ class Position:
     lot: float
     role: str = 'normal'  # v2.9: 'normal' (1st leg) | 'rescue' (No-OCO 2nd leg)
     boost: bool = False   # v3.1.3: SL-rescue BOOST leg (trail-after-+8 handoff)
+    boost_kind: str = 'RESCUE'  # v3.2.8: 'RALLY' | 'RESCUE'. ONLY consulted when
+    # boost is True; selects the breath-gap trail's arm/lock/gap. Defaults to
+    # 'RESCUE' so every existing boost Position (and the v3.2.7 rescue path) keeps
+    # the $8 arm / $8 lock / $3.50 gap byte-identical; a RALLY boost uses the
+    # tighter Phase-1 rally_lock_floor ($4) / rally_trail_gap ($1.50).
     closed: bool = False
     exit_price: Optional[float] = None
     exit_time: Optional[pd.Timestamp] = None
@@ -70,10 +75,20 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     if pos.closed:
         return pos.outcome
     sgn = 1.0 if pos.side == 'BUY' else -1.0
-    gap = float(getattr(cfg, 'boost_trail_gap_dollars', 3.50))
     hard = float(getattr(cfg, 'boost_sl_dollars', 10.0))
-    arm = float(getattr(cfg, 'boost_trail_arm_fav', 8.0))
-    floor = float(getattr(cfg, 'boost_lock_floor', 8.0))
+    # v3.2.8 Phase 1: RALLY boosts run a tighter breath-gap (arm/lock $4, gap $1.50)
+    # off their OWN dedicated keys; RESCUE boosts (and every legacy boost Position,
+    # which defaults boost_kind='RESCUE') keep the v3.2.7 $8 arm / $8 lock / $3.50 gap
+    # byte-identical. The $10 hard backstop is shared and unchanged for both.
+    # v3.2.8: each kind OWNS its trail numbers (rally.py / rescue.py). RALLY ->
+    # $4 arm/lock, $1.50 gap; RESCUE (the default for every legacy boost Position)
+    # -> $8 arm/lock, $3.50 gap, byte-identical to v3.2.7. Lazy import keeps this
+    # precious module free of the order-placement stack.
+    import rally as _rally, rescue as _rescue
+    _bk = _rally if getattr(pos, 'boost_kind', 'RESCUE') == 'RALLY' else _rescue
+    gap = _bk.trail_gap(cfg)
+    arm = _bk.trail_arm(cfg)
+    floor = _bk.lock_floor(cfg)
     backstop = pos.entry_price - sgn * hard          # the $10 hard SL backstop
 
     def trail_for(fav):
