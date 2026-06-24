@@ -28,8 +28,12 @@ from typing import List, Optional, Sequence, Tuple
 WEEKEND_GAP_HOURS = 24      # a first-tick gap larger than this == weekend wake
 EXPECTED_OFFSET = 3         # MetaQuotes-Demo is UTC+3
 OFFSET_RETRY_MAX = 3        # re-derive attempts before BLOCKING placement
-A1_SCHEDULED_IST_MIN = 5 * 60   # A1 = 05:00 AM IST (minutes since IST midnight)
+A1_SCHEDULED_IST_MIN = 5 * 60   # A1 = 05:00 AM IST WEEKDAY default (min since IST
+#   midnight). v3.3.6: this is the Tue-Fri value; on MONDAYS A1 is the 03:30-broker
+#   cushion = 06:00 IST, so the drift check must use the RESOLVER-derived expected
+#   (scheduled_a1_ist_min below) for the correct day, not this constant blindly.
 A1_DRIFT_TOL_MIN = 10       # |implied - scheduled| beyond this == drift
+IST_OFFSET_MIN = 5 * 60 + 30    # IST = UTC+5:30
 
 CONFIRMED = "CONFIRMED"
 RETRY = "RETRY"
@@ -87,6 +91,17 @@ def a1_drifted(implied_ist_min: float,
     """True when A1's implied IST fire-time has drifted from its 5:00 schedule by
     more than the tolerance -- the tripwire that fires BEFORE A1 places."""
     return abs(float(implied_ist_min) - float(scheduled_ist_min)) > float(tol_min)
+
+
+def scheduled_a1_ist_min(broker_hour: int, broker_minute: int,
+                         broker_tz_offset_hours: int = EXPECTED_OFFSET) -> int:
+    """A1's scheduled IST minutes-since-midnight derived from its RESOLVED broker
+    (hour, minute) -- the Monday-aware truth (03:30 broker -> 06:00 IST = 360),
+    weekday (02:30 -> 05:00 = 300) -- instead of the pinned weekday constant. Pass
+    the (broker_h, broker_m) that resolved_anchor_hm returns for the target day.
+    Pure display/expectation; no scheduling effect. v3.3.6."""
+    broker_min = int(broker_hour) * 60 + int(broker_minute)
+    return (broker_min - int(broker_tz_offset_hours) * 60 + IST_OFFSET_MIN) % (24 * 60)
 
 
 def fmt_hhmm(ist_min: float) -> str:

@@ -407,7 +407,10 @@ class Watchdog:
                 return f"${float(v):+.2f}"
             except (TypeError, ValueError):
                 return "$?"
-        next_anchor = status.get("next_anchor", "A1 02:00 broker")
+        # v3.3.6: the live status now writes a resolver-derived next_anchor (Monday
+        # A1 = 03:30 broker / 06:00 IST). Fallback mirrors that truth, not the old
+        # stale "A1 02:00 broker", for the rare status-without-the-key case.
+        next_anchor = status.get("next_anchor", "A1_02h_Asia 03:30 broker / 06:00 IST")
         lines = ["💤 AUREON — sleeping (market closed, auto-resume Monday)",
                  f"Next anchor: {next_anchor}"]
         ws = status.get("weekend_stats") or {}

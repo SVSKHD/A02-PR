@@ -119,7 +119,7 @@ class LiveTrader:
     DEFER_WAIT_BY_ANCHOR = {
         'A1_02h_Asia': 15,
         'A2_10h_London': 30,
-        'A3_1340_Overlap': 15,
+        'A3_1430_Overlap': 15,   # v3.3.6: A3 retimed 16:20 -> 17:00 IST (label re-encoded)
         'A4_1640_NYopen': 30,
     }
     DEFER_WAIT_DEFAULT = 15
@@ -611,7 +611,12 @@ class LiveTrader:
         # market. Fail-safe: any error here leaves the normal status intact.
         status["sleeping"] = sleeping
         if sleeping:
-            status["next_anchor"] = "A1 02:00 broker"
+            # v3.3.6: derive the next A1 (upcoming Monday -> 03:30 broker / 06:00 IST)
+            # from the resolver instead of the stale hardcoded "A1 02:00 broker".
+            try:
+                status["next_anchor"] = self._next_a1_display()
+            except Exception:
+                status["next_anchor"] = "A1 (time unresolved)"
             try:
                 import journal as _jmod
                 today = pd.Timestamp.now(tz='Asia/Kolkata').strftime('%Y-%m-%d')
@@ -720,18 +725,29 @@ class LiveTrader:
                 pass
             if confirmed:
                 self.offset_validated = True
+                # v3.3.6: derive A1's resolved time from the resolver so this Monday
+                # all-clear reports the TRUE scheduled time (06:00 IST via the Monday
+                # 03:30 broker cushion) instead of the stale hardcoded '0500'/5:00.
+                try:
+                    _a = self.cfg.anchors[0]
+                    _bd = self._broker_date(pd.Timestamp.now(tz="UTC"))
+                    _rh, _rm, _ih, _im = self._resolved_anchor_ist_hm(_a[0], _bd, _a[1], _a[2])
+                    _a1_ist_hhmm = f"{_ih:02d}{_im:02d}"
+                    _a1_ist_disp = f"{_ih:02d}:{_im:02d} IST ({_rh:02d}:{_rm:02d} broker)"
+                except Exception:
+                    _a1_ist_hhmm, _a1_ist_disp = '0500', '05:00 IST'
                 self.tele.success(
                     f"✅ Monday wake: broker offset confirmed +{int(off)}h "
                     f"(attempt {attempt}/{self.OFFSET_VALIDATE_RETRIES}, {reason}).")
                 # A1 RESOLVED -- Monday-morning all-clear (positive confirmation).
                 try:
                     self.ptrace.anchor_time_resolved(
-                        scheduled_ist='0500', offset_used=int(off),
+                        scheduled_ist=_a1_ist_hhmm, offset_used=int(off),
                         result='CONFIRMED')
                 except Exception:
                     pass
                 self.tele.success(
-                    f"🟢 A1 RESOLVED | scheduled 5:00 IST | offset +{int(off)}h "
+                    f"🟢 A1 RESOLVED | scheduled {_a1_ist_disp} | offset +{int(off)}h "
                     f"({reason}).")
                 return True
             # mismatch / not-yet-confirmed: loud BEFORE A1 places.
@@ -830,14 +846,17 @@ class LiveTrader:
             try:
                 a = self.cfg.anchors[0]
                 bdate = self._broker_date(pd.Timestamp.now(tz="UTC"))
-                rh, rm = self._resolved_anchor_hm(a[0], bdate, a[1], a[2])
-                next_anchor = f"{a[0]} {rh:02d}:{rm:02d}"
+                # v3.3.6: derive A1's time (broker + IST) from the resolver so the
+                # readiness line shows the TRUE resolved time -- 06:00 IST on Mondays
+                # (03:30 broker cushion), 05:00 IST on weekdays -- not a stale string.
+                rh, rm, ih, im = self._resolved_anchor_ist_hm(a[0], bdate, a[1], a[2])
+                next_anchor = f"{a[0]} {rh:02d}:{rm:02d} broker / {ih:02d}:{im:02d} IST"
             except Exception:
-                next_anchor = "A1 02:00"
+                next_anchor = "A1 (time unresolved)"
             state_ok = "ok" if isinstance(self.state, dict) and self.state else "fail"
             self.tele.info(
                 f"🔧 Ready: offset {off}h {tag} · next anchor "
-                f"{next_anchor} broker · state rehydrated {state_ok} ({reason})")
+                f"{next_anchor} · state rehydrated {state_ok} ({reason})")
         except Exception as e:
             log.warning(f"readiness line failed (non-fatal): {e}")
 
@@ -884,9 +903,13 @@ class LiveTrader:
             hours = tick_age_sec / 3600
             # ONE Telegram line on ENTERING weekend sleep (announce-once: the
             # while-loop below blocks here until Monday, so this never repeats).
+            try:
+                _next_a1 = self._next_a1_display()   # v3.3.6: resolver-derived (Mon 06:00 IST)
+            except Exception:
+                _next_a1 = "A1 (time unresolved)"
             self.tele.info(
                 f"💤 Weekend — market closed, sleeping, will auto-resume Monday. "
-                f"Next anchor A1 02:00 broker. "
+                f"Next anchor {_next_a1}. "
                 f"(last tick {hours:.1f}h old; entered via {reason})")
             # Persist state before the long sleep so a mid-weekend VPS reboot
             # rehydrates cleanly and the relaunched process re-enters this wait.
@@ -987,6 +1010,11 @@ class LiveTrader:
         _boost_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
         _whip_cap = _boost_n * _boost_sl * self.cfg.lot_size * 100
         _boost_gap = float(getattr(self.cfg, 'boost_trail_gap_dollars', 3.50))
+        # v3.3.6 banner-truth: RALLY boosts run their OWN $13 SL / -$910 cap / $2 trail
+        # (rally_* keys), NOT the rescue $10/$3.50 the banner used to print. Show both.
+        _rally_sl = float(getattr(self.cfg, 'rally_boost_sl', 13.0))
+        _rally_gap = float(getattr(self.cfg, 'rally_trail_gap', 2.00))
+        _rally_cap = _boost_n * _rally_sl * self.cfg.lot_size * 100
         # v3.1.0: alert-channel banner line (Discord, embed cards).
         _hb = int(getattr(self.cfg, 'discord_heartbeat_min', 60))
         _alert_line = (f"Alerts: Discord (embed cards) — commands ON, "
@@ -1005,7 +1033,7 @@ class LiveTrader:
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
             f"Ladder: `5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
-            f"Boost: `{_boost_n}x SL ${_boost_sl:.0f}` | breath-gap trail `${_boost_gap:.2f}` + $10 backstop | cap `-${_whip_cap:.0f}` | isolated from original\n"
+            f"Boost RALLY: `{_boost_n}x SL ${_rally_sl:.0f}` | trail `${_rally_gap:.2f}` | cap `-${_rally_cap:.0f}` · RESCUE: `SL ${_boost_sl:.0f}` | gap `${_boost_gap:.2f}` | cap `-${_whip_cap:.0f}` | isolated\n"
             f"{_alert_line}\n"
             f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
             f"v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`\n"
@@ -1018,7 +1046,7 @@ class LiveTrader:
                 f"-{self.cfg.daily_loss_pct*100:.1f}%",
                 f"{self.cfg.freeze_minutes}m / fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}",
                 "5>BE | 6>+4 | 10>peak-2",
-                f"${_boost_sl:.0f} + ${_boost_gap:.2f} breath-trail (isolated)",
+                f"RALLY ${_rally_sl:.0f}/cap-${_rally_cap:.0f} · RESCUE ${_boost_sl:.0f}/cap-${_whip_cap:.0f} (isolated)",
                 _alerts_val),
         )
         # v3.1.0: start the Discord heartbeat (no-op if Discord disabled).
@@ -1270,6 +1298,8 @@ LiveTrader._warmup_trade_channel    = _anchors_mod._warmup_trade_channel
 LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
 LiveTrader._confirm_a1_placement    = _anchors_mod._confirm_a1_placement
 LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
+LiveTrader._resolved_anchor_ist_hm  = _anchors_mod._resolved_anchor_ist_hm  # v3.3.6 display
+LiveTrader._next_a1_display         = _anchors_mod._next_a1_display          # v3.3.6 display
 LiveTrader._await_fresh_tick_for_placement = _anchors_mod._await_fresh_tick_for_placement
 LiveTrader._capture_a1_anchor_from_tick = _anchors_mod._capture_a1_anchor_from_tick
 LiveTrader._extract_ticket          = staticmethod(_anchors_mod._extract_ticket)

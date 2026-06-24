@@ -35,6 +35,43 @@ def resolved_anchor_hm(label, broker_date, hour, minute, cfg):
     return hour, minute
 
 
+def anchor_ist_hm(broker_h, broker_m, cfg):
+    """Convert a RESOLVED broker (hour, minute) to IST (hour, minute) using the
+    configured broker tz offset (broker = UTC+offset, IST = UTC+5:30). DISPLAY ONLY
+    -- this changes no scheduling/placement; it exists so readiness/status/banner can
+    show A1's real resolved time (Monday 03:30 broker -> 06:00 IST, weekday 02:30 ->
+    05:00 IST) instead of stale hardcoded strings. v3.3.6 telemetry-truth fix."""
+    broker_off = int(getattr(cfg, 'broker_tz_offset_hours', 3)) * 60
+    ist_off = 5 * 60 + 30   # IST = UTC+5:30
+    total = (int(broker_h) * 60 + int(broker_m)) - broker_off + ist_off
+    total %= (24 * 60)
+    return total // 60, total % 60
+
+
+def _resolved_anchor_ist_hm(self, label, broker_date, hour, minute):
+    """Resolve an anchor's (broker_h, broker_m) AND its IST (h, m) in one call --
+    the single display helper for readiness/status/banner. Returns
+    (broker_h, broker_m, ist_h, ist_m). Derives from _resolved_anchor_hm so the
+    Monday A1 cushion (03:30 broker / 06:00 IST) is reflected automatically; no
+    scheduling effect (display only). v3.3.6."""
+    rh, rm = self._resolved_anchor_hm(label, broker_date, hour, minute)
+    ih, im = anchor_ist_hm(rh, rm, self.cfg)
+    return rh, rm, ih, im
+
+
+def _next_a1_display(self):
+    """Display string for the NEXT A1 placement -- the upcoming Monday from the
+    weekend-sleep / closed-market texts -- as 'A1 <broker> broker / <ist> IST',
+    derived from the resolver (Monday cushion -> 03:30 broker / 06:00 IST). Replaces
+    the stale hardcoded 'A1 02:00 broker'. Display only, no scheduling effect. v3.3.6."""
+    a = self.cfg.anchors[0]
+    bdate = self._broker_date(pd.Timestamp.now(tz='UTC'))
+    days_ahead = (0 - bdate.weekday()) % 7   # 0 if already Monday, else days to Monday
+    target = bdate + timedelta(days=days_ahead)
+    rh, rm, ih, im = self._resolved_anchor_ist_hm(a[0], target, a[1], a[2])
+    return f"{a[0]} {rh:02d}:{rm:02d} broker / {ih:02d}:{im:02d} IST"
+
+
 def _resolved_anchor_hm(self, label, broker_date, hour, minute):
     """Resolve an anchor's (broker_hour, broker_minute), applying the Monday-only
     A1 cold-start cushion. Forex opens Mon 00:00 broker; A1 at 02:30 is only 2.5h
