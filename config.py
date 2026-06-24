@@ -232,6 +232,11 @@ class Config:
 
     # Risk
     starting_balance: float = 50000.0
+    # --- v3.2.9 manual TESTFIRE collision guard ---------------------------------
+    # `python bot.py testfire` fires ONE real anchor entry at current market, on
+    # demand. Rail #4: refuse if a SCHEDULED anchor is active or within this many
+    # minutes, so a manual test can never collide with a real anchor. Fail-closed.
+    testfire_collision_min: int = 30
     daily_loss_pct: float = 0.03  # 3% kill switch (Funding Pips Zero has 5% trailing DD — 3% daily gives a 2% multi-day buffer)
     weekly_loss_pct: float = 0.08
     account_floor_pct: float = 0.85  # halt new entries below this multiple of starting

@@ -45,7 +45,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
-                                         'verifyfb', 'rescuestats', 'bescratchscan'])
+                                         'testfire', 'verifyfb', 'rescuestats',
+                                         'bescratchscan'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -58,6 +59,9 @@ def main():
                         help="Required for live mode")
     parser.add_argument('--force', action='store_true',
                         help="selftest: allow market-order steps on a non-demo account")
+    parser.add_argument('--anchor', default='A2',
+                        help="testfire: anchor label for journal tagging / defer-window "
+                             "(price is current market, NOT the scheduled anchor price)")
     parser.add_argument('--backfill', metavar='YYYY-MM-DD', default=None,
                         help="verifyfb: re-write ONE day's Firestore doc from the journal CSV")
     parser.add_argument('--m1csv', default=None,
@@ -121,6 +125,16 @@ def main():
         # rc=10009 in ~2 minutes instead of waiting for a real live rescue.
         from selftest import run_selftest
         ok = run_selftest(cfg, force=args.force)
+        sys.exit(0 if ok else 1)
+
+    elif args.mode == 'testfire':
+        # v3.2.9: manual ONE-anchor entry at current market, on demand. Fires the
+        # EXACT scheduled placement path (straddle off current mid, $18 SL / $30 TP,
+        # No-OCO, rally(+5)/rescue(-10) boosts) then hands off to the live management
+        # loop. Fail-closed safety rails (DEMO only, no FP profile, flat book, no
+        # scheduled-anchor collision, one at a time) — see testfire.py. Real orders.
+        from testfire import run_testfire
+        ok = run_testfire(cfg, anchor=args.anchor)
         sys.exit(0 if ok else 1)
 
     elif args.mode == 'verifyfb':

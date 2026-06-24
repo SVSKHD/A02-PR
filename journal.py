@@ -175,6 +175,10 @@ def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, tick
         # v3.1.6 role: boosts tagged separately from the original (normal/rescue)
         # so each leg's P&L is its own line item, never silently pooled.
         ('boost' if shadow.get('boost') else shadow.get('role', 'normal')),
+        # v3.2.9: trigger source — 'SCHEDULED' for a clock anchor, 'TESTFIRE' for a
+        # manual on-demand entry. The TESTFIRE trade still COUNTS toward validation;
+        # this column makes it auditable, not excluded.
+        shadow.get('trigger_source', 'SCHEDULED'),
     ]
     new_file = not _os.path.exists(jpath)
     with open(jpath, "a", newline="") as f:
@@ -184,7 +188,7 @@ def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, tick
                         'entry_price','lot','initial_sl','initial_tp','max_favorable',
                         'exit_time_ist','actual_exit_price','modeled_trail_exit',
                         'trail_slip','exit_reason','realized_pnl_usd','ticket',
-                        'nohold_trail_exit','role'])
+                        'nohold_trail_exit','role','trigger_source'])
         w.writerow(row)
     log.info(f"journal: {shadow.get('anchor_label')} {side} {refined} "
              f"pnl=${pnl_usd:+.2f} trail_slip={trail_slip}")

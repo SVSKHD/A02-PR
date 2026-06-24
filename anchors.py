@@ -115,6 +115,13 @@ def _anchor_missed(self, label, anchor_utc, utc_now):
 def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
     if self.paused:
         return
+    # v3.2.9: during a manual TESTFIRE session, scheduled-anchor placement is
+    # SUPPRESSED so the manual entry is isolated and can never collide with a real
+    # anchor (rail #4). The deferred-anchor completion path (_complete_deferred_
+    # anchor in the tick loop) still runs, so the test-fire itself is placed and
+    # managed normally. Live management of the test position is unaffected.
+    if getattr(self, '_testfire_mode', False):
+        return
     # v3.0.5: bounded LATE-PLACEMENT window. An anchor stays eligible for
     # re-attempt for cfg.anchor_late_window_min after its scheduled time; the
     # original behavior is window_s=120 (anchor_late_window_min=0). Hard stops
@@ -668,12 +675,17 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         # the shadow pendings so fill/close can print scheduled vs actual times.
         self._mark_anchor_placed(label)
         sched_iso = anchor_utc.isoformat()
+        # v3.2.9: tag the source so a manual TESTFIRE entry is auditable in the
+        # journal and distinguishable from a clock-scheduled anchor. Defaults to
+        # 'SCHEDULED' so every existing (scheduled) placement is unchanged.
+        trigger_source = getattr(self, '_trigger_source', 'SCHEDULED')
         if buy_ticket is not None:
             self.shadow_pendings[buy_ticket] = {
                 'anchor_label': label, 'side': 'BUY',
                 'sibling_ticket': sell_ticket,  # None when SELL was skipped — fill handler tolerates None
                 'entry_price': buy_stop,
                 'sched_utc': sched_iso,
+                'trigger_source': trigger_source,
             }
         if sell_ticket is not None:
             self.shadow_pendings[sell_ticket] = {
@@ -681,6 +693,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                 'sibling_ticket': buy_ticket,  # None when BUY was skipped
                 'entry_price': sell_stop,
                 'sched_utc': sched_iso,
+                'trigger_source': trigger_source,
             }
         # Hot polling window
         self._hot_poll_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=30)

@@ -619,9 +619,26 @@ History (one line per behavioral change):
          refactor beyond the rally numbers; rescue output byte-identical. selftest ->
          83 steps (new 81 rally arm +5, 82 rally trail 4/1.5 + kind isolation, 83 split
          isolation + dispatcher routing + rescue-relocated byte-identity). Banner v3.2.8.
+  3.2.9  Manual TESTFIRE — `python bot.py testfire [--anchor A2]` fires ONE real anchor
+         entry at the CURRENT market price, off-schedule, so fills (straddle, boosts,
+         rally/rescue) can be watched on demand. REUSES the live placement path (does
+         NOT fork): arm_testfire drops a deferred anchor (defer_until=now) and the SAME
+         run() loop calls _complete_deferred_anchor -> _place_orders_for_anchor (which
+         already re-anchors to current price), so the straddle is current_mid +/-$5,
+         $18 SL / $30 TP, No-OCO, rally(+5)/rescue(-10) boosts — identical to a
+         scheduled anchor; only the trigger source + timestamp differ. Fail-closed
+         safety rails (testfire.py): (1) DEMO-only, no --force; (2) refuse FP/funded
+         profile even on demo; (3) flat book (broker + internal shadow); (4) no
+         scheduled-anchor collision within testfire_collision_min (default 30);
+         (5) one test-fire at a time. Scheduled anchors are SUPPRESSED during the
+         session (_testfire_mode gates _process_anchor_if_due). The trade is real and
+         COUNTS toward validation; journal tags trigger_source='TESTFIRE' (new column).
+         NO v3.2.8 boost number changed; rally + rescue byte-identical. selftest -> 88
+         steps (new 84 demo-only, 85 FP-refuse, 86 flat/in-flight, 87 anchor-window,
+         88 same-placement call-identity). Banner v3.2.9.
 """
 
-__version__ = "3.2.8"
+__version__ = "3.2.9"
 CODENAME = "Astra Hawk"
 
 

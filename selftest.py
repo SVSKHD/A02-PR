@@ -125,6 +125,12 @@ STEP_NAMES = {
     82: "rally trail 4/1.5",
     # v3.2.8 Phase 2/3 — rally/rescue/common file split + dispatcher isolation
     83: "boost split isolation",
+    # v3.2.9 manual TESTFIRE — fail-closed safety rails + same-placement reuse
+    84: "testfire demo-only",
+    85: "testfire FP refuse",
+    86: "testfire flat/in-flight",
+    87: "testfire anchor window",
+    88: "testfire same-placement",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -2950,6 +2956,165 @@ class SelfTest:
         self._record(83, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
+    # v3.2.9 manual TESTFIRE — fail-closed safety rails + same-placement reuse.
+    # NO real orders are placed in any of these steps: the adapter/broker is fully
+    # stubbed; placement is asserted by call-recording, not execution.
+    # ------------------------------------------------------------------------
+    def _testfire_stub(self, trade_mode=0, profile='STANDARD_5PCT', pos=(), pend=(),
+                       shadow=None, pending=None, evt_open=False, anchors=None):
+        import types, dataclasses
+        cfg = dataclasses.replace(self.cfg, account_profile=profile)
+        if anchors is not None:
+            cfg.anchors = anchors
+        DEMO = 0
+        mt5 = types.SimpleNamespace(
+            ACCOUNT_TRADE_MODE_DEMO=DEMO,
+            account_info=lambda: types.SimpleNamespace(trade_mode=trade_mode, balance=50000.0),
+            positions_get=lambda symbol=None: list(pos),
+            orders_get=lambda symbol=None: list(pend),
+            symbol_info_tick=lambda s: types.SimpleNamespace(bid=3995.0, ask=3995.2))
+        return types.SimpleNamespace(
+            cfg=cfg, adapter=types.SimpleNamespace(mt5=mt5),
+            shadow_positions=shadow or {}, shadow_pendings=pending or {},
+            _testfire_event_open=evt_open)
+
+    def _step_testfire_demo_only(self):
+        # 84: rail 1 DEMO-ONLY — testfire REFUSES on a non-demo account (no --force
+        # override) and CLEARS on demo. Fail-closed if account_info can't be read.
+        import types
+        import testfire as _tf
+        try:
+            far = pd.Timestamp('2026-06-24T00:00:00Z')  # 7h from A2 (10:00 broker)
+            real_ok, real_reason = _tf.testfire_preflight(
+                self._testfire_stub(trade_mode=2, anchors=[('A2', 10, 0)]), far)
+            demo_ok, _ = _tf.testfire_preflight(
+                self._testfire_stub(trade_mode=0, anchors=[('A2', 10, 0)]), far)
+            # account_info None -> fail-closed refuse (never assume safe)
+            tr = self._testfire_stub(anchors=[('A2', 10, 0)])
+            tr.adapter.mt5.account_info = lambda: None
+            none_ok, _ = _tf.testfire_preflight(tr, far)
+            ok = (real_ok is False and demo_ok is True and none_ok is False
+                  and 'DEMO-ONLY' in real_reason)
+            detail = f"non_demo_refused={not real_ok} demo_clears={demo_ok} none_failclosed={not none_ok}"
+        except Exception as e:
+            self._record(84, FAIL, f"raised: {e!r}"); return
+        self._record(84, PASS if ok else FAIL, detail)
+
+    def _step_testfire_fp_refuse(self):
+        # 85: rail 2 NO-FP — testfire REFUSES any FP/funded profile even on demo;
+        # only STANDARD_5PCT clears.
+        import testfire as _tf
+        try:
+            far = pd.Timestamp('2026-06-24T00:00:00Z')
+            fp_ok, fp_reason = _tf.testfire_preflight(
+                self._testfire_stub(profile='FPZERO_1PCT', anchors=[('A2', 10, 0)]), far)
+            std_ok, _ = _tf.testfire_preflight(
+                self._testfire_stub(profile='STANDARD_5PCT', anchors=[('A2', 10, 0)]), far)
+            ok = (fp_ok is False and std_ok is True and 'NO-FP' in fp_reason)
+            detail = f"fp_refused={not fp_ok} standard_clears={std_ok} reason={fp_reason[:40]}"
+        except Exception as e:
+            self._record(85, FAIL, f"raised: {e!r}"); return
+        self._record(85, PASS if ok else FAIL, detail)
+
+    def _step_testfire_flat_inflight(self):
+        # 86: rail 3 FLAT + rail 5 ONE-AT-A-TIME — testfire REFUSES when an anchor is
+        # in-flight (broker position OR pending OR internal shadow) or when a prior
+        # test-fire event is still open. Same flatness guard selftest's preflight uses.
+        import testfire as _tf
+        try:
+            far = pd.Timestamp('2026-06-24T00:00:00Z')
+            A = [('A2', 10, 0)]
+            pos_ok, pos_r = _tf.testfire_preflight(self._testfire_stub(pos=[object()], anchors=A), far)
+            pend_ok, _ = _tf.testfire_preflight(self._testfire_stub(pend=[object()], anchors=A), far)
+            shadow_ok, _ = _tf.testfire_preflight(self._testfire_stub(shadow={101: {}}, anchors=A), far)
+            shpend_ok, _ = _tf.testfire_preflight(self._testfire_stub(pending={102: {}}, anchors=A), far)
+            prior_ok, prior_r = _tf.testfire_preflight(self._testfire_stub(evt_open=True, anchors=A), far)
+            clean_ok, _ = _tf.testfire_preflight(self._testfire_stub(anchors=A), far)
+            ok = (pos_ok is False and pend_ok is False and shadow_ok is False
+                  and shpend_ok is False and prior_ok is False and clean_ok is True
+                  and 'FLAT' in pos_r and 'ONE-AT-A-TIME' in prior_r)
+            detail = (f"broker_pos={not pos_ok} broker_pend={not pend_ok} "
+                      f"shadow_pos={not shadow_ok} shadow_pend={not shpend_ok} "
+                      f"prior_event={not prior_ok} clean_clears={clean_ok}")
+        except Exception as e:
+            self._record(86, FAIL, f"raised: {e!r}"); return
+        self._record(86, PASS if ok else FAIL, detail)
+
+    def _step_testfire_anchor_window(self):
+        # 87: rail 4 NO-COLLISION — testfire REFUSES when a scheduled anchor is active
+        # or within testfire_collision_min; clears when the window is far. Uses the
+        # pure minutes_to_nearest_anchor helper (broker UTC+3).
+        import testfire as _tf
+        try:
+            A = [('A2', 10, 0)]  # 10:00 broker == 07:00 UTC
+            at_anchor = pd.Timestamp('2026-06-24T07:00:00Z')           # 0 min away
+            edge_in = pd.Timestamp('2026-06-24T06:45:00Z')             # 15 min (<=30) away
+            far = pd.Timestamp('2026-06-24T00:00:00Z')                 # 420 min away
+            at_ok, at_r = _tf.testfire_preflight(self._testfire_stub(anchors=A), at_anchor)
+            edge_ok, _ = _tf.testfire_preflight(self._testfire_stub(anchors=A), edge_in)
+            far_ok, _ = _tf.testfire_preflight(self._testfire_stub(anchors=A), far)
+            mins0 = _tf.minutes_to_nearest_anchor(self._testfire_stub(anchors=A).cfg, at_anchor)
+            ok = (at_ok is False and edge_ok is False and far_ok is True
+                  and 'NO-COLLISION' in at_r and abs(mins0) < 1e-6)
+            detail = (f"at_anchor_refused={not at_ok} within15_refused={not edge_ok} "
+                      f"far_clears={far_ok} nearest_min@anchor={mins0:.1f}")
+        except Exception as e:
+            self._record(87, FAIL, f"raised: {e!r}"); return
+        self._record(87, PASS if ok else FAIL, detail)
+
+    def _step_testfire_same_placement(self):
+        # 88: on a clean demo stub, testfire routes through the SAME placement entry a
+        # scheduled anchor uses — assert CALL IDENTITY (not a parallel copy): arm ->
+        # the live _complete_deferred_anchor -> _place_orders_for_anchor, anchored at
+        # the CURRENT price (anchor_price == current_price, current-mid straddle), with
+        # the journal tagged trigger_source='TESTFIRE' and scheduled anchors suppressed.
+        import types
+        import testfire as _tf
+        import anchors as _anchors
+        import live_trader as _lt
+        try:
+            far = pd.Timestamp('2026-06-24T00:00:00Z')
+            # (a) bound-method identity: the testfire path and the scheduled path use
+            #     the SAME _place_orders_for_anchor / _complete_deferred_anchor.
+            identity = (_lt.LiveTrader._place_orders_for_anchor is _anchors._place_orders_for_anchor
+                        and _lt.LiveTrader._complete_deferred_anchor is _anchors._complete_deferred_anchor)
+            # (b) arm + complete -> records ONE call to _place_orders_for_anchor with
+            #     anchor_price == current_price (current-mid anchoring), label tagged.
+            calls = []
+            tr = self._testfire_stub(anchors=[('A2', 10, 0)])
+            tr._deferred_anchor = None
+            tr._place_orders_for_anchor = (
+                lambda label, anchor_utc, anchor_price, current_price, *a, **k:
+                calls.append((label, anchor_price, current_price)))
+            tr._await_fresh_tick_for_placement = lambda label: (object(), 3995.1, 0.0)
+            tr._warmup_trade_channel = lambda label: True
+            tr._dump_mt5_state = lambda *a, **k: None
+            # preflight clears first (clean demo, far from anchor)
+            cleared, _ = _tf.testfire_preflight(tr, far)
+            _tf.arm_testfire(tr, 'A2', now_utc=far)
+            tagged = (tr._trigger_source == 'TESTFIRE' and tr._testfire_mode is True
+                      and tr._testfire_event_open is True)
+            _anchors._complete_deferred_anchor(tr)
+            routed = (len(calls) == 1 and calls[0][0] == 'A2'
+                      and abs(calls[0][1] - calls[0][2]) < 1e-9      # anchor == current price
+                      and abs(calls[0][1] - 3995.1) < 1e-9)
+            # (c) scheduled-anchor placement is SUPPRESSED while _testfire_mode is set.
+            tr2 = self._testfire_stub(anchors=[('A2', 10, 0)])
+            tr2.paused = False
+            tr2._testfire_mode = True
+            tr2.state = {'processed_anchors_today': set()}
+            tr2._deferred_anchor = 'UNTOUCHED'
+            _anchors._process_anchor_if_due(tr2, far.date(), pd.Timestamp('2026-06-24T07:00:00Z'))
+            suppressed = (tr2._deferred_anchor == 'UNTOUCHED')
+            ok = identity and cleared and tagged and routed and suppressed
+            detail = (f"call_identity={identity} preflight_cleared={cleared} "
+                      f"journal_tagged={tagged} routed_current_mid={routed} "
+                      f"scheduler_suppressed={suppressed}")
+        except Exception as e:
+            self._record(88, FAIL, f"raised: {e!r}"); return
+        self._record(88, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
     def _preflight(self) -> bool:
@@ -3113,6 +3278,12 @@ class SelfTest:
             self._step_rally_trail_4_15()
             # v3.2.8 Phase 2/3 — rally/rescue/common split + dispatcher isolation
             self._step_boost_split_isolation()
+            # v3.2.9 manual TESTFIRE — fail-closed safety rails + same-placement reuse
+            self._step_testfire_demo_only()
+            self._step_testfire_fp_refuse()
+            self._step_testfire_flat_inflight()
+            self._step_testfire_anchor_window()
+            self._step_testfire_same_placement()
         finally:
             self._cleanup()
         return self._report(ts)
