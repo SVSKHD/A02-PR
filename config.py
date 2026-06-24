@@ -202,6 +202,21 @@ class Config:
     rally_trail_gap: float = 2.00     # RALLY_TRAIL_GAP: v3.3.0 the rally boost trails
     #   at peak - $2.00 (was $1.50), matching the original leg's trail gap (trail_gap
     #   / banner "gap $2.00") so a rally boost rides the move and exits ~peak-$2.
+    # --- v3.3.4 RALLY PULLBACK DETECTOR (rally boosts only) -----------------------
+    # An entry-relative early-cut that sits ABOVE the $13 hard backstop (rally_boost_sl).
+    # A rally boost that pulls back AGAINST ITS ENTRY is HELD while the adverse
+    # excursion stays within T dollars (a pullback); crossing T cuts it early (a
+    # reversal); B minutes adverse without returning to entry also cuts it (a slow
+    # reversal). Returning to ENTRY ends the pullback and normal trail/backstop resume.
+    # The $13 backstop stays underneath as the hard gap floor. RESCUE never enters here.
+    # NUMBERS ARE TBD FROM LIVE DATA -- these are starting defaults, fully tunable.
+    rally_pullback_enabled: bool = True   # v3.3.4: ship ON with candidate numbers.
+    rally_pullback_tol_dollars: float = 13.0  # T: adverse $ vs entry. <= the $13 hard
+    #   backstop; clamped to it. At T=13 the DISTANCE cut coincides with the backstop
+    #   (no tighter distance cut) so the new behavior is the TIME bound + recovery; drop
+    #   T toward the $7-8 candidate once measured to cut reversals earlier.
+    rally_pullback_time_bound_min: float = 30.0  # B: minutes adverse (below/above entry)
+    #   without returning to entry before a slow-reversal cut. 0 disables the time bound.
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all

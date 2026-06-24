@@ -33,6 +33,10 @@ class Position:
     exit_price: Optional[float] = None
     exit_time: Optional[pd.Timestamp] = None
     outcome: Optional[str] = None  # 'SL', 'TP', 'Trail', 'EOD', 'KillSwitch'
+    pullback_since: Optional[pd.Timestamp] = None  # v3.3.4: when this RALLY boost
+    # first went adverse vs its entry in the CURRENT pullback (None = not in a
+    # pullback). Drives the rally pullback detector's B-minute slow-reversal cut;
+    # reset to None when price returns to entry. Ignored for non-rally / non-boost.
 
     @property
     def pnl_dist(self) -> float:
@@ -128,6 +132,47 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
                 fill = breath_sl
                 if _open is not None and _open > breath_sl:
                     fill = breath_sl if is_rally else min(backstop, _open)
+                return _close_boost(pos, ts, fill, backstop)
+
+    # (1b) v3.3.4 RALLY PULLBACK DETECTOR (rally boosts only) — sits ABOVE the $13
+    # hard backstop. A rally boost that pulls back AGAINST ENTRY is HELD while the
+    # adverse excursion stays within T dollars; crossing T cuts early (reversal), and
+    # B minutes adverse without returning to entry cuts (slow reversal). Returning to
+    # ENTRY ends the pullback and the normal trail/backstop resume. The $13 backstop
+    # (section 2) is untouched underneath. RESCUE never enters here. Numbers (T, B)
+    # are config knobs (TBD from live data); at T == the backstop the distance cut
+    # coincides with the backstop and only the time bound adds new behavior.
+    if is_rally and bool(getattr(cfg, 'rally_pullback_enabled', True)):
+        tol = float(getattr(cfg, 'rally_pullback_tol_dollars', 13.0))
+        tol = min(max(tol, 0.0), hard)            # never wider than the hard backstop
+        bmin = float(getattr(cfg, 'rally_pullback_time_bound_min', 30.0))
+        cut_level = pos.entry_price - sgn * tol   # entry -/+ T (>= backstop since tol<=hard)
+        adverse_extreme = bar.low if sgn > 0 else bar.high
+        crossed_T = adverse_extreme <= cut_level if sgn > 0 else adverse_extreme >= cut_level
+        recovered = bar.high >= pos.entry_price if sgn > 0 else bar.low <= pos.entry_price
+        in_pullback = adverse_extreme < pos.entry_price if sgn > 0 else adverse_extreme > pos.entry_price
+        if crossed_T:
+            # reversal: cut at the T threshold; a bar that GAPS THROUGH it fills at the
+            # open, floored by the $13 backstop (never worse than the hard SL).
+            fill = cut_level
+            if _open is not None and ((sgn > 0 and _open < cut_level)
+                                      or (sgn < 0 and _open > cut_level)):
+                fill = max(backstop, _open) if sgn > 0 else min(backstop, _open)
+            pos.pullback_since = None
+            return _close_boost(pos, ts, fill, backstop)
+        if recovered:
+            pos.pullback_since = None             # back to entry -> resume normal trail
+        elif in_pullback:
+            if getattr(pos, 'pullback_since', None) is None:
+                pos.pullback_since = ts           # pullback starts now
+            elapsed_min = (ts - pos.pullback_since).total_seconds() / 60.0
+            if bmin > 0 and elapsed_min >= bmin:
+                # slow reversal: cut at market (bar close), floored by the $13 backstop.
+                close_px = bar.get('close') if hasattr(bar, 'get') else getattr(bar, 'close', None)
+                if close_px is None:
+                    close_px = adverse_extreme
+                fill = max(backstop, close_px) if sgn > 0 else min(backstop, close_px)
+                pos.pullback_since = None
                 return _close_boost(pos, ts, fill, backstop)
 
     # (2) $10 HARD BACKSTOP — ALWAYS live (armed or not). current_sl == backstop
