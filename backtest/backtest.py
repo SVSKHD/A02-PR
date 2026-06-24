@@ -379,9 +379,10 @@ def run_month(ticks_df: pd.DataFrame, year: int, month: int, cfg: Config) -> Dic
                     orig_pnl = realize_pnl_usd(first_pos, cfg) + \
                         sum(realize_pnl_usd(p, cfg) for p in rescue_legs)
                     boost_pnl = sum(realize_pnl_usd(p, cfg) for p in boost_legs)
-                    # -$700 cap (clamp): model the live hard-close of the boosts'
-                    # combined loss BEFORE classifying the branch.
-                    _cap = boosts.boost_whipsaw_cap(cfg)
+                    # whipsaw cap (clamp): model the live hard-close of the boosts'
+                    # combined loss BEFORE classifying the branch. v3.3.3: per-kind
+                    # (RALLY -$910 / RESCUE -$700) -- read the firing event's kind.
+                    _cap = boosts.boost_whipsaw_cap(cfg, plan.kind)
                     if boost_pnl < -_cap:
                         boost_pnl = -_cap
                     branch = _branch_for(boost_pnl)

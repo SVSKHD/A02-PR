@@ -151,22 +151,26 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
 
 def enforce_cap(self, mid):
     """v3.2.0: hard-close a boost EVENT's boosts once their COMBINED open P&L
-    breaches the -$700 cap (A3 slipped to -715.05). Boosts only -- the original
-    leg is outside the cap (isolation). SHARED by both kinds; body byte-identical
-    to the v3.2.7 _enforce_boost_cap."""
-    try:
-        cap = boosts.boost_whipsaw_cap(self.cfg)
-    except Exception:
-        return
+    breaches the cap. Boosts only -- the original leg is outside the cap (isolation).
+    v3.3.3: the cap is PER-EVENT-KIND -- RALLY events use the rally SL ($13 ->
+    -$910), RESCUE events use the rescue SL ($10 -> -$700), never one shared value.
+    The event's kind is taken from its boosts' boost_kind shadow field."""
     by_event = {}
+    kind_of = {}
     for tk, sp in self.shadow_positions.items():
         if not sp.get('boost'):
             continue
         sgn = 1.0 if sp.get('side') == 'BUY' else -1.0
         pnl = sgn * (mid - float(sp.get('entry_price', mid))) * self.cfg.lot_size \
             * float(getattr(self.cfg, 'contract_size', 100.0))
-        by_event.setdefault(sp.get('boost_event'), []).append((tk, pnl))
+        eid = sp.get('boost_event')
+        by_event.setdefault(eid, []).append((tk, pnl))
+        kind_of.setdefault(eid, sp.get('boost_kind', 'RESCUE'))
     for eid, legs in by_event.items():
+        try:
+            cap = boosts.boost_whipsaw_cap(self.cfg, kind_of.get(eid, 'RESCUE'))
+        except Exception:
+            continue
         if sum(p for _, p in legs) <= -cap + 1e-6:
             for tk, _ in legs:
                 try:

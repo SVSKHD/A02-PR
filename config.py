@@ -128,7 +128,14 @@ class Config:
     # (2026-06-17 A1) whipsawed: a $6 stop was tagged by a $6 dip then price ran
     # +$8. The $10 stop is now the boost's HARD BACKSTOP only -- v3.1.6 adds a
     # tight breath-gap TRAIL on top (below), so a reversing boost exits at ~-(gap)
-    # not -$10. Per-pair whipsaw worst case stays 2 x $10 x 0.35 x 100 = -$700.
+    # not -$10. This is the RESCUE boost SL (UNCHANGED). Per-pair RESCUE whipsaw
+    # worst case stays 2 x $10 x 0.35 x 100 = -$700.
+    rally_boost_sl: float = 13.0  # v3.3.3 (owner choice): the RALLY boost hard
+    # SL/backstop, widened 10 -> 13 (was 12 pre-v3.3.3) so a rally pyramid is not
+    # tagged out by a shallow pullback before the move resumes. RALLY ONLY -- the
+    # RESCUE backstop stays $10 (boost_sl_dollars). The rally whipsaw cap scales
+    # with it: 2 x $13 x 0.35 x 100 = -$910 (vs the rescue cap -$700). The cap reads
+    # the per-event kind's SL, never one shared value (boosts.boost_sl_for).
     boost_trigger_dollars: float = 10.0  # v3.2.0: a lone leg must move this
     # far from its FILL before any boost fires -- +$10 => RALLY (same dir,
     # winning), -$10 => RESCUE (opposite, losing). Boosts NEVER fire at fill

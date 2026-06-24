@@ -35,6 +35,16 @@ def _trigger(cfg):
     return float(getattr(cfg, "boost_trigger_dollars", 10.0))
 
 
+def boost_sl_for(cfg, kind):
+    """v3.3.3: the boost hard-SL/backstop ($) for this event KIND -- per-kind, NOT
+    one shared value. RALLY -> rally_boost_sl ($13, owner-widened); RESCUE (and any
+    unknown/legacy kind) -> boost_sl_dollars ($10, unchanged). Both placement and the
+    whipsaw cap read THIS so a rally event uses $13 and a rescue event uses $10."""
+    if str(kind).upper() == "RALLY":
+        return float(getattr(cfg, "rally_boost_sl", 13.0))
+    return float(getattr(cfg, "boost_sl_dollars", 10.0))
+
+
 def _opposite(side):
     return "SELL" if side == "BUY" else "BUY"
 
@@ -81,7 +91,6 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg,
         n = max(0, min(3, int(_depth)) - 1)
     else:
         n = int(getattr(cfg, "rescue_boost_count", 2))
-    sl_d = float(getattr(cfg, "boost_sl_dollars", 10.0))
     tp_d = float(getattr(cfg, "tp_dist", 30.0))
 
     # leg excursion in the leg's own favor ($): >0 winning, <0 losing.
@@ -123,25 +132,32 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg,
             f"{leg_fill_price:.2f} (need >= ${arm_used:.0f}) -- refusing to fire at fill.")
         return None
 
+    # v3.3.3: SL is per-kind -- RALLY $13, RESCUE $10 (boost_sl_for), not shared.
+    sl_d = boost_sl_for(cfg, kind)
     return BoostPlan(kind=kind, event_type=etype, boost_side=side,
                      entry_ref=round(current_price, 2), n=n, sl_dollars=sl_d,
                      tp_dollars=tp_d, move_dollars=round(leg_fav, 2))
 
 
-def boost_whipsaw_cap(cfg):
-    """The hard combined-boost loss cap ($), = n x $sl x lot x contract. A boost
-    event whose combined realized+open loss reaches -cap closes remaining boosts."""
+def boost_whipsaw_cap(cfg, kind="RESCUE"):
+    """The hard combined-boost loss cap ($), = n x $sl x lot x contract, for this
+    event KIND. v3.3.3: the SL is per-kind (boost_sl_for) so RALLY caps at
+    2 x $13 x 0.35 x 100 = -$910 and RESCUE stays 2 x $10 x 0.35 x 100 = -$700 --
+    NOT one shared value. Default kind='RESCUE' keeps the historical $700 for any
+    legacy caller that doesn't pass a kind. A boost event whose combined
+    realized+open loss reaches -cap closes the remaining boosts."""
     return (int(getattr(cfg, "rescue_boost_count", 2))
-            * float(getattr(cfg, "boost_sl_dollars", 10.0))
+            * boost_sl_for(cfg, kind)
             * float(getattr(cfg, "lot_size", 0.35))
             * float(getattr(cfg, "contract_size", 100.0)))
 
 
-def cap_breached(combined_boost_pnl, cfg):
+def cap_breached(combined_boost_pnl, cfg, kind="RESCUE"):
     """True when the boosts' combined P&L has reached/breached the -cap (hard
-    close). Clamp-on-breach -- binds even when a single boost slipped past its SL."""
+    close) for this KIND. Clamp-on-breach -- binds even when a single boost slipped
+    past its SL. v3.3.3: reads the per-kind cap (RALLY -$910 / RESCUE -$700)."""
     try:
-        return float(combined_boost_pnl) <= -boost_whipsaw_cap(cfg) + _EPS
+        return float(combined_boost_pnl) <= -boost_whipsaw_cap(cfg, kind) + _EPS
     except (TypeError, ValueError):
         return False
 

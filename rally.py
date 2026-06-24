@@ -57,39 +57,60 @@ def trail_gap(cfg):
 
 
 # --- the break-and-hold gate (rally only, per the v3.2.7 split) -------------------
+def _has_rows(bars):
+    """Truthiness for a bars container that may be a python list OR a numpy
+    (structured) array. v3.3.3: a numpy array with >1 element raises in a bool
+    context ('The truth value of an array ... is ambiguous') -- that exact crash
+    (live A2 2026-06-24) made `if bars:` throw, the handler defaulted to ALLOWING,
+    and rally SELL boosts fired into a move bottom for -$701. Length-based so it is
+    safe for both list and ndarray; never raises."""
+    if bars is None:
+        return False
+    try:
+        return len(bars) > 0
+    except TypeError:
+        return bool(bars)
+
+
 def break_and_hold_ok(self, shadow, plan):
     """v3.2.4 Feature D gate (live): stack ONLY on a CONFIRMED break (cleared edge +
     held N M5 candles + retrace < Y), via the shared break_hold.classify on the
-    recent M5 bars. Disabled / no data / any error -> True (legacy: don't block).
-    Emits BREAK_CONFIRMED / BREAK_CANDIDATE / BREAK_FAILED(reason). The decision is
-    the pure shared fn; this only feeds it live candles. (v3.2.8: lifted verbatim
-    from fills._break_and_hold_ok -- break-and-hold stays on RALLY.)"""
+    recent M5 bars. Disabled / not enough data -> True (legacy: don't block).
+    Emits BREAK_CONFIRMED / BREAK_CANDIDATE / BREAK_FAILED(reason).
+
+    v3.3.3 FIX 1B -- FAIL CLOSED: if the gate raises for ANY reason it now BLOCKS the
+    fire (returns False) and logs loudly, instead of the old 'non-fatal, allowing'
+    default that let an unconfirmed/exhausted break stack. The gate exists to stop
+    rally boosts firing into a fake break; a gate that cannot evaluate must not fire.
+    RALLY only -- RESCUE bypasses this gate entirely (rescue_bypass_break_and_hold).
+    v3.3.3 FIX 1A: bars truthiness goes through _has_rows so a numpy array can't
+    raise the ambiguous-truth ValueError that triggered the bug."""
     import break_hold as _bh
     if not bool(getattr(self.cfg, 'break_and_hold_enabled', True)):
         return True
+    anchor = None
     try:
+        anchor = shadow.get('anchor_label') if hasattr(shadow, 'get') else None
         n = int(getattr(self.cfg, 'hold_candles_n', 2))
         tf = str(getattr(self.cfg, 'break_timeframe', 'M5'))
         bars = None
         for fn in ('get_latest_m5', 'get_latest_bars', 'get_latest_m1'):
             getter = getattr(self.adapter, fn, None)
-            if getter is not None:
-                try:
-                    bars = getter(self.cfg.symbol, n + 2)
-                    if bars:
-                        break
-                except TypeError:
-                    bars = getter(self.cfg.symbol, n + 2, tf)
-                    if bars:
-                        break
-        if not bars or len(bars) < n:
+            if getter is None:
+                continue
+            try:
+                bars = getter(self.cfg.symbol, n + 2)
+            except TypeError:
+                bars = getter(self.cfg.symbol, n + 2, tf)
+            if _has_rows(bars):
+                break
+        if not _has_rows(bars) or len(bars) < n:
             return True   # not enough data -> don't block (legacy)
         candles = [{'high': float(b['high']), 'low': float(b['low']),
                     'close': float(b['close'])} for b in bars]
         edge = float(shadow.get('leg_fill_price', shadow['entry_price']))
         result, reason = _bh.classify(plan.boost_side, edge, candles, self.cfg)
         tr = getattr(self, 'ptrace', None)
-        anchor = shadow.get('anchor_label')
         if tr is not None:
             if result == _bh.CONFIRMED:
                 tr.break_confirmed(anchor, side=plan.boost_side,
@@ -111,8 +132,26 @@ def break_and_hold_ok(self, shadow, plan):
                        f"@edge ${edge:.2f} — no fire")
         return False
     except Exception as e:
-        log.warning(f"break-and-hold check failed (non-fatal, allowing): {e!r}")
-        return True
+        # v3.3.3 FIX 1B: FAIL CLOSED. Do NOT fire the rally boost when the gate
+        # raises (the old default allowed it -> the -$701 A2 loss). Log loudly as a
+        # BLOCKED fire and trace it, then refuse.
+        side = getattr(plan, 'boost_side', '?')
+        msg = (f"🛑 RALLY BOOST BLOCKED — break-and-hold gate raised, FAILING CLOSED "
+               f"(no fire) {anchor} {side}: {e!r}")
+        log.error(msg)
+        tr = getattr(self, 'ptrace', None)
+        if tr is not None:
+            try:
+                tr.break_failed(anchor, side=side, break_level=None,
+                                reason='gate_exception_fail_closed', n_candles=0,
+                                timeframe=str(getattr(self.cfg, 'break_timeframe', 'M5')))
+            except Exception:
+                pass
+        try:
+            self.tele.error(msg)
+        except Exception:
+            pass
+        return False
 
 
 # --- the fire entrypoint the dispatcher routes a WINNING leg to -------------------
