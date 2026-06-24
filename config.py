@@ -63,6 +63,25 @@ class Config:
     break_dist_x: float = 3.0     # must clear the edge by >= this ($)
     hold_candles_n: int = 2       # must hold this many M5 candles past the edge
     max_retrace_y: float = 0.40   # retrace must stay < this fraction of break dist
+    # --- v3.3.5 CASE 2 fix: parent-profit override (RALLY only) -----------------
+    # The candle-structure gate above cannot tell a fresh fake spike (Case 1: spike
+    # off a flat fill, reverses -> MUST block, the -$701 loss) from a violent but
+    # GENUINE continuation (Case 2: a strong crash the parent leg is already riding
+    # deep in profit -> SHOULD fire). Both look violent in the first candles. The one
+    # reliable distinguisher: in Case 2 the PARENT is already deeply favorable in the
+    # SAME direction the boost fires. So: if the move is same-direction as the parent
+    # AND the parent's favorable excursion (max_fav vs entry, $) >= the threshold
+    # below, treat the break as CONFIRMED even if candle-structure says reversed --
+    # a proven continuation, not a fake spike. Below the threshold the strict gate is
+    # fully in force (Case 1 still blocks). The override ONLY loosens; it never makes
+    # the gate more permissive on a fresh spike. RESCUE is unaffected (it bypasses
+    # break-and-hold entirely). Live A2 2026-06-24: parent rode +$892 on a ~$32 plunge
+    # while the gate returned BREAK_FAILED the whole way down -> no boost fired.
+    parent_profit_override_enabled: bool = True
+    parent_established_dollars: float = 20.0  # TRIAL-CALIBRATED, NOT FINAL. Parent must
+    #   be >= +$20 favorable (max_fav vs entry, same units as the $5/$3/$13 knobs) for
+    #   the override to apply. Tunable WITHOUT a rebuild -- calibrate from trial data
+    #   (the BREAK_OVERRIDE_PARENT_ESTABLISHED PTRACE lines show every time it fired).
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose
