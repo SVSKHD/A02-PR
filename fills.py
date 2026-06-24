@@ -335,6 +335,8 @@ def _reconcile_with_broker(self):
                 'fill_time':    fill_time_utc.isoformat(),  # v2.3: persisted, restart-safe
                 'role':         'rescue' if is_rescue else 'normal',  # v2.9 / v2.9.8 structural
                 'sched_utc':    info.get('sched_utc'),  # v3.0.5: for close-msg times
+                # v3.2.9: carry the TESTFIRE/SCHEDULED tag through to the journal.
+                'trigger_source': info.get('trigger_source', 'SCHEDULED'),
                 # v3.2.0: boosts fire from the PER-TICK trigger once price moves a
                 # full $10 from THIS fill -- never at fill (the A3 -$900 bug).
                 'leg_fill_price': float(broker_p.price_open),
