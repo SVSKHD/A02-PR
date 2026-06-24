@@ -3430,8 +3430,9 @@ class SelfTest:
     def _step_rally_pullback_recover_time(self):
         # 95: RECOVERY to entry ends the pullback (reset, resume normal trail, no cut);
         # B minutes adverse WITHOUT returning to entry cuts at market (slow reversal);
-        # and at the SHIPPED default T=$13 the distance cut COINCIDES with the backstop
-        # (a -$12 adverse does NOT early-cut -- only the time bound / backstop do).
+        # and the feature SHIPS DEFAULT OFF (rally_pullback_enabled=False, T=$7.50) so
+        # the detector is INERT on the default config -- a bar that WOULD cross T if
+        # enabled does NOT cut; only the $13 backstop governs. Live exits unchanged.
         import dataclasses
         from strategy import update_position_on_bar
         try:
@@ -3459,15 +3460,20 @@ class SelfTest:
                                    ts0 + pd.Timedelta(minutes=32), cfg)
             time_ok = (held_open and pt.closed and pt.exit_price >= backstop - 1e-9
                        and abs(pt.exit_price - 95.0) < 0.05)
-            # (c) SHIPPED default T=13 == backstop: a -$12 adverse does NOT distance-cut.
-            cfg13 = self.cfg  # rally_pullback_tol_dollars defaults to 13.0
-            pd12 = self._rally_boost(cfg13, entry, ts0)
-            update_position_on_bar(pd12, pd.Series({'open': 99, 'high': 99, 'low': 88, 'close': 89}),
-                                   ts0 + pd.Timedelta(minutes=1), cfg13)
-            default_T_ok = (not pd12.closed and abs(float(getattr(cfg13, 'rally_pullback_tol_dollars', 13.0)) - 13.0) < 1e-9)
-            ok = recover_ok and time_ok and default_T_ok
+            # (c) SHIPS DEFAULT OFF + T=$7.50: on the default config the detector is
+            #     INERT -- a -$9 adverse bar (which WOULD cross T=$7.50 if enabled) is
+            #     NOT cut; only the $13 backstop governs (low 91 > entry-13=87 -> open).
+            cfgd = self.cfg  # defaults: enabled=False, tol=7.50
+            ships_off = (bool(getattr(cfgd, 'rally_pullback_enabled', False)) is False
+                         and abs(float(getattr(cfgd, 'rally_pullback_tol_dollars', 7.50)) - 7.50) < 1e-9)
+            pinert = self._rally_boost(cfgd, entry, ts0)
+            update_position_on_bar(pinert, pd.Series({'open': 99, 'high': 99, 'low': 91, 'close': 92}),
+                                   ts0 + pd.Timedelta(minutes=1), cfgd)
+            inert_ok = (not pinert.closed and pinert.pullback_since is None)
+            default_off_ok = (ships_off and inert_ok)
+            ok = recover_ok and time_ok and default_off_ok
             detail = (f"recovery_resets={recover_ok} time_bound_cut@{pt.exit_price:.0f}={time_ok} "
-                      f"defaultT13==backstop_no_early_cut={default_T_ok}")
+                      f"ships_off_T7.5={ships_off} default_inert={inert_ok}")
         except Exception as e:
             self._record(95, FAIL, f"raised: {e!r}"); return
         self._record(95, PASS if ok else FAIL, detail)

@@ -139,11 +139,11 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     # adverse excursion stays within T dollars; crossing T cuts early (reversal), and
     # B minutes adverse without returning to entry cuts (slow reversal). Returning to
     # ENTRY ends the pullback and the normal trail/backstop resume. The $13 backstop
-    # (section 2) is untouched underneath. RESCUE never enters here. Numbers (T, B)
-    # are config knobs (TBD from live data); at T == the backstop the distance cut
-    # coincides with the backstop and only the time bound adds new behavior.
-    if is_rally and bool(getattr(cfg, 'rally_pullback_enabled', True)):
-        tol = float(getattr(cfg, 'rally_pullback_tol_dollars', 13.0))
+    # (section 2) is untouched underneath. RESCUE never enters here. Numbers (T, B) are
+    # config knobs (TBD from live data) and the whole block is DEFAULT OFF (opt-in);
+    # tol is clamped to the backstop so it can never exceed the $13 hard floor.
+    if is_rally and bool(getattr(cfg, 'rally_pullback_enabled', False)):
+        tol = float(getattr(cfg, 'rally_pullback_tol_dollars', 7.50))
         tol = min(max(tol, 0.0), hard)            # never wider than the hard backstop
         bmin = float(getattr(cfg, 'rally_pullback_time_bound_min', 30.0))
         cut_level = pos.entry_price - sgn * tol   # entry -/+ T (>= backstop since tol<=hard)

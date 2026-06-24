@@ -699,18 +699,18 @@ History (one line per behavioral change):
          Returning to ENTRY ends the pullback and the normal trail/backstop resume.
          The $13 backstop stays underneath as the hard gap floor; a bar that gaps
          THROUGH T fills no better than the backstop. RESCUE is never governed by the
-         detector (rally-only; boost_kind gate). Config knobs (NUMBERS TBD FROM LIVE
-         DATA -- starting defaults, fully tunable): rally_pullback_enabled=True (ship
-         ON), rally_pullback_tol_dollars=13.0 (T; clamped to the backstop -- at $13 the
-         distance cut coincides with the backstop so only the time bound adds new
-         behavior; drop toward the $7-8 candidate once measured),
-         rally_pullback_time_bound_min=30.0 (B; 0 disables). Position gains a
-         pullback_since field (when the current pullback began; None outside one). No
-         rally trail number changed (fire +$5, trail peak-$2, +$3 floor, one-way) and
-         RESCUE is byte-identical. selftest -> 95 steps (new 94 pullback band:
-         hold-within-T / cut-beyond-T / gap-floored-at-backstop / rescue-unaffected;
-         95 recover/time: recovery resets, B-min slow-reversal cut, default T=13 ==
-         backstop no-early-cut). Banner v3.3.4.
+         detector (rally-only; boost_kind gate). Shipped flag-gated and DEFAULT OFF --
+         the code is INERT (live rally-boost exits UNCHANGED) until the owner flips it
+         on after validating T/B against live data. Config knobs (NUMBERS TBD FROM LIVE
+         DATA -- starting defaults, fully tunable): rally_pullback_enabled=False (opt-in),
+         rally_pullback_tol_dollars=7.50 (T; candidate $7-8 -> $7.50, must stay < the
+         $13 backstop, clamped to it), rally_pullback_time_bound_min=30.0 (B; 0 disables).
+         Position gains a pullback_since field (when the current pullback began; None
+         outside one). No rally trail number changed (fire +$5, trail peak-$2, +$3 floor,
+         one-way) and RESCUE is byte-identical. selftest -> 95 steps (new 94 pullback
+         band: hold-within-T / cut-beyond-T / gap-floored-at-backstop / rescue-unaffected,
+         proven with an enabled+tol=$8 override; 95 recover/time: recovery resets, B-min
+         slow-reversal cut, ships-default-OFF inert). Banner v3.3.4.
 """
 
 __version__ = "3.3.4"

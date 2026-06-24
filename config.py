@@ -210,11 +210,13 @@ class Config:
     # reversal). Returning to ENTRY ends the pullback and normal trail/backstop resume.
     # The $13 backstop stays underneath as the hard gap floor. RESCUE never enters here.
     # NUMBERS ARE TBD FROM LIVE DATA -- these are starting defaults, fully tunable.
-    rally_pullback_enabled: bool = True   # v3.3.4: ship ON with candidate numbers.
-    rally_pullback_tol_dollars: float = 13.0  # T: adverse $ vs entry. <= the $13 hard
-    #   backstop; clamped to it. At T=13 the DISTANCE cut coincides with the backstop
-    #   (no tighter distance cut) so the new behavior is the TIME bound + recovery; drop
-    #   T toward the $7-8 candidate once measured to cut reversals earlier.
+    # v3.3.4 ships the mechanism flag-gated and DEFAULT OFF: the code is inert (live
+    # rally-boost exits are UNCHANGED) until the owner flips rally_pullback_enabled on
+    # after validating T/B against live data. Flip to True to activate.
+    rally_pullback_enabled: bool = False  # v3.3.4: DEFAULT OFF (opt-in until measured).
+    rally_pullback_tol_dollars: float = 7.50  # T: adverse $ vs entry (candidate $7-8 ->
+    #   $7.50). Must stay < the $13 hard backstop (rally_boost_sl); clamped to it. Within
+    #   T = hold (pullback); cross T = cut early at the threshold (reversal).
     rally_pullback_time_bound_min: float = 30.0  # B: minutes adverse (below/above entry)
     #   without returning to entry before a slow-reversal cut. 0 disables the time bound.
     tstop_fav: float = 1.00  # v2.7.1 loser time-stop: at hold expiry, market-close any
