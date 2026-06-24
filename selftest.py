@@ -149,6 +149,7 @@ STEP_NAMES = {
     99: "readiness resolver",
     100: "a3 1700 reschedule",
     101: "v336 no logic chg",
+    102: "monday gate strict",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3691,6 +3692,40 @@ class SelfTest:
             self._record(101, FAIL, f"raised: {e!r}"); return
         self._record(101, PASS if ok else FAIL, detail)
 
+    def _step_monday_gate_strict(self):
+        # 102 (v3.3.6 FIX): the Monday A1 cushion is gated STRICTLY on the broker
+        # weekday. The REMOVED AUREON_TEST_FORCE_MONDAY_A1 hook must have NO effect
+        # even when set in the environment -- proving the LIVE scheduler (which shares
+        # this exact resolver via _anchor_sched_utc / _process_anchor_if_due) places
+        # weekday A1 at 02:30 broker, NEVER an hour late. Monday still gets the 03:30
+        # cushion. This is the regression guard for the 99/101 failure.
+        import os as _os, anchors as _anchors
+        from datetime import date as _date, timedelta as _td
+        prev = _os.environ.get('AUREON_TEST_FORCE_MONDAY_A1')
+        try:
+            _os.environ['AUREON_TEST_FORCE_MONDAY_A1'] = '1'   # the leaked foot-gun
+            base = _date(2026, 6, 24); monday = base - _td(days=base.weekday())
+            tuesday = monday + _td(days=1)
+            wk = _anchors.resolved_anchor_hm('A1_02h_Asia', tuesday, 2, 30, self.cfg)
+            mon = _anchors.resolved_anchor_hm('A1_02h_Asia', monday, 2, 30, self.cfg)
+            env_ignored_weekday = (wk == (2, 30))   # 02:30 broker DESPITE the env var
+            monday_cushion = (mon == (3, 30))       # Monday still gets the cushion
+            ist_ok = (_anchors.anchor_ist_hm(*wk, self.cfg) == (5, 0)
+                      and _anchors.anchor_ist_hm(*mon, self.cfg) == (6, 0))
+            ok = env_ignored_weekday and monday_cushion and ist_ok
+            detail = (f"env_var_ignored_weekday_0230broker={env_ignored_weekday} "
+                      f"monday_cushion_0330broker={monday_cushion} "
+                      f"ist(wk05:00/mon06:00)={ist_ok}")
+        except Exception as e:
+            self._record(102, FAIL, f"raised: {e!r}")
+            return
+        finally:
+            if prev is None:
+                _os.environ.pop('AUREON_TEST_FORCE_MONDAY_A1', None)
+            else:
+                _os.environ['AUREON_TEST_FORCE_MONDAY_A1'] = prev
+        self._record(102, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -3882,6 +3917,7 @@ class SelfTest:
             self._step_readiness_derives_resolver()
             self._step_a3_scheduled_1700()
             self._step_v336_no_logic_change()
+            self._step_monday_gate_strict()
         finally:
             self._cleanup()
         return self._report(ts)
