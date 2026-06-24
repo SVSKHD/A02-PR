@@ -128,6 +128,52 @@ def break_and_hold_ok(self, shadow, plan):
             self.tele.info(f"📈 BREAK CONFIRMED {plan.boost_side} {anchor} "
                            f"@edge ${edge:.2f} — stacking")
             return True
+        # v3.3.5 CASE 2 override (RALLY only): the candle-structure gate would BLOCK
+        # here (FAILED/CANDIDATE), but if this move is in the SAME direction as the
+        # parent leg AND the parent is already deeply favorable (max_fav vs its entry
+        # >= parent_established_dollars), the break is a PROVEN continuation, not a
+        # fake spike -- fire anyway and log it loudly. The override ONLY loosens: a
+        # parent that is NOT established (< threshold) leaves the strict gate fully in
+        # force, so a fresh spike off a flat fill (Case 1, the -$701 loss) STILL
+        # BLOCKS. RESCUE never reaches here (it bypasses break-and-hold entirely).
+        if bool(getattr(self.cfg, 'parent_profit_override_enabled', True)):
+            parent_side = shadow.get('side') if hasattr(shadow, 'get') else None
+            parent_entry = float(shadow.get('entry_price'))
+            parent_maxfav_price = float(shadow.get('max_fav', parent_entry))
+            if parent_side == 'BUY':
+                parent_fav = parent_maxfav_price - parent_entry
+            elif parent_side == 'SELL':
+                parent_fav = parent_entry - parent_maxfav_price
+            else:
+                parent_fav = 0.0
+            threshold = float(getattr(self.cfg, 'parent_established_dollars', 20.0))
+            same_dir = (parent_side == plan.boost_side)
+            if same_dir and parent_fav >= threshold:
+                if plan.boost_side == 'SELL':
+                    move_dollars = edge - min(c['low'] for c in candles)
+                else:
+                    move_dollars = max(c['high'] for c in candles) - edge
+                msg = (f"🟢 BREAK OVERRIDE — parent established (+${parent_fav:.2f} "
+                       f">= ${threshold:.2f}) {plan.boost_side} {anchor} @edge "
+                       f"${edge:.2f}: candle gate said {result} ({reason}) but a "
+                       f"deep same-direction parent is a proven continuation — "
+                       f"FIRING (move ${move_dollars:.2f})")
+                log.info(msg)
+                try:
+                    self.tele.info(msg)
+                except Exception:
+                    pass
+                if tr is not None:
+                    try:
+                        tr.break_override_parent_established(
+                            anchor, side=plan.boost_side, break_level=round(edge, 2),
+                            reason=reason, parent_max_fav=round(parent_fav, 2),
+                            threshold=round(threshold, 2),
+                            move_dollars=round(move_dollars, 2),
+                            n_candles=len(candles), timeframe=tf)
+                    except Exception:
+                        pass
+                return True
         self.tele.info(f"🚫 BREAK {result} ({reason}) {anchor} {plan.boost_side} "
                        f"@edge ${edge:.2f} — no fire")
         return False

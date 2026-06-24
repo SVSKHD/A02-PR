@@ -711,9 +711,30 @@ History (one line per behavioral change):
          band: hold-within-T / cut-beyond-T / gap-floored-at-backstop / rescue-unaffected,
          proven with an enabled+tol=$8 override; 95 recover/time: recovery resets, B-min
          slow-reversal cut, ships-default-OFF inert). Banner v3.3.4.
+  3.3.5  CASE 2 FIX -- parent-profit override for the break-and-hold gate (RALLY only;
+         rally.break_and_hold_ok). The gate cannot tell Case 1 (fresh fake spike off a
+         flat fill -> reverses -> MUST block, the -$701 loss) from Case 2 (strong crash
+         the parent is already riding -> continues -> SHOULD fire): both look violent in
+         the first candles. Live A2 2026-06-24: parent SELL rode +$892 on a ~$32 plunge
+         but break-and-hold returned BREAK_FAILED (reversed/retrace) the whole way down,
+         so NO boost fired. The one reliable distinguisher: in Case 2 the PARENT is
+         already DEEPLY favorable in the SAME direction the boost fires. So on the
+         would-block path, IF the move is same-direction as the parent AND the parent's
+         favorable excursion (max_fav vs entry, $) >= parent_established_dollars, the
+         break is treated as CONFIRMED (a proven continuation) and the boost FIRES,
+         logging a loud BREAK_OVERRIDE_PARENT_ESTABLISHED PTRACE line (parent_max_fav,
+         threshold, move_dollars) for the trial. The override ONLY loosens: below the
+         threshold the strict candle gate is fully in force (Case 1 still blocks), and
+         an opposite-direction move never qualifies. Config: parent_profit_override_
+         enabled=True, parent_established_dollars=20.0 (TRIAL-CALIBRATED, NOT FINAL --
+         tunable without a rebuild). RESCUE untouched (bypasses break-and-hold; 10/8/8/
+         3.50, cap -$700). $13 rally SL / -$910 cap / fail-closed handler all unchanged.
+         selftest -> 98 steps (new 96 case2 override fires + logs; 97 case1 fresh spike
+         still blocks incl. $19.99 boundary; 98 opposite-dir no-override + rescue bypass/
+         SL/cap unchanged). Banner v3.3.5.
 """
 
-__version__ = "3.3.4"
+__version__ = "3.3.5"
 CODENAME = "Astra Hawk"
 
 

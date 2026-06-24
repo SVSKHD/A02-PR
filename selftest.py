@@ -141,6 +141,10 @@ STEP_NAMES = {
     # v3.3.4 rally pullback detector (hold within T / cut beyond T / time bound)
     94: "rally pullback band",
     95: "rally pullback recover/time",
+    # v3.3.5 CASE 2 parent-profit override (fires strong continuations the gate blocked)
+    96: "case2 override fires",
+    97: "case1 still blocks",
+    98: "override dir/rescue",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3245,18 +3249,34 @@ class SelfTest:
     # ------------------------------------------------------------------------
     # v3.3.3 — break-and-hold crash fix (numpy-safe + fail-closed); rally SL $13
     # ------------------------------------------------------------------------
-    def _break_gate_stub(self, getter, side='BUY', kind='RALLY', edge=100.0):
+    def _break_gate_stub(self, getter, side='BUY', kind='RALLY', edge=100.0,
+                         parent_side=None, parent_max_fav=0.0, cfg=None):
         # Minimal trader-like object for rally.break_and_hold_ok: the gate reads
-        # cfg + adapter.get_latest_m5 + tele, and getattr(self,'ptrace',None)->None.
+        # cfg + adapter.get_latest_m5 + tele + ptrace. parent_max_fav ($, default 0 ->
+        # NOT established, so the v3.3.5 override never applies for the legacy tests)
+        # is converted to a parent max_fav PRICE in the parent's direction.
         import types
         self._gate_tele_errors = []
+        self._gate_tele_infos = []
+        self._gate_ptrace = []
         adapter = types.SimpleNamespace(get_latest_m5=getter)
         tele = types.SimpleNamespace(
-            info=lambda *a, **k: None,
+            info=lambda m, *a, **k: self._gate_tele_infos.append(m),
             error=lambda m, *a, **k: self._gate_tele_errors.append(m))
-        shadow = {'leg_fill_price': edge, 'entry_price': edge, 'anchor_label': 'A2'}
+        psd = parent_side or side
+        sgn = 1.0 if psd == 'BUY' else -1.0
+        max_fav_price = edge + sgn * float(parent_max_fav)
+        shadow = {'leg_fill_price': edge, 'entry_price': edge, 'anchor_label': 'A2',
+                  'side': psd, 'max_fav': max_fav_price}
         plan = types.SimpleNamespace(boost_side=side, kind=kind)
-        tr = types.SimpleNamespace(cfg=self.cfg, adapter=adapter, tele=tele)
+        events = self._gate_ptrace
+        class _PT:
+            def __getattr__(self, name):
+                def _rec(anchor=None, **kw):
+                    events.append((name, kw)); return None
+                return _rec
+        tr = types.SimpleNamespace(cfg=cfg or self.cfg, adapter=adapter, tele=tele,
+                                   ptrace=_PT())
         return tr, shadow, plan
 
     def _step_break_gate_npsafe(self):
@@ -3478,6 +3498,98 @@ class SelfTest:
             self._record(95, FAIL, f"raised: {e!r}"); return
         self._record(95, PASS if ok else FAIL, detail)
 
+    # --- v3.3.5 CASE 2 parent-profit override --------------------------------
+    # A violent SAME-shape SELL crash that the candle gate calls FAILED 'reversed'
+    # (candle popped back above the edge): the ONLY difference between a fake spike
+    # (Case 1) and a genuine continuation (Case 2) is whether the PARENT leg is
+    # already deeply favorable in the boost direction.
+    def _case2_bars(self):
+        # SELL break at edge 100: cleared down to low 88 (>=$3), but candle 1's HIGH
+        # 101 popped back THROUGH the edge -> classify(SELL) == FAILED 'reversed'.
+        return [{'high': 101.0, 'low': 90.0, 'close': 91.0},
+                {'high': 99.0, 'low': 88.0, 'close': 89.0}]
+
+    def _step_case2_override_fires(self):
+        # 96 CASE 2: parent SELL already +$25 favorable (>= $20 threshold), violent
+        # same-direction crash the candle gate FAILS ('reversed') -> the parent-profit
+        # override FIRES the boost (returns True) and logs BREAK_OVERRIDE_PARENT_
+        # ESTABLISHED carrying parent_max_fav / threshold / move_dollars for the trial.
+        import rally as _rally, break_hold as _bh
+        try:
+            bars = self._case2_bars()
+            # confirm the candle gate alone WOULD block (FAILED 'reversed').
+            state, reason = _bh.classify('SELL', 100.0, bars, self.cfg)
+            gate_would_block = (state == _bh.FAILED)
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                               parent_side='SELL', parent_max_fav=25.0)
+            fired = (_rally.break_and_hold_ok(tr, sh, pl) is True)
+            ev = [e for e in self._gate_ptrace
+                  if e[0] == 'break_override_parent_established']
+            logged = len(ev) == 1
+            kw = ev[0][1] if logged else {}
+            fields_ok = (logged and abs(kw.get('parent_max_fav', 0) - 25.0) < 0.05
+                         and abs(kw.get('threshold', 0) - 20.0) < 0.05
+                         and abs(kw.get('move_dollars', 0) - 12.0) < 0.05)
+            loud = any('OVERRIDE' in str(m) for m in self._gate_tele_infos)
+            ok = gate_would_block and fired and logged and fields_ok and loud
+            detail = (f"gate_would_block={gate_would_block} override_fires={fired} "
+                      f"ptrace_logged={logged} fields(maxfav/thr/move)={fields_ok} "
+                      f"loud_tele={loud}")
+        except Exception as e:
+            self._record(96, FAIL, f"raised: {e!r}"); return
+        self._record(96, PASS if ok else FAIL, detail)
+
+    def _step_case1_still_blocks(self):
+        # 97 CASE 1: the IDENTICAL violent shape, but the parent is NOT established
+        # (max_fav +$10 < $20) -> the override does NOT apply, the strict gate is fully
+        # in force, and the fresh spike STILL BLOCKS (returns False). This is the -$701
+        # fake-spike path: it must never fire just because the move looked violent.
+        import rally as _rally
+        try:
+            bars = self._case2_bars()
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                               parent_side='SELL', parent_max_fav=10.0)
+            blocked = (_rally.break_and_hold_ok(tr, sh, pl) is False)
+            no_override = not any(e[0] == 'break_override_parent_established'
+                                  for e in self._gate_ptrace)
+            # boundary: just below threshold ($19.99) still blocks (>= is the gate).
+            tr2, sh2, pl2 = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                                  parent_side='SELL', parent_max_fav=19.99)
+            boundary_blocks = (_rally.break_and_hold_ok(tr2, sh2, pl2) is False)
+            ok = blocked and no_override and boundary_blocks
+            detail = (f"fresh_spike_blocks={blocked} no_override_logged={no_override} "
+                      f"below_threshold_19.99_blocks={boundary_blocks}")
+        except Exception as e:
+            self._record(97, FAIL, f"raised: {e!r}"); return
+        self._record(97, PASS if ok else FAIL, detail)
+
+    def _step_override_dir_and_rescue(self):
+        # 98: the override is DIRECTIONAL and RALLY-only. (a) parent deeply established
+        # (+$25) but the move is OPPOSITE the parent (parent BUY, boost SELL) -> override
+        # does NOT apply, gate BLOCKS. (b) RESCUE is untouched: it bypasses break-and-
+        # hold entirely (rescue_bypass_break_and_hold True) and its SL/cap math
+        # ($10 / -$700) is unchanged by this version.
+        import rally as _rally, boosts as _boosts
+        try:
+            bars = self._case2_bars()
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                               parent_side='BUY', parent_max_fav=25.0)
+            opp_blocked = (_rally.break_and_hold_ok(tr, sh, pl) is False)
+            opp_no_override = not any(e[0] == 'break_override_parent_established'
+                                      for e in self._gate_ptrace)
+            rescue_bypass = bool(getattr(self.cfg, 'rescue_bypass_break_and_hold', True))
+            rescue_plan = _boosts.plan_boost_event('BUY', 4000.0, 4000.0 - 10.0, self.cfg)
+            rescue_sl_ok = abs(float(rescue_plan.sl_dollars) - 10.0) < 1e-9
+            rescue_cap = _boosts.boost_whipsaw_cap(self.cfg, 'RESCUE')
+            cap_ok = abs(rescue_cap - 700.0) < 1e-6
+            ok = opp_blocked and opp_no_override and rescue_bypass and rescue_sl_ok and cap_ok
+            detail = (f"opposite_dir_blocks={opp_blocked} no_override={opp_no_override} "
+                      f"rescue_bypass={rescue_bypass} rescue_sl$10={rescue_sl_ok} "
+                      f"rescue_cap_unchanged={cap_ok}")
+        except Exception as e:
+            self._record(98, FAIL, f"raised: {e!r}"); return
+        self._record(98, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -3659,6 +3771,11 @@ class SelfTest:
             # v3.3.4 — rally pullback detector (hold within T / cut beyond T / time bound)
             self._step_rally_pullback_band()
             self._step_rally_pullback_recover_time()
+            # v3.3.5 — CASE 2 parent-profit override (fires strong same-dir continuations
+            # the candle gate blocks; Case 1 fresh spike still blocks; dir/rescue guards)
+            self._step_case2_override_fires()
+            self._step_case1_still_blocks()
+            self._step_override_dir_and_rescue()
         finally:
             self._cleanup()
         return self._report(ts)

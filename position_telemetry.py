@@ -70,6 +70,10 @@ BREAK_EVAL = "BREAK_EVAL"
 BREAK_CANDIDATE = "BREAK_CANDIDATE"
 BREAK_CONFIRMED = "BREAK_CONFIRMED"
 BREAK_FAILED = "BREAK_FAILED"
+# v3.3.5 CASE 2 fix: parent-profit override fired a rally boost the candle-structure
+# gate would have BLOCKED, because the parent leg is already deeply established in the
+# same direction (a proven continuation, not a fake spike).
+BREAK_OVERRIDE_PARENT_ESTABLISHED = "BREAK_OVERRIDE_PARENT_ESTABLISHED"
 CONTINUATION_STACK = "CONTINUATION_STACK"
 FP_GUARD = "FP_GUARD"
 FP_GUARD_EVAL = "FP_GUARD_EVAL"
@@ -208,6 +212,8 @@ class PositionTracer:
     def break_candidate(self, anchor, **kw): return self.emit(BREAK_CANDIDATE, None, anchor, **kw)
     def break_confirmed(self, anchor, **kw): return self.emit(BREAK_CONFIRMED, None, anchor, **kw)
     def break_failed(self, anchor, **kw):  return self.emit(BREAK_FAILED, None, anchor, **kw)
+    def break_override_parent_established(self, anchor, **kw):
+        return self.emit(BREAK_OVERRIDE_PARENT_ESTABLISHED, None, anchor, **kw)
     def continuation_stack(self, anchor, **kw): return self.emit(CONTINUATION_STACK, None, anchor, **kw)
     def fp_guard(self, anchor="SYS", **kw): return self.emit(FP_GUARD_EVAL, None, anchor, **kw)
     def stack_complete(self, ticket, anchor, **kw): return self.emit(STACK_COMPLETE, ticket, anchor, **kw)
