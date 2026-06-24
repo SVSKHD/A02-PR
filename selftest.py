@@ -134,6 +134,10 @@ STEP_NAMES = {
     # v3.3.0 rally rides (peak-gap trail, not flat lock) + no sub-floor clip
     89: "rally rides not bails",
     90: "rally no subfloor clip",
+    # v3.3.3 break-and-hold crash fix + fail-closed; rally SL $13 / cap -$910
+    91: "break gate np-safe",
+    92: "break gate failclosed",
+    93: "rally sl13 cap910",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3236,6 +3240,135 @@ class SelfTest:
         self._record(90, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
+    # v3.3.3 — break-and-hold crash fix (numpy-safe + fail-closed); rally SL $13
+    # ------------------------------------------------------------------------
+    def _break_gate_stub(self, getter, side='BUY', kind='RALLY', edge=100.0):
+        # Minimal trader-like object for rally.break_and_hold_ok: the gate reads
+        # cfg + adapter.get_latest_m5 + tele, and getattr(self,'ptrace',None)->None.
+        import types
+        self._gate_tele_errors = []
+        adapter = types.SimpleNamespace(get_latest_m5=getter)
+        tele = types.SimpleNamespace(
+            info=lambda *a, **k: None,
+            error=lambda m, *a, **k: self._gate_tele_errors.append(m))
+        shadow = {'leg_fill_price': edge, 'entry_price': edge, 'anchor_label': 'A2'}
+        plan = types.SimpleNamespace(boost_side=side, kind=kind)
+        tr = types.SimpleNamespace(cfg=self.cfg, adapter=adapter, tele=tele)
+        return tr, shadow, plan
+
+    def _step_break_gate_npsafe(self):
+        # 91 (FIX 1A): feed the gate a NUMPY structured array of M5 bars -- the exact
+        # array-shaped input that made `if bars:` raise "truth value of an array ...
+        # is ambiguous" (live A2 2026-06-24). Assert: (a) it evaluates WITHOUT raising
+        # and (b) returns the correct decision -- a CONFIRMED break fires (True) and an
+        # EXHAUSTED move (spike then reverse through the edge) does NOT fire (False).
+        import numpy as np
+        import rally as _rally
+        try:
+            dt = [('high', 'f8'), ('low', 'f8'), ('close', 'f8')]
+            # CONFIRMED: cleared edge 100 by +$5 (peak 105), held 2 candles, retrace
+            # ~0.3 of the break (< max_retrace_y 0.40) -> fires.
+            confirmed_bars = np.array([(104.0, 103.5, 103.8),
+                                       (105.0, 104.0, 104.8)], dtype=dt)
+            # EXHAUSTED: spike to 105 then candle 2 falls back THROUGH the edge
+            # (low 98 < 100) -> FAILED 'reversed' -> no fire.
+            exhausted_bars = np.array([(105.0, 100.5, 101.0),
+                                       (101.0, 98.0, 98.0)], dtype=dt)
+            tr_c, sh_c, pl_c = self._break_gate_stub(lambda s, n: confirmed_bars)
+            tr_e, sh_e, pl_e = self._break_gate_stub(lambda s, n: exhausted_bars)
+            confirmed_fires = (_rally.break_and_hold_ok(tr_c, sh_c, pl_c) is True)
+            exhausted_no_fire = (_rally.break_and_hold_ok(tr_e, sh_e, pl_e) is False)
+            # _has_rows must be numpy-safe directly too (the bug's root call).
+            np_safe = (_rally._has_rows(confirmed_bars) is True
+                       and _rally._has_rows(np.array([], dtype=dt)) is False
+                       and _rally._has_rows(None) is False)
+            ok = confirmed_fires and exhausted_no_fire and np_safe
+            detail = (f"confirmed_fires={confirmed_fires} "
+                      f"exhausted_no_fire={exhausted_no_fire} np_safe_no_raise={np_safe}")
+        except Exception as e:
+            self._record(91, FAIL, f"raised: {e!r}"); return
+        self._record(91, PASS if ok else FAIL, detail)
+
+    def _step_break_gate_failclosed(self):
+        # 92 (FIX 1B): simulate the gate RAISING (the bars getter throws). The old
+        # handler logged "non-fatal, allowing" and returned True (fired into the fake
+        # break -> the -$701 loss). Now it FAILS CLOSED: returns False (BLOCKED) and
+        # logs loudly via tele.error. RALLY only (rescue bypasses the gate entirely,
+        # asserted by step 80).
+        import rally as _rally
+        try:
+            def _boom(symbol, count):
+                raise ValueError("The truth value of an array with more than one "
+                                 "element is ambiguous. Use a.any() or a.all()")
+            tr, sh, pl = self._break_gate_stub(_boom)
+            blocked = (_rally.break_and_hold_ok(tr, sh, pl) is False)
+            loud = any('BLOCKED' in str(m) for m in self._gate_tele_errors)
+            # disabled gate still short-circuits to True (no regression).
+            import dataclasses
+            tr2, sh2, pl2 = self._break_gate_stub(_boom)
+            tr2.cfg = dataclasses.replace(self.cfg, break_and_hold_enabled=False)
+            disabled_allows = (_rally.break_and_hold_ok(tr2, sh2, pl2) is True)
+            ok = blocked and loud and disabled_allows
+            detail = (f"gate_exception_blocked={blocked} logged_loud_BLOCKED={loud} "
+                      f"disabled_still_allows={disabled_allows}")
+        except Exception as e:
+            self._record(92, FAIL, f"raised: {e!r}"); return
+        self._record(92, PASS if ok else FAIL, detail)
+
+    def _step_rally_sl13_cap910(self):
+        # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
+        # cap -$700 -- per-kind, never one shared value. Asserts the plan SL, the live
+        # backstop geometry (entry +/- the kind's SL), and the per-kind cap math.
+        import boosts as _boosts
+        from strategy import Position, update_position_on_bar
+        try:
+            cfg = self.cfg
+            r_sl = float(getattr(cfg, 'rally_boost_sl', 13.0))
+            x_sl = float(getattr(cfg, 'boost_sl_dollars', 10.0))
+            lot = float(getattr(cfg, 'lot_size', 0.35))
+            con = float(getattr(cfg, 'contract_size', 100.0))
+            n = int(getattr(cfg, 'rescue_boost_count', 2))
+            fill = 4000.0
+            # (a) plan SL is per-kind: RALLY +$5 -> $13, RESCUE -$10 -> $10.
+            rally_plan = _boosts.plan_boost_event('BUY', fill, fill + 5.0, cfg)
+            rescue_plan = _boosts.plan_boost_event('BUY', fill, fill - 10.0, cfg)
+            plan_sl_ok = (rally_plan is not None and abs(rally_plan.sl_dollars - 13.0) < 1e-9
+                          and rescue_plan is not None and abs(rescue_plan.sl_dollars - 10.0) < 1e-9)
+            # (b) live backstop geometry: a benign bar ratchets current_sl to the
+            #     kind's backstop = entry -/+ SL (BUY -> entry - SL).
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            pr = Position(anchor_label='T', side='BUY', entry_price=entry, entry_time=ts0,
+                          current_sl=50.0, tp_level=entry + 30.0, max_fav=entry,
+                          lot=lot, role='rescue', boost=True, boost_kind='RALLY')
+            update_position_on_bar(pr, pd.Series({'open': 100, 'high': 101, 'low': 99, 'close': 100}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            rally_backstop_ok = (not pr.closed and abs(pr.current_sl - (entry - r_sl)) < 1e-6)
+            px = Position(anchor_label='T', side='BUY', entry_price=entry, entry_time=ts0,
+                          current_sl=50.0, tp_level=entry + 30.0, max_fav=entry,
+                          lot=lot, role='rescue', boost=True, boost_kind='RESCUE')
+            update_position_on_bar(px, pd.Series({'open': 100, 'high': 101, 'low': 99, 'close': 100}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            rescue_backstop_ok = (not px.closed and abs(px.current_sl - (entry - x_sl)) < 1e-6)
+            # (c) per-kind whipsaw cap: RALLY -$910, RESCUE -$700.
+            rally_cap = _boosts.boost_whipsaw_cap(cfg, 'RALLY')
+            rescue_cap = _boosts.boost_whipsaw_cap(cfg, 'RESCUE')
+            cap_ok = (abs(rally_cap - (n * r_sl * lot * con)) < 1e-6 and abs(rally_cap - 910.0) < 1e-6
+                      and abs(rescue_cap - (n * x_sl * lot * con)) < 1e-6 and abs(rescue_cap - 700.0) < 1e-6)
+            breach_ok = (_boosts.cap_breached(-915.0, cfg, 'RALLY') is True
+                         and _boosts.cap_breached(-905.0, cfg, 'RALLY') is False
+                         and _boosts.cap_breached(-715.05, cfg, 'RESCUE') is True
+                         and _boosts.cap_breached(-650.0, cfg) is False)  # default kind = RESCUE
+            ok = (plan_sl_ok and rally_backstop_ok and rescue_backstop_ok and cap_ok and breach_ok)
+            detail = (f"plan_sl(rally13/rescue10)={plan_sl_ok} "
+                      f"rally_backstop=entry-{r_sl:.0f}={rally_backstop_ok} "
+                      f"rescue_backstop=entry-{x_sl:.0f}={rescue_backstop_ok} "
+                      f"caps(rally${rally_cap:.0f}/rescue${rescue_cap:.0f})={cap_ok} breach={breach_ok}")
+        except Exception as e:
+            self._record(93, FAIL, f"raised: {e!r}"); return
+        self._record(93, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
     def _preflight(self) -> bool:
@@ -3409,6 +3542,10 @@ class SelfTest:
             # v3.3.0 — rally rides not bails + no sub-floor clip (PTRACE defect fix)
             self._step_rally_rides_not_bails()
             self._step_rally_no_subfloor_clip()
+            # v3.3.3 — break-and-hold crash fix + fail-closed; rally SL $13 / cap -$910
+            self._step_break_gate_npsafe()
+            self._step_break_gate_failclosed()
+            self._step_rally_sl13_cap910()
         finally:
             self._cleanup()
         return self._report(ts)

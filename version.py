@@ -666,9 +666,34 @@ History (one line per behavioral change):
          --force-window. No boost/rally/rescue number changed. selftest -> 90 steps
          (87 rewritten: default still refuses within 30 min, --force-window clears the
          rail-4 refusal while rails 1/2/3 still refuse their cases). Banner v3.3.1.
+  3.3.3  TWO fixes. (1 CRITICAL) break-and-hold gate crash + FAIL CLOSED. Live A2
+         2026-06-24: rally SELL boosts fired at the +$5 trigger at a move BOTTOM,
+         price reversed up, both hit SL for -$701. ROOT CAUSE: the break-and-hold
+         gate (rally.break_and_hold_ok) crashed on a numpy ambiguous-truth ValueError
+         ("truth value of an array with more than one element is ambiguous") because
+         the M5 bars container was tested with `if bars:` / `not bars` -- and the
+         handler DEFAULTED TO ALLOWING ("non-fatal, allowing"). FIX 1A: bars
+         truthiness now goes through _has_rows (length-based, safe for list AND numpy
+         array) so the gate evaluates without raising -- a rally boost fires ONLY on a
+         CONFIRMED break (edge cleared by break_dist_x + held hold_candles_n M5
+         candles + retrace < max_retrace_y), not on an exhausted spike. FIX 1B: the
+         exception handler now FAILS CLOSED -- any gate error BLOCKS the fire (no
+         boost) and logs loudly as 'RALLY BOOST BLOCKED', never 'allowing'. RALLY
+         only; RESCUE still bypasses break-and-hold by design (rescue_bypass_break_
+         and_hold). (2 owner choice) RALLY boost hard SL/backstop 10 -> 13
+         (rally_boost_sl=13.0; RALLY ONLY). RESCUE SL stays $10 (boost_sl_dollars
+         unchanged). The whipsaw cap is now PER-KIND (boosts.boost_sl_for): RALLY
+         2 x $13 x 0.35 x 100 = -$910, RESCUE 2 x $10 x 0.35 x 100 = -$700 -- the cap
+         reads the firing event's kind, never one shared value. Everything else on
+         rally unchanged: fire +$5, trail peak-$2, entry+$3 floor, one-way ratchet --
+         SL width only. RESCUE DO NOT TOUCH: arm $8 / lock $8 / gap $3.50 / SL $10 /
+         free-fire on commit / cap -$700 -- asserted unchanged. selftest -> new gate
+         array-input (no raise), gate-exception fail-closed (BLOCKED), exhausted-move
+         no-fire vs confirmed-break fires; rally SL $13 / backstop +/-$13 / cap -$910;
+         rescue SL $10 / cap -$700 unchanged. Banner v3.3.3.
 """
 
-__version__ = "3.3.1"
+__version__ = "3.3.3"
 CODENAME = "Astra Hawk"
 
 
