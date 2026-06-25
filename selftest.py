@@ -150,6 +150,10 @@ STEP_NAMES = {
     100: "a3 1700 reschedule",
     101: "v336 no logic chg",
     102: "monday gate strict",
+    # v3.3.8 5th anchor A5 at 22:00 IST (identical structure; journal-isolated)
+    103: "five anchors times",
+    104: "anchor no collide",
+    105: "a5 identical + fp5",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3726,6 +3730,112 @@ class SelfTest:
                 _os.environ['AUREON_TEST_FORCE_MONDAY_A1'] = prev
         self._record(102, PASS if ok else FAIL, detail)
 
+    # --- v3.3.8 5th anchor A5 @ 22:00 IST ------------------------------------
+    def _step_five_anchors_times(self):
+        # 103: the anchor list is exactly 5 (A1-A5) at the correct broker + IST times:
+        # A1 02:30/05:00 (Mon 03:30/06:00), A2 10:00/12:30, A3 14:30/17:00,
+        # A4 16:40/19:10, A5 19:30/22:00. A5 is the new one; A1-A4 unchanged.
+        import anchors as _anchors
+        from datetime import date as _date, timedelta as _td
+        try:
+            amap = {lbl: (h, m) for (lbl, h, m) in self.cfg.anchors}
+            labels = [lbl for (lbl, _, _) in self.cfg.anchors]
+            prefixes = [l[:2] for l in labels]
+            five = (len(self.cfg.anchors) == 5 and prefixes == ['A1', 'A2', 'A3', 'A4', 'A5'])
+            def by(p): return next(l for l in labels if l[:2] == p)
+            a1, a2, a3, a4, a5 = by('A1'), by('A2'), by('A3'), by('A4'), by('A5')
+            def ist(lbl):
+                h, m = amap[lbl]; return _anchors.anchor_ist_hm(h, m, self.cfg)
+            times_ok = (amap[a1] == (2, 30) and ist(a1) == (5, 0)
+                        and amap[a2] == (10, 0) and ist(a2) == (12, 30)
+                        and amap[a3] == (14, 30) and ist(a3) == (17, 0)
+                        and amap[a4] == (16, 40) and ist(a4) == (19, 10)
+                        and amap[a5] == (19, 30) and ist(a5) == (22, 0))
+            a5_2200 = (a5 == 'A5_1930_LateUS' and amap[a5] == (19, 30) and ist(a5) == (22, 0))
+            a3_1700 = (amap[a3] == (14, 30) and ist(a3) == (17, 0))
+            # Monday: only A1 shifts to 03:30/06:00; A5 stays 19:30/22:00.
+            base = _date(2026, 6, 24); monday = base - _td(days=base.weekday())
+            mon_a1 = _anchors.resolved_anchor_hm(a1, monday, amap[a1][0], amap[a1][1], self.cfg)
+            mon_a5 = _anchors.resolved_anchor_hm(a5, monday, amap[a5][0], amap[a5][1], self.cfg)
+            monday_ok = (mon_a1 == (3, 30) and mon_a5 == (19, 30))
+            ok = five and times_ok and a5_2200 and a3_1700 and monday_ok
+            detail = (f"five_anchors={five} times_ok={times_ok} a5_2200IST={a5_2200} "
+                      f"a3_still_1700={a3_1700} monday(A1=0330,A5=1930)={monday_ok}")
+        except Exception as e:
+            self._record(103, FAIL, f"raised: {e!r}"); return
+        self._record(103, PASS if ok else FAIL, detail)
+
+    def _step_anchor_no_collision(self):
+        # 104: NO collision among the 5 anchors -- the minimum pairwise gap (with the
+        # 24h wrap, on BOTH a weekday and Monday) is well clear of testfire_collision_
+        # min; A4<->A5 is 2h50m. The rail-4 guard (testfire.minutes_to_nearest_anchor)
+        # handles all 5 without error. If any pair collided this FAILS loudly.
+        import anchors as _anchors, testfire as _tf
+        from datetime import date as _date, timedelta as _td
+        try:
+            def min_gap(broker_date):
+                mins = sorted(sum(_anchors.resolved_anchor_hm(l, broker_date, h, m, self.cfg)[i] * (60 if i == 0 else 1)
+                                  for i in (0, 1)) for (l, h, m) in self.cfg.anchors)
+                g = []
+                for i in range(len(mins)):
+                    d = (mins[(i + 1) % len(mins)] - mins[i]) % 1440
+                    g.append(min(d, 1440 - d))
+                return min(g)
+            base = _date(2026, 6, 24); monday = base - _td(days=base.weekday()); tuesday = monday + _td(days=1)
+            min_wk = min_gap(tuesday); min_mon = min_gap(monday)
+            COLL = int(getattr(self.cfg, 'testfire_collision_min', 30))
+            no_collision = (min_wk > COLL and min_mon > COLL and min_wk >= 60 and min_mon >= 60)
+            a4 = next((h, m) for (l, h, m) in self.cfg.anchors if l[:2] == 'A4')
+            a5 = next((h, m) for (l, h, m) in self.cfg.anchors if l[:2] == 'A5')
+            a4a5 = abs((a5[0] * 60 + a5[1]) - (a4[0] * 60 + a4[1]))
+            a4a5_ok = (a4a5 == 170)   # 2h50m
+            rail4_ok = (_tf.minutes_to_nearest_anchor(self.cfg, pd.Timestamp('2026-06-24T12:00:00Z')) is not None)
+            ok = no_collision and a4a5_ok and rail4_ok
+            detail = (f"min_gap_weekday={min_wk}m monday={min_mon}m (>{COLL}) "
+                      f"A4<->A5={a4a5}m(2h50m)={a4a5_ok} rail4_guard_5anchors={rail4_ok}")
+        except Exception as e:
+            self._record(104, FAIL, f"raised: {e!r}"); return
+        self._record(104, PASS if ok else FAIL, detail)
+
+    def _step_a5_identical_fp5(self):
+        # 105: A5 uses IDENTICAL logic (no special-casing) and the FP guard handles 5
+        # anchors. A5: label[:2]=='A5', shares the same SL $18 / TP $30 / lot 0.35
+        # knobs as every anchor, NO Monday override (only A1), and a real defer wait.
+        # FP guard: per-stack worst-case = n legs (anchor-count agnostic) and the result
+        # is INVARIANT to how many anchors are configured (it caps the STACK, and total
+        # exposure is bounded per anchor since the 5 fire 2h+ apart, never overlapping).
+        import anchors as _anchors, fp_guard as _fp, dataclasses, live_trader as _lt
+        from datetime import date as _date, timedelta as _td
+        try:
+            a5 = next(l for (l, _, _) in self.cfg.anchors if l[:2] == 'A5')
+            shared_ok = (a5 == 'A5_1930_LateUS'
+                         and float(self.cfg.sl_dist) == 18.0
+                         and float(self.cfg.tp_dist) == 30.0
+                         and float(self.cfg.lot_size) == 0.35)
+            base = _date(2026, 6, 24); monday = base - _td(days=base.weekday())
+            no_override = (_anchors.resolved_anchor_hm(a5, monday, 19, 30, self.cfg) == (19, 30))
+            defer_ok = ('A5_1930_LateUS' in _lt.LiveTrader.DEFER_WAIT_BY_ANCHOR)
+            # FP guard handles 5 anchors:
+            bal = 50000.0
+            per = _fp.per_leg_loss_usd(self.cfg.lot_size, _fp.effective_sl_dist(self.cfg), 100.0)
+            g5 = _fp.guard_cfg(5, self.cfg, bal)
+            fp_wc_ok = abs(g5[1] - 5 * per) < 0.01                 # worst-case = 5 legs
+            fp_action_valid = g5[0] in (_fp.OK, _fp.REDUCE, _fp.BLOCK)
+            fp_allowed_bound = (0 <= g5[3] <= 5)
+            fp_ok_iff_within = ((g5[0] == _fp.OK) == (g5[1] <= g5[2]))  # OK iff worst-case <= limit
+            # invariant to anchor count: the guard ignores the anchor list entirely.
+            cfg4 = dataclasses.replace(self.cfg, anchors=list(self.cfg.anchors[:4]))
+            fp_invariant = (_fp.guard_cfg(5, cfg4, bal) == g5)
+            fp_handles_5 = (fp_wc_ok and fp_action_valid and fp_allowed_bound
+                            and fp_ok_iff_within and fp_invariant)
+            ok = shared_ok and no_override and defer_ok and fp_handles_5
+            detail = (f"A5_shared_knobs(SL18/TP30/lot0.35)={shared_ok} no_monday_override={no_override} "
+                      f"defer_wait={defer_ok} fp_guard_handles_5={fp_handles_5} "
+                      f"(wc=${g5[1]:.0f} lim=${g5[2]:.0f} act={g5[0]} allowed={g5[3]})")
+        except Exception as e:
+            self._record(105, FAIL, f"raised: {e!r}"); return
+        self._record(105, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -3918,6 +4028,10 @@ class SelfTest:
             self._step_a3_scheduled_1700()
             self._step_v336_no_logic_change()
             self._step_monday_gate_strict()
+            # v3.3.8 — 5th anchor A5 @ 22:00 IST (identical structure; no collision)
+            self._step_five_anchors_times()
+            self._step_anchor_no_collision()
+            self._step_a5_identical_fp5()
         finally:
             self._cleanup()
         return self._report(ts)

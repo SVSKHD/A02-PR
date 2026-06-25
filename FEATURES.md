@@ -25,7 +25,7 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
 ---
 
 ## CORE STRATEGY (unchanged)
-- 4 daily anchors IST: A1 5:00 (Mon 6:00 override), A2 12:30, A3 17:00 (v3.3.6: was 16:20), A4 19:10.
+- 5 daily anchors IST: A1 5:00 (Mon 6:00 override), A2 12:30, A3 17:00 (v3.3.6: was 16:20), A4 19:10, A5 22:00 (v3.3.8).
 - Straddle: buy stop = anchor +$5, sell stop = anchor -$5. Lot configurable.
 - Per leg: SL $18, TP $30. No-OCO (sibling stays live as rescue-capable).
 - Kill switch -3%. EOD flatten -> Firebase. Discord = sole alert channel.

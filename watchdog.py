@@ -391,7 +391,7 @@ class Watchdog:
             f"💰 Realized P&L: `${status.get('daily_pnl_realized', 0):.2f}`",
             f"📈 Open positions: `{status.get('open_positions', 0)}`",
             f"📋 Pending orders: `{status.get('pending_orders', 0)}`",
-            f"⚓ Anchors today: `{len(anchors)}/4`",
+            f"⚓ Anchors today: `{len(anchors)}/5`",   # v3.3.8: 5 anchors (A1-A5)
             f"   {', '.join(anchors) if anchors else '(none yet)'}",
             f"💓 Heartbeat: {hb_str}",
         ]

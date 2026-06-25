@@ -23,9 +23,11 @@ sibling stays live after the first fill, so a reversal can second-fill.
 - **SL $18 · TP $30.** First fill starts a **45-minute hold** (no trail exits
   inside the hold; SL / TP / ladder stay live).
 - **Anchors (broker = UTC+3 / IST):** A1 02:30 / 5:00 AM · A2 10:00 / 12:30 PM ·
-  A3 14:30 / 5:00 PM · A4 16:40 / 7:10 PM. On **Mondays only**, A1 fires at 03:30
-  broker / 6:00 AM IST (cold-start cushion; `cfg.monday_a1_override`). _(v3.3.6: A3
-  retimed 16:20 → 17:00 IST; label `A3_1430_Overlap` isolates the trial in the journal.)_
+  A3 14:30 / 5:00 PM · A4 16:40 / 7:10 PM · A5 19:30 / 10:00 PM. On **Mondays only**,
+  A1 fires at 03:30 broker / 6:00 AM IST (cold-start cushion; `cfg.monday_a1_override`).
+  _(v3.3.6: A3 retimed → 17:00 IST. v3.3.8: 5th anchor A5 `A5_1930_LateUS` added at
+  22:00 IST — identical structure; each anchor's trades are journal-tagged A1–A5 for
+  isolated month-end P&L.)_
 - **Ladder (one-way ratchet).** NORMAL leg: +$2.5 → BE · +$6 → lock +$4 · +$10 →
   trail peak−$2 (floor +$8). RESCUE leg: only the +$10 tier.
 - **$10 fleet trigger.** When a leg is −$10, the sibling fill becomes a RESCUE leg
