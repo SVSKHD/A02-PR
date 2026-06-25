@@ -443,6 +443,7 @@ def run_month(ticks_df: pd.DataFrame, year: int, month: int, cfg: Config) -> Dic
             'A2': round(a_net.get('A2_10h_London', 0.0), 2),
             'A3': round(a_net.get('A3_1430_Overlap', 0.0), 2),  # v3.3.6: A3 17:00 IST label
             'A4': round(a_net.get('A4_1640_NYopen', 0.0), 2),
+            'A5': round(a_net.get('A5_1930_LateUS', 0.0), 2),  # v3.3.8: A5 22:00 IST
             'day_net': round(daily_pnl, 2),
             'cumulative': round(equity - cfg.starting_balance, 2),
             'running_max_dd': round(max_dd_usd, 2),

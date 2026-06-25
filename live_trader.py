@@ -121,6 +121,7 @@ class LiveTrader:
         'A2_10h_London': 30,
         'A3_1430_Overlap': 15,   # v3.3.6: A3 retimed 16:20 -> 17:00 IST (label re-encoded)
         'A4_1640_NYopen': 30,
+        'A5_1930_LateUS': 30,   # v3.3.8: 22:00 IST US-session anchor (like A4)
     }
     DEFER_WAIT_DEFAULT = 15
 
@@ -1039,7 +1040,7 @@ class LiveTrader:
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
             f"Boost RALLY: `{_boost_n}x SL ${_rally_sl:.0f}` | trail `${_rally_gap:.2f}` | cap `-${_rally_cap:.0f}` · RESCUE: `SL ${_boost_sl:.0f}` | gap `${_boost_gap:.2f}` | cap `-${_whip_cap:.0f}` | isolated\n"
             f"{_alert_line}\n"
-            f"Defer waits: A1/A3=15s, A2/A4=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
+            f"Defer waits: A1/A3=15s, A2/A4/A5=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
             f"v3.0.0: `rescue=twin-open guard` | `boost-diag v2` | `13-module split`\n"
             f"Modules ({len(LOADED_MODULES)}): `{' '.join(LOADED_MODULES)}`"
             + fp_cap_label,

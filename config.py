@@ -268,6 +268,14 @@ class Config:
         # stays 'A3' so all per-anchor logic is unaffected.
         ("A3_1430_Overlap", 14, 30),
         ("A4_1640_NYopen", 16, 40),
+        # v3.3.8: 5th anchor A5 at 22:00 IST = 19:30 broker (UTC+3; IST = broker +
+        # 2:30). A NORMAL anchor -- identical structure to A1-A4 (straddle +/-$5,
+        # SL $18 / TP $30 / lot 0.35 from the shared cfg knobs, same boost / rescue /
+        # gate / pullback logic); a timing addition only, no special rules. Its own
+        # label A5_1930_LateUS tags its trades distinctly so it is isolated and judged
+        # on its own P&L + drawdown at month-end. Nearest neighbour A4 19:10 IST is
+        # 2h50m clear (no collision). label[:2] == 'A5'.
+        ("A5_1930_LateUS", 19, 30),
     ])
     # Monday cold-start cushion. Forex opens Mon 00:00 broker; A1 at 02:30 is only
     # 2.5h after week-open, when the Monday offset re-detect + still-thin M5 history

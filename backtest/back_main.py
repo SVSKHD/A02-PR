@@ -128,13 +128,13 @@ def main(argv):
     _r_on = "on" if getattr(cfg, 'rally_boosts_enabled', True) else "off"
     _s_on = "on" if getattr(cfg, 'rescue_boosts_enabled', True) else "off"
     out(f"boosts: RALLY={_r_on} RESCUE={_s_on}")
-    out("=" * 92)
+    out("=" * 104)
 
     # DAY-BY-DAY table
-    hdr = f"{'date':<12} {'A1':>10} {'A2':>10} {'A3':>10} {'A4':>10} " \
+    hdr = f"{'date':<12} {'A1':>10} {'A2':>10} {'A3':>10} {'A4':>10} {'A5':>10} " \
           f"{'day_net':>11} {'cumulative':>12} {'max_DD':>11}"
     out(hdr)
-    out("-" * 92)
+    out("-" * 104)
     for r in day_rows:
         note = ""
         if r['is_monday'] and r['mon_a1_time'] == '03:30':
@@ -142,9 +142,9 @@ def main(argv):
         elif r['kill']:
             note = "  KILL"
         out(f"{r['date']:<12} {r['A1']:>10.2f} {r['A2']:>10.2f} {r['A3']:>10.2f} "
-            f"{r['A4']:>10.2f} {r['day_net']:>11.2f} {r['cumulative']:>12.2f} "
-            f"{r['running_max_dd']:>11.2f}{note}")
-    out("-" * 92)
+            f"{r['A4']:>10.2f} {r['A5']:>10.2f} {r['day_net']:>11.2f} "
+            f"{r['cumulative']:>12.2f} {r['running_max_dd']:>11.2f}{note}")
+    out("-" * 104)
 
     # Per-anchor monthly totals + win rate
     out()

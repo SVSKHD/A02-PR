@@ -771,9 +771,25 @@ History (one line per behavioral change):
          selftest -> 102 steps (new 102 monday-gate-strict: env var SET but ignored ->
          weekday 02:30, Monday 03:30; 99/101 now green regardless of ambient env).
          Banner v3.3.7.
+  3.3.8  FIFTH ANCHOR. Added A5 at 22:00 IST = 19:30 broker (UTC+3) -- a NORMAL anchor,
+         IDENTICAL structure to A1-A4 (straddle +/-$5, SL $18 / TP $30 / lot 0.35 from
+         the shared cfg knobs, same boost / rescue / gate / pullback / resolver /
+         telemetry logic, all byte-identical). A timing addition only, NO special rules.
+         Label A5_1930_LateUS tags its trades distinctly so each of A1-A5 is journal-
+         isolated and judged on its own P&L + drawdown at month-end. The anchor list is
+         now 5 (A1 05:00/Mon 06:00, A2 12:30, A3 17:00, A4 19:10, A5 22:00 IST). Wired
+         the per-anchor defer-wait (A5=30s, US session), the watchdog count (/5), and
+         the backtest day-table + per-anchor aggregation to A5. COLLISION CHECK: the
+         minimum pairwise gap among the 5 is 2h10m (A3->A4) on weekday and Monday --
+         A4<->A5 is 2h50m -- all far clear of testfire_collision_min (30m); no pair
+         collides. FP guard is per-stack and anchor-count-agnostic, so it caps each
+         anchor's worst-case identically with 5 anchors (the 5 fire 2h+ apart and never
+         overlap). A1/A2/A3/A4 schedule + all trade logic UNCHANGED. selftest -> 105
+         steps (new 103 five-anchors-times; 104 no-collision incl. A4<->A5 2h50m + rail-4
+         guard handles 5; 105 A5-identical + FP-guard-handles-5). Banner v3.3.8.
 """
 
-__version__ = "3.3.7"
+__version__ = "3.3.8"
 CODENAME = "Astra Hawk"
 
 
