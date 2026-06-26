@@ -163,6 +163,25 @@ STEP_NAMES = {
     111: "ovr rescue unaff",
     112: "ovr $5arm unaff",
     113: "ovr no pb-collide",
+    # v3.5.0 adaptive pullback entry (RALLY + RESCUE; flag-gated, DEFAULT OFF)
+    114: "v35 rally freeze",
+    115: "v35 rescue freeze",
+    116: "v35 rally pull",
+    117: "v35 rally smooth",
+    118: "v35 rally timeout",
+    119: "v35 rescue pull",
+    120: "v35 rescue smooth",
+    121: "v35 rescue timeout",
+    122: "v35 dynamic sl",
+    123: "v35 separation",
+    124: "v35 $5arm unaff",
+    125: "v35 cap unchanged",
+    126: "R1 spike-collapse",
+    127: "R2 pull-continue",
+    128: "R3 rescue bounce",
+    129: "R4 pump-fade",
+    130: "R5 smooth runner",
+    131: "R6 chop skip",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4034,6 +4053,338 @@ class SelfTest:
             self._record(113, FAIL, f"raised: {e!r}"); return
         self._record(113, PASS if ok else FAIL, detail)
 
+    # --- v3.5.0 adaptive pullback entry (RALLY + RESCUE) ---------------------
+    def _pb_run(self, prices, *, direction, depth, fixed_sl, timeout=4, dynamic=True,
+                allow_smooth=False, smooth_from=None, buckets=None):
+        # Drive the PURE pullback_entry.step over a price path until ENTER/SKIP (or end).
+        # smooth_from = index from which break-and-hold is treated as CONFIRMED.
+        # Returns (decision, state, index, first_action).
+        import pullback_entry as _pe
+        st = {}
+        first = None
+        last = None
+        for i, p in enumerate(prices):
+            b = buckets[i] if buckets else 0
+            sc = bool(smooth_from is not None and i >= smooth_from)
+            last = _pe.step(st, direction=direction, pullback_depth=depth,
+                            fixed_sl=fixed_sl, timeout_candles=timeout,
+                            current_price=float(p), m5_bucket=b, parent_alive=True,
+                            smooth_confirm=sc, allow_smooth=allow_smooth, dynamic_sl=dynamic)
+            if first is None:
+                first = last['action']
+            if last['action'] in (_pe.ENTER, _pe.SKIP):
+                return last, st, i, first
+        return last, st, len(prices) - 1, first
+
+    def _step_v35_rally_freeze(self):
+        # 114 FREEZE — RALLY: override_entry_enabled=False (default) -> the override
+        # fires IMMEDIATELY exactly as v3.4.0/v3.3.8 (legacy BREAK_OVERRIDE, no entry_mode,
+        # no arm/skip). Byte-identical OFF path.
+        import rally as _rally
+        try:
+            flag_off = (bool(getattr(self.cfg, 'override_entry_enabled', False)) is False)
+            bars = self._case2_bars()
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                               parent_side='SELL', parent_max_fav=25.0)
+            fired = (_rally.break_and_hold_ok(tr, sh, pl) is True)
+            ev = [e for e in self._gate_ptrace if e[0] == 'break_override_parent_established']
+            legacy = (len(ev) == 1 and 'entry_mode' not in ev[0][1])
+            no_arm = not any(e[0] in ('override_entry_armed', 'override_entry_skipped',
+                                      'rescue_entry_armed') for e in self._gate_ptrace)
+            ok = flag_off and fired and legacy and no_arm
+            detail = f"flag_off={flag_off} immediate_fire={fired} legacy_event={legacy} no_arm={no_arm}"
+        except Exception as e:
+            self._record(114, FAIL, f"raised: {e!r}"); return
+        self._record(114, PASS if ok else FAIL, detail)
+
+    def _step_v35_rescue_freeze(self):
+        # 115 FREEZE — RESCUE: rescue_entry_enabled=False (default) -> the scan's rescue
+        # branch is NOT gated (today's immediate bypass-fire preserved). Proven by the
+        # gating boolean (kind=='RESCUE' AND flag) being False on the default cfg, plus
+        # the rescue plan SL $10 / cap -$700 unchanged.
+        import boosts as _boosts, dataclasses
+        try:
+            flag_off = (bool(getattr(self.cfg, 'rescue_entry_enabled', False)) is False)
+            # the exact scan gating condition for a RESCUE plan:
+            gated_off = not (True and bool(getattr(self.cfg, 'rescue_entry_enabled', False)))
+            cfg_on = dataclasses.replace(self.cfg, rescue_entry_enabled=True)
+            gated_on = (True and bool(getattr(cfg_on, 'rescue_entry_enabled', False)))
+            rescue_plan = _boosts.plan_boost_event('BUY', 4000.0, 4000.0 - 10.0, self.cfg)
+            sl_ok = abs(rescue_plan.sl_dollars - 10.0) < 1e-9
+            cap_ok = abs(_boosts.boost_whipsaw_cap(self.cfg, 'RESCUE') - 700.0) < 1e-6
+            ok = flag_off and gated_off and gated_on and sl_ok and cap_ok
+            detail = (f"flag_off={flag_off} bypass_when_off={gated_off} gated_when_on={gated_on} "
+                      f"rescue_SL$10={sl_ok} cap-$700={cap_ok}")
+        except Exception as e:
+            self._record(115, FAIL, f"raised: {e!r}"); return
+        self._record(115, PASS if ok else FAIL, detail)
+
+    def _step_v35_rally_pullback(self):
+        # 116 RALLY pullback entry: dip $13 from the high then TURN back up -> ENTER at
+        # the turn, dynamic SL BELOW the dip low (dip_low - $13).
+        try:
+            d, st, i, first = self._pb_run([3982.0, 4005.0, 3992.0, 3994.0],
+                                           direction='BUY', depth=13.0, fixed_sl=13.0,
+                                           dynamic=True, allow_smooth=False)
+            ok = (first == 'ARM' and d['action'] == 'ENTER' and d['mode'] == 'pullback'
+                  and abs(d['price'] - 3994.0) < 1e-9 and abs(d['sl'] - 3979.0) < 1e-9)
+            detail = f"enter@{d['price']}(=3994) SL@{d['sl']}(=3979,below dip 3992) mode={d['mode']}"
+        except Exception as e:
+            self._record(116, FAIL, f"raised: {e!r}"); return
+        self._record(116, PASS if ok else FAIL, detail)
+
+    def _step_v35_rally_smooth(self):
+        # 117 RALLY smooth entry: no qualifying dip, break-and-hold CONFIRMS the up-move
+        # -> ENTER on confirm, fixed SL entry-$13.
+        try:
+            d, st, i, first = self._pb_run([4000.0, 4002.0, 4004.0, 4006.0],
+                                           direction='BUY', depth=13.0, fixed_sl=13.0,
+                                           dynamic=True, allow_smooth=True, smooth_from=1)
+            ok = (d['action'] == 'ENTER' and d['mode'] == 'smooth'
+                  and abs(d['price'] - 4002.0) < 1e-9 and abs(d['sl'] - 3989.0) < 1e-9)
+            detail = f"smooth_enter@{d['price']} SL@{d['sl']}(=entry-13) mode={d['mode']}"
+        except Exception as e:
+            self._record(117, FAIL, f"raised: {e!r}"); return
+        self._record(117, PASS if ok else FAIL, detail)
+
+    def _step_v35_rally_timeout(self):
+        # 118 RALLY timeout: no dip, no smooth confirm -> SKIP after the timeout candles.
+        try:
+            d, st, i, first = self._pb_run([4000.0, 4001.0, 4000.0, 4001.0, 4000.0],
+                                           direction='BUY', depth=13.0, fixed_sl=13.0,
+                                           timeout=4, allow_smooth=True, smooth_from=None,
+                                           buckets=[0, 1, 2, 3, 4])
+            ok = (d['action'] == 'SKIP' and first == 'ARM')
+            detail = f"action={d['action']}(=SKIP) first={first}"
+        except Exception as e:
+            self._record(118, FAIL, f"raised: {e!r}"); return
+        self._record(118, PASS if ok else FAIL, detail)
+
+    def _step_v35_rescue_pullback(self):
+        # 119 RESCUE pullback entry: bounce UP $>=6 toward parent fill then ROLLOVER ->
+        # ENTER SELL at the rollover, dynamic SL ABOVE the bounce high (bounce_high + $10).
+        try:
+            d, st, i, first = self._pb_run([4032.90, 4042.0, 4040.0],
+                                           direction='SELL', depth=6.0, fixed_sl=10.0,
+                                           dynamic=True, allow_smooth=False)
+            ok = (first == 'ARM' and d['action'] == 'ENTER' and d['mode'] == 'pullback'
+                  and abs(d['price'] - 4040.0) < 1e-9 and abs(d['sl'] - 4052.0) < 1e-9
+                  and d['sl'] > 4042.0)
+            detail = f"sell_enter@{d['price']}(=4040) SL@{d['sl']}(=4052,above bounce 4042) mode={d['mode']}"
+        except Exception as e:
+            self._record(119, FAIL, f"raised: {e!r}"); return
+        self._record(119, PASS if ok else FAIL, detail)
+
+    def _step_v35_rescue_smooth(self):
+        # 120 RESCUE smooth entry: smooth DOWN-move, break-and-hold confirms -> ENTER
+        # SELL on confirm, fixed SL entry+$10.
+        try:
+            d, st, i, first = self._pb_run([4032.0, 4030.0, 4028.0],
+                                           direction='SELL', depth=6.0, fixed_sl=10.0,
+                                           dynamic=True, allow_smooth=True, smooth_from=1)
+            ok = (d['action'] == 'ENTER' and d['mode'] == 'smooth'
+                  and abs(d['price'] - 4030.0) < 1e-9 and abs(d['sl'] - 4040.0) < 1e-9)
+            detail = f"sell_smooth@{d['price']} SL@{d['sl']}(=entry+10) mode={d['mode']}"
+        except Exception as e:
+            self._record(120, FAIL, f"raised: {e!r}"); return
+        self._record(120, PASS if ok else FAIL, detail)
+
+    def _step_v35_rescue_timeout(self):
+        # 121 RESCUE timeout: no bounce, no smooth confirm -> SKIP (parent takes its SL
+        # alone, no hedge -- owner-confirmed acceptable).
+        try:
+            d, st, i, first = self._pb_run([4032.0, 4031.0, 4032.0, 4031.0, 4032.0],
+                                           direction='SELL', depth=6.0, fixed_sl=10.0,
+                                           timeout=4, allow_smooth=True, smooth_from=None,
+                                           buckets=[0, 1, 2, 3, 4])
+            ok = (d['action'] == 'SKIP' and first == 'ARM')
+            detail = f"action={d['action']}(=SKIP) first={first}"
+        except Exception as e:
+            self._record(121, FAIL, f"raised: {e!r}"); return
+        self._record(121, PASS if ok else FAIL, detail)
+
+    def _step_v35_dynamic_sl(self):
+        # 122 DYNAMIC SL: on the pullback path the SL is anchored BEYOND the retrace
+        # extreme (dip_low - $13), NOT entry - $13. Same path, dynamic vs fixed differ.
+        try:
+            dyn, _, _, _ = self._pb_run([3982.0, 4005.0, 3992.0, 3994.0], direction='BUY',
+                                        depth=13.0, fixed_sl=13.0, dynamic=True)
+            fix, _, _, _ = self._pb_run([3982.0, 4005.0, 3992.0, 3994.0], direction='BUY',
+                                        depth=13.0, fixed_sl=13.0, dynamic=False)
+            dynamic_anchored = abs(dyn['sl'] - (3992.0 - 13.0)) < 1e-9   # dip_low - 13
+            fixed_from_entry = abs(fix['sl'] - (3994.0 - 13.0)) < 1e-9   # entry - 13
+            differ_more_room = dyn['sl'] < fix['sl']                     # dynamic gives more room
+            ok = dynamic_anchored and fixed_from_entry and differ_more_room
+            detail = (f"dynamic@{dyn['sl']}(=dip-13) fixed@{fix['sl']}(=entry-13) "
+                      f"dynamic_more_room={differ_more_room}")
+        except Exception as e:
+            self._record(122, FAIL, f"raised: {e!r}"); return
+        self._record(122, PASS if ok else FAIL, detail)
+
+    def _step_v35_separation(self):
+        # 123 SEPARATION: the shared helper is STATELESS (no module state) -> rally and
+        # rescue runs are independent; and the two flags toggle independently (own keys).
+        import pullback_entry as _pe, dataclasses
+        try:
+            st_rally = {}
+            st_rescue = {}
+            # interleave: a rescue step must not perturb the rally state and vice versa.
+            _pe.step(st_rally, direction='BUY', pullback_depth=13.0, fixed_sl=13.0,
+                     timeout_candles=4, current_price=100.0, m5_bucket=0, parent_alive=True,
+                     smooth_confirm=False, allow_smooth=False, dynamic_sl=True)
+            _pe.step(st_rescue, direction='SELL', pullback_depth=6.0, fixed_sl=10.0,
+                     timeout_candles=4, current_price=200.0, m5_bucket=0, parent_alive=True,
+                     smooth_confirm=False, allow_smooth=False, dynamic_sl=True)
+            independent = (st_rally.get('cont_ext') == 100.0 and st_rescue.get('cont_ext') == 200.0
+                           and st_rally is not st_rescue)
+            # flags toggle independently (distinct config fields).
+            a = dataclasses.replace(self.cfg, override_entry_enabled=True, rescue_entry_enabled=False)
+            b = dataclasses.replace(self.cfg, override_entry_enabled=False, rescue_entry_enabled=True)
+            flags_independent = (a.override_entry_enabled and not a.rescue_entry_enabled
+                                 and not b.override_entry_enabled and b.rescue_entry_enabled)
+            ok = independent and flags_independent
+            detail = f"helper_stateless_independent={independent} flags_independent={flags_independent}"
+        except Exception as e:
+            self._record(123, FAIL, f"raised: {e!r}"); return
+        self._record(123, PASS if ok else FAIL, detail)
+
+    def _step_v35_5arm_unaffected(self):
+        # 124 $5-ARM UNAFFECTED: the +$5 RALLY arm (plan_boost_event) is identical with
+        # ALL new flags ON vs OFF -- it never reads override_entry_*/rescue_entry_*.
+        import boosts as _boosts, dataclasses
+        try:
+            cfg_on = dataclasses.replace(self.cfg, override_entry_enabled=True,
+                                         rescue_entry_enabled=True)
+            p_on = _boosts.plan_boost_event('BUY', 4000.0, 4005.0, cfg_on)
+            p_off = _boosts.plan_boost_event('BUY', 4000.0, 4005.0, self.cfg)
+            ok = (p_on is not None and p_on.kind == 'RALLY' and abs(p_on.sl_dollars - 13.0) < 1e-9
+                  and p_off is not None and p_on.kind == p_off.kind
+                  and abs(p_on.sl_dollars - p_off.sl_dollars) < 1e-9)
+            detail = f"+$5_RALLY_arm_identical(kind={p_on.kind},sl={p_on.sl_dollars})={ok}"
+        except Exception as e:
+            self._record(124, FAIL, f"raised: {e!r}"); return
+        self._record(124, PASS if ok else FAIL, detail)
+
+    def _step_v35_cap_unchanged(self):
+        # 125 CAP UNCHANGED: rescue cap stays -$700 (SL stays $10) with rescue_entry ON.
+        import boosts as _boosts, dataclasses
+        try:
+            cfg_on = dataclasses.replace(self.cfg, rescue_entry_enabled=True)
+            cap_ok = abs(_boosts.boost_whipsaw_cap(cfg_on, 'RESCUE') - 700.0) < 1e-6
+            sl_ok = abs(float(getattr(cfg_on, 'boost_sl_dollars', 10.0)) - 10.0) < 1e-9
+            rally_cap_ok = abs(_boosts.boost_whipsaw_cap(cfg_on, 'RALLY') - 910.0) < 1e-6
+            ok = cap_ok and sl_ok and rally_cap_ok
+            detail = f"rescue_cap-$700={cap_ok} rescue_SL$10={sl_ok} rally_cap-$910={rally_cap_ok}"
+        except Exception as e:
+            self._record(125, FAIL, f"raised: {e!r}"); return
+        self._record(125, PASS if ok else FAIL, detail)
+
+    def _step_R1_spike_collapse(self):
+        # R1 (126) SPIKE-THEN-COLLAPSE (rally): spike +$23 then straight down, no
+        # dip-then-resume -> ARM, no qualifying turn, no confirm -> TIMEOUT-SKIP. (Old
+        # behavior bought the spike top -> loss. New = $0.)
+        try:
+            d, st, i, first = self._pb_run(
+                [3982.0, 4005.0, 4000.0, 3995.0, 3990.0, 3985.0, 3980.0, 3975.0],
+                direction='BUY', depth=13.0, fixed_sl=13.0, timeout=4,
+                allow_smooth=True, smooth_from=None,   # collapse never confirms
+                buckets=[0, 0, 1, 2, 3, 4, 4, 4])
+            ok = (first == 'ARM' and d['action'] == 'SKIP')
+            detail = f"first={first} action={d['action']}(=SKIP, no top-buy)"
+        except Exception as e:
+            self._record(126, FAIL, f"raised: {e!r}"); return
+        self._record(126, PASS if ok else FAIL, detail)
+
+    def _step_R2_pull_continue(self):
+        # R2 (127) PULLBACK-THEN-CONTINUE (Jun25 A3): parent BUY 3981.97, spike ~4005,
+        # pullback to ~3992, then runs to 4030. ASSERT: enter ~3994 on the turn, SL below
+        # the dip (~3979). Boost PROFITABLE (vs actual -905). Headline rally win.
+        try:
+            d, st, i, first = self._pb_run([3981.97, 4005.0, 3992.0, 3994.0, 4030.0],
+                                           direction='BUY', depth=13.0, fixed_sl=13.0,
+                                           dynamic=True, allow_smooth=False)
+            entered = (d['action'] == 'ENTER' and d['mode'] == 'pullback')
+            good_entry = abs(d['price'] - 3994.0) < 1e-9 and abs(d['sl'] - 3979.0) < 1e-9
+            profitable_dir = (4030.0 - d['price']) > 0   # up-move continues above entry
+            ok = entered and good_entry and profitable_dir
+            detail = (f"enter@{d['price']} SL@{d['sl']} continues_to_4030_profit={profitable_dir} "
+                      f"(vs actual -$905)")
+        except Exception as e:
+            self._record(127, FAIL, f"raised: {e!r}"); return
+        self._record(127, PASS if ok else FAIL, detail)
+
+    def _step_R3_rescue_bounce(self):
+        # R3 (128) RESCUE BOUNCE-THEN-DROP (Jun25 A5): parent BUY 4042.90, rescue arms -10
+        # (~4032.90), bounce to ~4042 then drops to 4025/4008. ASSERT: does NOT fire at -10,
+        # enters SELL ~4040 on the rollover, SL above bounce high (~4052). PROFITABLE (vs -700).
+        try:
+            d, st, i, first = self._pb_run([4032.90, 4042.0, 4040.0, 4025.0, 4008.0],
+                                           direction='SELL', depth=6.0, fixed_sl=10.0,
+                                           dynamic=True, allow_smooth=False)
+            not_edge = (first == 'ARM')                 # did NOT fire at the -10 edge
+            entered = (d['action'] == 'ENTER' and d['mode'] == 'pullback')
+            good_entry = abs(d['price'] - 4040.0) < 1e-9 and d['sl'] > 4042.0
+            profitable_dir = (d['price'] - 4008.0) > 0   # drop continues below the SELL entry
+            ok = not_edge and entered and good_entry and profitable_dir
+            detail = (f"no_edge_fire={not_edge} sell@{d['price']} SL@{d['sl']}(above bounce) "
+                      f"drops_to_4008_profit={profitable_dir} (vs actual -$700)")
+        except Exception as e:
+            self._record(128, FAIL, f"raised: {e!r}"); return
+        self._record(128, PASS if ok else FAIL, detail)
+
+    def _step_R4_pump_fade(self):
+        # R4 (129) PUMP-THEN-FADE (rescue): price pumps up then fades back. ASSERT: ARMS,
+        # enters on the fade ROLLOVER (not blindly at the edge). Must NOT fire at the arm.
+        try:
+            d, st, i, first = self._pb_run([4032.0, 4040.0, 4038.0, 4032.0, 4025.0],
+                                           direction='SELL', depth=6.0, fixed_sl=10.0,
+                                           dynamic=True, allow_smooth=False)
+            not_edge = (first == 'ARM' and abs(d['price'] - 4032.0) > 1e-9)
+            on_rollover = (d['action'] == 'ENTER' and d['mode'] == 'pullback'
+                           and abs(d['price'] - 4038.0) < 1e-9)
+            ok = not_edge and on_rollover
+            detail = f"no_edge_fire={not_edge} enter_on_fade@{d['price']}(=4038) mode={d['mode']}"
+        except Exception as e:
+            self._record(129, FAIL, f"raised: {e!r}"); return
+        self._record(129, PASS if ok else FAIL, detail)
+
+    def _step_R5_smooth_runner(self):
+        # R5 (130) SMOOTH RUNNER (rally): clean run-up, no pullback. ASSERT: smooth branch
+        # fires IF break-and-hold confirms; if NO confirm -> SKIP (never blind-buy the top).
+        try:
+            up = [4000.0, 4002.0, 4004.0, 4006.0, 4008.0]
+            d_conf, _, _, _ = self._pb_run(up, direction='BUY', depth=13.0, fixed_sl=13.0,
+                                           allow_smooth=True, smooth_from=1)
+            d_noconf, _, _, f2 = self._pb_run(up, direction='BUY', depth=13.0, fixed_sl=13.0,
+                                              timeout=4, allow_smooth=True, smooth_from=None,
+                                              buckets=[0, 1, 2, 3, 4])
+            confirm_enters = (d_conf['action'] == 'ENTER' and d_conf['mode'] == 'smooth')
+            noconfirm_skips = (d_noconf['action'] == 'SKIP')
+            ok = confirm_enters and noconfirm_skips
+            detail = (f"with_confirm_enters_smooth={confirm_enters} "
+                      f"no_confirm_skips(no top-buy)={noconfirm_skips}")
+        except Exception as e:
+            self._record(130, FAIL, f"raised: {e!r}"); return
+        self._record(130, PASS if ok else FAIL, detail)
+
+    def _step_R6_chop_skip(self):
+        # R6 (131) CHOP (rally + rescue): tight-range wiggles never qualify as a pullback
+        # and never confirm -> SKIP (no boost on every wiggle).
+        try:
+            chop = [4000.0, 4002.0, 3999.0, 4001.0, 3998.0, 4000.0]
+            bk = [0, 1, 2, 3, 4, 4]
+            dr, _, _, fr = self._pb_run(chop, direction='BUY', depth=13.0, fixed_sl=13.0,
+                                        timeout=4, allow_smooth=True, smooth_from=None, buckets=bk)
+            dx, _, _, fx = self._pb_run(chop, direction='SELL', depth=6.0, fixed_sl=10.0,
+                                        timeout=4, allow_smooth=True, smooth_from=None, buckets=bk)
+            rally_skips = (dr['action'] == 'SKIP')
+            rescue_skips = (dx['action'] == 'SKIP')
+            ok = rally_skips and rescue_skips
+            detail = f"rally_chop_skips={rally_skips} rescue_chop_skips={rescue_skips}"
+        except Exception as e:
+            self._record(131, FAIL, f"raised: {e!r}"); return
+        self._record(131, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -4239,6 +4590,26 @@ class SelfTest:
             self._step_override_rescue_unaffected()
             self._step_override_5arm_unaffected()
             self._step_override_no_pullback_collision()
+            # v3.5.0 — adaptive pullback entry (RALLY + RESCUE; flag-gated, DEFAULT OFF)
+            self._step_v35_rally_freeze()
+            self._step_v35_rescue_freeze()
+            self._step_v35_rally_pullback()
+            self._step_v35_rally_smooth()
+            self._step_v35_rally_timeout()
+            self._step_v35_rescue_pullback()
+            self._step_v35_rescue_smooth()
+            self._step_v35_rescue_timeout()
+            self._step_v35_dynamic_sl()
+            self._step_v35_separation()
+            self._step_v35_5arm_unaffected()
+            self._step_v35_cap_unchanged()
+            # v3.5.0 regression fixtures from real charts (R1-R6)
+            self._step_R1_spike_collapse()
+            self._step_R2_pull_continue()
+            self._step_R3_rescue_bounce()
+            self._step_R4_pump_fade()
+            self._step_R5_smooth_runner()
+            self._step_R6_chop_skip()
         finally:
             self._cleanup()
         return self._report(ts)

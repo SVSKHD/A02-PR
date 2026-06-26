@@ -666,6 +666,12 @@ def _check_boost_triggers(self):
         if _gate_this:
             if not self._break_and_hold_ok(shadow, plan):
                 continue
+        elif plan.kind == 'RESCUE' and bool(getattr(self.cfg, 'rescue_entry_enabled', False)):
+            # v3.5.0 RESCUE adaptive pullback entry (flag ON): arm-then-wait for a
+            # bounce-rollover / smooth-confirm instead of the immediate bypass-fire.
+            # Flag OFF -> this branch is skipped and rescue free-fires exactly as today.
+            if not self._rescue_entry_ok(shadow, plan):
+                continue
         elif tr is not None:
             tr.break_eval(shadow.get('anchor_label'), side=plan.boost_side,
                           kind=plan.kind, result='BYPASS_RESCUE',
@@ -701,6 +707,14 @@ def _break_and_hold_ok(self, shadow, plan):
     gate (it stays on rally, per the v3.2.7 split). Kept as a bound LiveTrader method
     so the scan + selftest stubs hit it; body byte-identical, relocated to rally.py."""
     return rally.break_and_hold_ok(self, shadow, plan)
+
+
+def _rescue_entry_ok(self, shadow, plan):
+    """v3.5.0 seam -> rescue.entry_gate_ok: the RESCUE-only adaptive pullback-entry
+    gate (separate call site from the rally gate, per the standing rally/rescue split).
+    Only reached when rescue_entry_enabled is ON."""
+    import rescue
+    return rescue.entry_gate_ok(self, shadow, plan)
 
 
 def _fp_guard_ok(self, shadow, stack_after):

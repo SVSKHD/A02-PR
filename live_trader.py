@@ -1313,6 +1313,7 @@ LiveTrader._check_boost_triggers    = _fills_mod._check_boost_triggers
 LiveTrader._fire_boost_event        = _fills_mod._fire_boost_event
 LiveTrader._enforce_boost_cap       = _fills_mod._enforce_boost_cap
 LiveTrader._break_and_hold_ok       = _fills_mod._break_and_hold_ok
+LiveTrader._rescue_entry_ok         = _fills_mod._rescue_entry_ok   # v3.5.0 rescue gate seam
 LiveTrader._fp_guard_ok             = _fills_mod._fp_guard_ok
 LiveTrader._anchor_evt_block        = _fills_mod._anchor_evt_block
 LiveTrader._manage_trails_on_bar_close = _trails_mod._manage_trails_on_bar_close

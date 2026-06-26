@@ -42,6 +42,17 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
     sgn = 1.0 if side == 'BUY' else -1.0
     n = int(plan.n)
     sl_d = float(plan.sl_dollars)
+    # v3.5.0: an adaptive pullback entry (rally/rescue) stashes a DYNAMIC SL distance
+    # (entry -> beyond the retrace extreme) on the leg shadow; consume it so the boost
+    # stop sits below the dip low / above the bounce high. Absent (flag OFF / smooth
+    # entry) -> plan.sl_dollars (fixed) -> byte-identical to pre-v3.5.0.
+    try:
+        _sl_override = leg_shadow.pop('_boost_entry_sl_dollars_override', None) \
+            if hasattr(leg_shadow, 'pop') else None
+        if _sl_override is not None:
+            sl_d = float(_sl_override)
+    except Exception:
+        pass
     tp_d = float(plan.tp_dollars)
     ref = float(plan.entry_ref)
     leg_fill = float(leg_shadow.get('leg_fill_price', ref))

@@ -813,9 +813,34 @@ History (one line per behavioral change):
          no-fire; 108 pullback-fire; 109 timeout-skip; 110 parent-exit-clear; 111 rescue-
          unaffected; 112 +$5-arm-unaffected; 113 no rally_pullback_* collision). Banner
          v3.4.0. NOT merged to master -- feature branch, month-end candidate.
+  3.5.0  ADAPTIVE PULLBACK ENTRY (RALLY + RESCUE; flag-gated, DEFAULT OFF -- month-end
+         candidate). Both the rally override and the rescue hedge stop firing AT THE EDGE
+         and instead ARM then pick the best entry: PULLBACK (a counter-move then a TURN
+         back toward the trade -> enter at the turn, SL BEYOND the retrace extreme so the
+         retrace can't stop it), SMOOTH (no pullback but break-and-hold CONFIRMS the
+         continuation -- same mechanism as the $5 arm -> enter on confirm, fixed SL), or
+         SKIP (neither within the timeout). New SHARED helper pullback_entry.step (pure;
+         the ONE allowed shared piece -- no rally/rescue state, no merged path). RALLY
+         extends v3.4.0's override_entry_* (now adaptive: smooth branch + dynamic SL);
+         RESCUE is the NEW mirror -- it KEEPS the losing parent, ARMS at -$10 (instead of
+         today's immediate bypass-fire), and enters SELL on a bounce-rollover (SL above
+         the bounce high) or a confirmed smooth drop (SL entry+$10), addressing the
+         Jun 25 A5 -$1,330. New keys (DISTINCT, separate flags/call-sites): rally
+         override_entry_smooth_confirm=True, override_entry_dynamic_sl=True; rescue
+         rescue_entry_enabled=False (MASTER), rescue_entry_bounce_dollars=6.0,
+         rescue_entry_arm_timeout_candles=4, rescue_entry_smooth_confirm=True. Dynamic SL
+         threaded via shadow['_boost_entry_sl_dollars_override'] -> place_fleet (absent =
+         fixed = byte-identical OFF). New ptrace RESCUE_ENTRY_ARMED/SKIPPED/FIRED. Rescue
+         SL stays $10 / cap -$700 (the $10->$13 question is a SEPARATE month-end decision).
+         FREEZE: all new flags default OFF -> rally = v3.4.0 OFF path, rescue = today's
+         immediate bypass-fire, both byte-identical. selftest -> 131 steps (new 114-119
+         freeze+pullback+smooth+timeout for rally, 120-123 rescue freeze+pullback+smooth+
+         timeout, 124 dynamic-SL, 125 separation, 126 $5-arm-unaffected, 127 cap-unchanged;
+         R1-R6 regression fixtures 128-133 from real charts). RALLY/RESCUE stay separate;
+         $5 arm + rally_pullback_* exit untouched. Banner v3.5.0. NOT for merge to master.
 """
 
-__version__ = "3.4.0"
+__version__ = "3.5.0"
 CODENAME = "Astra Hawk"
 
 

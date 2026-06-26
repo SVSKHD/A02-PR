@@ -103,6 +103,35 @@ class Config:
     override_entry_first_touch: bool = True  # v1 = enter on first touch of the level.
     #   RESERVED: False (a confirm-candle close) is a later refinement, NOT implemented
     #   in v3.4.0 -- the gate uses first-touch regardless of this flag for now.
+    # --- v3.5.0 ADAPTIVE PULLBACK ENTRY (extends the override_entry_* path) ------
+    # When override_entry_enabled is ON, v3.5.0 upgrades the rally override entry from
+    # v3.4.0 first-touch to the ADAPTIVE rule (pullback turn / smooth break-and-hold
+    # confirm / timeout-skip, via the shared pullback_entry.step helper). These two
+    # toggles refine that path; both DEFAULT ON but are inert while override_entry_
+    # enabled is OFF (the whole block is skipped -> v3.4.0/v3.3.8 behavior preserved).
+    override_entry_smooth_confirm: bool = True  # allow the SMOOTH branch: if no pullback
+    #   appears but break-and-hold CONFIRMS the up-move (same mechanism as the $5 arm),
+    #   enter on the confirm. False -> pullback-or-skip only (no smooth entry).
+    override_entry_dynamic_sl: bool = True  # pullback entry: SL BEYOND the dip low
+    #   (dip_low - rally_boost_sl) so the retrace can't stop it. False -> fixed $13 from
+    #   entry. Smooth entries always use the fixed SL (no retrace extreme to anchor to).
+    # --- v3.5.0 RESCUE ADAPTIVE PULLBACK ENTRY (NEW mechanism, flag-gated OFF) ---
+    # MIRROR of the rally override entry for the RESCUE hedge. RESCUE today FIRES
+    # IMMEDIATELY at the -$10 arm (bypassing break-and-hold) and gets knifed by the
+    # bounce (Jun 25 A5: -$1,330). When rescue_entry_enabled is ON the rescue KEEPS the
+    # losing parent, ARMS at -$10, and waits: enter SELL on a BOUNCE-then-ROLLOVER (SL
+    # ABOVE the bounce high), or on a SMOOTH down-move that break-and-hold CONFIRMS (SL
+    # entry + $10), or SKIP if neither within the timeout (parent takes its SL alone).
+    # SEPARATE keys / flag / call-site from rally (standing rule); shares ONLY the pure
+    # pullback_entry.step helper. DEFAULT OFF -> today's immediate bypass-fire preserved
+    # (byte-identical). Rescue SL stays $10 (boost_sl_dollars) and the cap stays -$700;
+    # the $10->$13 question is a SEPARATE month-end decision (it would move the cap).
+    rescue_entry_enabled: bool = False  # v3.5.0 MASTER FLAG, DEFAULT OFF (freeze-safe).
+    rescue_entry_bounce_dollars: float = 6.0  # bounce $ UP toward the parent fill that
+    #   qualifies the retrace before the SELL entry on the rollover. Trial-tunable.
+    rescue_entry_arm_timeout_candles: int = 4  # M5 candles before SKIP (no hedge).
+    rescue_entry_smooth_confirm: bool = True  # allow the SMOOTH branch (break-and-hold
+    #   confirms the DOWN-move) -> enter SELL on confirm. False -> bounce-or-skip only.
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose
