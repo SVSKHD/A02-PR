@@ -339,6 +339,39 @@ not implemented) are first guesses, not final.
 > most of the time and the correct action is to **remove the override entirely**
 > (subtraction > addition), not enable this. Built flag-OFF so both options stay open.
 
+### v3.5.0 — adaptive pullback entry, RALLY + RESCUE (flag-gated, **DEFAULT OFF**, month-end candidate)
+
+**What's new.** Both the rally override and the rescue hedge stop firing *at the edge* of the
+move. They **arm**, then pick the best entry via one shared pure helper (`pullback_entry.step`):
+- **Pullback** — a counter-move (a dip for a BUY boost / a bounce for a SELL boost) then a
+  **turn** back toward the trade → enter at the turn, with the **SL placed beyond the retrace
+  extreme** (below the dip low / above the bounce high) so the natural retrace can't stop it.
+- **Smooth** — no pullback, but break-and-hold **confirms** the continuation (the same proven
+  mechanism as the +$5 arm) → enter on confirm, fixed SL.
+- **Skip** — neither within the timeout → no boost (parent runs alone).
+
+**Rally** extends v3.4.0's `override_entry_*` (now adaptive: smooth branch + dynamic SL).
+**Rescue is the new mirror** — instead of today's immediate −$10 bypass-fire, it **keeps the
+losing parent**, arms at −$10, and enters SELL on a bounce-rollover (SL above the bounce high)
+or a confirmed smooth drop (SL entry+$10), addressing the Jun 25 A5 −$1,330. RALLY and RESCUE
+stay **architecturally separate** — separate flags, keys, and call sites; they share only the
+pure helper (no shared state, no merged path).
+
+**OFF-by-default guarantee.** With `override_entry_enabled=False` and `rescue_entry_enabled=False`
+(both default), master behavior is **byte-identical** — rally = v3.4.0 OFF path, rescue = today's
+immediate bypass-fire. Proven by freeze tests 114/115. New PTRACE `RESCUE_ENTRY_ARMED/SKIPPED/FIRED`
+gives the rescue trial its data.
+
+**Open numbers (trial-tunable).** Bounce depth ($6), arm timeouts (4 M5 candles), the turn-confirm
+($1.5), and the smooth-confirm toggles are first guesses. **Rescue SL stays $10 / cap −$700** — the
+$10→$13 question is deferred to month-end (it would move the derived cap to −$910) and pullback
+entry may make $13 unnecessary.
+
+> ⚠️ **Ship vs delete, per path.** Built before the data. If a path rarely finds a clean pullback
+> or confirm, it will skip often — and the right call may be to **drop that path**, not enable it.
+> Both rally and rescue are flag-OFF so every option stays open. The six chart-derived regression
+> fixtures (R1–R6) encode the patterns the trial must reproduce.
+
 ---
 
 ## License

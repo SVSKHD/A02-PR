@@ -78,6 +78,12 @@ BREAK_OVERRIDE_PARENT_ESTABLISHED = "BREAK_OVERRIDE_PARENT_ESTABLISHED"
 # skipped (no pullback within the timeout) -- the trial's pullback-frequency data.
 OVERRIDE_ENTRY_ARMED = "OVERRIDE_ENTRY_ARMED"
 OVERRIDE_ENTRY_SKIPPED = "OVERRIDE_ENTRY_SKIPPED"
+# v3.5.0 RESCUE adaptive pullback entry: armed at -$10 (waiting for the bounce-rollover
+# / smooth confirm), skipped (no entry within the timeout -> parent takes its SL alone),
+# and fired (entered SELL on the rollover or smooth confirm).
+RESCUE_ENTRY_ARMED = "RESCUE_ENTRY_ARMED"
+RESCUE_ENTRY_SKIPPED = "RESCUE_ENTRY_SKIPPED"
+RESCUE_ENTRY_FIRED = "RESCUE_ENTRY_FIRED"
 CONTINUATION_STACK = "CONTINUATION_STACK"
 FP_GUARD = "FP_GUARD"
 FP_GUARD_EVAL = "FP_GUARD_EVAL"
@@ -222,6 +228,12 @@ class PositionTracer:
         return self.emit(OVERRIDE_ENTRY_ARMED, None, anchor, **kw)
     def override_entry_skipped(self, anchor, **kw):
         return self.emit(OVERRIDE_ENTRY_SKIPPED, None, anchor, **kw)
+    def rescue_entry_armed(self, anchor, **kw):
+        return self.emit(RESCUE_ENTRY_ARMED, None, anchor, **kw)
+    def rescue_entry_skipped(self, anchor, **kw):
+        return self.emit(RESCUE_ENTRY_SKIPPED, None, anchor, **kw)
+    def rescue_entry_fired(self, anchor, **kw):
+        return self.emit(RESCUE_ENTRY_FIRED, None, anchor, **kw)
     def continuation_stack(self, anchor, **kw): return self.emit(CONTINUATION_STACK, None, anchor, **kw)
     def fp_guard(self, anchor="SYS", **kw): return self.emit(FP_GUARD_EVAL, None, anchor, **kw)
     def stack_complete(self, ticket, anchor, **kw): return self.emit(STACK_COMPLETE, ticket, anchor, **kw)

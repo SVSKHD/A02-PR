@@ -155,27 +155,42 @@ def _override_grade(cfg, shadow, plan):
 
 def _override_entry_decision(self, shadow, plan, anchor, tf, edge, result, reason,
                              parent_fav, threshold, parent_side):
-    """v3.4.0 wrapper around override_pullback_step: reads the current tick price
-    (self._last_boost_mid, stashed by the scan) + a 5-min bucket id (wall clock), runs
-    the PURE state machine on shadow['override_arm'], emits telemetry on the ARM / SKIP
-    transitions and on FIRE, and returns the bool the gate hands back (True = fire now,
-    False = hold/skip). Never raises onto the gate (the gate's own except is below)."""
+    """v3.5.0 wrapper around the SHARED pullback_entry.step helper for the RALLY
+    override. Reads the current tick price (self._last_boost_mid) + a 5-min bucket id,
+    runs the adaptive state machine on shadow['override_arm'] (pullback-turn / smooth
+    break-and-hold confirm / timeout-skip), emits telemetry, and returns the bool the
+    gate hands back (True = fire now, False = hold/skip). The SMOOTH branch reuses the
+    break-and-hold result already computed by the gate (result == CONFIRMED). On a
+    pullback ENTER it stashes a DYNAMIC SL distance on the shadow so place_fleet sets
+    the boost stop BEYOND the dip low. Never raises onto the gate (its except is below).
+    RALLY ONLY -- separate keys/state from the rescue mirror."""
     import time as _time
+    import pullback_entry as _pe
+    import break_hold as _bh
     price = getattr(self, '_last_boost_mid', None)
     if price is None:
         return False   # no price this tick -> hold, never fire blind
     state = shadow.setdefault('override_arm', {})
     pre_armed = bool(state.get('armed'))
-    pre_skipped = bool(state.get('skipped'))
+    pre_done = state.get('done')
     m5_bucket = int(_time.time() // 300)   # 5-min wall-clock bucket (M5-close proxy)
-    decision = override_pullback_step(state, self.cfg, parent_side, float(price),
-                                      m5_bucket, parent_alive=True)
+    d = _pe.step(
+        state, direction=plan.boost_side,
+        pullback_depth=float(getattr(self.cfg, 'override_entry_pullback_dollars', 13.0)),
+        fixed_sl=float(getattr(self.cfg, 'rally_boost_sl', 13.0)),
+        timeout_candles=int(getattr(self.cfg, 'override_entry_arm_timeout_candles', 4)),
+        current_price=float(price), m5_bucket=m5_bucket, parent_alive=True,
+        smooth_confirm=(result == _bh.CONFIRMED),
+        allow_smooth=bool(getattr(self.cfg, 'override_entry_smooth_confirm', True)),
+        dynamic_sl=bool(getattr(self.cfg, 'override_entry_dynamic_sl', True)))
     tr = getattr(self, 'ptrace', None)
-    if decision == ARM_FIRE:
-        msg = (f"🟢 OVERRIDE PULLBACK ENTRY — armed +${parent_fav:.2f} parent, entered "
-               f"on ${getattr(self.cfg, 'override_entry_pullback_dollars', 13.0):.2f} "
-               f"retrace {plan.boost_side} {anchor} @ ${price:.2f} "
-               f"(extreme ${float(state.get('extreme', price)):.2f})")
+    if d['action'] == _pe.ENTER:
+        entry, sl, mode = float(d['price']), float(d['sl']), d['mode']
+        if mode == 'pullback':
+            # DYNAMIC SL: distance from entry to the beyond-the-dip stop -> place_fleet.
+            shadow['_boost_entry_sl_dollars_override'] = round(abs(entry - sl), 2)
+        msg = (f"🟢 OVERRIDE {mode.upper()} ENTRY — armed +${parent_fav:.2f} parent, "
+               f"{plan.boost_side} {anchor} @ ${entry:.2f} SL ${sl:.2f}")
         log.info(msg)
         try:
             self.tele.info(msg)
@@ -185,26 +200,25 @@ def _override_entry_decision(self, shadow, plan, anchor, tf, edge, result, reaso
             try:
                 tr.break_override_parent_established(
                     anchor, side=plan.boost_side, break_level=round(edge, 2),
-                    reason=f'pullback_entry/{reason}', parent_max_fav=round(parent_fav, 2),
-                    threshold=round(threshold, 2),
-                    move_dollars=round(float(state.get('fire_level', price)), 2),
-                    entry_mode='pullback_first_touch',
-                    extreme=round(float(state.get('extreme', price)), 2),
-                    arm_m5_count=int(state.get('arm_m5_count', 0)))
+                    reason=f'{mode}_entry/{reason}', parent_max_fav=round(parent_fav, 2),
+                    threshold=round(threshold, 2), move_dollars=round(entry, 2),
+                    entry_mode=mode, stop_price=round(sl, 2),
+                    extreme=round(float(state.get('cont_ext', entry)), 2),
+                    arm_m5_count=int(state.get('arm_m5', 0)))
             except Exception:
                 pass
         return True
-    if decision == ARM_SKIP:
-        if tr is not None and not pre_skipped:
+    if d['action'] == _pe.SKIP:
+        if tr is not None and not pre_done:
             try:
                 tr.override_entry_skipped(
                     anchor, side=plan.boost_side, parent_max_fav=round(parent_fav, 2),
-                    arm_m5_count=int(state.get('arm_m5_count', 0)),
-                    reason='arm_timeout_no_pullback')
+                    arm_m5_count=int(state.get('arm_m5', 0)),
+                    reason='arm_timeout_no_entry')
             except Exception:
                 pass
         return False
-    # ARM_HOLD: emit the ARMED line once (first registration), then hold silently.
+    # ARM: emit the ARMED line once (first registration), then hold silently.
     if tr is not None and not pre_armed:
         try:
             tr.override_entry_armed(
