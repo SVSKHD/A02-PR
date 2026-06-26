@@ -787,9 +787,35 @@ History (one line per behavioral change):
          overlap). A1/A2/A3/A4 schedule + all trade logic UNCHANGED. selftest -> 105
          steps (new 103 five-anchors-times; 104 no-collision incl. A4<->A5 2h50m + rail-4
          guard handles 5; 105 A5-identical + FP-guard-handles-5). Banner v3.3.8.
+  3.4.0  RALLY OVERRIDE PULLBACK-ENTRY (flag-gated, DEFAULT OFF -- month-end candidate).
+         The +$20 parent-direction override (v3.3.5) fires at the EXTREME of the move and
+         gets knifed by the natural breath (Jun 25 A3: fired the top, pulled back $13,
+         -$905). This OPT-IN gate restructures the override's fire TIMING: instead of the
+         immediate `return True`, it ARMS at +$20, tracks the running extreme, and ENTERS
+         on first touch of a override_entry_pullback_dollars ($13) retrace from that
+         extreme (SL still $13 from the pullback entry); if no pullback appears within
+         override_entry_arm_timeout_candles (4 M5 candles ~20min) it SKIPS the boost (a
+         skip is free; a bad entry costs $905). Cross-tick arm state lives in the parent
+         shadow (shadow['override_arm']) -> auto-cleared when the parent closes (no leak,
+         parent-exit-clear for free). PURE core rally.override_pullback_step (ARM/FIRE/
+         SKIP) + wrapper rally._override_entry_decision; M5 timeout counted via 5-min
+         wall-clock buckets (no new M5-close hook). New ptrace: OVERRIDE_ENTRY_ARMED /
+         OVERRIDE_ENTRY_SKIPPED (+ pullback fields on BREAK_OVERRIDE_PARENT_ESTABLISHED)
+         -> the trial's pullback-frequency data. RALLY override ONLY -- RESCUE, the +$5
+         rally arm, and the rally_pullback_* EXIT detector are UNTOUCHED. Config (all NEW,
+         DISTINCT from rally_pullback_*): override_entry_enabled=False (MASTER FLAG),
+         override_entry_pullback_dollars=13.0, override_entry_arm_timeout_candles=4,
+         override_entry_first_touch=True (v1; confirm-candle reserved). FREEZE: with the
+         flag OFF, break_and_hold_ok runs the v3.3.8 logic verbatim (immediate override
+         fire) -- byte-identical, the trial keeps running on the OFF path. NUMBERS ARE
+         TRIAL-TUNABLE; a high skip rate is a valid verdict (may mean DELETE the override,
+         not ship). selftest -> 113 steps (new 106 freeze-guard OFF==immediate; 107 arm-
+         no-fire; 108 pullback-fire; 109 timeout-skip; 110 parent-exit-clear; 111 rescue-
+         unaffected; 112 +$5-arm-unaffected; 113 no rally_pullback_* collision). Banner
+         v3.4.0. NOT merged to master -- feature branch, month-end candidate.
 """
 
-__version__ = "3.3.8"
+__version__ = "3.4.0"
 CODENAME = "Astra Hawk"
 
 

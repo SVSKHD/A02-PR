@@ -72,6 +72,150 @@ def _has_rows(bars):
         return bool(bars)
 
 
+# --- v3.4.0 RALLY OVERRIDE PULLBACK-ENTRY (flag-gated, DEFAULT OFF) ---------------
+# Replaces the override's immediate fire-at-the-extreme with arm -> wait for a pullback
+# -> enter on first touch (or skip on timeout). RALLY override ONLY. The state machine
+# core is PURE (no IO/clock/orders) so it is exhaustively testable; the wrapper does the
+# price/clock read + telemetry. Distinct from the rally_pullback_* EXIT detector.
+ARM_HOLD = 'ARM'    # registered / waiting -- do NOT fire this tick
+ARM_FIRE = 'FIRE'   # pullback level touched -- fire the boost NOW (at this price)
+ARM_SKIP = 'SKIP'   # timeout candles elapsed or parent gone -- cleared, never fire
+
+
+def override_pullback_step(state, cfg, parent_side, current_price, m5_bucket,
+                           parent_alive):
+    """PURE arm-then-pullback-entry state machine for the RALLY override (v3.4.0).
+
+    `state` is a per-parent mutable dict (lives in the parent shadow as
+    shadow['override_arm']); called once per tick while the parent is override-grade.
+    Returns ARM_HOLD (registered/holding, do NOT fire), ARM_FIRE (pullback level
+    touched -> fire NOW at current_price), or ARM_SKIP (timeout elapsed or parent gone
+    -> cleared, no fire; latched so the event never re-arms). Mutates `state` in place.
+    NO IO, NO clock, NO order placement -- m5_bucket (a 5-min bucket id) is supplied by
+    the caller so the timeout is countable without an M5-close hook."""
+    pull = float(getattr(cfg, 'override_entry_pullback_dollars', 13.0))
+    timeout = int(getattr(cfg, 'override_entry_arm_timeout_candles', 4))
+    # SKIP latches: once skipped (timeout/parent-exit) the event never re-arms.
+    if state.get('skipped'):
+        return ARM_SKIP
+    if not parent_alive:
+        state['skipped'] = True
+        return ARM_SKIP
+    if not state.get('armed'):
+        # ARM: register and seed the tracked extreme at the current price.
+        state['armed'] = True
+        state['side'] = parent_side
+        state['extreme'] = float(current_price)
+        state['m5_bucket'] = m5_bucket
+        state['arm_m5_count'] = 0
+        return ARM_HOLD
+    # advance the M5 timeout counter once per new 5-min bucket (an M5 close).
+    if m5_bucket != state.get('m5_bucket'):
+        state['arm_m5_count'] = int(state.get('arm_m5_count', 0)) + 1
+        state['m5_bucket'] = m5_bucket
+    # track the running extreme; entry triggers on a `pull`-dollar retrace from it.
+    if parent_side == 'BUY':
+        state['extreme'] = max(float(state['extreme']), float(current_price))
+        level = float(state['extreme']) - pull
+        touched = float(current_price) <= level
+    else:
+        state['extreme'] = min(float(state['extreme']), float(current_price))
+        level = float(state['extreme']) + pull
+        touched = float(current_price) >= level
+    # touch wins over a same-tick timeout (we got the pullback in time).
+    if touched:
+        state['fire_level'] = round(level, 2)
+        return ARM_FIRE
+    if timeout > 0 and int(state.get('arm_m5_count', 0)) >= timeout:
+        state['skipped'] = True
+        return ARM_SKIP
+    return ARM_HOLD
+
+
+def _override_grade(cfg, shadow, plan):
+    """PURE: is this parent OVERRIDE-GRADE (same direction as the boost AND already
+    >= parent_established_dollars favorable)? Returns (is_grade, parent_fav, threshold,
+    parent_side). Mirrors the inline computation in the legacy override branch so both
+    the flag-ON and flag-OFF paths read the same signal."""
+    if not bool(getattr(cfg, 'parent_profit_override_enabled', True)):
+        return False, 0.0, 0.0, None
+    parent_side = shadow.get('side') if hasattr(shadow, 'get') else None
+    parent_entry = float(shadow.get('entry_price'))
+    parent_maxfav_price = float(shadow.get('max_fav', parent_entry))
+    if parent_side == 'BUY':
+        parent_fav = parent_maxfav_price - parent_entry
+    elif parent_side == 'SELL':
+        parent_fav = parent_entry - parent_maxfav_price
+    else:
+        parent_fav = 0.0
+    threshold = float(getattr(cfg, 'parent_established_dollars', 20.0))
+    same_dir = (parent_side == plan.boost_side)
+    return (same_dir and parent_fav >= threshold), parent_fav, threshold, parent_side
+
+
+def _override_entry_decision(self, shadow, plan, anchor, tf, edge, result, reason,
+                             parent_fav, threshold, parent_side):
+    """v3.4.0 wrapper around override_pullback_step: reads the current tick price
+    (self._last_boost_mid, stashed by the scan) + a 5-min bucket id (wall clock), runs
+    the PURE state machine on shadow['override_arm'], emits telemetry on the ARM / SKIP
+    transitions and on FIRE, and returns the bool the gate hands back (True = fire now,
+    False = hold/skip). Never raises onto the gate (the gate's own except is below)."""
+    import time as _time
+    price = getattr(self, '_last_boost_mid', None)
+    if price is None:
+        return False   # no price this tick -> hold, never fire blind
+    state = shadow.setdefault('override_arm', {})
+    pre_armed = bool(state.get('armed'))
+    pre_skipped = bool(state.get('skipped'))
+    m5_bucket = int(_time.time() // 300)   # 5-min wall-clock bucket (M5-close proxy)
+    decision = override_pullback_step(state, self.cfg, parent_side, float(price),
+                                      m5_bucket, parent_alive=True)
+    tr = getattr(self, 'ptrace', None)
+    if decision == ARM_FIRE:
+        msg = (f"🟢 OVERRIDE PULLBACK ENTRY — armed +${parent_fav:.2f} parent, entered "
+               f"on ${getattr(self.cfg, 'override_entry_pullback_dollars', 13.0):.2f} "
+               f"retrace {plan.boost_side} {anchor} @ ${price:.2f} "
+               f"(extreme ${float(state.get('extreme', price)):.2f})")
+        log.info(msg)
+        try:
+            self.tele.info(msg)
+        except Exception:
+            pass
+        if tr is not None:
+            try:
+                tr.break_override_parent_established(
+                    anchor, side=plan.boost_side, break_level=round(edge, 2),
+                    reason=f'pullback_entry/{reason}', parent_max_fav=round(parent_fav, 2),
+                    threshold=round(threshold, 2),
+                    move_dollars=round(float(state.get('fire_level', price)), 2),
+                    entry_mode='pullback_first_touch',
+                    extreme=round(float(state.get('extreme', price)), 2),
+                    arm_m5_count=int(state.get('arm_m5_count', 0)))
+            except Exception:
+                pass
+        return True
+    if decision == ARM_SKIP:
+        if tr is not None and not pre_skipped:
+            try:
+                tr.override_entry_skipped(
+                    anchor, side=plan.boost_side, parent_max_fav=round(parent_fav, 2),
+                    arm_m5_count=int(state.get('arm_m5_count', 0)),
+                    reason='arm_timeout_no_pullback')
+            except Exception:
+                pass
+        return False
+    # ARM_HOLD: emit the ARMED line once (first registration), then hold silently.
+    if tr is not None and not pre_armed:
+        try:
+            tr.override_entry_armed(
+                anchor, side=plan.boost_side, parent_max_fav=round(parent_fav, 2),
+                threshold=round(threshold, 2), position_price=round(float(price), 2),
+                pullback_needed=float(getattr(self.cfg, 'override_entry_pullback_dollars', 13.0)))
+        except Exception:
+            pass
+    return False
+
+
 def break_and_hold_ok(self, shadow, plan):
     """v3.2.4 Feature D gate (live): stack ONLY on a CONFIRMED break (cleared edge +
     held N M5 candles + retrace < Y), via the shared break_hold.classify on the
@@ -124,6 +268,19 @@ def break_and_hold_ok(self, shadow, plan):
                 tr.break_candidate(anchor, side=plan.boost_side,
                                    break_level=round(edge, 2), reason=reason,
                                    n_candles=len(candles), timeframe=tf)
+        # v3.4.0 RALLY OVERRIDE PULLBACK-ENTRY (flag-gated, DEFAULT OFF). When the flag
+        # is ON and this parent is OVERRIDE-GRADE, the arm-then-pullback state machine
+        # GOVERNS the fire decision (arm at +$20, enter on the retrace, skip on timeout)
+        # -- superseding both the immediate CONFIRMED fire and the legacy override below,
+        # because the whole point is NOT firing at the extreme. With the flag OFF this
+        # entire block is skipped and the original v3.3.8 logic runs verbatim
+        # (byte-identical). RESCUE never reaches here; the +$5 arm path is upstream.
+        if bool(getattr(self.cfg, 'override_entry_enabled', False)):
+            _og, _pfav, _thr, _pside = _override_grade(self.cfg, shadow, plan)
+            if _og:
+                return _override_entry_decision(
+                    self, shadow, plan, anchor, tf, edge, result, reason,
+                    _pfav, _thr, _pside)
         if result == _bh.CONFIRMED:
             self.tele.info(f"📈 BREAK CONFIRMED {plan.boost_side} {anchor} "
                            f"@edge ${edge:.2f} — stacking")

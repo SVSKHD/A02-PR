@@ -154,6 +154,15 @@ STEP_NAMES = {
     103: "five anchors times",
     104: "anchor no collide",
     105: "a5 identical + fp5",
+    # v3.4.0 RALLY override pullback-entry (flag-gated, DEFAULT OFF)
+    106: "ovr freeze guard",
+    107: "ovr arm no-fire",
+    108: "ovr pullback fire",
+    109: "ovr timeout skip",
+    110: "ovr parent-exit",
+    111: "ovr rescue unaff",
+    112: "ovr $5arm unaff",
+    113: "ovr no pb-collide",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3274,7 +3283,7 @@ class SelfTest:
     # v3.3.3 — break-and-hold crash fix (numpy-safe + fail-closed); rally SL $13
     # ------------------------------------------------------------------------
     def _break_gate_stub(self, getter, side='BUY', kind='RALLY', edge=100.0,
-                         parent_side=None, parent_max_fav=0.0, cfg=None):
+                         parent_side=None, parent_max_fav=0.0, cfg=None, last_mid=None):
         # Minimal trader-like object for rally.break_and_hold_ok: the gate reads
         # cfg + adapter.get_latest_m5 + tele + ptrace. parent_max_fav ($, default 0 ->
         # NOT established, so the v3.3.5 override never applies for the legacy tests)
@@ -3301,6 +3310,8 @@ class SelfTest:
                 return _rec
         tr = types.SimpleNamespace(cfg=cfg or self.cfg, adapter=adapter, tele=tele,
                                    ptrace=_PT())
+        if last_mid is not None:        # v3.4.0: current tick price for the pullback gate
+            tr._last_boost_mid = float(last_mid)
         return tr, shadow, plan
 
     def _step_break_gate_npsafe(self):
@@ -3836,6 +3847,193 @@ class SelfTest:
             self._record(105, FAIL, f"raised: {e!r}"); return
         self._record(105, PASS if ok else FAIL, detail)
 
+    # --- v3.4.0 RALLY override pullback-entry (flag-gated, DEFAULT OFF) -------
+    def _step_override_freeze_guard(self):
+        # 106 FREEZE GUARD: with override_entry_enabled=False (default), break_and_hold_ok
+        # fires the override IMMEDIATELY exactly as v3.3.8 -- no arm, no pullback. Same
+        # override-grade SELL crash as test 96: returns True and emits the LEGACY
+        # BREAK_OVERRIDE event (no entry_mode field), and NO arm/skip events.
+        import rally as _rally
+        try:
+            flag_off = (bool(getattr(self.cfg, 'override_entry_enabled', False)) is False)
+            bars = self._case2_bars()
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                               parent_side='SELL', parent_max_fav=25.0)
+            fired = (_rally.break_and_hold_ok(tr, sh, pl) is True)
+            ev = [e for e in self._gate_ptrace if e[0] == 'break_override_parent_established']
+            legacy_immediate = (len(ev) == 1 and 'entry_mode' not in ev[0][1])
+            no_arm_events = not any(e[0] in ('override_entry_armed', 'override_entry_skipped')
+                                    for e in self._gate_ptrace)
+            ok = flag_off and fired and legacy_immediate and no_arm_events
+            detail = (f"flag_default_off={flag_off} fires_immediately={fired} "
+                      f"legacy_event_no_pullback={legacy_immediate} no_arm/skip={no_arm_events}")
+        except Exception as e:
+            self._record(106, FAIL, f"raised: {e!r}"); return
+        self._record(106, PASS if ok else FAIL, detail)
+
+    def _step_override_arm_no_fire(self):
+        # 107 ARM-NO-FIRE: flag ON, parent override-grade (+$25) -> first gate eval ARMS
+        # (state registered) and returns False (NO order). OVERRIDE_ENTRY_ARMED emitted.
+        import rally as _rally, dataclasses
+        try:
+            cfg_on = dataclasses.replace(self.cfg, override_entry_enabled=True)
+            bars = [{'high': 101.0, 'low': 99.0, 'close': 100.0},
+                    {'high': 102.0, 'low': 100.0, 'close': 101.0}]
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='BUY',
+                                               parent_side='BUY', parent_max_fav=25.0,
+                                               cfg=cfg_on, last_mid=100.0)
+            no_fire = (_rally.break_and_hold_ok(tr, sh, pl) is False)
+            armed = bool(sh.get('override_arm', {}).get('armed'))
+            armed_ev = any(e[0] == 'override_entry_armed' for e in self._gate_ptrace)
+            ok = no_fire and armed and armed_ev
+            detail = (f"flag_on_no_fire={no_fire} state_armed={armed} armed_ptrace={armed_ev}")
+        except Exception as e:
+            self._record(107, FAIL, f"raised: {e!r}"); return
+        self._record(107, PASS if ok else FAIL, detail)
+
+    def _step_override_pullback_fire(self):
+        # 108 PULLBACK FIRE (pure state machine): armed, price runs then retraces the
+        # $13 band from the tracked extreme -> FIRE at extreme-/+13. SL stays $13 from
+        # that entry (rally_boost_sl). BUY and SELL mirror.
+        import rally as _rally, dataclasses
+        try:
+            cfg = dataclasses.replace(self.cfg, override_entry_enabled=True,
+                                      override_entry_pullback_dollars=13.0)
+            stb = {}
+            d0 = _rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 1, True)   # ARM
+            d1 = _rally.override_pullback_step(stb, cfg, 'BUY', 110.0, 1, True)   # extreme->110
+            d2 = _rally.override_pullback_step(stb, cfg, 'BUY', 96.0, 1, True)    # 96<=110-13=97 FIRE
+            buy_ok = (d0 == _rally.ARM_HOLD and d1 == _rally.ARM_HOLD
+                      and d2 == _rally.ARM_FIRE and abs(stb['fire_level'] - 97.0) < 1e-9)
+            sts = {}
+            _rally.override_pullback_step(sts, cfg, 'SELL', 100.0, 1, True)       # ARM
+            _rally.override_pullback_step(sts, cfg, 'SELL', 90.0, 1, True)        # extreme->90
+            ds = _rally.override_pullback_step(sts, cfg, 'SELL', 104.0, 1, True)  # 104>=90+13=103 FIRE
+            sell_ok = (ds == _rally.ARM_FIRE and abs(sts['fire_level'] - 103.0) < 1e-9)
+            sl_from_entry = abs(float(getattr(cfg, 'rally_boost_sl', 13.0)) - 13.0) < 1e-9
+            ok = buy_ok and sell_ok and sl_from_entry
+            detail = (f"BUY_fire@{stb.get('fire_level')}(=97)={buy_ok} "
+                      f"SELL_fire@{sts.get('fire_level')}(=103)={sell_ok} SL$13_from_entry={sl_from_entry}")
+        except Exception as e:
+            self._record(108, FAIL, f"raised: {e!r}"); return
+        self._record(108, PASS if ok else FAIL, detail)
+
+    def _step_override_timeout_skip(self):
+        # 109 TIMEOUT-SKIP (pure): armed, no $13 pullback within override_entry_arm_
+        # timeout_candles M5 closes -> SKIP, state cleared (skipped latched, never re-arms).
+        import rally as _rally, dataclasses
+        try:
+            cfg = dataclasses.replace(self.cfg, override_entry_enabled=True,
+                                      override_entry_arm_timeout_candles=4)
+            stb = {}
+            _rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 0, True)        # ARM @ bucket0
+            seq = [_rally.override_pullback_step(stb, cfg, 'BUY', 100.0, b, True)  # price never touches
+                   for b in (1, 2, 3, 4)]
+            skip_at_timeout = (seq[:3] == [_rally.ARM_HOLD] * 3 and seq[3] == _rally.ARM_SKIP)
+            cleared = (stb.get('skipped') is True)
+            latched = (_rally.override_pullback_step(stb, cfg, 'BUY', 96.0, 5, True) == _rally.ARM_SKIP)
+            ok = skip_at_timeout and cleared and latched
+            detail = (f"hold_x3_then_skip@4candles={skip_at_timeout} cleared={cleared} "
+                      f"skip_latched_even_on_touch={latched}")
+        except Exception as e:
+            self._record(109, FAIL, f"raised: {e!r}"); return
+        self._record(109, PASS if ok else FAIL, detail)
+
+    def _step_override_parent_exit_clear(self):
+        # 110 PARENT-EXIT CLEAR (pure): armed, then parent_alive=False (parent hit TP/SL)
+        # -> SKIP, state cleared. Latched: a later touch does NOT fire. (At runtime this
+        # is also structural -- a closed parent is removed from the scan and its shadow,
+        # so shadow['override_arm'] vanishes with it.)
+        import rally as _rally, dataclasses
+        try:
+            cfg = dataclasses.replace(self.cfg, override_entry_enabled=True)
+            stb = {}
+            _rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 0, True)        # ARM
+            exit_skip = (_rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 0,
+                         parent_alive=False) == _rally.ARM_SKIP)
+            cleared = (stb.get('skipped') is True)
+            no_fire_after = (_rally.override_pullback_step(stb, cfg, 'BUY', 80.0, 0, True)
+                             == _rally.ARM_SKIP)   # a deep touch still does NOT fire
+            ok = exit_skip and cleared and no_fire_after
+            detail = (f"parent_exit_skips={exit_skip} cleared={cleared} no_fire_after_exit={no_fire_after}")
+        except Exception as e:
+            self._record(110, FAIL, f"raised: {e!r}"); return
+        self._record(110, PASS if ok else FAIL, detail)
+
+    def _step_override_rescue_unaffected(self):
+        # 111 RESCUE-UNAFFECTED: with override_entry_enabled ON, the RESCUE plan is
+        # byte-identical (SL $10, cap -$700, bypass) -- the override gate is RALLY-only
+        # and rescue never reaches it. Plan identical flag ON vs OFF.
+        import boosts as _boosts, dataclasses
+        try:
+            cfg_on = dataclasses.replace(self.cfg, override_entry_enabled=True)
+            r_on = _boosts.plan_boost_event('BUY', 4000.0, 4000.0 - 10.0, cfg_on)
+            r_off = _boosts.plan_boost_event('BUY', 4000.0, 4000.0 - 10.0, self.cfg)
+            sl_ok = (abs(r_on.sl_dollars - 10.0) < 1e-9 and r_on.kind == r_off.kind
+                     and abs(r_on.sl_dollars - r_off.sl_dollars) < 1e-9)
+            cap_ok = abs(_boosts.boost_whipsaw_cap(cfg_on, 'RESCUE') - 700.0) < 1e-6
+            bypass_ok = bool(getattr(cfg_on, 'rescue_bypass_break_and_hold', True))
+            ok = sl_ok and cap_ok and bypass_ok
+            detail = (f"rescue_SL$10_identical_on/off={sl_ok} cap-$700={cap_ok} bypass={bypass_ok}")
+        except Exception as e:
+            self._record(111, FAIL, f"raised: {e!r}"); return
+        self._record(111, PASS if ok else FAIL, detail)
+
+    def _step_override_5arm_unaffected(self):
+        # 112 +$5-ARM-UNAFFECTED: the normal +$5 RALLY arm (boosts.plan_boost_event) is
+        # unchanged with the flag ON or OFF -- it does not read override_entry_*. A +$5
+        # winning leg yields the same RALLY plan (SL $13) regardless of the flag.
+        import boosts as _boosts, dataclasses
+        try:
+            cfg_on = dataclasses.replace(self.cfg, override_entry_enabled=True)
+            p_on = _boosts.plan_boost_event('BUY', 4000.0, 4005.0, cfg_on)
+            p_off = _boosts.plan_boost_event('BUY', 4000.0, 4005.0, self.cfg)
+            arm_ok = (p_on is not None and p_on.kind == 'RALLY'
+                      and abs(p_on.sl_dollars - 13.0) < 1e-9
+                      and p_off is not None and p_on.kind == p_off.kind
+                      and abs(p_on.sl_dollars - p_off.sl_dollars) < 1e-9)
+            ok = arm_ok
+            detail = (f"+$5_RALLY_arm_identical_on/off(kind={p_on.kind if p_on else None},"
+                      f"sl={p_on.sl_dollars if p_on else None})={arm_ok}")
+        except Exception as e:
+            self._record(112, FAIL, f"raised: {e!r}"); return
+        self._record(112, PASS if ok else FAIL, detail)
+
+    def _step_override_no_pullback_collision(self):
+        # 113 NO-COLLISION: the new ENTRY keys are DISTINCT from the rally_pullback_*
+        # EXIT detector, defaults intact, and the EXIT detector still cuts with the
+        # ENTRY flag ON (override_entry_* never touches strategy._update_boost_on_bar).
+        import dataclasses
+        from strategy import update_position_on_bar
+        try:
+            entry_keys = {'override_entry_enabled', 'override_entry_pullback_dollars',
+                          'override_entry_arm_timeout_candles', 'override_entry_first_touch'}
+            exit_keys = {'rally_pullback_enabled', 'rally_pullback_tol_dollars',
+                         'rally_pullback_time_bound_min'}
+            disjoint = (entry_keys.isdisjoint(exit_keys)
+                        and all(not k.startswith('rally_pullback') for k in entry_keys))
+            defaults_ok = (getattr(self.cfg, 'rally_pullback_enabled') is False
+                           and abs(getattr(self.cfg, 'rally_pullback_tol_dollars') - 7.5) < 1e-9
+                           and getattr(self.cfg, 'override_entry_enabled') is False
+                           and abs(getattr(self.cfg, 'override_entry_pullback_dollars') - 13.0) < 1e-9
+                           and int(getattr(self.cfg, 'override_entry_arm_timeout_candles')) == 4)
+            # EXIT detector still cuts with the ENTRY flag ON (entry flag is inert here).
+            cfg = dataclasses.replace(self.cfg, rally_pullback_enabled=True,
+                                      rally_pullback_tol_dollars=8.0,
+                                      override_entry_enabled=True)
+            entry = 100.0
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            pc = self._rally_boost(cfg, entry, ts0)
+            update_position_on_bar(pc, pd.Series({'open': 99, 'high': 99, 'low': 91, 'close': 92}),
+                                   ts0 + pd.Timedelta(minutes=1), cfg)
+            exit_still_cuts = bool(pc.closed)
+            ok = disjoint and defaults_ok and exit_still_cuts
+            detail = (f"keys_disjoint={disjoint} defaults_intact={defaults_ok} "
+                      f"exit_detector_cuts_with_entry_flag_on={exit_still_cuts}")
+        except Exception as e:
+            self._record(113, FAIL, f"raised: {e!r}"); return
+        self._record(113, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -4032,6 +4230,15 @@ class SelfTest:
             self._step_five_anchors_times()
             self._step_anchor_no_collision()
             self._step_a5_identical_fp5()
+            # v3.4.0 — RALLY override pullback-entry (flag-gated, DEFAULT OFF)
+            self._step_override_freeze_guard()
+            self._step_override_arm_no_fire()
+            self._step_override_pullback_fire()
+            self._step_override_timeout_skip()
+            self._step_override_parent_exit_clear()
+            self._step_override_rescue_unaffected()
+            self._step_override_5arm_unaffected()
+            self._step_override_no_pullback_collision()
         finally:
             self._cleanup()
         return self._report(ts)

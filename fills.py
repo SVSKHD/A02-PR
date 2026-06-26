@@ -583,6 +583,10 @@ def _check_boost_triggers(self):
         mid = (float(tk.bid) + float(tk.ask)) / 2.0
     except Exception:
         return
+    # v3.4.0: stash the current tick price so the RALLY override pullback-entry gate
+    # (rally._override_entry_decision) can read it without a signature change. Harmless
+    # when override_entry_enabled is OFF (the gate never reads it).
+    self._last_boost_mid = mid
     import tick_hold as _th
     # v3.2.8 Phase 1: ASYMMETRIC arm. A WINNING leg arms RALLY at +rally_arm_fav ($5);
     # a LOSING leg arms RESCUE at -rescue_arm ($10, unchanged boost_trigger_dollars).
