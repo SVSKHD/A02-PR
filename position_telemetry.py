@@ -74,6 +74,10 @@ BREAK_FAILED = "BREAK_FAILED"
 # gate would have BLOCKED, because the parent leg is already deeply established in the
 # same direction (a proven continuation, not a fake spike).
 BREAK_OVERRIDE_PARENT_ESTABLISHED = "BREAK_OVERRIDE_PARENT_ESTABLISHED"
+# v3.4.0 RALLY override pullback-entry: armed at +$20 (waiting for the retrace) and
+# skipped (no pullback within the timeout) -- the trial's pullback-frequency data.
+OVERRIDE_ENTRY_ARMED = "OVERRIDE_ENTRY_ARMED"
+OVERRIDE_ENTRY_SKIPPED = "OVERRIDE_ENTRY_SKIPPED"
 CONTINUATION_STACK = "CONTINUATION_STACK"
 FP_GUARD = "FP_GUARD"
 FP_GUARD_EVAL = "FP_GUARD_EVAL"
@@ -214,6 +218,10 @@ class PositionTracer:
     def break_failed(self, anchor, **kw):  return self.emit(BREAK_FAILED, None, anchor, **kw)
     def break_override_parent_established(self, anchor, **kw):
         return self.emit(BREAK_OVERRIDE_PARENT_ESTABLISHED, None, anchor, **kw)
+    def override_entry_armed(self, anchor, **kw):
+        return self.emit(OVERRIDE_ENTRY_ARMED, None, anchor, **kw)
+    def override_entry_skipped(self, anchor, **kw):
+        return self.emit(OVERRIDE_ENTRY_SKIPPED, None, anchor, **kw)
     def continuation_stack(self, anchor, **kw): return self.emit(CONTINUATION_STACK, None, anchor, **kw)
     def fp_guard(self, anchor="SYS", **kw): return self.emit(FP_GUARD_EVAL, None, anchor, **kw)
     def stack_complete(self, ticket, anchor, **kw): return self.emit(STACK_COMPLETE, ticket, anchor, **kw)

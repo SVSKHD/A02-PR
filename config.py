@@ -82,6 +82,27 @@ class Config:
     #   be >= +$20 favorable (max_fav vs entry, same units as the $5/$3/$13 knobs) for
     #   the override to apply. Tunable WITHOUT a rebuild -- calibrate from trial data
     #   (the BREAK_OVERRIDE_PARENT_ESTABLISHED PTRACE lines show every time it fired).
+    # --- v3.4.0 RALLY OVERRIDE PULLBACK-ENTRY (flag-gated, DEFAULT OFF) ----------
+    # The override (above) fires the instant the parent is +$20 same-direction -- i.e.
+    # at the EXTREME of the move, which got knifed by the natural breath (Jun 25 A3:
+    # fired the top, pulled back $13, -$905). This OPT-IN gate, when enabled, instead
+    # ARMS at +$20 and waits for price to retrace override_entry_pullback_dollars from
+    # the tracked extreme, then enters on first touch (SL still $13 from THAT entry).
+    # If no pullback appears within override_entry_arm_timeout_candles M5 candles -> SKIP
+    # the boost (a skip is free; a bad entry costs $905). RALLY override ONLY -- RESCUE
+    # and the +$5 rally arm are untouched. DISTINCT from the rally_pullback_* EXIT
+    # detector below (this is an ENTRY gate). DEFAULT OFF: with the flag off, the
+    # override fires immediately exactly as v3.3.8 (byte-identical). NUMBERS ARE TRIAL-
+    # TUNABLE -- band depth + timeout are first guesses, and a high skip rate is a valid
+    # verdict (it may mean DELETE the override, not ship this).
+    override_entry_enabled: bool = False  # v3.4.0 MASTER FLAG, DEFAULT OFF (freeze-safe).
+    override_entry_pullback_dollars: float = 13.0  # retrace $ from the tracked extreme
+    #   that arms-then-enters the boost on first touch (entry = extreme -/+ this).
+    override_entry_arm_timeout_candles: int = 4  # M5 candles (~20 min) to wait for the
+    #   pullback before SKIPPING the boost. Owner's suggested default; trial-tunable.
+    override_entry_first_touch: bool = True  # v1 = enter on first touch of the level.
+    #   RESERVED: False (a confirm-candle close) is a later refinement, NOT implemented
+    #   in v3.4.0 -- the gate uses first-touch regardless of this flag for now.
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose

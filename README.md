@@ -312,6 +312,33 @@ returns last-trading-day per-anchor P&L + week-to-date.
   5:00 AM). The defect was display-only — readiness/status/banner now derive A1's
   time from the resolver (`_resolved_anchor_hm`) instead of stale hardcoded strings.
 
+### v3.4.0 — RALLY override pullback-entry (flag-gated, **DEFAULT OFF**, month-end candidate)
+
+**What's new.** The +$20 parent-direction RALLY override (v3.3.5) fires at the *extreme*
+of the move and gets knifed by the natural breath (Jun 25 A3: fired the top, pulled back
+$13, −$905). When `override_entry_enabled=True`, the override no longer fires immediately:
+it **arms** at +$20, tracks the running extreme, and **enters on the first touch** of a
+`override_entry_pullback_dollars` ($13) retrace from that extreme (SL still $13 from the
+pullback entry). If no pullback appears within `override_entry_arm_timeout_candles` (4 M5
+candles ≈ 20 min) it **skips** the boost (a skip is free; a bad entry costs ~$905). New
+PTRACE `OVERRIDE_ENTRY_ARMED` / `OVERRIDE_ENTRY_SKIPPED` give the trial its
+pullback-frequency data. RALLY override **only** — RESCUE, the +$5 rally arm, and the
+`rally_pullback_*` **exit** detector are untouched.
+
+**OFF-by-default guarantee.** With `override_entry_enabled=False` (the default),
+`rally.break_and_hold_ok` runs the v3.3.8 logic **verbatim** — the override fires
+immediately, byte-identical. The live demo trial keeps running on the OFF path. Proven by
+selftest 106 (freeze guard) plus the unchanged override tests 96/97/98.
+
+**Open numbers the trial will tune.** Band depth ($13), arm timeout (4 M5 candles), and
+first-touch-vs-confirm-candle (`override_entry_first_touch=True`; confirm-candle reserved,
+not implemented) are first guesses, not final.
+
+> ⚠️ **May become DELETE, not SHIP.** This was built *before* the pullback-frequency data
+> exists. If the trial shows override-grade moves rarely pull back, the detector will skip
+> most of the time and the correct action is to **remove the override entirely**
+> (subtraction > addition), not enable this. Built flag-OFF so both options stay open.
+
 ---
 
 ## License
