@@ -182,6 +182,24 @@ STEP_NAMES = {
     129: "R4 pump-fade",
     130: "R5 smooth runner",
     131: "R6 chop skip",
+    # ROGUE — self-anchoring monster-rider (flag-gated; demo default ON, funded OFF)
+    132: "rogue freeze/gate",
+    133: "rogue detect monster",
+    134: "rogue weak no-slot",
+    135: "rogue cap blocks @10",
+    136: "rogue early entry",
+    137: "rogue adaptive trail",
+    138: "rogue loss-stop -150",
+    139: "rogue 3-fail pause",
+    140: "rogue closure isol",
+    141: "rogue rescue capped",
+    142: "rogue rally reuse",
+    143: "rogue demo/funded",
+    144: "rogue tagging",
+    145: "rogue ride-unlimited",
+    # Watchdog boot validator (Task 1)
+    146: "watchdog safe-start",
+    147: "watchdog do-not-start",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4385,6 +4403,301 @@ class SelfTest:
             self._record(131, FAIL, f"raised: {e!r}"); return
         self._record(131, PASS if ok else FAIL, detail)
 
+    # --- ROGUE: self-anchoring monster-rider --------------------------------
+    def _step_rogue_freeze_gate(self):
+        # 132 FREEZE + GATE: rogue_enabled raw default FALSE -> should_run False ->
+        # master byte-identical (no watch/anchor/entry). A FUNDED account force-disables
+        # rogue even when the flag is ON (mandatory gate); demo (non-funded) runs it.
+        import rogue as _rogue, dataclasses
+        try:
+            off_raw = (bool(getattr(self.cfg, 'rogue_enabled', False)) is False
+                       and _rogue.should_run(self.cfg, is_funded=False) is False)
+            cfg_on = dataclasses.replace(self.cfg, rogue_enabled=True)
+            funded_gate = (_rogue.should_run(cfg_on, is_funded=True) is False)
+            demo_runs = (_rogue.should_run(cfg_on, is_funded=False) is True)
+            ok = off_raw and funded_gate and demo_runs
+            detail = f"raw_off_master_identical={off_raw} funded_force_off={funded_gate} demo_runs={demo_runs}"
+        except Exception as e:
+            self._record(132, FAIL, f"raised: {e!r}"); return
+        self._record(132, PASS if ok else FAIL, detail)
+
+    def _step_rogue_detect_monster(self):
+        # 133 SELF-ANCHORING: a strong move (4 same-dir M5 closes, range>=$15, thrust)
+        # drops the anchor at the MOVE-COMPLETION PRICE (the turn extreme), not a clock
+        # time. Jun26-like: 4024 -> 3983 SELL monster -> anchor @ 3983.
+        import rogue as _rogue
+        try:
+            cs = [{'open': 4024, 'high': 4025, 'low': 4014, 'close': 4015},
+                  {'open': 4015, 'high': 4016, 'low': 4004, 'close': 4005},
+                  {'open': 4005, 'high': 4006, 'low': 3994, 'close': 3995},
+                  {'open': 3995, 'high': 3996, 'low': 3983, 'close': 3984}]
+            is_m, mdir, comp = _rogue.detect_monster(cs, self.cfg)
+            ok = (is_m is True and mdir == 'SELL' and abs(comp - 3983.0) < 1e-9)
+            detail = f"is_monster={is_m} dir={mdir} anchor@completion={comp}(=3983,not_clock)"
+        except Exception as e:
+            self._record(133, FAIL, f"raised: {e!r}"); return
+        self._record(133, PASS if ok else FAIL, detail)
+
+    def _step_rogue_weak_no_slot(self):
+        # 134 SETUP GATE: a WEAK move (mixed direction OR range < $15) is NOT a monster ->
+        # no anchor, no entry, no re-anchor slot consumed.
+        import rogue as _rogue
+        try:
+            mixed = [{'open': 4000, 'high': 4006, 'low': 3999, 'close': 4005},   # up
+                     {'open': 4005, 'high': 4006, 'low': 3998, 'close': 3999},   # down
+                     {'open': 3999, 'high': 4006, 'low': 3998, 'close': 4005},   # up
+                     {'open': 4005, 'high': 4006, 'low': 3998, 'close': 3999}]   # down
+            small = [{'open': 4000, 'high': 4001, 'low': 3999, 'close': 4000.5},
+                     {'open': 4000.5, 'high': 4001.5, 'low': 3999.5, 'close': 4001},
+                     {'open': 4001, 'high': 4002, 'low': 4000, 'close': 4001.5},
+                     {'open': 4001.5, 'high': 4002.5, 'low': 4000.5, 'close': 4002}]
+            no_mixed = (_rogue.detect_monster(mixed, self.cfg)[0] is False)
+            no_small = (_rogue.detect_monster(small, self.cfg)[0] is False)  # range < $15
+            gov = _rogue.new_day_state()
+            slot_unconsumed = (gov['reanchor_count'] == 0)   # detection never calls record_entry
+            ok = no_mixed and no_small and slot_unconsumed
+            detail = f"mixed_not_monster={no_mixed} small_range_not_monster={no_small} no_slot={slot_unconsumed}"
+        except Exception as e:
+            self._record(134, FAIL, f"raised: {e!r}"); return
+        self._record(134, PASS if ok else FAIL, detail)
+
+    def _step_rogue_cap_blocks(self):
+        # 135 CAP: re-entry blocked once the daily cap (rogue_max_reentries_per_day=10)
+        # is hit. Each NEW entry consumes one slot; the 11th is refused.
+        import rogue as _rogue
+        try:
+            cap = int(getattr(self.cfg, 'rogue_max_reentries_per_day', 10))
+            gov = _rogue.new_day_state()
+            allowed = 0
+            for _ in range(cap):
+                ok_i, _r = _rogue.can_enter(gov, self.cfg)
+                if ok_i:
+                    allowed += 1
+                    _rogue.record_entry(gov)
+            blocked, reason = _rogue.can_enter(gov, self.cfg)
+            ok = (cap == 10 and allowed == 10 and gov['reanchor_count'] == 10
+                  and blocked is False and reason == 'daily_cap')
+            detail = f"cap={cap} allowed={allowed} 11th_blocked={blocked is False} reason={reason}"
+        except Exception as e:
+            self._record(135, FAIL, f"raised: {e!r}"); return
+        self._record(135, PASS if ok else FAIL, detail)
+
+    def _step_rogue_early_entry(self):
+        # 136 EARLY ENTRY (Jun26): anchor 3983, next leg BUY. Enter ~$20 in (4003), SL $5
+        # tight (3998) -- NOT chasing the obvious top (~4080). A too-early move ($12 in,
+        # 3995) does NOT enter.
+        import rogue as _rogue
+        try:
+            en, epx, sl = _rogue.entry_decision(3983.0, 'BUY', 4003.0, self.cfg)
+            early_ok = (en is True and abs(epx - 4003.0) < 1e-9 and abs(sl - 3998.0) < 1e-9
+                        and epx < 4080.0)
+            too_early = _rogue.entry_decision(3983.0, 'BUY', 3995.0, self.cfg)[0]
+            ok = early_ok and (too_early is False)
+            detail = f"enter@{epx}(~$20 in) SL@{sl}($5) not_top(<4080)={epx<4080} 12in_no_enter={not too_early}"
+        except Exception as e:
+            self._record(136, FAIL, f"raised: {e!r}"); return
+        self._record(136, PASS if ok else FAIL, detail)
+
+    def _step_rogue_adaptive_trail(self):
+        # 137 ADAPTIVE TRAIL: tight early ($3) until profit >= widen ($15), then wide
+        # ($6) -- the transition that lets a real monster ride. early/deep/widen tested.
+        import rogue as _rogue
+        try:
+            early = _rogue.trail_gap(10.0, self.cfg)   # < 15 -> 3
+            at = _rogue.trail_gap(15.0, self.cfg)      # == 15 -> 6
+            deep = _rogue.trail_gap(25.0, self.cfg)    # > 15 -> 6
+            ok = (abs(early - 3.0) < 1e-9 and abs(at - 6.0) < 1e-9 and abs(deep - 6.0) < 1e-9)
+            detail = f"early@$10={early}(=3) at_widen@$15={at}(=6) deep@$25={deep}(=6)"
+        except Exception as e:
+            self._record(137, FAIL, f"raised: {e!r}"); return
+        self._record(137, PASS if ok else FAIL, detail)
+
+    def _step_rogue_loss_stop(self):
+        # 138 GOVERNOR: cumulative day P&L <= -$150 STOPS new entries for the day.
+        import rogue as _rogue
+        try:
+            gov = _rogue.new_day_state()
+            _rogue.record_close(gov, -100.0, was_fail=True, cfg=self.cfg)
+            still_ok = _rogue.can_enter(gov, self.cfg)[0]            # -100 > -150 -> ok
+            _rogue.record_close(gov, -60.0, was_fail=False, cfg=self.cfg)  # -160 -> stop
+            blocked, reason = _rogue.can_enter(gov, self.cfg)
+            ok = (still_ok is True and gov['loss_stopped'] is True
+                  and blocked is False and reason == 'daily_loss_stop')
+            detail = f"at_-100_ok={still_ok} at_-160_stops={gov['loss_stopped']} reason={reason}"
+        except Exception as e:
+            self._record(138, FAIL, f"raised: {e!r}"); return
+        self._record(138, PASS if ok else FAIL, detail)
+
+    def _step_rogue_fail_pause(self):
+        # 139 GOVERNOR: 3 consecutive init-SL fake-outs PAUSE new entries; a winner in
+        # between RESETS the streak.
+        import rogue as _rogue
+        try:
+            gov = _rogue.new_day_state()
+            for _ in range(3):
+                _rogue.record_close(gov, -5.0, was_fail=True, cfg=self.cfg)
+            blocked, reason = _rogue.can_enter(gov, self.cfg)
+            pauses = (gov['consec_fails'] == 3 and gov['fail_paused'] is True
+                      and blocked is False and reason == 'consecutive_fail_pause')
+            g2 = _rogue.new_day_state()
+            _rogue.record_close(g2, -5.0, True, self.cfg)
+            _rogue.record_close(g2, -5.0, True, self.cfg)
+            _rogue.record_close(g2, +12.0, False, self.cfg)   # a winner resets
+            resets = (g2['consec_fails'] == 0 and g2['fail_paused'] is False)
+            ok = pauses and resets
+            detail = f"3_fails_pause={pauses} winner_resets_streak={resets}"
+        except Exception as e:
+            self._record(139, FAIL, f"raised: {e!r}"); return
+        self._record(139, PASS if ok else FAIL, detail)
+
+    def _step_rogue_closure_isolation(self):
+        # 140 CLOSURE ISOLATION: a ROGUE close closes ONLY rogue legs; an ANCHOR close
+        # closes ONLY anchor legs. No generic close-all; distinct magic/leg_type.
+        import rogue as _rogue
+        try:
+            rogue_pos = {'magic': _rogue.ROGUE_MAGIC, 'leg_type': 'rogue'}
+            anchor_pos = {'magic': 20260522, 'leg_type': 'normal'}
+            r_closes_r = _rogue.closes(rogue_pos, 'ROGUE')
+            r_skips_anchor = (_rogue.closes(anchor_pos, 'ROGUE') is False)
+            a_closes_a = _rogue.closes(anchor_pos, 'ANCHOR')
+            a_skips_rogue = (_rogue.closes(rogue_pos, 'ANCHOR') is False)
+            ok = r_closes_r and r_skips_anchor and a_closes_a and a_skips_rogue
+            detail = (f"rogue_close_only_rogue={r_closes_r and r_skips_anchor} "
+                      f"anchor_close_only_anchor={a_closes_a and a_skips_rogue}")
+        except Exception as e:
+            self._record(140, FAIL, f"raised: {e!r}"); return
+        self._record(140, PASS if ok else FAIL, detail)
+
+    def _step_rogue_rescue_capped(self):
+        # 141 REUSE — RESCUE on fail is CAPPED: a Rogue rescue leg reuses the RESCUE state
+        # machine from the Rogue anchor and inherits the SAME derived cap discipline
+        # (boost_whipsaw_cap -$700), so a bad Rogue catch cannot stack uncapped loss.
+        # ROGUE-tagged (own magic, distinct from the anchor).
+        import boosts as _boosts, rogue as _rogue
+        try:
+            cap = _boosts.boost_whipsaw_cap(self.cfg, 'RESCUE')
+            capped = abs(cap - 700.0) < 1e-6
+            breach = _boosts.cap_breached(-705.0, self.cfg, 'RESCUE')   # binds at the cap
+            rogue_tagged = (_rogue.ROGUE_MAGIC != 20260522)
+            ok = capped and (breach is True) and rogue_tagged
+            detail = f"rescue_cap-$700={capped} cap_binds={breach} rogue_tagged={rogue_tagged}"
+        except Exception as e:
+            self._record(141, FAIL, f"raised: {e!r}"); return
+        self._record(141, PASS if ok else FAIL, detail)
+
+    def _step_rogue_rally_reuse(self):
+        # 142 REUSE — RALLY on strength: a Rogue ride/pyramid reuses the shared RALLY
+        # accessors ($5 arm) from the Rogue anchor, ROGUE-tagged. Shared HELPERS only --
+        # no merged path (rogue has its own magic/leg_type/counter).
+        import rally as _rally, rogue as _rogue
+        try:
+            arm = _rally.event_arm(self.cfg)              # reused $5 rally arm
+            reuse_ok = abs(arm - 5.0) < 1e-9
+            tag_ok = (_rogue.ROGUE_LEG_TYPE == 'rogue' and _rogue.ROGUE_MAGIC != 20260522)
+            ok = reuse_ok and tag_ok
+            detail = f"rally_arm_reused=${arm}(=5) rogue_tagged={tag_ok}"
+        except Exception as e:
+            self._record(142, FAIL, f"raised: {e!r}"); return
+        self._record(142, PASS if ok else FAIL, detail)
+
+    def _step_rogue_demo_funded(self):
+        # 143 DEMO default-ON / FUNDED default-OFF: funded_default(demo, funded). A funded
+        # account is NEVER promoted (the mandatory gate); only demo/non-funded runs hot.
+        import rogue as _rogue
+        try:
+            demo_on = (_rogue.funded_default(True, False) is True)
+            funded_off = (_rogue.funded_default(True, True) is False)   # funded wins
+            funded_off2 = (_rogue.funded_default(False, True) is False)
+            nondemo_off = (_rogue.funded_default(False, False) is False)
+            ok = demo_on and funded_off and funded_off2 and nondemo_off
+            detail = f"demo_ON={demo_on} funded_OFF(gate)={funded_off and funded_off2} nondemo_OFF={nondemo_off}"
+        except Exception as e:
+            self._record(143, FAIL, f"raised: {e!r}"); return
+        self._record(143, PASS if ok else FAIL, detail)
+
+    def _step_rogue_tagging(self):
+        # 144 TAGGING: tag ROGUE, leg_type 'rogue', alert prefix [ROGUE], distinct magic,
+        # own counter -- all distinct from the anchor + warmup magics.
+        import rogue as _rogue
+        try:
+            ok = (_rogue.ROGUE_LABEL == 'ROGUE' and _rogue.ROGUE_LEG_TYPE == 'rogue'
+                  and _rogue.ROGUE_ALERT_PREFIX == '[ROGUE]'
+                  and _rogue.ROGUE_MAGIC not in (20260522, 9999998)
+                  and 'reanchor_count' in _rogue.new_day_state()
+                  and hasattr(self.cfg, 'rogue_max_reentries_per_day'))
+            detail = (f"tag={_rogue.ROGUE_LABEL} leg_type={_rogue.ROGUE_LEG_TYPE} "
+                      f"prefix={_rogue.ROGUE_ALERT_PREFIX} magic={_rogue.ROGUE_MAGIC}(distinct) own_counter=True")
+        except Exception as e:
+            self._record(144, FAIL, f"raised: {e!r}"); return
+        self._record(144, PASS if ok else FAIL, detail)
+
+    def _step_rogue_ride_unlimited(self):
+        # 145 RIDE-WINNER-UNLIMITED: the cap counts ONLY new entries (record_entry).
+        # Trailing an open winner consumes NO slot -- a single catch can ride a monster
+        # as far as the trail goes. The cap (10) bounds NEW entries, not the ride.
+        import rogue as _rogue
+        try:
+            gov = _rogue.new_day_state()
+            _rogue.record_entry(gov)                      # one NEW entry
+            # simulate a long ride: many trail updates, ZERO new entries -> count stays 1.
+            for _profit in (5, 10, 20, 40, 80, 111):
+                _ = _rogue.trail_gap(_profit, self.cfg)   # trailing only; no record_entry
+            ride_uncapped = (gov['reanchor_count'] == 1)
+            # the cap still bounds NEW entries to 10 regardless of how far winners ride.
+            for _ in range(9):
+                _rogue.record_entry(gov)
+            blocked, reason = _rogue.can_enter(gov, self.cfg)
+            cap_on_new_only = (gov['reanchor_count'] == 10 and blocked is False
+                               and reason == 'daily_cap')
+            ok = ride_uncapped and cap_on_new_only
+            detail = f"trailing_consumes_no_slot={ride_uncapped} cap_counts_new_entries_only={cap_on_new_only}"
+        except Exception as e:
+            self._record(145, FAIL, f"raised: {e!r}"); return
+        self._record(145, PASS if ok else FAIL, detail)
+
+    # --- Watchdog boot validator (Task 1) -----------------------------------
+    def _step_watchdog_safe_start(self):
+        # 146 SAFE-TO-START: the validator probes the REAL cfg (its checks carry the
+        # ACTUAL flag values, not a template) and returns 0 wiring failures -> SAFE.
+        # LIVE-pending checks are present but do NOT block the verdict.
+        import aureon_validator as _v
+        try:
+            rep = _v.validate(self.cfg)
+            safe = (rep['verdict'] == 'SAFE-TO-START' and len(rep['wiring_failures']) == 0)
+            flag_checks = [c for c in rep['checks'] if c['name'].startswith('flag:')]
+            real_val = f"rogue_enabled={getattr(self.cfg, 'rogue_enabled')!r}"
+            reflects_real = any(real_val in c['detail'] for c in flag_checks)  # actual state
+            pending_nonblocking = (len(rep['pending']) >= 1 and rep['verdict'] == 'SAFE-TO-START')
+            proceeds = (_v.run_boot_validation(self.cfg, skip=False) is True)
+            default_on = (_v.VALIDATOR_ENABLED is True)
+            ok = safe and reflects_real and pending_nonblocking and proceeds and default_on
+            detail = (f"verdict={rep['verdict']} reflects_real_config={reflects_real} "
+                      f"pending_nonblocking={pending_nonblocking} default_on={default_on}")
+        except Exception as e:
+            self._record(146, FAIL, f"raised: {e!r}"); return
+        self._record(146, PASS if ok else FAIL, detail)
+
+    def _step_watchdog_do_not_start(self):
+        # 147 DO-NOT-START: a cfg MISSING the wired flags trips wiring failures ->
+        # verdict DO-NOT-START and the boot gate returns False (abort, the bot must NOT
+        # trade). --skip-validator bypasses (returns True), proving the escape exists but
+        # is not the default.
+        import aureon_validator as _v
+        try:
+            class _BadCfg:   # a cfg with NONE of the wired feature flags
+                pass
+            bad = _BadCfg()
+            rep = _v.validate(bad)
+            do_not_start = (rep['verdict'] == 'DO-NOT-START' and len(rep['wiring_failures']) >= 1)
+            aborts = (_v.run_boot_validation(bad, skip=False) is False)   # boot gate aborts
+            skip_bypasses = (_v.run_boot_validation(bad, skip=True) is True)  # explicit escape
+            ok = do_not_start and aborts and skip_bypasses
+            detail = (f"verdict={rep['verdict']} wiring_failures={len(rep['wiring_failures'])} "
+                      f"boot_aborts={aborts} --skip_bypasses={skip_bypasses}")
+        except Exception as e:
+            self._record(147, FAIL, f"raised: {e!r}"); return
+        self._record(147, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -4610,6 +4923,24 @@ class SelfTest:
             self._step_R4_pump_fade()
             self._step_R5_smooth_runner()
             self._step_R6_chop_skip()
+            # ROGUE — self-anchoring monster-rider (flag-gated; demo default ON)
+            self._step_rogue_freeze_gate()
+            self._step_rogue_detect_monster()
+            self._step_rogue_weak_no_slot()
+            self._step_rogue_cap_blocks()
+            self._step_rogue_early_entry()
+            self._step_rogue_adaptive_trail()
+            self._step_rogue_loss_stop()
+            self._step_rogue_fail_pause()
+            self._step_rogue_closure_isolation()
+            self._step_rogue_rescue_capped()
+            self._step_rogue_rally_reuse()
+            self._step_rogue_demo_funded()
+            self._step_rogue_tagging()
+            self._step_rogue_ride_unlimited()
+            # Watchdog boot validator (Task 1)
+            self._step_watchdog_safe_start()
+            self._step_watchdog_do_not_start()
         finally:
             self._cleanup()
         return self._report(ts)

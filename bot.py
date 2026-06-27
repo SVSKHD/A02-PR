@@ -35,6 +35,19 @@ from backtest import run_backtest, summarize_backtest
 log = logging.getLogger("AUREON")
 
 
+def _boot_watchdog_ok(cfg, args):
+    """Boot gate: run the watchdog wiring validator BEFORE any trading starts. Default
+    ON; --skip-validator bypasses (manual debug only). Returns True to proceed, False to
+    abort (caller exits non-zero). A wiring failure means the bot must NOT trade."""
+    try:
+        from aureon_validator import run_boot_validation
+        return run_boot_validation(cfg, skip=bool(getattr(args, 'skip_validator', False)))
+    except Exception as e:
+        # the validator itself failing to run is a wiring failure -> DO-NOT-START.
+        log.error(f"🛑 watchdog could not run ({e!r}) — DO-NOT-START (the bot will NOT trade).")
+        return False
+
+
 def main():
     # Load .env if present (no-op if not). Must run BEFORE telemetry import
     # reads env vars in submodules.
@@ -59,6 +72,10 @@ def main():
                         help="Required for live mode")
     parser.add_argument('--force', action='store_true',
                         help="selftest: allow market-order steps on a non-demo account")
+    parser.add_argument('--skip-validator', action='store_true',
+                        help="boot: bypass the watchdog wiring validator (MANUAL DEBUG "
+                             "ONLY). Default is to validate; the bot will NOT trade on a "
+                             "wiring failure.")
     parser.add_argument('--anchor', default='A2',
                         help="testfire: anchor label for journal tagging / defer-window "
                              "(price is current market, NOT the scheduled anchor price)")
@@ -114,6 +131,8 @@ def main():
         log.info(f"\nWrote {trades_path} and {stats_path}")
 
     elif args.mode == 'paper':
+        if not _boot_watchdog_ok(cfg, args):
+            sys.exit(2)
         run_live(cfg, paper=True)
 
     elif args.mode == 'live':
@@ -121,6 +140,8 @@ def main():
             log.error("Live mode requires --i-understand-the-risks flag. Real money at stake. "
                       "Re-read AUREON_V2_SPEC.md §4 (Risk Management) and §5 (Live Adjustments) first.")
             sys.exit(1)
+        if not _boot_watchdog_ok(cfg, args):
+            sys.exit(2)
         run_live(cfg, paper=False)
 
     elif args.mode == 'selftest':

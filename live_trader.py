@@ -1004,6 +1004,13 @@ class LiveTrader:
         # so validate the offset and post readiness here before the loop trades.
         self._validate_offset_on_wake(reason=reason)
         self._post_readiness(reason=reason)
+        # ROGUE: demo default-ON promotion / funded force-OFF gate (guarded; raw config
+        # default is OFF so this is the only place rogue can switch ON, demo-only).
+        try:
+            import rogue as _rogue
+            _rogue.promote_on_boot(self)
+        except Exception:
+            pass
         return True
 
     # ------------------------------------------------------------------------
@@ -1170,6 +1177,15 @@ class LiveTrader:
         # 3b. v3.2.0 PER-TICK boost trigger: fire RALLY/RESCUE boosts only
         # once price is >= $10 from a lone leg's fill (never at fill); cap.
         self._check_boost_triggers()
+
+        # 3c. ROGUE per-tick driver (self-anchoring monster-rider). No-op unless
+        # rogue is ON (demo-promoted, never funded). Fully guarded -- a rogue error
+        # never breaks anchor management (the _tick except below also catches it).
+        try:
+            import rogue as _rogue
+            _rogue.drive(self)
+        except Exception:
+            pass
 
         # 4. Handle inbound commands
         self._handle_commands()

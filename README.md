@@ -372,6 +372,30 @@ entry may make $13 unnecessary.
 > Both rally and rescue are flag-OFF so every option stays open. The six chart-derived regression
 > fixtures (R1–R6) encode the patterns the trial must reproduce.
 
+### ROGUE — self-anchoring monster-rider (flag-gated; **demo default ON**, funded OFF)
+
+A SEPARATE mechanism from the clock anchors. ROGUE plants its **own price-anchor** where a
+strong move completes, then hunts the next leg — reusing the rally/rescue/trail **helpers**
+from that anchor, but tagged `[ROGUE]` and closed **only** against its own magic
+(`20260626`) / `leg_type=rogue`. It never touches an anchor (Non-OCO) position and vice
+versa (no generic close-all).
+
+- **Loop:** watch M5 → detect a monster (`rogue_min_candles=4` same-dir, range ≥ `$15`,
+  thrust ≥ `1.5×`) → anchor at the move-completion price → enter early (~$20 in, `init_sl=$5`),
+  not chasing the top → ride on the **adaptive trail** (`$3` early, `$6` once profit ≥ `$15`).
+- **Cap + gate:** `rogue_max_reentries_per_day=10` NEW entries; a weak move does **not** consume
+  a slot; **ride-winner-unlimited** — trailing an open winner is never capped.
+- **Mandatory governors:** `rogue_daily_loss_stop=-150` and `rogue_consecutive_fail_stop=3`
+  (3 fake-outs → pause) — what makes a 10-cap survivable on a thin edge.
+- **Run gate:** `rogue_enabled` raw default **OFF** (so all-flags-off == master, byte-identical);
+  the demo boot **promotes it ON**; a **funded account force-disables it** (un-proven Rogue
+  never boots on real capital). Promotion to funded only after the demo trial proves it.
+- **Reuse is capped:** a Rogue rescue-on-fail inherits the same derived `−$700` cap discipline.
+
+> ⚠️ Net-positive only if real monsters appear often enough to cover the `$5` fake-out stops.
+> The trial measures that frequency (win-rate, fake-out-rate) before the daily numbers are
+> trusted. Best case (Jun 26 +$1,320 single leg) is rare; most attempts are fake-outs.
+
 ---
 
 ## License
