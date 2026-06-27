@@ -197,6 +197,9 @@ STEP_NAMES = {
     143: "rogue demo/funded",
     144: "rogue tagging",
     145: "rogue ride-unlimited",
+    # Watchdog boot validator (Task 1)
+    146: "watchdog safe-start",
+    147: "watchdog do-not-start",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4652,6 +4655,49 @@ class SelfTest:
             self._record(145, FAIL, f"raised: {e!r}"); return
         self._record(145, PASS if ok else FAIL, detail)
 
+    # --- Watchdog boot validator (Task 1) -----------------------------------
+    def _step_watchdog_safe_start(self):
+        # 146 SAFE-TO-START: the validator probes the REAL cfg (its checks carry the
+        # ACTUAL flag values, not a template) and returns 0 wiring failures -> SAFE.
+        # LIVE-pending checks are present but do NOT block the verdict.
+        import aureon_validator as _v
+        try:
+            rep = _v.validate(self.cfg)
+            safe = (rep['verdict'] == 'SAFE-TO-START' and len(rep['wiring_failures']) == 0)
+            flag_checks = [c for c in rep['checks'] if c['name'].startswith('flag:')]
+            real_val = f"rogue_enabled={getattr(self.cfg, 'rogue_enabled')!r}"
+            reflects_real = any(real_val in c['detail'] for c in flag_checks)  # actual state
+            pending_nonblocking = (len(rep['pending']) >= 1 and rep['verdict'] == 'SAFE-TO-START')
+            proceeds = (_v.run_boot_validation(self.cfg, skip=False) is True)
+            default_on = (_v.VALIDATOR_ENABLED is True)
+            ok = safe and reflects_real and pending_nonblocking and proceeds and default_on
+            detail = (f"verdict={rep['verdict']} reflects_real_config={reflects_real} "
+                      f"pending_nonblocking={pending_nonblocking} default_on={default_on}")
+        except Exception as e:
+            self._record(146, FAIL, f"raised: {e!r}"); return
+        self._record(146, PASS if ok else FAIL, detail)
+
+    def _step_watchdog_do_not_start(self):
+        # 147 DO-NOT-START: a cfg MISSING the wired flags trips wiring failures ->
+        # verdict DO-NOT-START and the boot gate returns False (abort, the bot must NOT
+        # trade). --skip-validator bypasses (returns True), proving the escape exists but
+        # is not the default.
+        import aureon_validator as _v
+        try:
+            class _BadCfg:   # a cfg with NONE of the wired feature flags
+                pass
+            bad = _BadCfg()
+            rep = _v.validate(bad)
+            do_not_start = (rep['verdict'] == 'DO-NOT-START' and len(rep['wiring_failures']) >= 1)
+            aborts = (_v.run_boot_validation(bad, skip=False) is False)   # boot gate aborts
+            skip_bypasses = (_v.run_boot_validation(bad, skip=True) is True)  # explicit escape
+            ok = do_not_start and aborts and skip_bypasses
+            detail = (f"verdict={rep['verdict']} wiring_failures={len(rep['wiring_failures'])} "
+                      f"boot_aborts={aborts} --skip_bypasses={skip_bypasses}")
+        except Exception as e:
+            self._record(147, FAIL, f"raised: {e!r}"); return
+        self._record(147, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -4892,6 +4938,9 @@ class SelfTest:
             self._step_rogue_demo_funded()
             self._step_rogue_tagging()
             self._step_rogue_ride_unlimited()
+            # Watchdog boot validator (Task 1)
+            self._step_watchdog_safe_start()
+            self._step_watchdog_do_not_start()
         finally:
             self._cleanup()
         return self._report(ts)
