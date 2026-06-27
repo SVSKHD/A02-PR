@@ -132,6 +132,33 @@ class Config:
     rescue_entry_arm_timeout_candles: int = 4  # M5 candles before SKIP (no hedge).
     rescue_entry_smooth_confirm: bool = True  # allow the SMOOTH branch (break-and-hold
     #   confirms the DOWN-move) -> enter SELL on confirm. False -> bounce-or-skip only.
+    # --- ROGUE: the self-anchoring monster-rider (SEPARATE from the clock anchors) ---
+    # Rogue plants its OWN price-anchor where a strong move completes, then hunts the next
+    # leg, reusing the rally/rescue/trail HELPERS from that anchor -- but ROGUE-tagged and
+    # closed only against its own magic/label. rogue_enabled is the single master switch.
+    # FREEZE: the RAW default is False -> all-flags-off == master (byte-identical). DEMO
+    # default-ON is a RUNTIME promotion (rogue.funded_default: the boot sets it True on a
+    # demo / non-funded account); a FUNDED account FORCE-disables it (rogue.should_run --
+    # mandatory gate, un-proven Rogue never boots ON on real capital). With it OFF there
+    # is NO watching, anchoring, or entering. Rogue is the deliberate demo-only exception;
+    # all OTHER strategy flags stay default OFF.
+    rogue_enabled: bool = False        # MASTER SWITCH (raw default OFF; demo boot promotes ON)
+    rogue_daywatch: bool = True        # continuous M5 vision (only meaningful when rogue_enabled)
+    rogue_reuse_rally: bool = True     # ride/pyramid via RALLY logic on strong continuation
+    rogue_reuse_rescue: bool = True    # hedge via RESCUE logic when the catch goes against
+    rogue_max_reentries_per_day: int = 10   # HARD ceiling on NEW entries/day (the cap)
+    rogue_min_candles: int = 4         # strong-move trigger: >= this many same-dir M5 closes
+    rogue_min_range: float = 15.0      # ... AND total range >= $15
+    rogue_body_mult: float = 1.5       # ... AND combined body >= this x avg bar range (thrust)
+    rogue_entry_confirm: float = 20.0  # early entry: enter ~$20 in off the anchor (not the top)
+    rogue_init_sl: float = 5.0         # tight initial stop -> a fake-out is a small capped loss
+    rogue_trail_arm: float = 5.0       # profit ($) before the adaptive trail engages
+    rogue_trail_gap_early: float = 3.0 # tight trail until deep in profit (protect vs fake-out)
+    rogue_trail_gap_deep: float = 6.0  # wider once proven (don't shake out a real monster)
+    rogue_trail_widen_at: float = 15.0 # profit ($) at which the trail widens 3 -> 6
+    # GOVERNORS on the 10-cap (mandatory brakes for a thin edge):
+    rogue_daily_loss_stop: float = -150.0   # Rogue STOPS new entries for the day at -$150
+    rogue_consecutive_fail_stop: int = 3    # 3 init-SL fake-outs in a row -> pause new entries
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose

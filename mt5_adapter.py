@@ -472,7 +472,7 @@ class MT5Adapter:
 
     def place_market_order(self, symbol: str, side: str, lot: float,
                            sl: float, tp: float, comment: str = "AUREON_v2_market",
-                           dry_run: bool = False):
+                           dry_run: bool = False, magic: int = 20260522):
         """Place an IMMEDIATE market order. Used only for in-flight breakout
         recovery: when pre-flight passed but broker rejected anyway because
         price moved past the threshold during the millisecond order was in flight."""
@@ -500,7 +500,7 @@ class MT5Adapter:
             "sl": sl,
             "tp": tp,
             "deviation": 50,
-            "magic": 20260522,
+            "magic": int(magic),   # ROGUE passes ROGUE_MAGIC for label-scoped isolation
             "comment": comment,
             "type_time": mt5.ORDER_TIME_DAY,
             "type_filling": mt5.ORDER_FILLING_IOC,

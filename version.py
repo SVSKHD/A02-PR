@@ -840,7 +840,7 @@ History (one line per behavioral change):
          $5 arm + rally_pullback_* exit untouched. Banner v3.5.0. NOT for merge to master.
 """
 
-__version__ = "3.5.0"
+__version__ = "3.5.0"  # ROGUE on feature/rogue (branch only; not merged)
 CODENAME = "Astra Hawk"
 
 
