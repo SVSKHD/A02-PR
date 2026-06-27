@@ -132,6 +132,34 @@ class Config:
     rescue_entry_arm_timeout_candles: int = 4  # M5 candles before SKIP (no hedge).
     rescue_entry_smooth_confirm: bool = True  # allow the SMOOTH branch (break-and-hold
     #   confirms the DOWN-move) -> enter SELL on confirm. False -> bounce-or-skip only.
+    # --- v3.5.0 "all-16" wiring: per-feature flags ------------------------------
+    # UTILITIES (8-11): read-only / alert-only telemetry -- DEFAULT ON; they NEVER
+    # touch order flow (proven in the self-test), so they are safe on during the trial
+    # and they are the keystone measurement for the keep-vs-delete decision.
+    util_pullback_log: bool = True    # 8: per-anchor armed/pulled-back/entered/skipped -> daily JSON
+    util_boost_ledger: bool = True    # 9: every boost event (arm/fire/skip px, P&L) -> ledger.csv
+    util_daily_report: bool = True    # 10: per-anchor markdown report from the trades CSV (read-only)
+    util_preflight: bool = True       # 11: boot self-check (offset detected / anchors / flags / market)
+    # STRATEGY EXTRAS (12-14): WIRED but DEFAULT OFF -- owner flips post-trial, one at a
+    # time, measured against the logged baseline. OFF -> v3.5.0 core behavior unchanged.
+    entry_confirm_candle: bool = False  # 12: require an M5 close in the entry direction
+    #   before filling (replaces first-touch) in BOTH the rally + rescue adaptive paths.
+    entry_adaptive_depth: bool = False  # 13: pullback/bounce depth scales with recent ATR
+    #   instead of the fixed $13/$6. OFF -> fixed depths.
+    atr_period: int = 14              # 13: ATR lookback (M5 bars) when entry_adaptive_depth ON.
+    atr_mult: float = 1.0             # 13: depth = atr_mult * ATR when entry_adaptive_depth ON.
+    rescue_sl_wide: bool = False      # 14: widen the RESCUE boost SL $10 -> rescue_sl_wide_dollars.
+    #   The rescue cap is DERIVED (count x SL x lot x 100) so this MOVES it -$700 -> -$910
+    #   (recomputed via boosts.boost_sl_for; asserted in the self-test). OFF -> $10 / -$700.
+    rescue_sl_wide_dollars: float = 13.0  # 14: the wide RESCUE SL when rescue_sl_wide ON.
+    # HOTFIXES (15-16): telemetry/safety correctness, no order-logic change -- DEFAULT ON.
+    fix_boost_telemetry: bool = True  # 15: emit the boost trail-advance (LOCK_ARM/TRAIL_ADVANCE)
+    #   so a boost trail EXIT is never falsely flagged exit_trail_without_trail_advance.
+    #   OFF restores the pre-v3.3.0 silent emission (telemetry noise only; no P&L effect).
+    fix_a1_offset: bool = True        # 16: the A1 wake offset detector retries/awaits a fresh
+    #   tick and NEVER falls back to 0h (already enforced by mt5_adapter._detect_tick_time_
+    #   offset Tier 1/2; asserted in the self-test). OFF does NOT re-introduce a 0h guess --
+    #   an undetected offset still BLOCKS placement (fail-safe; never trade on a wrong offset).
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose

@@ -838,6 +838,27 @@ History (one line per behavioral change):
          timeout, 124 dynamic-SL, 125 separation, 126 $5-arm-unaffected, 127 cap-unchanged;
          R1-R6 regression fixtures 128-133 from real charts). RALLY/RESCUE stay separate;
          $5 arm + rally_pullback_* exit untouched. Banner v3.5.0. NOT for merge to master.
+  3.5.0-all16  FULL BUILD (feature/v3.5.0-all16): the v3.5.0 core (1-7, already in master)
+         PLUS the 11 nice-to-haves, each behind its OWN flag, defaults per the directive.
+         UTILITIES (8-11, telemetry/read-only, DEFAULT ON, NEVER touch order flow):
+         8 util_pullback_log (per-anchor armed/pulled-back/entered/skipped -> daily JSON),
+         9 util_boost_ledger (every boost event -> ledger.csv), 10 util_daily_report
+         (per-anchor markdown from the trades CSV), 11 util_preflight (boot self-check:
+         offset/anchors/flags/market -- alert-only, the adapter offset guard is the real
+         block). New pure module boost_metrics.py holds the cores. STRATEGY EXTRAS (12-14,
+         WIRED but DEFAULT OFF): 12 entry_confirm_candle (require an M5 close in direction
+         before fill, replaces first-touch, both paths), 13 entry_adaptive_depth (depth =
+         atr_mult*ATR via pullback_entry.effective_depth/atr_from_candles; else fixed),
+         14 rescue_sl_wide (RESCUE SL $10->$13 via boosts.boost_sl_for so the DERIVED cap
+         moves -$700->-$910 with it). HOTFIXES (15-16, DEFAULT ON): 15 fix_boost_telemetry
+         (gates the v3.3.0 boost trail-advance emission so EXIT isn't falsely flagged),
+         16 fix_a1_offset (the wake offset detector already refuses 0h -- Tier1 live / Tier2
+         stale-consistency in mt5_adapter; flag + assert, OFF never re-introduces a 0h guess).
+         FREEZE: all STRATEGY flags OFF -> behavior == v3.5.0 core == master. selftest ->
+         145 steps (132-145 new: utilities 8-11 produce artifacts w/o order effect, 12
+         confirm-candle gates vs first-touch, 13 ATR depth, 14 cap recompute -$910, 15/16
+         hotfix asserts, per-flag independence, full freeze, flag-table check). NOT for
+         merge to master.
 """
 
 __version__ = "3.5.0"

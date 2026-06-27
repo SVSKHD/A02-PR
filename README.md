@@ -372,6 +372,39 @@ entry may make $13 unnecessary.
 > Both rally and rescue are flag-OFF so every option stays open. The six chart-derived regression
 > fixtures (R1–R6) encode the patterns the trial must reproduce.
 
+### v3.5.0 "all-16" — full feature wiring (flag reference)
+
+All 16 features are wired, each behind its own flag. **Every strategy flag defaults OFF**, so with
+the strategy flags off the live behavior is **byte-identical to master** (v3.5.0 core). The owner
+flips features on one at a time and measures each against the logged baseline. Utilities (8–11) and
+hotfixes (15–16) default ON — they never change order logic (proven in the self-test).
+
+| # | flag / param | default | effect | OFF → ON |
+|---|---|---|---|---|
+| 1 | `override_entry_enabled` | **OFF** | rally adaptive entry (arm +$20, pullback turn) | immediate override fire → arm-then-pullback |
+| 2 | `rescue_entry_enabled` | **OFF** | rescue adaptive entry (arm −$10, SELL on rollover) | immediate −$10 bypass-fire → arm-then-bounce |
+| 3 | `override_entry_smooth_confirm` / `rescue_entry_smooth_confirm` | ON\* | smooth break-and-hold capture | pullback-or-skip → also enter on confirm |
+| 4 | `override_entry_dynamic_sl` | ON\* | SL beyond the retrace extreme | fixed $13 → beyond dip low |
+| 5 | `override_entry_arm_timeout_candles` / `rescue_entry_arm_timeout_candles` | 4 | M5 candles before skip | — |
+| 6 | (flag-off defaults) | — | dormant unless flipped | — |
+| 7 | R1–R6 regression fixtures | — | encode real-chart patterns | self-test only |
+| 8 | `util_pullback_log` | ON | per-anchor armed/pulled-back/entered/skipped → daily JSON | telemetry only |
+| 9 | `util_boost_ledger` | ON | every boost event → `boost_ledger.csv` | telemetry only |
+| 10 | `util_daily_report` | ON | per-anchor markdown from trades CSV (EOD) | read-only |
+| 11 | `util_preflight` | ON | boot self-check (offset/anchors/flags/market) | alert-only (the offset block is the real gate) |
+| 12 | `entry_confirm_candle` | **OFF** | require an M5 close in direction before fill | first-touch → confirm-candle (both paths) |
+| 13 | `entry_adaptive_depth` (`atr_period`=14, `atr_mult`=1.0) | **OFF** | depth scales with ATR | fixed $13/$6 → `atr_mult`×ATR |
+| 14 | `rescue_sl_wide` (`rescue_sl_wide_dollars`=13) | **OFF** | widen rescue SL $10→$13 | SL $10 / cap −$700 → SL $13 / **cap −$910** (derived, recomputed) |
+| 15 | `fix_boost_telemetry` | ON | emit boost trail-advance so EXIT isn't falsely flagged | telemetry only, no P&L |
+| 16 | `fix_a1_offset` | ON | wake offset never falls back to 0h (already enforced) | OFF never re-adds a 0h guess (block is fail-safe) |
+
+\* within their parent entry flag — inert while `override_entry_enabled` / `rescue_entry_enabled` is OFF.
+
+**Measurement plan:** run the trial with CORE (1–7) ON and strategy extras (12–14) OFF; utilities
+(8–11) collect. At month-end the pullback-frequency log (8) + boost ledger (9) show whether the
+override pulls back often enough to keep — and whether 12/13/14 are justified. Flip them one at a
+time **after**, each measured against the logged baseline.
+
 ---
 
 ## License

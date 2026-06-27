@@ -154,7 +154,7 @@ def _override_grade(cfg, shadow, plan):
 
 
 def _override_entry_decision(self, shadow, plan, anchor, tf, edge, result, reason,
-                             parent_fav, threshold, parent_side):
+                             parent_fav, threshold, parent_side, candles=None):
     """v3.5.0 wrapper around the SHARED pullback_entry.step helper for the RALLY
     override. Reads the current tick price (self._last_boost_mid) + a 5-min bucket id,
     runs the adaptive state machine on shadow['override_arm'] (pullback-turn / smooth
@@ -174,16 +174,41 @@ def _override_entry_decision(self, shadow, plan, anchor, tf, edge, result, reaso
     pre_armed = bool(state.get('armed'))
     pre_done = state.get('done')
     m5_bucket = int(_time.time() // 300)   # 5-min wall-clock bucket (M5-close proxy)
+    # feature 13: adaptive depth tracks recent ATR when entry_adaptive_depth is ON.
+    _depth = _pe.effective_depth(
+        self.cfg, float(getattr(self.cfg, 'override_entry_pullback_dollars', 13.0)),
+        _pe.atr_from_candles(candles))
     d = _pe.step(
-        state, direction=plan.boost_side,
-        pullback_depth=float(getattr(self.cfg, 'override_entry_pullback_dollars', 13.0)),
+        state, direction=plan.boost_side, pullback_depth=_depth,
         fixed_sl=float(getattr(self.cfg, 'rally_boost_sl', 13.0)),
         timeout_candles=int(getattr(self.cfg, 'override_entry_arm_timeout_candles', 4)),
         current_price=float(price), m5_bucket=m5_bucket, parent_alive=True,
         smooth_confirm=(result == _bh.CONFIRMED),
         allow_smooth=bool(getattr(self.cfg, 'override_entry_smooth_confirm', True)),
-        dynamic_sl=bool(getattr(self.cfg, 'override_entry_dynamic_sl', True)))
+        dynamic_sl=bool(getattr(self.cfg, 'override_entry_dynamic_sl', True)),
+        confirm_candle=bool(getattr(self.cfg, 'entry_confirm_candle', False)))  # feature 12
     tr = getattr(self, 'ptrace', None)
+    # features 8/9 (telemetry only; fully guarded -> never touches the fire decision).
+    try:
+        import boost_metrics as _bm
+        import pandas as _pd
+        if state.get('phase') == 'pullback' and not state.get('_pb_logged'):
+            state['_pb_logged'] = True
+            _bm.record_pullback_event(self, anchor, 'RALLY', 'pulled_back')
+        if d['action'] == _pe.ENTER:
+            _bm.record_pullback_event(self, anchor, 'RALLY', 'entered')
+            _bm.append_ledger(self, {'ts': _pd.Timestamp.now(tz='UTC').isoformat(),
+                                     'anchor': anchor, 'kind': 'RALLY', 'event': 'enter',
+                                     'arm_px': round(float(state.get('cont_ext', price)), 2),
+                                     'entry_px': round(float(d['price']), 2)})
+        elif d['action'] == _pe.SKIP and not pre_done:
+            _bm.record_pullback_event(self, anchor, 'RALLY', 'skipped')
+            _bm.append_ledger(self, {'ts': _pd.Timestamp.now(tz='UTC').isoformat(),
+                                     'anchor': anchor, 'kind': 'RALLY', 'event': 'skip'})
+        elif d['action'] == _pe.ARM and not pre_armed:
+            _bm.record_pullback_event(self, anchor, 'RALLY', 'armed')
+    except Exception:
+        pass
     if d['action'] == _pe.ENTER:
         entry, sl, mode = float(d['price']), float(d['sl']), d['mode']
         if mode == 'pullback':
@@ -294,7 +319,7 @@ def break_and_hold_ok(self, shadow, plan):
             if _og:
                 return _override_entry_decision(
                     self, shadow, plan, anchor, tf, edge, result, reason,
-                    _pfav, _thr, _pside)
+                    _pfav, _thr, _pside, candles)
         if result == _bh.CONFIRMED:
             self.tele.info(f"📈 BREAK CONFIRMED {plan.boost_side} {anchor} "
                            f"@edge ${edge:.2f} — stacking")
