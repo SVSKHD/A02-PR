@@ -42,9 +42,30 @@ def _result(action, price=None, sl=None, mode=None):
     return {'action': action, 'price': price, 'sl': sl, 'mode': mode}
 
 
+def effective_depth(cfg, fixed_depth, atr):
+    """v3.5.0 feature 13: the pullback/bounce depth in $. When entry_adaptive_depth is
+    ON and a positive ATR is available, the depth tracks recent volatility
+    (atr_mult * ATR); OFF (default) -> the fixed per-kind depth ($13 rally / $6 rescue).
+    PURE -- the caller supplies the ATR from recent M5 bars."""
+    if bool(getattr(cfg, 'entry_adaptive_depth', False)) and atr and float(atr) > 0:
+        return float(getattr(cfg, 'atr_mult', 1.0)) * float(atr)
+    return float(fixed_depth)
+
+
+def atr_from_candles(candles):
+    """v3.5.0 feature 13 helper: a simple ATR ($) = mean true range over the supplied
+    M5 candles (high-low per bar; gaps ignored -- adequate for depth scaling). Returns
+    0.0 if there are no candles. PURE."""
+    cs = [c for c in (candles or []) if c is not None]
+    if not cs:
+        return 0.0
+    trs = [abs(float(c['high']) - float(c['low'])) for c in cs]
+    return sum(trs) / len(trs) if trs else 0.0
+
+
 def step(state, *, direction, pullback_depth, fixed_sl, timeout_candles,
          current_price, m5_bucket, parent_alive, smooth_confirm, allow_smooth,
-         dynamic_sl):
+         dynamic_sl, confirm_candle=False):
     """One tick of the adaptive entry machine. `state` is a per-parent mutable dict
     (lives in the parent shadow under the mechanism's OWN key). Returns
     {'action', 'price', 'sl', 'mode'}: ARM (hold), ENTER (fire at price, stop at sl,
@@ -89,7 +110,20 @@ def step(state, *, direction, pullback_depth, fixed_sl, timeout_candles,
                              else max(float(state['retr_ext']), p))
         # TURN: price reverses from the retrace extreme back toward D by >= the confirm.
         turn = sgn * (p - float(state['retr_ext']))  # BUY: p-dip_low ; SELL: bounce_high-p
-        if turn >= TURN_CONFIRM_DOLLARS:
+        if turn < TURN_CONFIRM_DOLLARS:
+            state.pop('turn_bucket', None)   # turn not (yet) valid -> drop any pending confirm
+        else:
+            # v3.5.0 feature 12: when entry_confirm_candle is ON, the turn must be held
+            # to an M5 CLOSE in the entry direction before filling (replaces first-touch):
+            # arm the confirm on the first qualifying turn, enter only once the 5-min
+            # bucket advances with price still in-direction. OFF -> first-touch (enter now).
+            if confirm_candle:
+                tb = state.get('turn_bucket')
+                if tb is None:
+                    state['turn_bucket'] = m5_bucket
+                    return _result(ARM)          # wait for the candle to close
+                if m5_bucket == tb:
+                    return _result(ARM)          # same M5 candle -> not yet closed
             entry = p
             if dynamic_sl:
                 sl = round(float(state['retr_ext']) - sgn * fixed_sl, 2)  # beyond the extreme

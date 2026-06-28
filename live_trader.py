@@ -1004,6 +1004,13 @@ class LiveTrader:
         # so validate the offset and post readiness here before the loop trades.
         self._validate_offset_on_wake(reason=reason)
         self._post_readiness(reason=reason)
+        # v3.5.0 feature 11: boot preflight self-check (alert-only; never gates here --
+        # the adapter offset guard is the real block). Fully guarded.
+        try:
+            import boost_metrics as _bm
+            _bm.run_preflight(self)
+        except Exception:
+            pass
         # ROGUE: demo default-ON promotion / funded force-OFF gate (guarded; raw config
         # default is OFF so this is the only place rogue can switch ON, demo-only).
         try:
@@ -1231,6 +1238,12 @@ class LiveTrader:
             # capture). Guarded so it fires once and never blocks the EOD path.
             if self.state.get('firebase_eod_date') != str(broker_date):
                 self._firebase_save_daily(broker_date)
+                # v3.5.0 feature 10: per-anchor markdown report (read-only; guarded).
+                try:
+                    import boost_metrics as _bm
+                    _bm.run_daily_report(self)
+                except Exception:
+                    pass
                 self.state['firebase_eod_date'] = str(broker_date)
                 self._save_state()
             if self._tick_counter % self.STATUS_EVERY_TICKS == 0:

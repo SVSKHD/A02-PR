@@ -42,6 +42,11 @@ def boost_sl_for(cfg, kind):
     whipsaw cap read THIS so a rally event uses $13 and a rescue event uses $10."""
     if str(kind).upper() == "RALLY":
         return float(getattr(cfg, "rally_boost_sl", 13.0))
+    # v3.5.0 feature 14: rescue_sl_wide widens the RESCUE SL $10 -> $13. Because BOTH the
+    # placement and the whipsaw cap read THIS function, the derived cap moves with it
+    # (-$700 -> -$910) automatically. DEFAULT OFF -> boost_sl_dollars ($10, byte-identical).
+    if bool(getattr(cfg, "rescue_sl_wide", False)):
+        return float(getattr(cfg, "rescue_sl_wide_dollars", 13.0))
     return float(getattr(cfg, "boost_sl_dollars", 10.0))
 
 

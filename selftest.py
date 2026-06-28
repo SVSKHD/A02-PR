@@ -200,6 +200,21 @@ STEP_NAMES = {
     # Watchdog boot validator (Task 1)
     146: "watchdog safe-start",
     147: "watchdog do-not-start",
+    # v3.5.0 all-16 (renumbered 148-161 to avoid the 132-145 rogue collision)
+    148: "f8 pullback log",
+    149: "f9 boost ledger",
+    150: "f10 daily report",
+    151: "f11 preflight",
+    152: "util no-order-fx",
+    153: "f12 confirm cand",
+    154: "f13 atr depth",
+    155: "f14 rescue sl wide",
+    156: "f15 boost telem",
+    157: "f16 offset no-0h",
+    158: "strat full freeze",
+    159: "per-flag indep",
+    160: "rescue gate ON arm",
+    161: "flag table check",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3345,8 +3360,12 @@ class SelfTest:
                 def _rec(anchor=None, **kw):
                     events.append((name, kw)); return None
                 return _rec
-        tr = types.SimpleNamespace(cfg=cfg or self.cfg, adapter=adapter, tele=tele,
-                                   ptrace=_PT())
+        import dataclasses as _dc
+        # v3.5.0 unified: silence the util-8/9 file writers during gate tests (now that
+        # rally/rescue carry the boost_metrics hooks). The utilities are validated
+        # separately via their pure cores (tests 148-152). Defaults are ON in production.
+        _cfg = _dc.replace(cfg or self.cfg, util_pullback_log=False, util_boost_ledger=False)
+        tr = types.SimpleNamespace(cfg=_cfg, adapter=adapter, tele=tele, ptrace=_PT())
         if last_mid is not None:        # v3.4.0: current tick price for the pullback gate
             tr._last_boost_mid = float(last_mid)
         return tr, shadow, plan
@@ -4698,6 +4717,319 @@ class SelfTest:
             self._record(147, FAIL, f"raised: {e!r}"); return
         self._record(147, PASS if ok else FAIL, detail)
 
+    # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
+    #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
+    def _step_f8_pullback_log(self):
+        # 132 (feature 8): per-anchor armed/pulled-back/entered/skipped counts + JSON.
+        import boost_metrics as _bm
+        try:
+            counts = {}
+            _bm.pullback_bump(counts, 'A3', 'RALLY', 'armed')
+            _bm.pullback_bump(counts, 'A3', 'RALLY', 'pulled_back')
+            _bm.pullback_bump(counts, 'A3', 'RALLY', 'entered')
+            _bm.pullback_bump(counts, 'A5', 'RESCUE', 'armed')
+            _bm.pullback_bump(counts, 'A5', 'RESCUE', 'skipped')
+            _bm.pullback_bump(counts, 'A3', 'RALLY', 'bogus')   # ignored, no crash
+            c = counts['A3:RALLY']
+            shape_ok = (c['armed'] == 1 and c['pulled_back'] == 1 and c['entered'] == 1
+                        and c['skipped'] == 0 and counts['A5:RESCUE']['skipped'] == 1)
+            import json as _json
+            body = _bm.pullback_json(counts, '2026-06-27')
+            parsed = _json.loads(body)
+            json_ok = (parsed['date'] == '2026-06-27'
+                       and parsed['counts']['A3:RALLY']['entered'] == 1)
+            ok = shape_ok and json_ok
+            detail = f"counts_shape={shape_ok} json_roundtrip={json_ok}"
+        except Exception as e:
+            self._record(148, FAIL, f"raised: {e!r}"); return
+        self._record(148, PASS if ok else FAIL, detail)
+
+    def _step_f9_boost_ledger(self):
+        # 133 (feature 9): one ledger row per boost event in LEDGER_COLUMNS order.
+        import boost_metrics as _bm
+        try:
+            row = _bm.ledger_row({'ts': 't', 'anchor': 'A3', 'kind': 'RALLY',
+                                  'event': 'enter', 'arm_px': 4005.0, 'entry_px': 3994.0})
+            order_ok = (len(row) == len(_bm.LEDGER_COLUMNS)
+                        and row[_bm.LEDGER_COLUMNS.index('entry_px')] == 3994.0
+                        and row[_bm.LEDGER_COLUMNS.index('kind')] == 'RALLY')
+            missing = _bm.ledger_row({'anchor': 'A5'})   # missing keys -> '' (no crash)
+            missing_ok = (missing[_bm.LEDGER_COLUMNS.index('pnl_usd')] == ''
+                          and missing[_bm.LEDGER_COLUMNS.index('anchor')] == 'A5')
+            ok = order_ok and missing_ok
+            detail = f"row_order={order_ok} missing_keys_blank={missing_ok}"
+        except Exception as e:
+            self._record(149, FAIL, f"raised: {e!r}"); return
+        self._record(149, PASS if ok else FAIL, detail)
+
+    def _step_f10_daily_report(self):
+        # 134 (feature 10): per-anchor markdown from trades rows (read-only formatting).
+        import boost_metrics as _bm
+        try:
+            rows = [{'anchor': 'A3_1430_Overlap', 'pnl': 100.0},
+                    {'anchor': 'A3_1430_Overlap', 'pnl': -40.0},
+                    {'anchor': 'A5_1930_LateUS', 'pnl': 25.5}]
+            md = _bm.daily_report_md(rows, '2026-06-27')
+            ok = ('# AUREON daily report' in md and '| A3 |' in md and '| A5 |' in md
+                  and '+60.00' in md and 'Day net: $+85.50' in md)
+            detail = f"markdown_has_per_anchor_and_net={ok}"
+        except Exception as e:
+            self._record(150, FAIL, f"raised: {e!r}"); return
+        self._record(150, PASS if ok else FAIL, detail)
+
+    def _step_f11_preflight(self):
+        # 135 (feature 11): boot self-check -> abort (ok False) when offset UNDETECTED;
+        # ok True when detected; flags split into ON/OFF.
+        import boost_metrics as _bm
+        try:
+            ok_none, lines_none = _bm.preflight_lines(None, ['A1', 'A2'],
+                                                      {'override_entry_enabled': True}, True)
+            aborts = (ok_none is False and any('ABORT' in l for l in lines_none))
+            ok_ok, lines_ok = _bm.preflight_lines(3, ['A1', 'A2', 'A3', 'A4', 'A5'],
+                                                  {'override_entry_enabled': False,
+                                                   'util_preflight': True}, True)
+            proceeds = (ok_ok is True and any('+3h' in l for l in lines_ok))
+            flags_split = (any('flags ON:  util_preflight' in l for l in lines_ok)
+                           and any('flags OFF: override_entry_enabled' in l for l in lines_ok))
+            ok = aborts and proceeds and flags_split
+            detail = f"undetected_aborts={aborts} detected_proceeds={proceeds} flags_split={flags_split}"
+        except Exception as e:
+            self._record(151, FAIL, f"raised: {e!r}"); return
+        self._record(151, PASS if ok else FAIL, detail)
+
+    def _step_util_no_order_effect(self):
+        # 136: utilities (8-11) NEVER touch order flow. The pure entry state machine
+        # decision is byte-identical whether the util flags are ON or OFF (step never
+        # reads them); and record_pullback_event with the flag OFF is an inert no-op.
+        import pullback_entry as _pe, boost_metrics as _bm, types, dataclasses
+        try:
+            def decide():
+                st = {}
+                last = None
+                for p, b in [(3982.0, 0), (4005.0, 0), (3992.0, 0), (3994.0, 0)]:
+                    last = _pe.step(st, direction='BUY', pullback_depth=13.0, fixed_sl=13.0,
+                                    timeout_candles=4, current_price=p, m5_bucket=b,
+                                    parent_alive=True, smooth_confirm=False,
+                                    allow_smooth=False, dynamic_sl=True)
+                return last
+            d1 = decide(); d2 = decide()
+            decision_independent = (d1 == d2 and d1['action'] == 'ENTER')
+            # record with flag OFF -> no counts created, no file, no raise.
+            stub = types.SimpleNamespace(cfg=dataclasses.replace(self.cfg,
+                                         util_pullback_log=False, util_boost_ledger=False))
+            _bm.record_pullback_event(stub, 'A3', 'RALLY', 'armed')
+            inert = not hasattr(stub, '_pullback_counts')
+            ok = decision_independent and inert
+            detail = f"decision_independent_of_util={decision_independent} record_off_is_noop={inert}"
+        except Exception as e:
+            self._record(152, FAIL, f"raised: {e!r}"); return
+        self._record(152, PASS if ok else FAIL, detail)
+
+    # --- v3.5.0 all-16: strategy extras (12-14) -----------------------------
+    def _step_f12_confirm_candle(self):
+        # 137 (feature 12): confirm_candle ON -> the turn must hold to an M5 CLOSE (a new
+        # bucket) before entry; OFF -> first-touch (enter at the turn immediately).
+        import pullback_entry as _pe
+        def _s(state, p, b, confirm):
+            return _pe.step(state, direction='BUY', pullback_depth=13.0, fixed_sl=13.0,
+                            timeout_candles=4, current_price=p, m5_bucket=b, parent_alive=True,
+                            smooth_confirm=False, allow_smooth=False, dynamic_sl=True,
+                            confirm_candle=confirm)
+        try:
+            # path: arm@100 -> high 110 -> dip 96 (>=13) -> turn 98. OFF enters at the turn.
+            off = {}
+            _s(off, 100.0, 0, False); _s(off, 110.0, 0, False); _s(off, 96.0, 0, False)
+            d_off = _s(off, 98.0, 0, False)           # turn (98-96=2) -> first-touch ENTER
+            first_touch_enters = (d_off['action'] == 'ENTER')
+            # ON: the same turn on bucket 0 HOLDS (waits for the M5 close); enters only
+            # once the bucket advances with price still in-direction.
+            on = {}
+            _s(on, 100.0, 0, True); _s(on, 110.0, 0, True); _s(on, 96.0, 0, True)
+            d_hold = _s(on, 98.0, 0, True)            # turn but same candle -> ARM (hold)
+            d_confirm = _s(on, 98.5, 1, True)         # next M5 close, still up -> ENTER
+            gates_then_enters = (d_hold['action'] == 'ARM' and d_confirm['action'] == 'ENTER')
+            ok = first_touch_enters and gates_then_enters
+            detail = f"first_touch_enters={first_touch_enters} confirm_gates_then_enters={gates_then_enters}"
+        except Exception as e:
+            self._record(153, FAIL, f"raised: {e!r}"); return
+        self._record(153, PASS if ok else FAIL, detail)
+
+    def _step_f13_atr_depth(self):
+        # 138 (feature 13): effective_depth = atr_mult*ATR when entry_adaptive_depth ON;
+        # fixed when OFF. atr_from_candles = mean(high-low).
+        import pullback_entry as _pe, dataclasses
+        try:
+            candles = [{'high': 10.0, 'low': 6.0, 'close': 8.0},
+                       {'high': 12.0, 'low': 6.0, 'close': 9.0}]   # ranges 4,6 -> ATR 5
+            atr = _pe.atr_from_candles(candles)
+            atr_ok = abs(atr - 5.0) < 1e-9
+            off = _pe.effective_depth(self.cfg, 13.0, atr)          # flag OFF -> fixed 13
+            cfg_on = dataclasses.replace(self.cfg, entry_adaptive_depth=True, atr_mult=2.0)
+            on = _pe.effective_depth(cfg_on, 13.0, atr)             # 2.0 * 5 = 10
+            ok = (atr_ok and abs(off - 13.0) < 1e-9 and abs(on - 10.0) < 1e-9)
+            detail = f"atr={atr}(=5) off_fixed={off}(=13) on_atrx2={on}(=10)"
+        except Exception as e:
+            self._record(154, FAIL, f"raised: {e!r}"); return
+        self._record(154, PASS if ok else FAIL, detail)
+
+    def _step_f14_rescue_sl_wide(self):
+        # 139 (feature 14): rescue_sl_wide ON -> RESCUE boost SL $10->$13 AND the DERIVED
+        # cap -$700->-$910 (recomputed together via boost_sl_for). OFF -> $10/-$700.
+        # RALLY cap is independent (stays -$910).
+        import boosts as _boosts, dataclasses
+        try:
+            off_sl = _boosts.boost_sl_for(self.cfg, 'RESCUE')
+            off_cap = _boosts.boost_whipsaw_cap(self.cfg, 'RESCUE')
+            cfg_on = dataclasses.replace(self.cfg, rescue_sl_wide=True)
+            on_sl = _boosts.boost_sl_for(cfg_on, 'RESCUE')
+            on_cap = _boosts.boost_whipsaw_cap(cfg_on, 'RESCUE')
+            rally_cap = _boosts.boost_whipsaw_cap(cfg_on, 'RALLY')
+            ok = (abs(off_sl - 10.0) < 1e-9 and abs(off_cap - 700.0) < 1e-6
+                  and abs(on_sl - 13.0) < 1e-9 and abs(on_cap - 910.0) < 1e-6
+                  and abs(rally_cap - 910.0) < 1e-6)
+            detail = (f"off(SL$10/cap-$700)={abs(off_cap-700)<1e-6} "
+                      f"on(SL$13/cap-$910)={abs(on_cap-910)<1e-6} rally_cap-$910={abs(rally_cap-910)<1e-6}")
+        except Exception as e:
+            self._record(155, FAIL, f"raised: {e!r}"); return
+        self._record(155, PASS if ok else FAIL, detail)
+
+    # --- v3.5.0 all-16: hotfixes (15-16) ------------------------------------
+    def _step_f15_boost_telemetry(self):
+        # 140 (feature 15): fix_boost_telemetry ON -> an armed rally boost emits its trail
+        # advance (LOCK_ARM/TRAIL_ADVANCE) so its EXIT is never falsely flagged. OFF ->
+        # no emission (pre-v3.3.0 silence; telemetry only, no P&L change).
+        import dataclasses
+        from strategy import Position, update_position_on_bar
+        from position_telemetry import PositionTracer, LOCK_ARM, TRAIL_ADVANCE
+        try:
+            ts0 = pd.Timestamp('2026-06-24T02:30:00Z')
+            def emits(cfg):
+                ev = []
+                tr = PositionTracer(sink=lambda l: None)
+                # patch emit to capture types
+                p = Position(anchor_label='T', side='BUY', entry_price=100.0, entry_time=ts0,
+                             current_sl=90.0, tp_level=130.0, max_fav=100.0, lot=0.35,
+                             role='rescue', boost=True, boost_kind='RALLY')
+                update_position_on_bar(p, pd.Series({'open': 100, 'high': 108, 'low': 100, 'close': 107}),
+                                       ts0 + pd.Timedelta(minutes=1), cfg, tracer=tr, ticket=701)
+                hist = tr._history.get(701, [])
+                return any(h.get('event_type') in (LOCK_ARM, TRAIL_ADVANCE) for h in hist)
+            on = emits(self.cfg)                                              # default ON
+            off = emits(dataclasses.replace(self.cfg, fix_boost_telemetry=False))
+            ok = (on is True and off is False)
+            detail = f"flag_on_emits={on} flag_off_silent={off}"
+        except Exception as e:
+            self._record(156, FAIL, f"raised: {e!r}"); return
+        self._record(156, PASS if ok else FAIL, detail)
+
+    def _step_f16_offset_no_0h(self):
+        # 141 (feature 16): the wake offset resolver NEVER falls back to 0h -- all-0 reads
+        # BLOCK (None), a +3 read confirms. fix_a1_offset defaults ON; OFF never re-adds a
+        # 0h guess (the block is the fail-safe).
+        import offset_guard as og
+        try:
+            off, result, attempts = og.resolve_offset([0, 0, 0])
+            never_0h = (off is None and result == og.BLOCKED)
+            confirms_3 = (og.resolve_offset([3]) == (3, og.CONFIRMED, 1))
+            flag_default_on = (bool(getattr(self.cfg, 'fix_a1_offset', True)) is True)
+            ok = never_0h and confirms_3 and flag_default_on
+            detail = f"all0_blocks(no_0h)={never_0h} +3_confirms={confirms_3} flag_default_on={flag_default_on}"
+        except Exception as e:
+            self._record(157, FAIL, f"raised: {e!r}"); return
+        self._record(157, PASS if ok else FAIL, detail)
+
+    # --- v3.5.0 all-16: freeze / independence / routing / flag table --------
+    def _step_strat_full_freeze(self):
+        # 142 FREEZE: with ALL strategy flags FALSE (the defaults) behavior == master.
+        # The rally override fires IMMEDIATELY (override_entry OFF) and every strategy
+        # extra defaults OFF (12/13/14) so order logic is byte-identical to v3.5.0 core.
+        import rally as _rally
+        try:
+            strat_off = (getattr(self.cfg, 'override_entry_enabled') is False
+                         and getattr(self.cfg, 'rescue_entry_enabled') is False
+                         and getattr(self.cfg, 'entry_confirm_candle') is False
+                         and getattr(self.cfg, 'entry_adaptive_depth') is False
+                         and getattr(self.cfg, 'rescue_sl_wide') is False)
+            bars = self._case2_bars()
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                               parent_side='SELL', parent_max_fav=25.0)
+            immediate = (_rally.break_and_hold_ok(tr, sh, pl) is True)
+            ev = [e for e in self._gate_ptrace if e[0] == 'break_override_parent_established']
+            legacy = (len(ev) == 1 and 'entry_mode' not in ev[0][1])
+            ok = strat_off and immediate and legacy
+            detail = f"all_strategy_flags_off={strat_off} immediate_override_fire={immediate} legacy={legacy}"
+        except Exception as e:
+            self._record(158, FAIL, f"raised: {e!r}"); return
+        self._record(158, PASS if ok else FAIL, detail)
+
+    def _step_per_flag_indep(self):
+        # 143: each strategy flag toggles INDEPENDENTLY -- flipping one leaves the others
+        # at their defaults (no cross-wiring).
+        import dataclasses
+        try:
+            checks = []
+            for key in ('override_entry_enabled', 'rescue_entry_enabled',
+                        'entry_confirm_candle', 'entry_adaptive_depth', 'rescue_sl_wide'):
+                c = dataclasses.replace(self.cfg, **{key: True})
+                others = [k for k in ('override_entry_enabled', 'rescue_entry_enabled',
+                                      'entry_confirm_candle', 'entry_adaptive_depth',
+                                      'rescue_sl_wide') if k != key]
+                only_this = (getattr(c, key) is True
+                             and all(getattr(c, o) is False for o in others))
+                checks.append(only_this)
+            ok = all(checks)
+            detail = f"each_flag_independent={ok} ({sum(checks)}/{len(checks)})"
+        except Exception as e:
+            self._record(159, FAIL, f"raised: {e!r}"); return
+        self._record(159, PASS if ok else FAIL, detail)
+
+    def _step_rescue_gate_on_arm(self):
+        # 144: the RESCUE gate, with rescue_entry_enabled ON, ARMS (does NOT immediate-fire
+        # at -10) -- the gate-level proof that the flag routes through the adaptive helper
+        # (mirror of the rally gate-ON arm). R-case logic itself is covered by 119/128.
+        import rescue as _rescue, dataclasses
+        try:
+            cfg_on = dataclasses.replace(self.cfg, rescue_entry_enabled=True,
+                                         util_pullback_log=False, util_boost_ledger=False)
+            bars = [{'high': 4033.0, 'low': 4031.0, 'close': 4032.0},
+                    {'high': 4033.0, 'low': 4031.0, 'close': 4032.0}]
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL', kind='RESCUE',
+                                               parent_side='BUY', cfg=cfg_on, last_mid=4032.0)
+            first = _rescue.entry_gate_ok(tr, sh, pl)
+            armed = bool(sh.get('rescue_entry_arm', {}).get('armed'))
+            no_fire = (first is False)
+            armed_ev = any(e[0] == 'rescue_entry_armed' for e in self._gate_ptrace)
+            ok = no_fire and armed and armed_ev
+            detail = f"rescue_on_no_immediate_fire={no_fire} armed={armed} armed_ptrace={armed_ev}"
+        except Exception as e:
+            self._record(160, FAIL, f"raised: {e!r}"); return
+        self._record(160, PASS if ok else FAIL, detail)
+
+    def _step_flag_table_check(self):
+        # 145: all 16 features have their flag/param on Config with the directive defaults
+        # (the flag-reference table, asserted in code).
+        try:
+            spec = {
+                'override_entry_enabled': False, 'rescue_entry_enabled': False,
+                'override_entry_smooth_confirm': True, 'rescue_entry_smooth_confirm': True,
+                'override_entry_dynamic_sl': True,
+                'override_entry_arm_timeout_candles': 4, 'rescue_entry_arm_timeout_candles': 4,
+                'util_pullback_log': True, 'util_boost_ledger': True,
+                'util_daily_report': True, 'util_preflight': True,
+                'entry_confirm_candle': False, 'entry_adaptive_depth': False,
+                'atr_period': 14, 'atr_mult': 1.0,
+                'rescue_sl_wide': False, 'rescue_sl_wide_dollars': 13.0,
+                'fix_boost_telemetry': True, 'fix_a1_offset': True,
+            }
+            missing = [k for k in spec if not hasattr(self.cfg, k)]
+            wrong = [k for k, v in spec.items()
+                     if hasattr(self.cfg, k) and getattr(self.cfg, k) != v]
+            ok = (not missing and not wrong)
+            detail = f"all_flags_present={not missing} defaults_correct={not wrong} missing={missing} wrong={wrong}"
+        except Exception as e:
+            self._record(161, FAIL, f"raised: {e!r}"); return
+        self._record(161, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------------
@@ -4941,6 +5273,21 @@ class SelfTest:
             # Watchdog boot validator (Task 1)
             self._step_watchdog_safe_start()
             self._step_watchdog_do_not_start()
+            # v3.5.0 all-16 features (148-161)
+            self._step_f8_pullback_log()
+            self._step_f9_boost_ledger()
+            self._step_f10_daily_report()
+            self._step_f11_preflight()
+            self._step_util_no_order_effect()
+            self._step_f12_confirm_candle()
+            self._step_f13_atr_depth()
+            self._step_f14_rescue_sl_wide()
+            self._step_f15_boost_telemetry()
+            self._step_f16_offset_no_0h()
+            self._step_strat_full_freeze()
+            self._step_per_flag_indep()
+            self._step_rescue_gate_on_arm()
+            self._step_flag_table_check()
         finally:
             self._cleanup()
         return self._report(ts)

@@ -211,7 +211,8 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     # the ratchet); each subsequent advance is a TRAIL_ADVANCE. Emission only when a
     # tracer is supplied (live path) -- selftest/backtest callers pass None and stay
     # byte-identical. The numbers (current_sl) are unchanged; this is observability.
-    if tracer is not None and fav >= arm and sgn * (pos.current_sl - _prev_sl) > 1e-9:
+    if (tracer is not None and bool(getattr(cfg, 'fix_boost_telemetry', True))
+            and fav >= arm and sgn * (pos.current_sl - _prev_sl) > 1e-9):  # v3.5.0 feature 15
         _was_backstop = sgn * (_prev_sl - backstop) <= 1e-9
         _kw = dict(side=pos.side, position_price=round(pos.entry_price, 2),
                    max_fav=round(pos.max_fav, 2), stop_price=round(pos.current_sl, 2),
