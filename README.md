@@ -396,6 +396,16 @@ versa (no generic close-all).
 > The trial measures that frequency (win-rate, fake-out-rate) before the daily numbers are
 > trusted. Best case (Jun 26 +$1,320 single leg) is rare; most attempts are fake-outs.
 
+### `feature/unified-3.5.0` — the whole v3.5.0 line on one branch
+
+This branch merges the two divergent v3.5.0 lines into one: the **all-16 features**
+(utilities 8–11 default ON, strategy extras 12–14 default OFF, hotfixes 15–16 default ON),
+**ROGUE**, and the **boot watchdog**. The selftest was renumbered to remove the 132–145
+collision: **rogue 132–145 · watchdog 146–147 · all-16 148–161** → **161 unique tests, 0 fail.**
+Every strategy flag is OFF by default and `rogue_enabled` is raw-default OFF, so
+`byte_identical_with_rogue_off` still holds. RALLY / RESCUE / ROGUE stay separate (shared
+helpers only; closures label-scoped). No logic changed in the merge — it's a port + renumber.
+
 ---
 
 ## License

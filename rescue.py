@@ -82,6 +82,7 @@ def entry_gate_ok(self, shadow, plan):
         # SMOOTH-confirm: break-and-hold on the rescue (SELL) direction (same mechanism
         # as the $5 arm). Any failure -> not confirmed (conservative).
         smooth_ok = False
+        candles = None   # captured for feature-13 ATR (depth scaling)
         if bool(getattr(self.cfg, 'rescue_entry_smooth_confirm', True)):
             try:
                 n = int(getattr(self.cfg, 'hold_candles_n', 2))
@@ -109,16 +110,44 @@ def entry_gate_ok(self, shadow, plan):
         pre_armed = bool(state.get('armed'))
         pre_done = state.get('done')
         m5_bucket = int(_time.time() // 300)
+        import boosts as _boosts
+        # feature 13: adaptive depth (ATR) when entry_adaptive_depth ON; feature 14:
+        # rescue fixed SL via boost_sl_for so rescue_sl_wide ($10->$13) is honored here
+        # AND in the derived cap together.
+        _depth = _pe.effective_depth(
+            self.cfg, float(getattr(self.cfg, 'rescue_entry_bounce_dollars', 6.0)),
+            _pe.atr_from_candles(candles))
         d = _pe.step(
-            state, direction=plan.boost_side,
-            pullback_depth=float(getattr(self.cfg, 'rescue_entry_bounce_dollars', 6.0)),
-            fixed_sl=float(getattr(self.cfg, 'boost_sl_dollars', 10.0)),
+            state, direction=plan.boost_side, pullback_depth=_depth,
+            fixed_sl=float(_boosts.boost_sl_for(self.cfg, 'RESCUE')),
             timeout_candles=int(getattr(self.cfg, 'rescue_entry_arm_timeout_candles', 4)),
             current_price=float(price), m5_bucket=m5_bucket, parent_alive=True,
             smooth_confirm=smooth_ok,
             allow_smooth=bool(getattr(self.cfg, 'rescue_entry_smooth_confirm', True)),
-            dynamic_sl=True)   # rescue pullback SL is ALWAYS above the bounce high
+            dynamic_sl=True,   # rescue pullback SL is ALWAYS above the bounce high
+            confirm_candle=bool(getattr(self.cfg, 'entry_confirm_candle', False)))  # feature 12
         tr = getattr(self, 'ptrace', None)
+        # features 8/9 (telemetry only; fully guarded -> never touches the fire decision).
+        try:
+            import boost_metrics as _bm
+            import pandas as _pd
+            if state.get('phase') == 'pullback' and not state.get('_pb_logged'):
+                state['_pb_logged'] = True
+                _bm.record_pullback_event(self, anchor, 'RESCUE', 'pulled_back')
+            if d['action'] == _pe.ENTER:
+                _bm.record_pullback_event(self, anchor, 'RESCUE', 'entered')
+                _bm.append_ledger(self, {'ts': _pd.Timestamp.now(tz='UTC').isoformat(),
+                                         'anchor': anchor, 'kind': 'RESCUE', 'event': 'enter',
+                                         'arm_px': round(float(state.get('cont_ext', price)), 2),
+                                         'entry_px': round(float(d['price']), 2)})
+            elif d['action'] == _pe.SKIP and not pre_done:
+                _bm.record_pullback_event(self, anchor, 'RESCUE', 'skipped')
+                _bm.append_ledger(self, {'ts': _pd.Timestamp.now(tz='UTC').isoformat(),
+                                         'anchor': anchor, 'kind': 'RESCUE', 'event': 'skip'})
+            elif d['action'] == _pe.ARM and not pre_armed:
+                _bm.record_pullback_event(self, anchor, 'RESCUE', 'armed')
+        except Exception:
+            pass
         if d['action'] == _pe.ENTER:
             entry, sl, mode = float(d['price']), float(d['sl']), d['mode']
             if mode == 'pullback':
