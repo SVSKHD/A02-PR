@@ -270,6 +270,17 @@ class SelfTest:
     def _rcname(rc):
         return _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
 
+    # MARKET_CLOSED retcode: on a weekend the broker rejects every live order
+    # with rc=10018. That is an ENVIRONMENTAL condition (the market is shut),
+    # not a logic failure -- the live-order steps (4/5/6/8) SKIP, never FAIL, so
+    # a clean weekend run still verdicts READY.
+    MARKET_CLOSED_RC = 10018
+
+    @classmethod
+    def _market_closed(cls, *rcs):
+        """True if ANY of the supplied retcodes is MARKET_CLOSED (10018)."""
+        return any(rc == cls.MARKET_CLOSED_RC for rc in rcs)
+
     @staticmethod
     def _ticket(res):
         if res is None:
@@ -406,6 +417,9 @@ class SelfTest:
         ok = (b_rc == 10009 and s_rc == 10009)
         detail = (f"buy {b_rc} ({self._rcname(b_rc)}), sell {s_rc} "
                   f"({self._rcname(s_rc)}), cancelled")
+        if not ok and self._market_closed(b_rc, s_rc):
+            self._record(4, SKIP, f"MARKET_CLOSED — {detail}")
+            return
         self._record(4, PASS if ok else FAIL, detail)
 
     def _step_market_place(self):
@@ -438,6 +452,9 @@ class SelfTest:
         ok = (rc == 10009)
         detail = (f"{rc} ({self._rcname(rc)}), comment '{mt5_comment(cmt)}'"
                   f"={len(mt5_comment(cmt))}, closed{last_err}")
+        if not ok and self._market_closed(rc):
+            self._record(5, SKIP, f"MARKET_CLOSED — {detail}")
+            return
         self._record(5, PASS if ok else FAIL, detail)
 
     def _step_sl_modify(self):
@@ -454,7 +471,10 @@ class SelfTest:
         rc = self._rc(res)
         tk = self._ticket(res)
         if rc != 10009 or not tk:
-            self._record(6, FAIL, f"setup position failed rc={rc} ({self._rcname(rc)})")
+            status = SKIP if self._market_closed(rc) else FAIL
+            prefix = "MARKET_CLOSED — " if status == SKIP else ""
+            self._record(6, status,
+                         f"{prefix}setup position failed rc={rc} ({self._rcname(rc)})")
             if tk:
                 self._close(tk)
             return
@@ -465,6 +485,10 @@ class SelfTest:
         m_rc = self._rc(mod)
         self._close(tk)
         ok = (m_rc == 10009)
+        if not ok and self._market_closed(m_rc):
+            self._record(6, SKIP,
+                         f"MARKET_CLOSED — {m_rc} ({self._rcname(m_rc)}), SL->${new_sl}")
+            return
         self._record(6, PASS if ok else FAIL,
                      f"{m_rc} ({self._rcname(m_rc)}), SL->${new_sl}")
 
@@ -496,12 +520,14 @@ class SelfTest:
             self._record(8, FAIL, "rescue gate did not classify a twin-open 2nd fill")
             return
         outcomes = []
+        rcs = []
         all_ok = True
         for i in range(n):
             cmt = f"AUR_{label[:2]}_{side[0]}_B{i+1}"
             res = self.adapter.place_market_order(
                 self.symbol, side, lot, sl=b_sl, tp=b_tp, comment=cmt)
             rc = self._rc(res)
+            rcs.append(rc)
             tk = self._ticket(res)
             if rc == 10009 and tk:
                 self._open_positions.add(tk)
@@ -510,7 +536,11 @@ class SelfTest:
             outcomes.append(f"boost{i+1} {rc} '{mt5_comment(cmt)}'={len(mt5_comment(cmt))}")
             if tk:
                 self._close(tk)
-        self._record(8, PASS if all_ok else FAIL, ", ".join(outcomes) + ", closed")
+        detail = ", ".join(outcomes) + ", closed"
+        if not all_ok and self._market_closed(*rcs):
+            self._record(8, SKIP, f"MARKET_CLOSED — {detail}")
+            return
+        self._record(8, PASS if all_ok else FAIL, detail)
 
     def _step_ts_header(self):
         # v3.0.4: the timestamp header is the single source for every alert
