@@ -215,6 +215,8 @@ STEP_NAMES = {
     159: "per-flag indep",
     160: "rescue gate ON arm",
     161: "flag table check",
+    # Watchdog rogue promotion-rule line (post-trial)
+    162: "watchdog rogue rule",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4717,6 +4719,30 @@ class SelfTest:
             self._record(147, FAIL, f"raised: {e!r}"); return
         self._record(147, PASS if ok else FAIL, detail)
 
+    def _step_watchdog_rogue_rule(self):
+        # 162 rogue promotion-rule line: the validator reports the rogue PROMOTION RULE
+        # (report-only), not the live state. At watchdog time cfg.rogue_enabled is the RAW
+        # value (promote_on_boot flips it later, inside the LiveTrader), so the line must
+        # exist, be a passing WIRING check, and never gate the verdict.
+        import aureon_validator as _v
+        try:
+            rep = _v.validate(self.cfg)
+            named = [c for c in rep['checks'] if c['name'] == 'rogue:promotion_rule']
+            present = (len(named) == 1)
+            c = named[0] if present else {}
+            ok_true = (present and c.get('ok') is True)
+            is_wiring = (present and c.get('kind') == _v.WIRING)
+            in_wiring_ok = any(x['name'] == 'rogue:promotion_rule' for x in rep['wiring_ok'])
+            # report-only: it must NOT introduce a wiring failure for the real cfg.
+            no_fail = all(x['name'] != 'rogue:promotion_rule' for x in rep['wiring_failures'])
+            mentions_rule = (present and 'demo boot promotes ON' in c.get('detail', ''))
+            ok = present and ok_true and is_wiring and in_wiring_ok and no_fail and mentions_rule
+            detail = (f"present={present} ok={ok_true} wiring={is_wiring} "
+                      f"in_wiring_ok={in_wiring_ok} reports_rule={mentions_rule}")
+        except Exception as e:
+            self._record(162, FAIL, f"raised: {e!r}"); return
+        self._record(162, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -5288,6 +5314,8 @@ class SelfTest:
             self._step_per_flag_indep()
             self._step_rescue_gate_on_arm()
             self._step_flag_table_check()
+            # Watchdog rogue promotion-rule line (post-trial)
+            self._step_watchdog_rogue_rule()
         finally:
             self._cleanup()
         return self._report(ts)
