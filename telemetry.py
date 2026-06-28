@@ -320,7 +320,13 @@ class Telemetry:
             try:
                 self._deliver(event)
             except Exception as e:
-                self._log.exception(f"Telemetry delivery failed: {e}")
+                # The reporting logger may itself be the failure source (broken
+                # rotating handler), so guard the report too -- the worker loop
+                # must never die on a delivery error.
+                try:
+                    self._log.exception(f"Telemetry delivery failed: {e}")
+                except Exception:
+                    pass
 
     def _deliver(self, event: dict):
         sev = Severity(event["severity"])
@@ -335,7 +341,14 @@ class Telemetry:
             Severity.ERROR:    self._log.error,
             Severity.CRITICAL: self._log.critical,
         }.get(sev, self._log.info)
-        method(msg)
+        # The console/file logger can raise (e.g. a Windows log-rotation rename
+        # failure surfacing through emit). A telemetry delivery must NEVER crash
+        # its caller -- swallow any logging failure so the worker/stop-drain and,
+        # ultimately, SelfTest teardown keep running.
+        try:
+            method(msg)
+        except Exception:
+            pass
 
         # File
         if self._fh:
