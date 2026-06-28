@@ -16,6 +16,40 @@ import pandas as pd
 log = logging.getLogger("AUREON")
 
 
+from logging.handlers import TimedRotatingFileHandler as _TimedRotatingFileHandler
+
+
+class _SafeRotatingFileHandler(_TimedRotatingFileHandler):
+    """TimedRotatingFileHandler whose midnight rollover can NEVER raise.
+
+    On Windows, doRollover() calls os.rename() on the still-open (or externally
+    held) log file and raises PermissionError [WinError 32]. Unguarded, that
+    error escapes through logging and crashes whatever was emitting -- including
+    the selftest teardown. Here the rename is wrapped: on PermissionError/OSError
+    we emit a single console warning, skip THIS rollover, and keep writing to the
+    current file. The base class already advanced rolloverAt, so the next attempt
+    is naturally the following midnight. No trading behavior depends on this."""
+
+    def doRollover(self):  # noqa: D401 -- override
+        try:
+            super().doRollover()
+        except (PermissionError, OSError) as e:
+            # Keep the current stream usable: if the base class closed it before
+            # the rename failed, reopen so logging continues uninterrupted.
+            try:
+                if self.stream is None and not self.delay:
+                    self.stream = self._open()
+            except Exception:
+                pass
+            try:
+                logging.getLogger("AUREON").warning(
+                    "log rotation skipped (file locked: %s); continuing on the "
+                    "current file, will retry at next midnight.", e
+                )
+            except Exception:
+                pass
+
+
 def setup_logging(level: str = "INFO", log_dir: str = "./logs",
                   app_name: str = "aureon"):
     """Set up logging to BOTH stdout and a daily-rotated file in log_dir.
@@ -44,12 +78,21 @@ def setup_logging(level: str = "INFO", log_dir: str = "./logs",
     console.setFormatter(fmt)
     root.addHandler(console)
 
-    # Daily-rotated file handler
-    from logging.handlers import TimedRotatingFileHandler
+    # Daily-rotated file handler.
+    # Windows-safe: TimedRotatingFileHandler.doRollover() renames the open log
+    # file at midnight. On Windows the file is still held open (and may be held
+    # by a tail/editor too), so os.rename raises PermissionError [WinError 32].
+    # The stock handler has no guard, so that error propagates up through
+    # logging.emit -> the telemetry worker -> SelfTest.run() teardown, scoring a
+    # clean test run as FAILED. _SafeRotatingFileHandler swallows the rename
+    # failure: it logs ONE warning to the console and keeps writing to the
+    # current file, retrying the rollover at the next midnight. Rotation failure
+    # must NEVER raise into the app. delay=True defers opening the file until the
+    # first emit (so the handle isn't held needlessly before anything is logged).
     log_file = os.path.join(log_dir, f"{app_name}.log")
-    file_handler = TimedRotatingFileHandler(
+    file_handler = _SafeRotatingFileHandler(
         log_file, when='midnight', interval=1, backupCount=30, utc=True,
-        encoding='utf-8'
+        encoding='utf-8', delay=True
     )
     file_handler.setFormatter(fmt)
     file_handler.suffix = "%Y-%m-%d"  # so rotated files become aureon.log.2026-05-25
