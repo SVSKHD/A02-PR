@@ -98,6 +98,14 @@ def _probe(cfg):
     pending('live:boost_fills_rc10009', 'verified at the first real rescue/boost fill')
     pending('live:rogue_monster_entry', 'verified at the first real monster catch')
     pending('live:anchor_places_at_schedule', 'verified at the first scheduled anchor')
+
+    # 7. ROGUE promotion RULE (report-only). At watchdog time cfg.rogue_enabled is the
+    #    RAW value -- promote_on_boot() flips False->True for a demo account later, inside
+    #    the LiveTrader. So we report the RULE, not the live state: printing the raw flag
+    #    here would falsely read OFF on a demo boot. Always passes; no broker call.
+    w('rogue:promotion_rule', True,
+      f'rogue_enabled raw={getattr(cfg, "rogue_enabled", False)!r}; '
+      f'demo boot promotes ON, funded forces OFF')
     return checks
 
 
