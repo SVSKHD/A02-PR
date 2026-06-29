@@ -217,6 +217,8 @@ STEP_NAMES = {
     161: "flag table check",
     # Watchdog rogue promotion-rule line (post-trial)
     162: "watchdog rogue rule",
+    # run_live() guaranteed rogue promotion on every live boot
+    163: "rogue promote boot",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4773,6 +4775,58 @@ class SelfTest:
             self._record(162, FAIL, f"raised: {e!r}"); return
         self._record(162, PASS if ok else FAIL, detail)
 
+    def _step_rogue_promote_live_boot(self):
+        # 163 run_live() promotes rogue on EVERY live boot. The in-class call
+        # lives inside wait_until_market_open(), which RETURNS EARLY on the
+        # weekend/sleep->wake path -> promotion never ran and rogue stayed
+        # dormant. run_live() must promote unconditionally on the LIVE path
+        # (after the adapter connects, before trading) and NEVER on paper.
+        # Driven with stubs so no MT5 / live loop is needed: a demo-account stub
+        # adapter, a no-op LiveTrader, and a throwaway cfg (the real self.cfg is
+        # never mutated).
+        import live_trader as _lt
+        import mt5_adapter as _mt5a
+        import types as _types
+        try:
+            DEMO = 0
+            def _mk_adapter(is_demo):
+                mt5 = _types.SimpleNamespace(
+                    ACCOUNT_TRADE_MODE_DEMO=DEMO,
+                    account_info=lambda: _types.SimpleNamespace(
+                        trade_mode=(DEMO if is_demo else 2)))
+                return _types.SimpleNamespace(mt5=mt5, shutdown=lambda: None)
+
+            class _StubTrader:   # captures cfg/adapter; run() is a no-op (no loop)
+                def __init__(self, cfg, adapter, paper=True):
+                    self.cfg, self.adapter, self.paper = cfg, adapter, paper
+                def run(self):
+                    return None
+
+            def _drive(paper, is_demo):
+                # throwaway cfg so the shared self.cfg is never mutated.
+                cfg = _types.SimpleNamespace(symbol='XAUUSD', rogue_enabled=False,
+                                             EXPECTED_BROKER_OFFSET_HOURS=None)
+                adapter = _mk_adapter(is_demo)
+                orig_LT, orig_AD = _lt.LiveTrader, _mt5a.MT5Adapter
+                _lt.LiveTrader = _StubTrader
+                _mt5a.MT5Adapter = lambda *a, **k: adapter
+                try:
+                    _lt.run_live(cfg, paper=paper)
+                finally:
+                    _lt.LiveTrader, _mt5a.MT5Adapter = orig_LT, orig_AD
+                return cfg.rogue_enabled
+
+            live_demo_on = (_drive(paper=False, is_demo=True) is True)    # LIVE+demo -> ON
+            live_funded_off = (_drive(paper=False, is_demo=False) is False)  # LIVE+funded -> OFF
+            paper_never = (_drive(paper=True, is_demo=True) is False)     # PAPER -> never promotes
+            ok = live_demo_on and live_funded_off and paper_never
+            detail = (f"live_demo_promotes={live_demo_on} "
+                      f"live_funded_forced_off={live_funded_off} "
+                      f"paper_never_promotes={paper_never}")
+        except Exception as e:
+            self._record(163, FAIL, f"raised: {e!r}"); return
+        self._record(163, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -5346,6 +5400,8 @@ class SelfTest:
             self._step_flag_table_check()
             # Watchdog rogue promotion-rule line (post-trial)
             self._step_watchdog_rogue_rule()
+            # run_live() guaranteed rogue promotion on every live boot
+            self._step_rogue_promote_live_boot()
         finally:
             self._cleanup()
         return self._report(ts)
