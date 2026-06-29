@@ -221,6 +221,8 @@ STEP_NAMES = {
     163: "rogue promote boot",
     # Rogue ML pipeline: pattern logger + model gate (pass-through default) + archive
     164: "rogue ml gate",
+    # Rogue ML: EOD champion/challenger autotrain + exit-feature capture
+    165: "rogue ml train",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4958,6 +4960,124 @@ class SelfTest:
             _rm.reset_singleton()
         self._record(164, PASS if ok else FAIL, detail)
 
+    def _step_rogue_ml_train(self):
+        # 165 Rogue ML autotrain (champion/challenger, fail-safe) + exit-feature capture.
+        # Covers: (g) autotrain SKIPS when rows<300; (h) champion is KEPT when the challenger
+        # is not better (promotion rule + same-data re-train doesn't replace); a fresh model
+        # is PROMOTED when there is no champion (model can come into being); and (i) EXIT
+        # features (entry_price, max_fav, trail_path_summary, exit_price, held_minutes,
+        # outcome_dollars) are captured on a simulated close, with a losing close re-labeled
+        # FAKEOUT. All pure-Python -- no sklearn, no MT5.
+        import rogue_autotrain as _rat
+        import rogue_patternlog as _pl
+        import tempfile, shutil, os, csv, types
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix="aureon_mltrain_")
+
+            # --- (g) insufficient data -> skip ---
+            run_small = os.path.join(tmp, "small")
+            os.makedirs(run_small)
+            for k in range(20):
+                _pl.log_eval(run_small, ts=f"2026-06-29 0{k%6}:00:00", direction='BUY',
+                             features={'range_dollars': 20, 'body_ratio': 0.8,
+                                       'candle_count': 4, 'atr': 5, 'spread': 0.2,
+                                       'confirm_dollars': 22, 'time_bucket': 'asia'},
+                             decision='ENTER', model_score=1.0, entry_price=4000.0,
+                             outcome_dollars=(10.0 if k % 2 else -5.0))
+            v_small = _rat.run(run_small, archive_dir=os.path.join(tmp, "noarch"),
+                               model_path=os.path.join(tmp, "m_small.pkl"))
+            skips_small = (v_small['action'] == 'skip_insufficient' and v_small['rows'] < 300
+                           and not os.path.exists(os.path.join(tmp, "m_small.pkl")))
+
+            # --- (h) promotion rule: champion kept when challenger not better ---
+            keep_worse = (_rat.decide_promotion({'acc': 0.71, 'fakeout_recall': 0.6},
+                                                {'acc': 0.68, 'fakeout_recall': 0.6})[0] is False)
+            promote_none = (_rat.decide_promotion(None, {'acc': 0.6, 'fakeout_recall': 0.5})[0] is True)
+            promote_better = (_rat.decide_promotion({'acc': 0.60, 'fakeout_recall': 0.5},
+                                                    {'acc': 0.70, 'fakeout_recall': 0.6})[0] is True)
+            keep_equal = (_rat.decide_promotion({'acc': 0.70, 'fakeout_recall': 0.6},
+                                                {'acc': 0.70, 'fakeout_recall': 0.6})[0] is False)
+
+            # --- (h) integration: >=300 rows with a learnable signal. First run has NO
+            #     champion -> PROMOTE; second run on the SAME data -> challenger == champion
+            #     (not better by margin) -> KEEP. Proves a champion is never replaced by a
+            #     non-better model. ---
+            run_big = os.path.join(tmp, "big")
+            os.makedirs(run_big)
+            for k in range(360):
+                win = (k % 2 == 0)                       # learnable: confirm high -> win
+                _pl.log_eval(run_big, ts=f"2026-06-{1 + k // 24:02d} {k % 24:02d}:00:00",
+                             direction=('BUY' if win else 'SELL'),
+                             features={'range_dollars': (25 if win else 16),
+                                       'body_ratio': (0.85 if win else 0.55),
+                                       'candle_count': 4, 'atr': (6 if win else 4),
+                                       'spread': 0.2,
+                                       'confirm_dollars': (28 if win else 20),
+                                       'time_bucket': ('london' if win else 'asia')},
+                             decision='ENTER', model_score=1.0, entry_price=4000.0 + k,
+                             outcome_dollars=(15.0 if win else -6.0))
+            mp = os.path.join(tmp, "champ.pkl")
+            v1 = _rat.run(run_big, archive_dir=os.path.join(tmp, "noarch"), model_path=mp)
+            v2 = _rat.run(run_big, archive_dir=os.path.join(tmp, "noarch"), model_path=mp)
+            promoted_from_nothing = (v1['action'] == 'promoted' and os.path.exists(mp))
+            kept_on_rerun = (v2['action'] == 'kept_champion')
+
+            # --- (i) exit-feature capture on a close (winner) + FAKEOUT relabel (loser) ---
+            run_x = os.path.join(tmp, "exit")
+            os.makedirs(run_x)
+            # seed an ENTER row, then simulate the close via observe()'s backfill path.
+            ts_enter = "2026-06-29 06:00:00"
+            _pl.log_eval(run_x, ts=ts_enter, direction='SELL',
+                         features={'range_dollars': 20, 'body_ratio': 0.8, 'candle_count': 4,
+                                   'atr': 5, 'spread': 0.2, 'confirm_dollars': 25,
+                                   'time_bucket': 'asia'},
+                         decision='ENTER', model_score=1.0, entry_price=4075.0)
+            # winning SELL: entry 4075 -> peak 4040 -> exit(sl) 4050 => +25 fav, +25 outcome.
+            _pl.backfill_exit(run_x, ts_enter,
+                              {'max_fav': 35.0, 'trail_path_summary': '4075.0->4040.0->4050.0',
+                               'exit_price': 4050.0, 'held_minutes': 42.0,
+                               'outcome_dollars': 25.0})
+            with open(os.path.join(run_x, "rogue_patterns.csv")) as f:
+                xrow = list(csv.DictReader(f))[0]
+            exit_captured = all(str(xrow.get(c, '')) != '' for c in
+                                ('entry_price', 'max_fav', 'trail_path_summary',
+                                 'exit_price', 'held_minutes', 'outcome_dollars'))
+
+            # losing close -> decision relabeled FAKEOUT.
+            ts_enter2 = "2026-06-29 07:00:00"
+            _pl.log_eval(run_x, ts=ts_enter2, direction='BUY',
+                         features={'range_dollars': 18, 'body_ratio': 0.7, 'candle_count': 4,
+                                   'atr': 4, 'spread': 0.2, 'confirm_dollars': 22,
+                                   'time_bucket': 'london'},
+                         decision='ENTER', model_score=1.0, entry_price=4000.0)
+            _pl.backfill_exit(run_x, ts_enter2,
+                              {'max_fav': 1.0, 'trail_path_summary': '4000->4001->3995',
+                               'exit_price': 3995.0, 'held_minutes': 5.0,
+                               'outcome_dollars': -5.0}, decision=_pl.FAKEOUT)
+            with open(os.path.join(run_x, "rogue_patterns.csv")) as f:
+                rows_x = list(csv.DictReader(f))
+            fakeout_relabel = any(r['decision'] == 'FAKEOUT'
+                                  and str(r['outcome_dollars']) == '-5.0' for r in rows_x)
+
+            ok = (skips_small and keep_worse and promote_none and promote_better
+                  and keep_equal and promoted_from_nothing and kept_on_rerun
+                  and exit_captured and fakeout_relabel)
+            detail = (f"(g)skip<300={skips_small} (h)keep_worse={keep_worse} "
+                      f"promote_none={promote_none} promote_better={promote_better} "
+                      f"keep_equal={keep_equal} promoted_new={promoted_from_nothing} "
+                      f"kept_rerun={kept_on_rerun} (i)exit_captured={exit_captured} "
+                      f"fakeout_relabel={fakeout_relabel}")
+        except Exception as e:
+            self._record(165, FAIL, f"raised: {e!r}")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(165, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -5535,6 +5655,8 @@ class SelfTest:
             self._step_rogue_promote_live_boot()
             # Rogue ML pipeline: pattern logger + model gate + archive
             self._step_rogue_ml_gate()
+            # Rogue ML: EOD champion/challenger autotrain + exit-feature capture
+            self._step_rogue_ml_train()
         finally:
             self._cleanup()
         return self._report(ts)

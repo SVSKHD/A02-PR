@@ -2,18 +2,21 @@
 
 Logging / file-IO ONLY. Places NO orders, changes NO decision, and is NEVER on the anchor
 (Non-OCO, magic 20260522) path. On every Rogue evaluation the gate hook in rogue.py calls
-log_eval() to append ONE row of PRICE-INVARIANT shape features + the decision + the gate's
-model_score to run_dir/rogue_patterns.csv -- so each day is a replayable training set of
-what Rogue saw, what the model scored, and what was chosen (ENTER / SKIP / SKIP_BY_MODEL),
-with the negatives included (those are the rows a model needs).
+log_eval() to append ONE row to run_dir/rogue_patterns.csv:
+
+  ENTRY (the model's normalized, PRICE-INVARIANT shape features + the gate decision):
+    ts, direction, range_dollars, body_ratio, candle_count, atr, spread, time_bucket,
+    confirm_dollars, decision (ENTER/SKIP/FAKEOUT/SKIP_BY_MODEL), model_score
+  EXIT (captured later on close, for a FUTURE Phase-3 exit model -- captured now, NOT used
+  to decide anything in this task):
+    entry_price, max_fav, trail_path_summary, exit_price, held_minutes, outcome_dollars
 
 observe() is a behavior-NEUTRAL close watcher: it reads broker state to detect a closed
-Rogue ticket and backfills outcome_dollars (and labels a give-back FAKEOUT). It never
-mutates the Rogue mechanism's state. archive_day() freezes each broker day's files into
-logs/archive/{date}/.
+Rogue ticket, then backfills the exit columns of the matching ENTER row -- WITHOUT mutating
+the Rogue mechanism. archive_day() freezes each broker day's files into logs/archive/{date}/.
 
-Everything is GUARDED: a logging/file error can never reach trading. With rogue_enabled
-OFF (raw default) nothing here runs -> byte-identical to master.
+Everything is GUARDED: a logging/file error can never reach trading. With rogue_enabled OFF
+(raw default) nothing here runs -> byte-identical to master.
 """
 from __future__ import annotations
 
@@ -29,17 +32,23 @@ ROGUE_MAGIC = 20260626   # anchors (20260522) / warmup (9999998) NEVER appear he
 PATTERNS_CSV = "rogue_patterns.csv"
 TRADES_CSV = "rogue_trades.csv"
 
+# entry (shape features + decision) ... then exit (filled on close).
 PATTERN_COLUMNS = ['ts', 'direction', 'range_dollars', 'body_ratio', 'candle_count',
                    'atr', 'spread', 'time_bucket', 'confirm_dollars', 'decision',
-                   'model_score', 'outcome_dollars', 'magic']
+                   'model_score',
+                   'entry_price', 'max_fav', 'trail_path_summary', 'exit_price',
+                   'held_minutes', 'outcome_dollars', 'magic']
 TRADE_COLUMNS = ['ts', 'event', 'direction', 'entry', 'exit', 'sl',
                  'outcome_dollars', 'ticket', 'magic']
 
+EXIT_COLUMNS = ['max_fav', 'trail_path_summary', 'exit_price', 'held_minutes',
+                'outcome_dollars']
+
 # decision labels
 ENTER = 'ENTER'
-SKIP = 'SKIP'                 # governor blocked (cap / loss-stop / fail-pause)
+SKIP = 'SKIP'                      # governor blocked (cap / loss-stop / fail-pause)
 SKIP_BY_MODEL = 'SKIP_BY_MODEL'   # the trained gate blocked (score < threshold)
-FAKEOUT = 'FAKEOUT'          # entered then gave back to the stop
+FAKEOUT = 'FAKEOUT'               # entered then gave back to the stop
 
 
 # --- coarse session bucket + numeric code (price-invariant context) ---------------
@@ -63,7 +72,6 @@ def time_of_day_bucket(hour_utc):
 
 
 def time_bucket_code(bucket):
-    """Stable int code for the model's numeric vector (unknown -> -1)."""
     try:
         return _BUCKETS.index(bucket)
     except Exception:
@@ -72,9 +80,9 @@ def time_bucket_code(bucket):
 
 # --- pure, price-INVARIANT shape features -----------------------------------------
 def normalized_features(bars):
-    """Reduce recent M5 bars to shape features (NO raw price levels leak out):
-    range_dollars (hi-lo $), body_ratio (sum|body|/sum|range|, thrust 0..1),
-    candle_count, atr (mean bar range $). PURE."""
+    """Recent M5 bars -> shape features (NO raw price levels): range_dollars (hi-lo $),
+    body_ratio (sum|body|/sum|range|, thrust 0..1), candle_count, atr (mean bar range $).
+    PURE."""
     cs = [c for c in (bars or []) if c is not None]
     n = len(cs)
     if n == 0:
@@ -89,9 +97,8 @@ def normalized_features(bars):
 
 
 def build_features(bars, *, spread=0.0, confirm_dollars=0.0, ts=None):
-    """Assemble the full normalized feature dict the logger + model share. Adds spread,
-    confirm_dollars (how far price moved past the anchor at the eval), time_bucket and its
-    numeric code. PURE."""
+    """Full normalized feature dict the logger + model share (adds spread, confirm_dollars,
+    time_bucket + numeric code). PURE -- no raw price levels."""
     feats = normalized_features(bars)
     bucket = 'unknown'
     if ts is not None:
@@ -117,10 +124,9 @@ def _append_row(path, columns, row):
 
 
 def log_eval(run_dir, *, ts, direction, features, decision, model_score,
-             outcome_dollars='', magic=ROGUE_MAGIC):
-    """Append ONE Rogue evaluation row (features + decision + model_score) to
-    rogue_patterns.csv. Returns the row dict (caller may remember ts for backfill).
-    Guarded -- returns None on IO error, never raises."""
+             entry_price='', outcome_dollars='', magic=ROGUE_MAGIC):
+    """Append ONE Rogue evaluation row (entry shape features + decision + model_score, with
+    the exit columns left blank to be backfilled on close). Returns the row dict. Guarded."""
     try:
         f = features or {}
         row = {
@@ -128,10 +134,11 @@ def log_eval(run_dir, *, ts, direction, features, decision, model_score,
             'range_dollars': f.get('range_dollars', ''), 'body_ratio': f.get('body_ratio', ''),
             'candle_count': f.get('candle_count', ''), 'atr': f.get('atr', ''),
             'spread': f.get('spread', ''), 'time_bucket': f.get('time_bucket', ''),
-            'confirm_dollars': f.get('confirm_dollars', ''),
-            'decision': decision,
+            'confirm_dollars': f.get('confirm_dollars', ''), 'decision': decision,
             'model_score': ('' if model_score is None else round(float(model_score), 4)),
-            'outcome_dollars': outcome_dollars, 'magic': int(magic),
+            'entry_price': entry_price, 'max_fav': '', 'trail_path_summary': '',
+            'exit_price': '', 'held_minutes': '', 'outcome_dollars': outcome_dollars,
+            'magic': int(magic),
         }
         _append_row(os.path.join(run_dir, PATTERNS_CSV), PATTERN_COLUMNS, row)
         return row
@@ -154,10 +161,10 @@ def log_trade(run_dir, *, ts, event, direction, entry, exit_px, sl,
         return None
 
 
-def backfill_outcome(run_dir, ts, outcome_dollars, decision=None):
-    """Fill outcome_dollars (and optionally re-label) on the ENTER patterns row whose ts
-    matches, via atomic temp-then-replace. On ANY error the file is left untouched (the
-    realized $ still lives in rogue_trades.csv). Guarded."""
+def backfill_exit(run_dir, enter_ts, exit_fields, decision=None):
+    """Fill the EXIT columns (and optionally re-label decision) on the ENTER patterns row
+    whose ts matches, via atomic temp-then-replace. On ANY error the file is left untouched
+    (the realized $ still lives in rogue_trades.csv). Guarded. Returns True on a hit."""
     path = os.path.join(run_dir, PATTERNS_CSV)
     if not os.path.exists(path):
         return False
@@ -166,10 +173,12 @@ def backfill_outcome(run_dir, ts, outcome_dollars, decision=None):
             rows = list(csv.DictReader(f))
         hit = False
         for r in rows:
-            if (not hit and str(r.get('ts')) == str(ts)
+            if (not hit and str(r.get('ts')) == str(enter_ts)
                     and str(r.get('decision')) == ENTER
                     and str(r.get('outcome_dollars', '')) == ''):
-                r['outcome_dollars'] = outcome_dollars
+                for k in EXIT_COLUMNS:
+                    if k in exit_fields:
+                        r[k] = exit_fields[k]
                 if decision is not None:
                     r['decision'] = decision
                 hit = True
@@ -188,9 +197,17 @@ def backfill_outcome(run_dir, ts, outcome_dollars, decision=None):
         return False
 
 
-# --- behavior-NEUTRAL close watcher (outcome capture; never mutates the mechanism) -
+# --- behavior-NEUTRAL close watcher (exit capture; never mutates the mechanism) ----
+def _held_minutes(enter_ts, close_ts):
+    try:
+        import pandas as _pd
+        return round((_pd.Timestamp(close_ts) - _pd.Timestamp(enter_ts)).total_seconds() / 60.0, 1)
+    except Exception:
+        return ''
+
+
 def observe(trader):
-    """Detect a CLOSED Rogue position and record its realized $ -- WITHOUT touching the
+    """Detect a CLOSED Rogue position and record its EXIT features -- WITHOUT touching the
     Rogue mechanism's state (pure observation). Wired after rogue.drive(). Rogue-only;
     returns immediately unless should_run. Guarded."""
     try:
@@ -202,7 +219,8 @@ def observe(trader):
             return
         rpl = getattr(trader, '_rpl', None)
         if rpl is None:
-            rpl = {'open_ticket': None, 'open_snap': None, 'enter_ts': None, 'closed': set()}
+            rpl = {'open_ticket': None, 'open_snap': None, 'enter_ts': None,
+                   'enter_price': None, 'closed': set()}
             trader._rpl = rpl
         open_ = st.get('open')
         run_dir = getattr(trader, 'run_dir', '.')
@@ -211,29 +229,42 @@ def observe(trader):
             ts = _pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S')
         except Exception:
             ts = ''
-        # remember the live open + its enter ts (set by the gate hook on rpl['enter_ts']).
+        # while open: remember the live snapshot (peak = max favorable excursion).
         if open_ is not None and open_.get('ticket') is not None:
             rpl['open_ticket'] = open_.get('ticket')
             rpl['open_snap'] = dict(open_)
             return
-        # open is None in state but we had a ticket -> the position is gone (closed).
+        # open gone from state but we had a ticket -> the position closed.
         tk = rpl.get('open_ticket')
         snap = rpl.get('open_snap')
         if tk is None or snap is None or tk in rpl.get('closed', set()):
             return
         if not _ticket_closed(trader, tk):
             return
-        sgn = 1.0 if snap.get('side') == 'BUY' else -1.0
+        side = snap.get('side')
+        sgn = 1.0 if side == 'BUY' else -1.0
         try:
-            outcome = round(sgn * (float(snap.get('sl')) - float(snap.get('entry'))), 2)
+            entry = float(snap.get('entry'))
+            peak = float(snap.get('peak', entry))
+            exit_px = float(snap.get('sl'))   # closed on the trailing/init stop
+            outcome = round(sgn * (exit_px - entry), 2)
+            max_fav = round(sgn * (peak - entry), 2)
         except Exception:
-            outcome = ''
-        log_trade(run_dir, ts=ts, event='close', direction=snap.get('side'),
-                  entry=snap.get('entry'), exit_px=snap.get('sl'), sl=snap.get('sl'),
+            entry = peak = exit_px = ''
+            outcome = max_fav = ''
+        enter_ts = rpl.get('enter_ts')
+        held = _held_minutes(enter_ts, ts) if enter_ts else ''
+        trail_path = (f"{entry}->{peak}->{exit_px}"
+                      if '' not in (entry, peak, exit_px) else '')
+        log_trade(run_dir, ts=ts, event='close', direction=side,
+                  entry=entry, exit_px=exit_px, sl=exit_px,
                   outcome_dollars=outcome, ticket=tk)
-        if rpl.get('enter_ts') and outcome != '':
-            backfill_outcome(run_dir, rpl['enter_ts'], outcome,
-                             decision=(FAKEOUT if outcome <= 0 else None))
+        if enter_ts and outcome != '':
+            backfill_exit(run_dir, enter_ts,
+                          {'max_fav': max_fav, 'trail_path_summary': trail_path,
+                           'exit_price': exit_px, 'held_minutes': held,
+                           'outcome_dollars': outcome},
+                          decision=(FAKEOUT if outcome <= 0 else None))
         rpl.setdefault('closed', set()).add(tk)
         rpl['open_ticket'] = None
         rpl['open_snap'] = None
@@ -243,7 +274,7 @@ def observe(trader):
 
 def _ticket_closed(trader, ticket):
     """True if `ticket` is no longer an open broker position. Conservative: any read error
-    -> False (do NOT claim a close we cannot confirm)."""
+    -> False (never claim a close we cannot confirm)."""
     try:
         pos = trader.adapter.mt5.positions_get(ticket=int(ticket))
         return not pos
@@ -254,9 +285,9 @@ def _ticket_closed(trader, ticket):
 # --- dated EOD archive (copy, not move -- live files keep rolling) ------------------
 def archive_day(run_dir, *, broker_date, price_log_dir=None, daylog_path=None,
                 base_log_dir="./logs"):
-    """Freeze the day's Rogue + trade files into base_log_dir/archive/{broker_date}/. COPIES
-    rogue_patterns.csv, rogue_trades.csv, today_trades.csv, price_{date}.csv (never moves --
-    live files keep rolling). Returns archived basenames. Guarded."""
+    """Freeze the day's files into base_log_dir/archive/{broker_date}/. COPIES
+    rogue_patterns.csv, rogue_trades.csv, today_trades.csv, price_{date}.csv (never moves).
+    Returns archived basenames. Guarded."""
     archived = []
     try:
         dest = os.path.join(base_log_dir, "archive", str(broker_date))

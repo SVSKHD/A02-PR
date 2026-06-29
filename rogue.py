@@ -331,7 +331,8 @@ def _model_gate(trader, st, price, epx, sl, ok):
         decision = _pl.SKIP_BY_MODEL if blocked else (_pl.ENTER if ok else _pl.SKIP)
         if st.get('rpl_eval_anchor') != st.get('anchor'):   # one eval per setup (no flood)
             _pl.log_eval(getattr(trader, 'run_dir', '.'), ts=ts, direction=st.get('leg_dir'),
-                         features=feats, decision=decision, model_score=score)
+                         features=feats, decision=decision, model_score=score,
+                         entry_price=(round(float(epx), 2) if decision == _pl.ENTER else ''))
             st['rpl_eval_anchor'] = st.get('anchor')
             if decision == _pl.ENTER:
                 rpl = getattr(trader, '_rpl', None)
@@ -339,6 +340,7 @@ def _model_gate(trader, st, price, epx, sl, ok):
                     rpl = {}
                     trader._rpl = rpl
                 rpl['enter_ts'] = ts
+                rpl['enter_price'] = round(float(epx), 2)
         if blocked:
             trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} SKIP_BY_MODEL "
                              f"score={round(float(score), 3)} < thr {thr}")

@@ -1264,6 +1264,18 @@ class LiveTrader:
                                      daylog_path=self.daylog_path)
                 except Exception:
                     pass
+                # ROGUE EOD champion/challenger auto-train (Rogue-ONLY; AFTER the archive).
+                # Trains a challenger, promotes ONLY if it beats the champion (fail-safe:
+                # champion can only improve). EOD only, never per-trade. Fully guarded --
+                # an ML error never affects trading or the next boot.
+                try:
+                    import rogue as _rogue
+                    if _rogue.should_run(self.cfg,
+                                         is_funded=not _rogue.account_is_demo(self)):
+                        import rogue_autotrain as _rat
+                        _rat.run(self.run_dir, archive_dir="./logs/archive")
+                except Exception:
+                    pass
                 self.state['firebase_eod_date'] = str(broker_date)
                 self._save_state()
             if self._tick_counter % self.STATUS_EVERY_TICKS == 0:
