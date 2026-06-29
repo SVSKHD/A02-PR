@@ -1287,6 +1287,22 @@ def run_live(cfg, paper: bool = True):
                          expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))  # Tier-2 consistency
     try:
         trader = LiveTrader(cfg, adapter, paper=paper)
+        # ROGUE promotion — GUARANTEED on every LIVE boot. The other call site
+        # lives inside wait_until_market_open(), which RETURNS EARLY on the
+        # weekend/sleep->wake path (it never reaches the promotion line), leaving
+        # rogue dormant. Promote here too: this runs on every live start
+        # regardless of weekday/weekend/wake, AFTER the adapter is connected (so
+        # account_is_demo reads the real account) and BEFORE trading starts.
+        # LIVE only -- paper must never promote. Idempotent (just sets the flag
+        # True on a demo account); fully guarded so it can never abort the boot.
+        # rogue_enabled stays raw-False in config (the freeze); promotion is
+        # runtime-only.
+        if not paper:
+            try:
+                import rogue as _rogue
+                _rogue.promote_on_boot(trader)
+            except Exception:
+                pass
         trader.run()
     finally:
         adapter.shutdown()
