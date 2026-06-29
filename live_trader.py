@@ -1194,6 +1194,15 @@ class LiveTrader:
         except Exception:
             pass
 
+        # 3d. ROGUE pattern logger (Rogue-ONLY observer; logging/file-IO only, never an
+        # order/anchor path). Records the decision + price-invariant features of each
+        # Rogue evaluation. Fully guarded -- a logger error never touches trading.
+        try:
+            import rogue_patternlog as _rpl
+            _rpl.observe(self)
+        except Exception:
+            pass
+
         # 4. Handle inbound commands
         self._handle_commands()
 
@@ -1242,6 +1251,16 @@ class LiveTrader:
                 try:
                     import boost_metrics as _bm
                     _bm.run_daily_report(self)
+                except Exception:
+                    pass
+                # ROGUE dated EOD archive: freeze this day's pattern/trade/price files
+                # into logs/archive/{broker_date}/ (copy, not move -- live files keep
+                # rolling). Logging/file-IO only; fully guarded.
+                try:
+                    import rogue_patternlog as _rpl
+                    _rpl.archive_day(self.run_dir, broker_date=broker_date,
+                                     price_log_dir=self.price_log_dir,
+                                     daylog_path=self.daylog_path)
                 except Exception:
                     pass
                 self.state['firebase_eod_date'] = str(broker_date)

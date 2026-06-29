@@ -219,6 +219,8 @@ STEP_NAMES = {
     162: "watchdog rogue rule",
     # run_live() guaranteed rogue promotion on every live boot
     163: "rogue promote boot",
+    # Rogue pattern logger + dated EOD archive (logging/file-IO only)
+    164: "rogue patternlog",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4827,6 +4829,112 @@ class SelfTest:
             self._record(163, FAIL, f"raised: {e!r}"); return
         self._record(163, PASS if ok else FAIL, detail)
 
+    def _step_rogue_patternlog(self):
+        # 164 Rogue pattern logger + dated EOD archive (logging/file-IO ONLY).
+        # Drives the observer through a monster SETUP -> ENTER -> winning CLOSE and a
+        # second setup that abandons the first (SKIP). Asserts: rows land in
+        # rogue_patterns.csv, every row carries the ROGUE magic (20260626) and NEVER the
+        # anchor magic (20260522), rogue_enabled OFF writes NOTHING (anchors produce no
+        # rows), and archive_day copies the day's files into logs/archive/{date}/.
+        import rogue_patternlog as _rpl
+        import tempfile, shutil, os, csv, types
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix="aureon_rpl_")
+            run_dir = os.path.join(tmp, "run")
+            price_dir = os.path.join(run_dir, "price_log")
+            os.makedirs(price_dir, exist_ok=True)
+            bdate = "2026-06-29"
+
+            monster = [{'open': 100, 'high': 101, 'low': 99.5, 'close': 100.8}] * 5
+
+            def _mk_trader(rogue_on):
+                mt5 = types.SimpleNamespace(
+                    ACCOUNT_TRADE_MODE_DEMO=0,
+                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=100.0, ask=100.2))
+                adapter = types.SimpleNamespace(
+                    mt5=mt5, get_latest_m5=lambda sym, n: monster)
+                cfg = types.SimpleNamespace(symbol='XAUUSD', rogue_enabled=rogue_on,
+                                            rogue_min_candles=4, rogue_min_range=15.0,
+                                            rogue_body_mult=1.5)
+                return types.SimpleNamespace(cfg=cfg, adapter=adapter, run_dir=run_dir,
+                                             _rogue=None, _rpl=None)
+
+            tr = _mk_trader(rogue_on=True)
+            # SETUP1 -> ENTER -> ride -> winning CLOSE
+            tr._rogue = {'anchor': 100.0, 'leg_dir': 'BUY', 'open': None}
+            _rpl.observe(tr)                                   # new setup (no row yet)
+            tr._rogue['open'] = {'ticket': 11, 'side': 'BUY', 'entry': 120.0,
+                                 'sl': 117.0, 'peak': 120.0}
+            _rpl.observe(tr)                                   # ENTER row + enter trade
+            tr._rogue['open']['sl'] = 130.0                   # trail ratcheted into profit
+            _rpl.observe(tr)                                   # snapshot the winning SL
+            tr._rogue['open'] = None
+            _rpl.observe(tr)                                   # CLOSE: outcome +10, backfill
+            # SETUP2 abandons SETUP1's leftover? Use a fresh trader for a clean SKIP.
+            tr2 = _mk_trader(rogue_on=True)
+            tr2._rogue = {'anchor': 100.0, 'leg_dir': 'BUY', 'open': None}
+            _rpl.observe(tr2)                                  # setup A (never entered)
+            tr2._rogue = {'anchor': 200.0, 'leg_dir': 'SELL', 'open': None}
+            _rpl.observe(tr2)                                  # setup B -> A logged SKIP
+
+            patterns = os.path.join(run_dir, "rogue_patterns.csv")
+            trades = os.path.join(run_dir, "rogue_trades.csv")
+            with open(patterns) as f:
+                prows = list(csv.DictReader(f))
+            with open(trades) as f:
+                trows = list(csv.DictReader(f))
+            decisions = [r['decision'] for r in prows]
+            magics = {int(r['magic']) for r in prows} | {int(r['magic']) for r in trows}
+            enter_row = next((r for r in prows if r['decision'] == 'ENTER'), {})
+
+            has_enter = 'ENTER' in decisions
+            has_skip = 'SKIP' in decisions
+            rogue_only_magic = (magics == {20260626})        # never the anchor 20260522
+            outcome_backfilled = (str(enter_row.get('outcome_dollars')) == '10.0')
+            price_invariant = all(k in (enter_row or {}) for k in
+                                  ('range_dollars', 'body_ratio', 'atr', 'tod_bucket'))
+            trade_events = {r['event'] for r in trows}
+            has_fills = {'enter', 'close'} <= trade_events
+
+            # rogue OFF -> observer writes NOTHING (anchors never produce rows here).
+            off_dir = os.path.join(tmp, "off")
+            os.makedirs(off_dir, exist_ok=True)
+            tr_off = _mk_trader(rogue_on=False)
+            tr_off.run_dir = off_dir
+            tr_off._rogue = {'anchor': 100.0, 'leg_dir': 'BUY', 'open': None}
+            _rpl.observe(tr_off)
+            off_silent = not os.path.exists(os.path.join(off_dir, "rogue_patterns.csv"))
+
+            # dated EOD archive (copy, not move).
+            open(os.path.join(run_dir, "today_trades.csv"), 'w').write("ts,pnl\n")
+            open(os.path.join(price_dir, f"price_{bdate}.csv"), 'w').write("ts,bid,ask\n")
+            archived = _rpl.archive_day(run_dir, broker_date=bdate,
+                                        price_log_dir=price_dir,
+                                        daylog_path=os.path.join(run_dir, "today_trades.csv"),
+                                        base_log_dir=os.path.join(tmp, "logs"))
+            adir = os.path.join(tmp, "logs", "archive", bdate)
+            archive_ok = (os.path.isdir(adir)
+                          and {"rogue_patterns.csv", "rogue_trades.csv", "today_trades.csv",
+                               f"price_{bdate}.csv"} <= set(os.listdir(adir))
+                          and os.path.exists(patterns))   # COPIED: live file still present
+
+            ok = (has_enter and has_skip and rogue_only_magic and outcome_backfilled
+                  and price_invariant and has_fills and off_silent and archive_ok)
+            detail = (f"enter={has_enter} skip={has_skip} rogue_only_magic={rogue_only_magic} "
+                      f"outcome_backfill={outcome_backfilled} price_invariant={price_invariant} "
+                      f"fills={has_fills} off_silent={off_silent} archive={archive_ok}")
+        except Exception as e:
+            self._record(164, FAIL, f"raised: {e!r}")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(164, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -5402,6 +5510,8 @@ class SelfTest:
             self._step_watchdog_rogue_rule()
             # run_live() guaranteed rogue promotion on every live boot
             self._step_rogue_promote_live_boot()
+            # Rogue pattern logger + dated EOD archive (logging/file-IO only)
+            self._step_rogue_patternlog()
         finally:
             self._cleanup()
         return self._report(ts)
