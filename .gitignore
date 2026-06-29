@@ -23,6 +23,11 @@ status.json
 trades_*.csv
 today_trades.csv
 
+# Runtime ledgers / Rogue ML capture (regenerated each run; never source)
+boost_ledger.csv
+rogue_patterns.csv
+rogue_trades.csv
+
 # Backtest/analysis outputs
 output/
 reports/

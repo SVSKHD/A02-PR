@@ -187,6 +187,14 @@ class Config:
     # GOVERNORS on the 10-cap (mandatory brakes for a thin edge):
     rogue_daily_loss_stop: float = -150.0   # Rogue STOPS new entries for the day at -$150
     rogue_consecutive_fail_stop: int = 3    # 3 init-SL fake-outs in a row -> pause new entries
+    # --- ML confidence gate (BOTH default OFF/safe -> pure pass-through) ----------
+    # The gate at the Rogue entry point always computes + logs a model score, but only
+    # BLOCKS a trade when rogue_model_gate_enabled is True AND the score is below
+    # rogue_model_threshold. Default False => the gate is inert (logs the score, never
+    # blocks); live behavior is byte-identical until a trained model is proven and the
+    # flag is turned on. An untrained model / any predict error scores 1.0 (fail OPEN).
+    rogue_model_gate_enabled: bool = False   # gate inert until proven
+    rogue_model_threshold: float = 0.5       # min follow-through confidence to ENTER (when on)
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose

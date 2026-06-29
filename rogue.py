@@ -250,9 +250,18 @@ def drive(trader):
         price = _mid(trader)
         if (st.get('open') is None and st.get('anchor') is not None and price is not None):
             ok, _why = can_enter(st['gov'], trader.cfg)
-            if ok:
-                enter, epx, sl = entry_decision(st['anchor'], st['leg_dir'], price, trader.cfg)
-                if enter:
+            enter, epx, sl = entry_decision(st['anchor'], st['leg_dir'], price, trader.cfg)
+            if enter:
+                # MODEL GATE (pass-through by default). Computes + logs a confidence score
+                # for EVERY confirmed setup; only BLOCKS when rogue_model_gate_enabled AND
+                # the score is below threshold. With the gate disabled (default) this is
+                # byte-neutral to the order path: placement still happens iff (ok and enter),
+                # exactly as before -- the score is logged but never blocks. An untrained
+                # model and any predict() error both score 1.0 (fail OPEN), so the model
+                # can never silently kill Rogue. One eval logged per anchor (no flooding).
+                if not _model_gate(trader, st, price, epx, sl, ok):
+                    pass   # gated: SKIP_BY_MODEL already logged; do NOT enter
+                elif ok:
                     _place_rogue_entry(trader, st, epx, sl)
         # 3. MANAGE the open winner on the adaptive trail (RIDE-WINNER-UNLIMITED).
         if st.get('open') is not None and price is not None:
@@ -283,6 +292,62 @@ def _mid(trader):
         return (float(tk.bid) + float(tk.ask)) / 2.0
     except Exception:
         return getattr(trader, '_last_boost_mid', None)
+
+
+def _now_ts():
+    try:
+        import pandas as _pd
+        return _pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return ''
+
+
+def _spread(trader):
+    try:
+        tk = trader.adapter.mt5.symbol_info_tick(trader.cfg.symbol)
+        return round(float(tk.ask) - float(tk.bid), 2)
+    except Exception:
+        return 0.0
+
+
+def _model_gate(trader, st, price, epx, sl, ok):
+    """The ML confidence gate at the Rogue entry point. Returns True to PROCEED, False to
+    BLOCK (SKIP_BY_MODEL). It ALWAYS computes + logs a model_score for the confirmed setup
+    (one row per anchor), but only BLOCKS when rogue_model_gate_enabled AND score < the
+    threshold. PASS-THROUGH by default (gate disabled -> never blocks -> order path
+    byte-identical; only a log row is added). Untrained model and any predict() error both
+    score 1.0 (FAIL OPEN). Fully guarded -- a gate error never blocks Rogue."""
+    try:
+        import rogue_patternlog as _pl
+        import rogue_model as _rm
+        ts = _now_ts()
+        confirm = abs(float(price) - float(st.get('anchor')))
+        feats = _pl.build_features(_recent_m5(trader), spread=_spread(trader),
+                                   confirm_dollars=confirm, ts=ts)
+        score = _rm.get_model(getattr(trader.cfg, 'rogue_model_path', None)).predict(feats)
+        gate_on = bool(getattr(trader.cfg, 'rogue_model_gate_enabled', False))
+        thr = float(getattr(trader.cfg, 'rogue_model_threshold', 0.5))
+        blocked = gate_on and (float(score) < thr)
+        decision = _pl.SKIP_BY_MODEL if blocked else (_pl.ENTER if ok else _pl.SKIP)
+        if st.get('rpl_eval_anchor') != st.get('anchor'):   # one eval per setup (no flood)
+            _pl.log_eval(getattr(trader, 'run_dir', '.'), ts=ts, direction=st.get('leg_dir'),
+                         features=feats, decision=decision, model_score=score,
+                         entry_price=(round(float(epx), 2) if decision == _pl.ENTER else ''))
+            st['rpl_eval_anchor'] = st.get('anchor')
+            if decision == _pl.ENTER:
+                rpl = getattr(trader, '_rpl', None)
+                if rpl is None:
+                    rpl = {}
+                    trader._rpl = rpl
+                rpl['enter_ts'] = ts
+                rpl['enter_price'] = round(float(epx), 2)
+        if blocked:
+            trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} SKIP_BY_MODEL "
+                             f"score={round(float(score), 3)} < thr {thr}")
+        return (not blocked)
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} model gate non-fatal: {e!r}")
+        return True   # FAIL OPEN: a gate error must never block Rogue
 
 
 def _place_rogue_entry(trader, st, entry_px, sl):
