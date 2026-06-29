@@ -1194,6 +1194,16 @@ class LiveTrader:
         except Exception:
             pass
 
+        # 3d. ROGUE close watcher (Rogue-ONLY; logging/file-IO only, behavior-neutral --
+        # reads broker state to record a closed Rogue ticket's realized $, never mutates
+        # the mechanism). The eval rows themselves are logged by the gate hook in rogue.py.
+        # Fully guarded -- never touches trading.
+        try:
+            import rogue_patternlog as _rpl
+            _rpl.observe(self)
+        except Exception:
+            pass
+
         # 4. Handle inbound commands
         self._handle_commands()
 
@@ -1242,6 +1252,16 @@ class LiveTrader:
                 try:
                     import boost_metrics as _bm
                     _bm.run_daily_report(self)
+                except Exception:
+                    pass
+                # ROGUE dated EOD archive: freeze this day's rogue_patterns.csv +
+                # rogue_trades.csv (+ today_trades / price_log) into
+                # logs/archive/{broker_date}/ (copy, not move). Logging/file-IO only.
+                try:
+                    import rogue_patternlog as _rpl
+                    _rpl.archive_day(self.run_dir, broker_date=broker_date,
+                                     price_log_dir=self.price_log_dir,
+                                     daylog_path=self.daylog_path)
                 except Exception:
                     pass
                 self.state['firebase_eod_date'] = str(broker_date)
