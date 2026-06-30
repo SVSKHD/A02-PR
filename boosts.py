@@ -144,6 +144,54 @@ def plan_boost_event(leg_side, leg_fill_price, current_price, cfg,
                      tp_dollars=tp_d, move_dollars=round(leg_fav, 2))
 
 
+def plan_trapped_late_rescue(leg_side, leg_fill_price, current_price, cfg):
+    """F-B (PURE, flag-gated DEFAULT OFF): a TRAPPED No-OCO losing straddle leg may arm a
+    CAPPED late-rescue hedge instead of riding naked to its full -$18 SL. Returns a
+    BoostPlan (kind RESCUE, OPPOSITE the trapped leg, with its OWN hard SL
+    trapped_rescue_sl_dollars) ONCE the leg is >= trapped_rescue_arm_dollars ADVERSE from
+    its fill -- else None. With trapped_late_rescue_enabled OFF (default) this ALWAYS
+    returns None, so the caller path is byte-identical (the loser rides to its SL).
+    Never raises. Anchor-side decision only -- the caller guarantees no Rogue ticket."""
+    if not bool(getattr(cfg, "trapped_late_rescue_enabled", False)):
+        return None
+    try:
+        leg_fill_price = float(leg_fill_price)
+        current_price = float(current_price)
+    except (TypeError, ValueError):
+        return None
+    arm = float(getattr(cfg, "trapped_rescue_arm_dollars", 10.0))
+    # leg excursion in the leg's OWN favor ($): < 0 means losing (trapped).
+    leg_fav = (current_price - leg_fill_price) if leg_side == "BUY" \
+        else (leg_fill_price - current_price)
+    if leg_fav > -(arm - _EPS):
+        return None  # not yet trapped by the arm distance -> do not fire
+    _depth = getattr(cfg, "stack_depth", None)
+    if _depth is not None:
+        n = max(0, min(3, int(_depth)) - 1)
+    else:
+        n = int(getattr(cfg, "rescue_boost_count", 2))
+    if n <= 0:
+        return None
+    side = _opposite(leg_side)              # hedge OPPOSITE the trapped leg
+    sl_d = float(getattr(cfg, "trapped_rescue_sl_dollars", 13.0))  # the hedge's OWN cap
+    tp_d = float(getattr(cfg, "tp_dist", 30.0))
+    return BoostPlan(kind="RESCUE", event_type="TRAPPED_LATE_RESCUE", boost_side=side,
+                     entry_ref=round(current_price, 2), n=n, sl_dollars=sl_d,
+                     tp_dollars=tp_d, move_dollars=round(leg_fav, 2))
+
+
+def trapped_rescue_cap(cfg):
+    """F-B: the hard combined-loss cap ($) for a trapped late-rescue fleet =
+    n x trapped_rescue_sl_dollars x lot x contract. This is what BOUNDS a reverse-whipsaw
+    (the hedge can never lose more than this) -- a naked late hedge would be unbounded."""
+    _depth = getattr(cfg, "stack_depth", None)
+    n = (max(0, min(3, int(_depth)) - 1) if _depth is not None
+         else int(getattr(cfg, "rescue_boost_count", 2)))
+    return (n * float(getattr(cfg, "trapped_rescue_sl_dollars", 13.0))
+            * float(getattr(cfg, "lot_size", 0.35))
+            * float(getattr(cfg, "contract_size", 100.0)))
+
+
 def boost_whipsaw_cap(cfg, kind="RESCUE"):
     """The hard combined-boost loss cap ($), = n x $sl x lot x contract, for this
     event KIND. v3.3.3: the SL is per-kind (boost_sl_for) so RALLY caps at

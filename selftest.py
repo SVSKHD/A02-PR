@@ -247,6 +247,8 @@ STEP_NAMES = {
     182: "boost A1 replay",
     # E-5: Rogue daily loss stop -150 -> -525
     183: "rogue stop -525",
+    # F-B: trapped-leg capped late-rescue (No-OCO whipsaw), DEFAULT OFF
+    184: "fb late rescue",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5512,6 +5514,49 @@ class SelfTest:
             self._record(183, FAIL, f"raised: {e!r}"); return
         self._record(183, PASS if ok else FAIL, detail)
 
+    def _step_fb_trapped_late_rescue(self):
+        # 184 F-B: trapped-leg CAPPED late-rescue (No-OCO whipsaw), flag-gated DEFAULT OFF.
+        # (a) flag OFF -> plan is None (byte-identical: the trapped loser rides to its full
+        # -$18 SL, no late hedge); (b) flag ON + >= arm adverse -> a capped hedge OPPOSITE
+        # the trapped leg with its OWN $13 SL; (c) flag ON but < arm adverse -> None (not yet
+        # armed); (d) a SELL trapped leg arms a BUY hedge; (e) the reverse-whipsaw is BOUNDED
+        # -- combined worst case = n x $13 x lot x 100 (trapped_rescue_cap), finite, never the
+        # naked unbounded double-loss. Pure decision (boosts.plan_trapped_late_rescue) -- the
+        # live fills.py hook is a thin wrapper gated by the SAME flag, so flag OFF is a no-op.
+        import boosts as _b, dataclasses
+        try:
+            cfg_off = self.cfg                                  # default: flag OFF
+            cfg_on = dataclasses.replace(self.cfg, trapped_late_rescue_enabled=True,
+                                         trapped_rescue_arm_dollars=10.0,
+                                         trapped_rescue_sl_dollars=13.0)
+            # trapped losing BUY leg: fill 4065.64 -> price slides to 4055.64 (-$10 adverse)
+            off = _b.plan_trapped_late_rescue('BUY', 4065.64, 4055.64, cfg_off)
+            on = _b.plan_trapped_late_rescue('BUY', 4065.64, 4055.64, cfg_on)
+            early = _b.plan_trapped_late_rescue('BUY', 4065.64, 4059.64, cfg_on)  # -$6 < arm
+            on_sell = _b.plan_trapped_late_rescue('SELL', 4000.0, 4010.0, cfg_on)  # -$10
+            cap = _b.trapped_rescue_cap(cfg_on)
+            expected_cap = int(getattr(cfg_on, 'rescue_boost_count', 2)) * 13.0 \
+                * float(cfg_on.lot_size) * 100.0
+
+            flag_off_none = (off is None)                       # (a) byte-identical
+            armed = (on is not None and on.boost_side == 'SELL'
+                     and abs(on.sl_dollars - 13.0) < 1e-9       # (b) own $13 SL
+                     and on.kind == 'RESCUE'
+                     and on.event_type == 'TRAPPED_LATE_RESCUE')
+            not_early = (early is None)                         # (c) not yet armed
+            sell_arms_buy = (on_sell is not None and on_sell.boost_side == 'BUY')  # (d)
+            # (e) reverse-whipsaw bounded: the hedge's own-SL worst case <= the cap (finite)
+            bounded = (cap > 0 and abs(cap - expected_cap) < 1e-6 and on is not None
+                       and (on.n * on.sl_dollars * float(cfg_on.lot_size) * 100.0)
+                       <= cap + 1e-6)
+            ok = flag_off_none and armed and not_early and sell_arms_buy and bounded
+            detail = (f"(a)OFF_none={flag_off_none} (b)armed_SELL_sl13={armed} "
+                      f"(c)not_armed<arm={not_early} (d)SELL->BUY={sell_arms_buy} "
+                      f"(e)cap=${cap:.0f}_bounded={bounded}")
+        except Exception as e:
+            self._record(184, FAIL, f"raised: {e!r}"); return
+        self._record(184, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -6113,6 +6158,8 @@ class SelfTest:
             self._step_b6_boost_a1_replay()
             # E-5: Rogue daily loss stop -150 -> -525
             self._step_e5_rogue_stop_525()
+            # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
+            self._step_fb_trapped_late_rescue()
         finally:
             self._cleanup()
         return self._report(ts)
