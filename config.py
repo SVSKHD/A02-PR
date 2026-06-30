@@ -434,6 +434,18 @@ class Config:
     # window behavior). One placement per anchor per day regardless.
     anchor_late_window_min: int = 10
 
+    # --- E-12 FEED-DEATH WATCHDOG (2026-06-30 incident) -------------------------
+    # That morning the XAUUSD subscription dropped 06:00-10:08 and `_market_closed_now`'s
+    # probe raised "symbol_info_tick returned None -- symbol not subscribed?" ~13,833 times:
+    # the bot logged a warning EVERY tick, never re-subscribed, never alerted, and went
+    # blind through the morning monster. This watchdog (feed_watchdog.FeedWatchdog, wired in
+    # _market_closed_now) re-subscribes on repeated failures and fires ONE throttled FEED DOWN
+    # alert. feed_watchdog_enabled=False -> byte-identical to the pre-fix per-tick warning.
+    feed_watchdog_enabled: bool = True    # ON by default -- it is a safety net, never trades
+    feed_recover_after_fails: int = 30    # consecutive 'not subscribed' failures before a re-subscribe
+    feed_recover_max_tries: int = 5       # failed re-subscribe attempts before the first FEED DOWN alert
+    feed_alert_cooldown_min: float = 5.0  # min minutes between FEED DOWN alerts (then it keeps retrying)
+
     # Operational
     log_level: str = "INFO"
     state_file: str = "aureon_v2_state.json"
