@@ -189,7 +189,7 @@ STEP_NAMES = {
     135: "rogue cap blocks @10",
     136: "rogue early entry",
     137: "rogue adaptive trail",
-    138: "rogue loss-stop -150",
+    138: "rogue loss-stop",
     139: "rogue 3-fail pause",
     140: "rogue closure isol",
     141: "rogue rescue capped",
@@ -245,6 +245,8 @@ STEP_NAMES = {
     180: "boost isolation",
     181: "boost rescue unaff",
     182: "boost A1 replay",
+    # E-5: Rogue daily loss stop -150 -> -525
+    183: "rogue stop -525",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4592,17 +4594,18 @@ class SelfTest:
         self._record(137, PASS if ok else FAIL, detail)
 
     def _step_rogue_loss_stop(self):
-        # 138 GOVERNOR: cumulative day P&L <= -$150 STOPS new entries for the day.
+        # 138 GOVERNOR: cumulative day P&L <= rogue_daily_loss_stop (E-5: -$525) STOPS new
+        # entries for the day.
         import rogue as _rogue
         try:
             gov = _rogue.new_day_state()
-            _rogue.record_close(gov, -100.0, was_fail=True, cfg=self.cfg)
-            still_ok = _rogue.can_enter(gov, self.cfg)[0]            # -100 > -150 -> ok
-            _rogue.record_close(gov, -60.0, was_fail=False, cfg=self.cfg)  # -160 -> stop
+            _rogue.record_close(gov, -300.0, was_fail=True, cfg=self.cfg)
+            still_ok = _rogue.can_enter(gov, self.cfg)[0]            # -300 > -525 -> ok
+            _rogue.record_close(gov, -260.0, was_fail=False, cfg=self.cfg)  # -560 -> stop
             blocked, reason = _rogue.can_enter(gov, self.cfg)
             ok = (still_ok is True and gov['loss_stopped'] is True
                   and blocked is False and reason == 'daily_loss_stop')
-            detail = f"at_-100_ok={still_ok} at_-160_stops={gov['loss_stopped']} reason={reason}"
+            detail = f"at_-300_ok={still_ok} at_-560_stops={gov['loss_stopped']} reason={reason}"
         except Exception as e:
             self._record(138, FAIL, f"raised: {e!r}"); return
         self._record(138, PASS if ok else FAIL, detail)
@@ -5292,11 +5295,13 @@ class SelfTest:
         self._record(173, PASS if ok else FAIL, detail)
 
     def _step_r4_rogue_loss_stop_trips(self):
-        # 174 (T-R4): with the governor now fed (E-2), one init-SL fake-out (-$175) trips the
-        # -$150 daily loss stop -> loss_stopped True and can_enter blocks. No longer inert.
+        # 174 (T-R4): with the governor now fed (E-2), a losing day that crosses the daily
+        # loss stop (E-5: -$525) trips loss_stopped -> can_enter blocks. No longer inert.
+        # (E-5 raised the stop -150 -> -525, so a single -$175 strike no longer halts; a
+        # -$600 day does -- proven here via the live close path.)
         import rogue as _R
         try:
-            tr, _ = self._r_trader(open_at_broker=False, pnl=-175.0)
+            tr, _ = self._r_trader(open_at_broker=False, pnl=-600.0)
             _R.detect_close(tr, tr._rogue)
             ok_enter, reason = _R.can_enter(tr._rogue['gov'], tr.cfg)
             ok = (tr._rogue['gov']['loss_stopped'] and not ok_enter
@@ -5466,6 +5471,46 @@ class SelfTest:
         except Exception as e:
             self._record(182, FAIL, f"raised: {e!r}"); return
         self._record(182, PASS if ok else FAIL, detail)
+
+    def _step_e5_rogue_stop_525(self):
+        # 183 E-5: rogue_daily_loss_stop -150 -> -525. Ladder: at -$175 (one init-SL strike)
+        # Rogue still trades, at -$350 (two) still trades, at -$525 (three) it HALTS
+        # (reason=daily_loss_stop). And the 3-consecutive-fail PAUSE can now fire BEFORE the
+        # loss stop (3 small fakeouts of -$5 = -$15, far above -$525) -- which was impossible
+        # at the old -$150 (a single -$175 strike halted first).
+        import rogue as _rogue
+        try:
+            # ladder on init-SL strikes (-$175 each)
+            gov = _rogue.new_day_state()
+            _rogue.record_close(gov, -175.0, was_fail=True, cfg=self.cfg)
+            at_175 = _rogue.can_enter(gov, self.cfg)
+            _rogue.record_close(gov, -175.0, was_fail=True, cfg=self.cfg)
+            at_350 = _rogue.can_enter(gov, self.cfg)
+            _rogue.record_close(gov, -175.0, was_fail=True, cfg=self.cfg)   # -525
+            at_525_blocked, at_525_reason = _rogue.can_enter(gov, self.cfg)
+            # NOTE: at exactly 3 strikes both brakes trip; 'daily_loss_stop' OR
+            # 'consecutive_fail_pause' are both valid HALTS -- assert it halted.
+            ladder_ok = (at_175[0] is True and at_350[0] is True
+                         and at_525_blocked is False
+                         and at_525_reason in ('daily_loss_stop', 'consecutive_fail_pause')
+                         and gov['loss_stopped'] is True)
+            # fail-pause fires BEFORE the loss stop on SMALL fakeouts (now reachable).
+            g2 = _rogue.new_day_state()
+            for _ in range(3):
+                _rogue.record_close(g2, -5.0, was_fail=True, cfg=self.cfg)   # -15 total
+            paused_blocked, paused_reason = _rogue.can_enter(g2, self.cfg)
+            fail_before_loss = (g2['fail_paused'] is True and g2['loss_stopped'] is False
+                                and paused_blocked is False
+                                and paused_reason == 'consecutive_fail_pause')
+            # the config value itself
+            stop_val = (abs(float(getattr(self.cfg, 'rogue_daily_loss_stop')) + 525.0) < 1e-9)
+            ok = ladder_ok and fail_before_loss and stop_val
+            detail = (f"-175_ok={at_175[0]} -350_ok={at_350[0]} -525_halts={not at_525_blocked}"
+                      f"({at_525_reason}) fail_pause_before_loss={fail_before_loss} "
+                      f"stop=-525={stop_val}")
+        except Exception as e:
+            self._record(183, FAIL, f"raised: {e!r}"); return
+        self._record(183, PASS if ok else FAIL, detail)
 
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
@@ -6066,6 +6111,8 @@ class SelfTest:
             self._step_b4_boost_isolation()
             self._step_b5_boost_rescue_unaffected()
             self._step_b6_boost_a1_replay()
+            # E-5: Rogue daily loss stop -150 -> -525
+            self._step_e5_rogue_stop_525()
         finally:
             self._cleanup()
         return self._report(ts)

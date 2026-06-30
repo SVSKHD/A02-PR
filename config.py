@@ -185,7 +185,12 @@ class Config:
     rogue_trail_gap_deep: float = 6.0  # wider once proven (don't shake out a real monster)
     rogue_trail_widen_at: float = 15.0 # profit ($) at which the trail widens 3 -> 6
     # GOVERNORS on the 10-cap (mandatory brakes for a thin edge):
-    rogue_daily_loss_stop: float = -150.0   # Rogue STOPS new entries for the day at -$150
+    rogue_daily_loss_stop: float = -525.0   # E-5 (owner decision): Rogue STOPS new entries
+    # for the day at -$525 (was -$150). Rationale: one init-SL strike is -$175 (rogue_init_sl
+    # $5 x 0.35 x 100), so the old -$150 halted Rogue on the FIRST fake-out -- the
+    # 3-consecutive-fail pause and the 10/day cap could never engage. At -$525 = 3 init-SL
+    # strikes, the 3-fail pause (and small-fakeout streaks) can fire BEFORE the daily halt,
+    # while a genuine whipsaw day still hard-stops at -$525.
     rogue_consecutive_fail_stop: int = 3    # 3 init-SL fake-outs in a row -> pause new entries
     # E-4: at EOD, flatten an OPEN Rogue position instead of letting it ride overnight on
     # its own SL/TP. DEFAULT OFF = current behavior (rides). Rogue-scoped (closes ONLY the
