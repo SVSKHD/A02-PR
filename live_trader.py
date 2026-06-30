@@ -1306,6 +1306,13 @@ class LiveTrader:
         if self._eod_reached(broker_date, utc_now):
             if self.shadow_positions or self.shadow_pendings:
                 self._flatten_all(reason="EOD")
+            # E-4: rogue EOD flatten (flag rogue_flatten_at_eod, default OFF -> rides).
+            # Rogue-scoped (closes ONLY the Rogue ticket); guarded so it never blocks EOD.
+            try:
+                import rogue as _rogue
+                _rogue.eod_flatten(self)
+            except Exception:
+                pass
             # v3.0.0 commit 3: Firebase EOD journal -- ONCE per broker day, after
             # the book is flat and the day's P&L is final (never during anchor
             # capture). Guarded so it fires once and never blocks the EOD path.

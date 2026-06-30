@@ -263,7 +263,12 @@ def drive(trader):
                     pass   # gated: SKIP_BY_MODEL already logged; do NOT enter
                 elif ok:
                     _place_rogue_entry(trader, st, epx, sl)
-        # 3. MANAGE the open winner on the adaptive trail (RIDE-WINNER-UNLIMITED).
+        # 3. DETECT a broker-side close FIRST (E-2/E-3): book the governor + clear st['open']
+        # so the day-stop/fail-pause get real data AND Rogue can re-enter the same day (and
+        # the patternlog observe() close branch then runs). If still open, manage the trail.
+        if st.get('open') is not None:
+            detect_close(trader, st)
+        # 4. MANAGE the open winner on the adaptive trail (RIDE-WINNER-UNLIMITED).
         if st.get('open') is not None and price is not None:
             _manage_rogue_open(trader, st, price)
     except Exception as e:
@@ -398,3 +403,86 @@ def _manage_rogue_open(trader, st, price):
                 trader.adapter.modify_position_sl(int(o['ticket']), new_sl)
         except Exception:
             pass
+
+
+# --- E-2/E-3 close-detection + governor wiring (Rogue-ONLY, never closes anything) -----
+def _rogue_close_pnl(trader, ticket):
+    """Realized $ of a CLOSED Rogue position from its broker close deal (entry==1):
+    profit + swap + commission (same convention as the anchor fill path). Returns None if
+    the close deal isn't in history yet. READ-ONLY."""
+    try:
+        deals = trader.adapter.mt5.history_deals_get(position=int(ticket)) or []
+        cd = next((d for d in deals if getattr(d, 'entry', None) == 1), None)
+        if cd is None:
+            return None
+        return float(cd.profit) + float(cd.swap) + float(cd.commission)
+    except Exception:
+        return None
+
+
+def detect_close(trader, st):
+    """E-2/E-3: detect a BROKER-side close of the open Rogue position and book it ONCE --
+    update the day-governor via record_close (day_pnl / consec_fails / loss_stopped /
+    fail_paused) and clear st['open'] so Rogue can re-enter the same day AND the patternlog
+    observe() close branch runs. Returns True if a close was booked.
+
+    ISOLATION: only ever inspects st['open']'s OWN ticket and issues NO close (the broker
+    SL/TP already closed it) -- it can NEVER touch an anchor (20260522) ticket. Rogue P&L
+    stays in the governor; it is NOT mixed into the anchor state['daily_pnl'] (the global
+    kill switch still sees Rogue via live equity). Guarded; never raises onto the tick."""
+    o = st.get('open')
+    if not o or o.get('ticket') is None:
+        return False
+    tk = int(o['ticket'])
+    try:
+        still = trader.adapter.mt5.positions_get(ticket=tk)
+    except Exception:
+        return False
+    if still:
+        return False                     # still open at the broker -> nothing to book
+    pnl = _rogue_close_pnl(trader, tk)
+    if pnl is None:
+        pnl = 0.0                        # close deal not in history yet -> book 0, still clear
+    was_fail = float(pnl) <= 0.0         # a non-winning close = init-SL fake-out (winner resets)
+    record_close(st['gov'], pnl, was_fail, trader.cfg)
+    st['open'] = None
+    try:
+        g = st['gov']
+        brake = ('LOSS-STOP' if g.get('loss_stopped')
+                 else ('FAIL-PAUSE' if g.get('fail_paused') else 'live'))
+        trader.tele.info(
+            f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} CLOSE {o.get('side')} #{tk} "
+            f"P&L ${float(pnl):+.2f} | day ${float(g.get('day_pnl', 0.0)):+.2f} | "
+            f"fails {int(g.get('consec_fails', 0))} | {brake}")
+    except Exception:
+        pass
+    return True
+
+
+def eod_flatten(trader):
+    """E-4 (flag rogue_flatten_at_eod, DEFAULT OFF): at EOD close an OPEN Rogue position so
+    it does not ride overnight on its own SL/TP. DEFAULT OFF -> no-op (rides, current
+    behavior). ROGUE-ONLY: closes ONLY st['open']'s own ticket (never an anchor 20260522
+    ticket), then books it via the governor + clears st['open']. Guarded; never raises."""
+    try:
+        if not bool(getattr(trader.cfg, 'rogue_flatten_at_eod', False)):
+            return False
+        st = getattr(trader, '_rogue', None)
+        if not st or not st.get('open') or st['open'].get('ticket') is None:
+            return False
+        tk = int(st['open']['ticket'])
+        trader.adapter.close_position(tk, dry_run=trader.paper)   # ROGUE ticket ONLY
+        pnl = _rogue_close_pnl(trader, tk)
+        if pnl is None:
+            pnl = 0.0
+        record_close(st['gov'], pnl, float(pnl) <= 0.0, trader.cfg)
+        st['open'] = None
+        try:
+            trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} EOD flatten -> closed "
+                             f"#{tk} P&L ${float(pnl):+.2f}")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} eod_flatten non-fatal: {e!r}")
+        return False

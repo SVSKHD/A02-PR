@@ -229,6 +229,14 @@ STEP_NAMES = {
     168: "feed alert+cooldn",
     169: "feed warn throttle",
     170: "feed wd disabled",
+    # E-2/E-3/E-4 Rogue brakes (NOTE: 171-176 collide with fix2's T-B 171-176 --
+    # renumber to 177-182 on whichever of fix2/fix3 merges second; mechanical rebase)
+    171: "rogue rec_close",
+    172: "rogue reentry",
+    173: "rogue obs close",
+    174: "rogue loss-stop",
+    175: "rogue eod flag",
+    176: "rogue isolation",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5188,6 +5196,149 @@ class SelfTest:
             self._record(170, FAIL, f"raised: {e!r}"); return
         self._record(170, PASS if ok else FAIL, detail)
 
+    # --- E-2/E-3/E-4 Rogue brakes (close-detection + governor + EOD flatten) --------
+    # Drive the PURE rogue functions + rogue_patternlog.observe with a stub trader (no
+    # MT5). ROGUE_TK is a Rogue ticket; ANCHOR_TK carries the anchor magic 20260522 so the
+    # isolation step can prove the Rogue close path NEVER closes an anchor ticket.
+    _R_ROGUE_TK = 900001
+    _R_ANCHOR_TK = 20260522001
+
+    def _r_trader(self, open_at_broker, pnl, cfg=None, paper=False):
+        import types, rogue as _R
+        tk = self._R_ROGUE_TK
+        closes = []          # records every close_position(ticket) call
+        def positions_get(ticket=None):
+            return [object()] if (ticket == tk and open_at_broker) else []
+        def history_deals_get(position=None):
+            return ([types.SimpleNamespace(entry=1, profit=pnl, swap=0.0, commission=0.0)]
+                    if position == tk else [])
+        def close_position(t, dry_run=False):
+            closes.append(int(t))
+        mt5 = types.SimpleNamespace(positions_get=positions_get, history_deals_get=history_deals_get,
+                                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
+                                    ACCOUNT_TRADE_MODE_DEMO=0)
+        tr = types.SimpleNamespace(
+            cfg=cfg or self.cfg, paper=paper,
+            adapter=types.SimpleNamespace(mt5=mt5, close_position=close_position),
+            tele=types.SimpleNamespace(info=lambda *a, **k: None, warn=lambda *a, **k: None),
+            state={'last_broker_date': '2026-06-30'})
+        tr._rogue = {'day': '2026-06-30', 'gov': _R.new_day_state(), 'anchor': 4000.0,
+                     'leg_dir': 'BUY',
+                     'open': {'ticket': tk, 'side': 'BUY', 'entry': 4000.0, 'sl': 3995.0,
+                              'peak': 4010.0}}
+        return tr, closes
+
+    def _step_r1_rogue_record_close(self):
+        # 171 (T-R1): a broker-side Rogue close books the governor ONCE (day_pnl reflects
+        # the realized $) and clears st['open'] -- and issues NO close itself.
+        import rogue as _R
+        try:
+            tr, closes = self._r_trader(open_at_broker=False, pnl=50.0)
+            booked = _R.detect_close(tr, tr._rogue)
+            ok = (booked and abs(tr._rogue['gov']['day_pnl'] - 50.0) < 1e-9
+                  and tr._rogue['open'] is None and closes == [])
+            detail = f"booked={booked} day_pnl={tr._rogue['gov']['day_pnl']} open_cleared={tr._rogue['open'] is None} closes={closes}"
+        except Exception as e:
+            self._record(171, FAIL, f"raised: {e!r}"); return
+        self._record(171, PASS if ok else FAIL, detail)
+
+    def _step_r2_rogue_reentry_allowed(self):
+        # 172 (T-R2): after a (winning) close, st['open'] is None AND can_enter -> ok, so
+        # Rogue can take its next entry the SAME day (E-3 re-entry restored).
+        import rogue as _R
+        try:
+            tr, _ = self._r_trader(open_at_broker=False, pnl=50.0)
+            _R.detect_close(tr, tr._rogue)
+            ok_enter, reason = _R.can_enter(tr._rogue['gov'], tr.cfg)
+            ok = tr._rogue['open'] is None and ok_enter and reason == 'ok'
+            detail = f"open_cleared={tr._rogue['open'] is None} can_enter={ok_enter} reason={reason}"
+        except Exception as e:
+            self._record(172, FAIL, f"raised: {e!r}"); return
+        self._record(172, PASS if ok else FAIL, detail)
+
+    def _step_r3_rogue_observe_close(self):
+        # 173 (T-R3): once st['open'] is cleared on a close, rogue_patternlog.observe()'s
+        # CLOSE branch runs (F-A exit data captured) -- proven by its state effect
+        # (open_ticket -> None, ticket added to the 'closed' set).
+        import rogue_patternlog as _RPL, dataclasses, tempfile, shutil
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_rogueobs_')
+            tr, _ = self._r_trader(open_at_broker=False, pnl=20.0,
+                                   cfg=dataclasses.replace(self.cfg, rogue_enabled=True))
+            tr.run_dir = tmp
+            _RPL.observe(tr)                       # snapshot the open position into _rpl
+            snap_ok = tr._rpl.get('open_ticket') == self._R_ROGUE_TK
+            tr._rogue['open'] = None               # detect_close cleared it
+            _RPL.observe(tr)                       # open gone + ticket closed -> CLOSE branch
+            ran = (tr._rpl.get('open_ticket') is None
+                   and self._R_ROGUE_TK in tr._rpl.get('closed', set()))
+            ok = snap_ok and ran
+            detail = f"snapshot={snap_ok} close_branch_ran={ran}"
+        except Exception as e:
+            self._record(173, FAIL, f"raised: {e!r}")
+            if tmp: shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp: shutil.rmtree(tmp, ignore_errors=True)
+        self._record(173, PASS if ok else FAIL, detail)
+
+    def _step_r4_rogue_loss_stop_trips(self):
+        # 174 (T-R4): with the governor now fed (E-2), one init-SL fake-out (-$175) trips the
+        # -$150 daily loss stop -> loss_stopped True and can_enter blocks. No longer inert.
+        import rogue as _R
+        try:
+            tr, _ = self._r_trader(open_at_broker=False, pnl=-175.0)
+            _R.detect_close(tr, tr._rogue)
+            ok_enter, reason = _R.can_enter(tr._rogue['gov'], tr.cfg)
+            ok = (tr._rogue['gov']['loss_stopped'] and not ok_enter
+                  and reason == 'daily_loss_stop')
+            detail = f"day_pnl={tr._rogue['gov']['day_pnl']} loss_stopped={tr._rogue['gov']['loss_stopped']} reason={reason}"
+        except Exception as e:
+            self._record(174, FAIL, f"raised: {e!r}"); return
+        self._record(174, PASS if ok else FAIL, detail)
+
+    def _step_r5_rogue_eod_flag(self):
+        # 175 (T-R5): rogue_flatten_at_eod OFF -> eod_flatten is a no-op (rides; default);
+        # ON -> it closes the open Rogue ticket and clears st['open'].
+        import rogue as _R, dataclasses
+        try:
+            tr_off, closes_off = self._r_trader(open_at_broker=True, pnl=30.0, cfg=self.cfg)
+            did_off = _R.eod_flatten(tr_off)
+            tr_on, closes_on = self._r_trader(
+                open_at_broker=True, pnl=30.0,
+                cfg=dataclasses.replace(self.cfg, rogue_flatten_at_eod=True))
+            did_on = _R.eod_flatten(tr_on)
+            ok = (did_off is False and closes_off == [] and tr_off._rogue['open'] is not None
+                  and did_on is True and closes_on == [self._R_ROGUE_TK]
+                  and tr_on._rogue['open'] is None)
+            detail = f"OFF: did={did_off} closes={closes_off} rides={tr_off._rogue['open'] is not None} | ON: did={did_on} closes={closes_on}"
+        except Exception as e:
+            self._record(175, FAIL, f"raised: {e!r}"); return
+        self._record(175, PASS if ok else FAIL, detail)
+
+    def _step_r6_rogue_isolation(self):
+        # 176 (T-R6): isolation -- the Rogue close path NEVER closes a 20260522 anchor
+        # ticket. detect_close issues no close at all; eod_flatten(ON) closes ONLY the
+        # Rogue ticket. Assert no anchor ticket is ever passed to close_position.
+        import rogue as _R, dataclasses
+        try:
+            tr_d, closes_d = self._r_trader(open_at_broker=False, pnl=-10.0)
+            _R.detect_close(tr_d, tr_d._rogue)                       # books, no close
+            tr_e, closes_e = self._r_trader(
+                open_at_broker=True, pnl=10.0,
+                cfg=dataclasses.replace(self.cfg, rogue_flatten_at_eod=True))
+            _R.eod_flatten(tr_e)                                     # closes ROGUE tk only
+            all_closes = closes_d + closes_e
+            anchor_touched = any(c == self._R_ANCHOR_TK for c in all_closes)
+            only_rogue = all(c == self._R_ROGUE_TK for c in all_closes)
+            ok = (closes_d == [] and closes_e == [self._R_ROGUE_TK]
+                  and not anchor_touched and only_rogue)
+            detail = f"detect_closes={closes_d} eod_closes={closes_e} anchor_touched={anchor_touched}"
+        except Exception as e:
+            self._record(176, FAIL, f"raised: {e!r}"); return
+        self._record(176, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -5773,6 +5924,13 @@ class SelfTest:
             self._step_f3_feed_alert_then_cooldown()
             self._step_f4_feed_warn_throttled()
             self._step_f5_feed_disabled_byte_identical()
+            # E-2/E-3/E-4 Rogue brakes (pure rogue + stubs; no MT5 needed)
+            self._step_r1_rogue_record_close()
+            self._step_r2_rogue_reentry_allowed()
+            self._step_r3_rogue_observe_close()
+            self._step_r4_rogue_loss_stop_trips()
+            self._step_r5_rogue_eod_flag()
+            self._step_r6_rogue_isolation()
         finally:
             self._cleanup()
         return self._report(ts)

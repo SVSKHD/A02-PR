@@ -187,6 +187,14 @@ class Config:
     # GOVERNORS on the 10-cap (mandatory brakes for a thin edge):
     rogue_daily_loss_stop: float = -150.0   # Rogue STOPS new entries for the day at -$150
     rogue_consecutive_fail_stop: int = 3    # 3 init-SL fake-outs in a row -> pause new entries
+    # E-4: at EOD, flatten an OPEN Rogue position instead of letting it ride overnight on
+    # its own SL/TP. DEFAULT OFF = current behavior (rides). Rogue-scoped (closes ONLY the
+    # Rogue ticket; never an anchor 20260522 ticket).
+    rogue_flatten_at_eod: bool = False
+    # E-5 (surfaced by E-2): one init-SL fake-out books -$175 (rogue_init_sl $5 x 0.35 x
+    # 100 = 175) which already trips this -$150 daily stop -> a SINGLE strike halts Rogue
+    # for the day, so the 3-consecutive-fail pause can essentially never fire. Left at -150
+    # pending the owner's call (keep one-strike-halt, or scale to -525 for 3 strikes).
     # --- ML confidence gate (BOTH default OFF/safe -> pure pass-through) ----------
     # The gate at the Rogue entry point always computes + logs a model score, but only
     # BLOCKS a trade when rogue_model_gate_enabled is True AND the score is below
