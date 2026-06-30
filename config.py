@@ -351,7 +351,7 @@ class Config:
     # least as long as the parent instead of bailing early. Bounded at the boost's own
     # breakeven so it can never ride into a loss. RALLY-only; RESCUE untouched. DEFAULT
     # OFF -> byte-identical until the owner validates it live.
-    boost_ride_with_parent: bool = False
+    boost_ride_with_parent: bool = True
     # --- v3.3.4 RALLY PULLBACK DETECTOR (rally boosts only) -----------------------
     # An entry-relative early-cut that sits ABOVE the $13 hard backstop (rally_boost_sl).
     # A rally boost that pulls back AGAINST ITS ENTRY is HELD while the adverse
