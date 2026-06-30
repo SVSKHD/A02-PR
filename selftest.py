@@ -223,6 +223,12 @@ STEP_NAMES = {
     164: "rogue ml gate",
     # Rogue ML: EOD champion/challenger autotrain + exit-feature capture
     165: "rogue ml train",
+    # E-12 feed-death watchdog (re-subscribe + throttled FEED DOWN alert)
+    166: "feed resub @N",
+    167: "feed resub reset",
+    168: "feed alert+cooldn",
+    169: "feed warn throttle",
+    170: "feed wd disabled",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5078,6 +5084,110 @@ class SelfTest:
                 shutil.rmtree(tmp, ignore_errors=True)
         self._record(165, PASS if ok else FAIL, detail)
 
+    # --- E-12 feed-death watchdog (re-subscribe + throttled FEED DOWN alert) ----
+    # All five drive the PURE feed_watchdog.FeedWatchdog with a synthetic monotonic
+    # clock -- no MT5, no Discord -- so the live probe path and these tests honor the
+    # exact same rule (import-path identity). 30 fails -> re-subscribe; 5 failed
+    # attempts -> one alert then cooldown; warning throttled; disabled == byte-identical.
+    def _feed_wd_cfg(self):
+        import dataclasses
+        return dataclasses.replace(
+            self.cfg, feed_watchdog_enabled=True, feed_recover_after_fails=30,
+            feed_recover_max_tries=5, feed_alert_cooldown_min=5.0)
+
+    def _step_f1_feed_resubscribe_after_n(self):
+        # 166 (T-F1): re-subscribe fires after EXACTLY feed_recover_after_fails (30)
+        # consecutive failures -- not before. The first 29 never re-subscribe; the 30th does.
+        import feed_watchdog as fw
+        try:
+            cfg = self._feed_wd_cfg()
+            wd = fw.FeedWatchdog()
+            none_before = all(not wd.on_failure(cfg, float(t)).resubscribe for t in range(29))
+            a30 = wd.on_failure(cfg, 29.0)   # the 30th failure
+            fires_at_30 = (a30.resubscribe and a30.attempt == 1 and a30.fails == 30)
+            ok = none_before and fires_at_30
+            detail = f"none_in_first29={none_before} resub_at_30={fires_at_30} attempt={a30.attempt}"
+        except Exception as e:
+            self._record(166, FAIL, f"raised: {e!r}"); return
+        self._record(166, PASS if ok else FAIL, detail)
+
+    def _step_f2_feed_success_resets(self):
+        # 167 (T-F2): a successful probe (on_success) resets the counter + attempts +
+        # last-alert, so the NEXT failure starts a clean episode (fails=1, no re-subscribe).
+        import feed_watchdog as fw
+        try:
+            cfg = self._feed_wd_cfg()
+            wd = fw.FeedWatchdog()
+            for t in range(30):
+                wd.on_failure(cfg, float(t))     # drive to 30 -> one re-subscribe (attempt 1)
+            recovered = wd.on_success()
+            reset = (wd.fails == 0 and wd.attempts == 0 and wd.last_alert_s is None)
+            a_next = wd.on_failure(cfg, 100.0)   # fresh episode
+            clean_restart = (a_next.fails == 1 and not a_next.resubscribe)
+            ok = recovered and reset and clean_restart
+            detail = f"recovered={recovered} reset={reset} clean_restart={clean_restart}"
+        except Exception as e:
+            self._record(167, FAIL, f"raised: {e!r}"); return
+        self._record(167, PASS if ok else FAIL, detail)
+
+    def _step_f3_feed_alert_then_cooldown(self):
+        # 168 (T-F3): after feed_recover_max_tries (5) failed re-subscribes EXACTLY ONE
+        # FEED DOWN alert fires (at attempt 5 / fail 150); further alerts wait for the
+        # feed_alert_cooldown_min (5m=300s) cooldown to elapse on the monotonic clock.
+        import feed_watchdog as fw
+        try:
+            cfg = self._feed_wd_cfg()
+            wd = fw.FeedWatchdog()
+            alerts = []
+            for i in range(300):                 # 1s apart
+                a = wd.on_failure(cfg, float(i))
+                if a.alert:
+                    alerts.append((i, a.attempt, a.fails))
+            one_alert = (len(alerts) == 1 and alerts[0][1] == 5 and alerts[0][2] == 150)
+            second = None
+            for i in range(300, 700):
+                a = wd.on_failure(cfg, float(i))
+                if a.alert:
+                    second = i; break
+            cooldown_respected = (second is not None and (second - alerts[0][0]) >= 300)
+            ok = one_alert and cooldown_respected
+            detail = (f"alerts_in_first300={len(alerts)} first@fail={alerts[0][2] if alerts else None} "
+                      f"attempt={alerts[0][1] if alerts else None} 2nd_after_cooldown={cooldown_respected}")
+        except Exception as e:
+            self._record(168, FAIL, f"raised: {e!r}"); return
+        self._record(168, PASS if ok else FAIL, detail)
+
+    def _step_f4_feed_warn_throttled(self):
+        # 169 (T-F4): 1000 consecutive failures must NOT log 1000 warnings (the 13,833-line
+        # bug). Throttled to the episode-start line + a count every N -> <= 1 + floor(1000/N).
+        import feed_watchdog as fw
+        try:
+            cfg = self._feed_wd_cfg()
+            wd = fw.FeedWatchdog()
+            warns = sum(1 for i in range(1000) if wd.on_failure(cfg, float(i)).warn)
+            heartbeat = 1000 // 30
+            ok = (warns <= (1 + heartbeat)) and warns < 50
+            detail = f"warns={warns} (<= 1+{heartbeat}={1 + heartbeat}; not 1000)"
+        except Exception as e:
+            self._record(169, FAIL, f"raised: {e!r}"); return
+        self._record(169, PASS if ok else FAIL, detail)
+
+    def _step_f5_feed_disabled_byte_identical(self):
+        # 170 (T-F5): feed_watchdog_enabled=False -> on_failure warns EVERY call and NEVER
+        # re-subscribes or alerts == the pre-fix per-tick warning (byte-identical behavior).
+        import feed_watchdog as fw, dataclasses
+        try:
+            cfg_off = dataclasses.replace(self._feed_wd_cfg(), feed_watchdog_enabled=False)
+            wd = fw.FeedWatchdog()
+            acts = [wd.on_failure(cfg_off, float(i)) for i in range(100)]
+            all_warn = all(a.warn for a in acts)
+            no_action = not any(a.resubscribe or a.alert for a in acts)
+            ok = all_warn and no_action
+            detail = f"all_warn={all_warn} no_resubscribe_no_alert={no_action} (n=100)"
+        except Exception as e:
+            self._record(170, FAIL, f"raised: {e!r}"); return
+        self._record(170, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -5657,6 +5767,12 @@ class SelfTest:
             self._step_rogue_ml_gate()
             # Rogue ML: EOD champion/challenger autotrain + exit-feature capture
             self._step_rogue_ml_train()
+            # E-12 feed-death watchdog (pure FeedWatchdog; no MT5 needed)
+            self._step_f1_feed_resubscribe_after_n()
+            self._step_f2_feed_success_resets()
+            self._step_f3_feed_alert_then_cooldown()
+            self._step_f4_feed_warn_throttled()
+            self._step_f5_feed_disabled_byte_identical()
         finally:
             self._cleanup()
         return self._report(ts)

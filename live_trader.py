@@ -681,14 +681,77 @@ class LiveTrader:
 
     def _market_closed_now(self) -> bool:
         """Cheap probe: True if the broker's last tick is >1h old (weekend or a
-        holiday). False on any error -- never blocks trading on a probe failure."""
+        holiday). False on any error -- never blocks trading on a probe failure.
+
+        E-12: a probe failure is usually the feed/subscription dropping (the
+        2026-06-30 'symbol not subscribed' storm), not a closed market. The
+        feed watchdog (re-subscribe + throttled FEED DOWN alert) is driven from
+        here; a successful probe ends any in-flight feed-death episode."""
         try:
             server_utc = self.adapter.server_time_utc()
             age = (pd.Timestamp.now(tz='UTC') - server_utc).total_seconds()
+            self._feed_watchdog_ok()
             return age > 3600
         except Exception as e:
-            log.warning(f"market-closed probe failed: {e}")
+            self._feed_watchdog_fail(e)
             return False
+
+    def _feed_watchdog_ok(self):
+        """A market-closed probe SUCCEEDED -- the feed is alive. End any feed-death
+        episode and (once) announce recovery. No-op until a failure has created the
+        watchdog, and silent unless the watchdog is enabled."""
+        wd = getattr(self, '_feed_wd', None)
+        if wd is None:
+            return
+        recovered = wd.on_success()
+        if recovered and bool(getattr(self.cfg, 'feed_watchdog_enabled', True)):
+            log.warning("FEED RECOVERED — market-closed probe read a tick again.")
+            try:
+                self.tele.info("✅ *FEED RECOVERED* — ticks live again; resuming "
+                               "normal operation.")
+            except Exception:
+                pass
+
+    def _feed_watchdog_fail(self, err):
+        """A market-closed probe FAILED ('not subscribed'). Drive the watchdog: throttle
+        the warning, attempt a re-subscribe on the backoff cadence, and fire ONE FEED DOWN
+        alert after feed_recover_max_tries failed attempts. When the watchdog is DISABLED
+        this emits the exact pre-fix warning line every call (byte-identical)."""
+        import time as _time
+        import feed_watchdog as _fw
+        wd = getattr(self, '_feed_wd', None)
+        if wd is None:
+            wd = _fw.FeedWatchdog()
+            self._feed_wd = wd
+        act = wd.on_failure(self.cfg, _time.monotonic())
+        if not bool(getattr(self.cfg, 'feed_watchdog_enabled', True)):
+            # Pre-watchdog behavior, unchanged.
+            log.warning(f"market-closed probe failed: {err}")
+            return
+        if act.warn:
+            log.warning(
+                f"market-closed probe failed ({act.fails} consecutive, blind "
+                f"~{act.blind_s / 60.0:.1f}m): {err}")
+        if act.resubscribe:
+            ok = False
+            try:
+                ok = bool(self.adapter.resubscribe())
+            except Exception as e:
+                log.warning(f"feed re-subscribe raised: {e!r}")
+            log.warning(
+                f"FEED re-subscribe attempt {act.attempt}/"
+                f"{int(getattr(self.cfg, 'feed_recover_max_tries', 5))} for "
+                f"{self.cfg.symbol} -> {'select OK' if ok else 'FAILED'}")
+        if act.alert:
+            try:
+                self.tele.critical(
+                    f"🚨 *FEED DOWN — bot blind*\n"
+                    f"No ticks for ~{act.blind_s / 60.0:.0f} min "
+                    f"({act.fails} failed probes, {act.attempt} re-subscribe attempts).\n"
+                    f"Symbol `{self.cfg.symbol}` not subscribed — bot cannot trade or "
+                    f"trail until the feed returns. Check the MT5 terminal / Market Watch.")
+            except Exception:
+                pass
 
     def _validate_offset_on_wake(self, reason: str = "wake") -> bool:
         """Guard 1 (core fix): on wake/startup, force a fresh broker time-offset

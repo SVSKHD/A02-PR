@@ -216,6 +216,20 @@ class MT5Adapter:
         self.tick_time_offset_hours = off
         return True
 
+    def resubscribe(self) -> bool:
+        """E-12: re-subscribe the trading symbol to Market Watch after a feed drop.
+        symbol_info_tick returns None when the symbol falls out of Market Watch (the
+        2026-06-30 'not subscribed' storm); symbol_select(symbol, True) re-adds it so
+        ticks resume. Returns True iff MT5 reported the select succeeded. Guarded -- a
+        re-subscribe attempt must never raise onto the probe/tick loop. NOTE: a True
+        return means the select call succeeded, not that ticks are flowing yet; the
+        next market-closed probe confirms recovery (FeedWatchdog.on_success)."""
+        try:
+            return bool(self.mt5.symbol_select(self.symbol, True))
+        except Exception as e:
+            log.warning(f"resubscribe({self.symbol}) raised: {e!r}")
+            return False
+
     def shutdown(self):
         self.mt5.shutdown()
 
