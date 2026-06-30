@@ -211,6 +211,157 @@ def promote_on_boot(trader):
         return bool(getattr(trader.cfg, 'rogue_enabled', False))
 
 
+# --- Fix 4: A1-ANCHORED REDESIGN — PURE cores (flag-gated; OFF -> never reached) ------
+def a1_seed_anchor(last_close_level, a1_price):
+    """Fix 4 ANCHOR: the price the next A1-mode entry is measured from. CHAIN to the last
+    CLOSED Rogue level when one exists; otherwise seed from the day's A1 anchor price
+    (read-only). Returns the anchor price, or None if neither is available (engine waits).
+    PURE."""
+    if last_close_level is not None:
+        return float(last_close_level)
+    if a1_price is not None:
+        return float(a1_price)
+    return None
+
+
+def a1_entry_decision(anchor_price, current_price, cfg):
+    """Fix 4 ENTRY: once price has moved rogue_entry_confirm_redesign ($10) off the anchor,
+    ENTER in the MOVE direction (up -> BUY / down -> SELL) with a tight init SL
+    (rogue_init_sl on the wrong side). Returns (enter, side, entry_price, init_sl). PURE."""
+    confirm = float(getattr(cfg, 'rogue_entry_confirm_redesign', 10.0))
+    init_sl = float(getattr(cfg, 'rogue_init_sl', 5.0))
+    try:
+        a = float(anchor_price)
+        p = float(current_price)
+    except (TypeError, ValueError):
+        return False, None, None, None
+    move = p - a
+    if move >= confirm:
+        return True, 'BUY', round(p, 2), round(p - init_sl, 2)
+    if move <= -confirm:
+        return True, 'SELL', round(p, 2), round(p + init_sl, 2)
+    return False, None, None, None
+
+
+def a1_reversal_confirmed(entry_price, side, current_price, cfg):
+    """Fix 4 REVERSAL: price has crossed the entry AND moved rogue_reversal_dollars ($10)
+    PAST entry AGAINST the trade -> the trial is known WRONG -> recover in the new direction.
+    Measured in DOLLARS off entry (NOT candles). NOT a two-way hedge. Returns True/False.
+    PURE."""
+    rev = float(getattr(cfg, 'rogue_reversal_dollars', 10.0))
+    try:
+        e = float(entry_price)
+        p = float(current_price)
+    except (TypeError, ValueError):
+        return False
+    if side == 'BUY':
+        return (e - p) >= rev           # dropped >= $10 below a BUY entry
+    if side == 'SELL':
+        return (p - e) >= rev           # rose >= $10 above a SELL entry
+    return False
+
+
+def a1_soft_lock_met(day_pnl, cfg):
+    """Fix 4 TARGET: the soft floor (rogue_daily_soft_lock, $30) is BANKED but is NEVER a
+    hard stop -- the engine keeps hunting after it is met. Returns True once met. PURE."""
+    try:
+        return float(day_pnl) >= float(getattr(cfg, 'rogue_daily_soft_lock', 30.0))
+    except (TypeError, ValueError):
+        return False
+
+
+def a1_rescue_cap(cfg):
+    """Fix 4 BRAKE (per-rescue): the combined cap ($) on a reversal recovery =
+    rescue_boost_count x rogue_rescue_cap_dollars x lot x contract -- bounds the recovery.
+    PURE."""
+    return (int(getattr(cfg, 'rescue_boost_count', 2))
+            * float(getattr(cfg, 'rogue_rescue_cap_dollars', 13.0))
+            * float(getattr(cfg, 'lot_size', 0.35))
+            * float(getattr(cfg, 'contract_size', 100.0)))
+
+
+def _a1_anchor_price(trader):
+    """READ-ONLY cross-read of the day's A1 anchor price from the anchor engine. Tries the
+    A1 shadow position / pending entry price, then a persisted state key. Returns None if
+    unavailable (the engine then waits). NEVER mutates or closes an anchor leg. Guarded."""
+    try:
+        for attr in ('shadow_positions', 'shadow_pendings'):
+            book = getattr(trader, attr, None) or {}
+            for sh in book.values():
+                lbl = str(sh.get('anchor_label', '')) if hasattr(sh, 'get') else ''
+                if lbl.startswith('A1'):
+                    px = sh.get('leg_fill_price', sh.get('entry_price'))
+                    if px is not None:
+                        return float(px)
+    except Exception:
+        pass
+    try:
+        st = getattr(trader, 'state', {}) or {}
+        for k in ('a1_anchor_price', 'A1_anchor_price', 'a1_price'):
+            if st.get(k) is not None:
+                return float(st[k])
+    except Exception:
+        pass
+    return None
+
+
+def _drive_a1(trader, st):
+    """Fix 4 A1-ANCHORED driver (impure; runs ONLY when rogue_a1_anchor_mode is ON). Seeds
+    from A1 (read-only) / chains to the last closed Rogue level, enters on a $10 move,
+    rides continuation on the existing trail, and on a confirmed reversal closes the wrong-
+    way leg + recovers in the new direction (capped). Brake = the live daily loss stop.
+    The $30 soft lock is banked but never halts. ROGUE-only (magic 20260626). Guarded."""
+    # A1-mode keys live alongside the shared anchor/open keys.
+    st.setdefault('a1_last_close', None)   # last CLOSED Rogue level (chain target)
+    st.setdefault('a1_reverted', False)    # next entry is a capped recovery leg
+    price = _mid(trader)
+    if price is None:
+        return
+    # book a broker-side close FIRST (frees the slot + records the level for chaining).
+    o_before = st.get('open')
+    if o_before is not None:
+        # REVERSAL: the open leg is known wrong -> close it (broker SL likely already did)
+        # and chain-recover in the NEW direction next.
+        if a1_reversal_confirmed(o_before.get('entry'), o_before.get('side'), price, trader.cfg):
+            tk = o_before.get('ticket')
+            try:
+                if tk is not None:
+                    trader.adapter.close_position(int(tk), dry_run=trader.paper)  # ROGUE only
+            except Exception:
+                pass
+            st['a1_last_close'] = float(o_before.get('entry'))
+            st['a1_reverted'] = True
+            detect_close(trader, st)        # book P&L + clear st['open'] (guarded)
+            return
+        # CONTINUATION: ride the winner on the proven adaptive trail.
+        _manage_rogue_open(trader, st, price)
+        # also book a broker close if the trail/SL fired.
+        detect_close(trader, st)
+        if st.get('open') is not None:
+            st['a1_last_close'] = None      # still riding
+        return
+    # no open: book any pending close, then try a fresh entry off the (chained) anchor.
+    detect_close(trader, st)
+    anchor = a1_seed_anchor(st.get('a1_last_close'), _a1_anchor_price(trader))
+    if anchor is None:
+        return
+    ok, _why = can_enter(st['gov'], trader.cfg)   # BRAKE: daily loss stop / cap / fail-pause
+    if not ok:
+        return
+    enter, side, epx, sl = a1_entry_decision(anchor, price, trader.cfg)
+    if not enter:
+        return
+    # a reversal-recovery leg uses the wider per-rescue cap as its SL (still bounded).
+    if st.get('a1_reverted'):
+        cap = float(getattr(trader.cfg, 'rogue_rescue_cap_dollars', 13.0))
+        sl = round(epx - cap, 2) if side == 'BUY' else round(epx + cap, 2)
+        st['a1_reverted'] = False
+    st['leg_dir'] = side
+    st['anchor'] = anchor
+    _place_rogue_entry(trader, st, epx, sl)
+    st['a1_last_close'] = None
+
+
 def drive(trader):
     """The per-tick Rogue driver. Runs ONLY when should_run (rogue_enabled AND not
     funded) and rogue_daywatch -- otherwise an immediate no-op (no watch/anchor/entry).
@@ -234,6 +385,13 @@ def drive(trader):
             st = {'day': today, 'gov': new_day_state(),
                   'anchor': None, 'leg_dir': None, 'open': None}
             trader._rogue = st
+        # Fix 4: A1-ANCHORED REDESIGN (flag-gated, DEFAULT OFF). ON -> the new engine seeds
+        # from the day's A1 anchor (read-only) / chains to the last closed Rogue level and
+        # skips monster-detection. OFF (default) -> fall through to the legacy monster
+        # pipeline below, byte-identical.
+        if bool(getattr(trader.cfg, 'rogue_a1_anchor_mode', False)):
+            _drive_a1(trader, st)
+            return
         bars = _recent_m5(trader)
         if not bars:
             return
