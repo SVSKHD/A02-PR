@@ -29,6 +29,11 @@ class Position:
     # 'RESCUE' so every existing boost Position (and the v3.2.7 rescue path) keeps
     # the $8 arm / $8 lock / $3.50 gap byte-identical; a RALLY boost uses the
     # tighter Phase-1 rally_lock_floor ($4) / rally_trail_gap ($1.50).
+    parent_sl: Optional[float] = None  # E-6: the PARENT anchor leg's current trailing
+    # stop, resolved READ-ONLY by the caller (trails) from this boost's parent_ticket.
+    # Consulted ONLY for a RALLY boost when cfg.boost_ride_with_parent is ON, to hold the
+    # boost's exit no tighter than the parent (ride-with-parent). None -> no parent
+    # resolved (parent closed / missing) -> the boost runs its own trail, unchanged.
     closed: bool = False
     exit_price: Optional[float] = None
     exit_time: Optional[pd.Timestamp] = None
@@ -56,6 +61,30 @@ def _close_boost(pos, ts, fill, backstop):
     else:
         pos.outcome = 'BoostSL' if fill >= backstop - 0.01 else 'BoostTrail'
     return pos.outcome
+
+
+def _ride_with_parent_stop(pos, cfg, stop, is_rally):
+    """E-6 (RALLY-only, flag-gated DEFAULT OFF): return a boost stop held no TIGHTER than
+    the parent anchor leg's current trailing stop, so an ARMED rally boost rides at least
+    as long as the parent on the same move instead of bailing on its own tight floor (the
+    2026-06-30 +$105-vs-+$491 gap). `pos.parent_sl` is the parent's current_sl, resolved
+    READ-ONLY by trails -- this NEVER closes or mutates the parent (isolation intact).
+
+    'No tighter' is sign-correct: a SELL trailing stop sits ABOVE price, so the HIGHER of
+    (own, parent) survives a bounce longer (max); a BUY stop sits BELOW price, so the LOWER
+    survives longer (min). Bounded at the boost's OWN entry (breakeven) so riding-with-parent
+    can never drag the boost into a loss, even if the parent's stop is barely in profit.
+    Returns `stop` unchanged when the flag is OFF, the leg isn't RALLY, or no parent_sl was
+    resolved -> byte-identical to today."""
+    if not is_rally or not bool(getattr(cfg, 'boost_ride_with_parent', False)):
+        return stop
+    psl = getattr(pos, 'parent_sl', None)
+    if psl is None:
+        return stop
+    e = pos.entry_price
+    if pos.side == 'SELL':
+        return min(max(stop, float(psl)), e)   # ride longer (higher), but never above BE
+    return max(min(stop, float(psl)), e)        # BUY: ride longer (lower), never below BE
 
 
 def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
@@ -115,9 +144,20 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     armed = peak_fav >= arm
     _open = bar.get('open') if hasattr(bar, 'get') else getattr(bar, 'open', None)
 
+    # E-6: once ARMED, ride the boost's STOP with the parent. Clamp the incoming broker
+    # stop up-front so BOTH this bar's hard-backstop check (section 2, which reads
+    # current_sl) and the broker SL re-assert ride no tighter than the parent. ARMED-only:
+    # below +arm the boost keeps its full $13/$10 backstop (the helper's BE bound would
+    # otherwise wrongly tighten an unarmed backstop). RALLY+flag only -> else unchanged.
+    if armed:
+        pos.current_sl = _ride_with_parent_stop(pos, cfg, pos.current_sl, is_rally)
+
     # (1) ARMED breath-gap trail EXIT (off entirely below +arm).
     if armed:
         breath_sl = trail_for(peak_fav)
+        # E-6: hold the software exit no tighter than the parent's current stop (RALLY
+        # only, flag-gated). No-op when OFF/non-rally/no parent -> byte-identical.
+        breath_sl = _ride_with_parent_stop(pos, cfg, breath_sl, is_rally)
         if sgn > 0:
             if bar.low <= breath_sl:                      # trail hit
                 fill = breath_sl
@@ -205,6 +245,12 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
         pos.current_sl = max(pos.current_sl, new_sl)
     else:
         pos.current_sl = min(pos.current_sl, new_sl)
+    # E-6: re-apply the parent ride to the ratcheted stop (the ratchet above re-tightens
+    # from the boost's own peak) so the PERSISTED / broker-re-asserted stop rides with the
+    # parent. ARMED-only (fav >= arm); below +arm the $13/$10 backstop is untouched.
+    # RALLY-only, flag-OFF -> unchanged. Bounded at the boost's own BE (never into a loss).
+    if fav >= arm:
+        pos.current_sl = _ride_with_parent_stop(pos, cfg, pos.current_sl, is_rally)
     # v3.3.0: trace the boost's armed trail so its EXIT is never flagged
     # exit_trail_without_trail_advance (the test-fire PTRACE defect). The FIRST
     # armed advance is the LOCK_ARM (the stop leaves the $10 backstop and engages

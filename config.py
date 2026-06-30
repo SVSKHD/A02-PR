@@ -342,6 +342,16 @@ class Config:
     rally_trail_gap: float = 2.00     # RALLY_TRAIL_GAP: v3.3.0 the rally boost trails
     #   at peak - $2.00 (was $1.50), matching the original leg's trail gap (trail_gap
     #   / banner "gap $2.00") so a rally boost rides the move and exits ~peak-$2.
+    # --- E-6 BOOST RIDES WITH PARENT (2026-06-30 A1; flag-gated, DEFAULT OFF) -----
+    # The 06-30 A1 RALLY boosts armed on their OWN small peak, floored at +$3, and
+    # software-exited at 4001.61 (+$105) on the first bounce while the parent anchor
+    # SELL rode its broker trail to 3997.27 (+$491) -- same move, 4.7x the result. When
+    # ON, an ARMED rally boost holds its software exit no TIGHTER than the parent anchor
+    # leg's current trailing stop (resolved READ-ONLY via parent_ticket), so it rides at
+    # least as long as the parent instead of bailing early. Bounded at the boost's own
+    # breakeven so it can never ride into a loss. RALLY-only; RESCUE untouched. DEFAULT
+    # OFF -> byte-identical until the owner validates it live.
+    boost_ride_with_parent: bool = False
     # --- v3.3.4 RALLY PULLBACK DETECTOR (rally boosts only) -----------------------
     # An entry-relative early-cut that sits ABOVE the $13 hard backstop (rally_boost_sl).
     # A rally boost that pulls back AGAINST ITS ENTRY is HELD while the adverse
