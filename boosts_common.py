@@ -105,6 +105,9 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
                     'fill_time': pd.Timestamp.now(tz='UTC').isoformat(),
                     'role': 'rescue', 'boost': True, 'boost_event': event_id,
                     'boost_kind': plan.kind,  # v3.2.8: RALLY -> tighter trail; RESCUE default
+                    # E-6: the parent leg this boost pyramided off -- trails resolves it
+                    # READ-ONLY to ride the boost with the parent's stop (RALLY only).
+                    'parent_ticket': int(leg_ticket),
                 }
             self.tele.send(
                 f"✅⚡ {plan.kind} BOOST{bi + 1} {side} FILLED @ ${b_fp} (ticket {b_tk})",

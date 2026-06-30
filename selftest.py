@@ -237,6 +237,14 @@ STEP_NAMES = {
     174: "rogue loss-stop",
     175: "rogue eod flag",
     176: "rogue isolation",
+    # E-6 boost rides with parent (RALLY-only, flag-gated). Renumbered 177-182:
+    # 171-176 are fix3's Rogue brakes (merged to master first); this block followed.
+    177: "boost ride parent",
+    178: "boost parent gone",
+    179: "boost ride OFF",
+    180: "boost isolation",
+    181: "boost rescue unaff",
+    182: "boost A1 replay",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5339,6 +5347,126 @@ class SelfTest:
             self._record(176, FAIL, f"raised: {e!r}"); return
         self._record(176, PASS if ok else FAIL, detail)
 
+    # --- E-6 boost rides with parent (RALLY-only, flag boost_ride_with_parent) ------
+    # Renumbered 177-182 (fix3's Rogue brakes took 171-176 on master). Drives the PURE
+    # strategy._update_boost_on_bar + trails._resolve_parent_sl, no MT5. 2026-06-30 A1:
+    # RALLY boost SELL entry 4004.61, just armed at +$5 -> own breath/current_sl = +$3
+    # floor = 4001.61; parent anchor SELL still riding with a looser (higher) stop 4003.
+    def _b6_boost(self, side='SELL', entry=4004.61, max_fav=3999.61, current_sl=4001.61,
+                  parent_sl=4003.0, kind='RALLY'):
+        import strategy as _S
+        return _S.Position(anchor_label='A1', side=side, entry_price=entry, entry_time=None,
+                           current_sl=current_sl, tp_level=(entry - 200 if side == 'SELL' else entry + 200),
+                           max_fav=max_fav, lot=0.35, boost=True, boost_kind=kind,
+                           parent_sl=parent_sl)
+
+    def _b6_step(self, cfg, b, hi):
+        import strategy as _S
+        import pandas as _pd
+        bar = _pd.Series({'open': 3999.61, 'high': hi, 'low': 3999.61, 'close': hi})
+        return _S._update_boost_on_bar(b, bar, _pd.Timestamp('2026-06-30T07:00:00Z'), cfg)
+
+    def _b6_cfg(self, on):
+        import dataclasses
+        return dataclasses.replace(self.cfg, boost_ride_with_parent=bool(on))
+
+    def _step_b1_boost_rides_parent(self):
+        # 177 (T-B1): flag ON, parent still riding (stop 4003 looser than the boost's own
+        # +$3 floor 4001.61) -> the armed boost does NOT exit on the 4001.61 bounce; its
+        # stop tracks the parent (4003). It rides instead of bailing at +$105.
+        try:
+            b = self._b6_boost(parent_sl=4003.0)
+            self._b6_step(self._b6_cfg(True), b, 4001.61)
+            ok = (not b.closed) and abs(b.current_sl - 4003.0) < 1e-6
+            detail = f"closed={b.closed} (expect False) boost_sl={round(b.current_sl,2)} tracks parent 4003"
+        except Exception as e:
+            self._record(177, FAIL, f"raised: {e!r}"); return
+        self._record(177, PASS if ok else FAIL, detail)
+
+    def _step_b2_boost_parent_closed(self):
+        # 178 (T-B2): flag ON but parent already closed (parent_sl None) -> the boost falls
+        # back to its OWN trail and exits ~4001.61, no crash (edge case #2).
+        try:
+            b = self._b6_boost(parent_sl=None)
+            self._b6_step(self._b6_cfg(True), b, 4001.61)
+            ok = b.closed and abs(b.exit_price - 4001.61) < 1e-6
+            detail = f"closed={b.closed} exit={round(b.exit_price,2) if b.exit_price is not None else None} (own trail fallback)"
+        except Exception as e:
+            self._record(178, FAIL, f"raised: {e!r}"); return
+        self._record(178, PASS if ok else FAIL, detail)
+
+    def _step_b3_boost_ride_off_identical(self):
+        # 179 (T-B3): flag OFF -> byte-identical to today: the boost floors out at 4001.61
+        # (+$105 @ 0.35x100=35/$) exactly as before, proving the flag isolates the change.
+        try:
+            b = self._b6_boost(parent_sl=4003.0)
+            self._b6_step(self._b6_cfg(False), b, 4001.61)
+            pnl = (4004.61 - b.exit_price) * 35.0
+            ok = b.closed and abs(b.exit_price - 4001.61) < 1e-6 and abs(pnl - 105.0) < 0.6
+            detail = f"closed={b.closed} exit={round(b.exit_price,2)} pnl=${round(pnl,2)} (expect +105, unchanged)"
+        except Exception as e:
+            self._record(179, FAIL, f"raised: {e!r}"); return
+        self._record(179, PASS if ok else FAIL, detail)
+
+    def _step_b4_boost_isolation(self):
+        # 180 (T-B4): isolation. trails._resolve_parent_sl only READS the parent's
+        # current_sl; it never mutates the parent shadow and never closes it. Missing parent
+        # -> None (no crash); flag OFF -> None (no resolve). The boost carries only a float
+        # parent_sl, never a reference to the parent dict -> no cross-magic close path.
+        import trails as _T, types, copy
+        try:
+            parent = {'side': 'SELL', 'current_sl': 3997.27, 'anchor_label': 'A1'}
+            parent_before = copy.deepcopy(parent)
+            on = types.SimpleNamespace(cfg=self._b6_cfg(True),
+                                       shadow_positions={555: parent},
+                                       _rl_ok=lambda *a, **k: True)
+            sh = {'boost': True, 'parent_ticket': 555, 'anchor_label': 'A1', 'boost_event': 'e1'}
+            psl = _T._resolve_parent_sl(on, sh)
+            reads_ok = abs(psl - 3997.27) < 1e-6
+            parent_unmutated = (parent == parent_before)
+            none_missing = _T._resolve_parent_sl(on, {'boost': True, 'parent_ticket': 999,
+                                                      'boost_event': 'e2'}) is None
+            off = types.SimpleNamespace(cfg=self._b6_cfg(False),
+                                        shadow_positions={555: parent},
+                                        _rl_ok=lambda *a, **k: True)
+            none_off = _T._resolve_parent_sl(off, sh) is None
+            float_only = isinstance(psl, float)   # boost gets a value, not the parent object
+            ok = reads_ok and parent_unmutated and none_missing and none_off and float_only
+            detail = (f"read={reads_ok} parent_unmutated={parent_unmutated} "
+                      f"none_missing={none_missing} none_off={none_off} float_only={float_only}")
+        except Exception as e:
+            self._record(180, FAIL, f"raised: {e!r}"); return
+        self._record(180, PASS if ok else FAIL, detail)
+
+    def _step_b5_boost_rescue_unaffected(self):
+        # 181 (T-B5): RESCUE boosts are unaffected (RALLY-only change). A RESCUE boost with
+        # the same numbers + flag ON still exits on its own trail (the gate is is_rally).
+        try:
+            b = self._b6_boost(parent_sl=4003.0, kind='RESCUE')
+            self._b6_step(self._b6_cfg(True), b, 4001.61)
+            ok = b.closed   # RESCUE ignores the parent ride; closes as before
+            detail = f"closed={b.closed} (expect True; RESCUE ignores ride-with-parent)"
+        except Exception as e:
+            self._record(181, FAIL, f"raised: {e!r}"); return
+        self._record(181, PASS if ok else FAIL, detail)
+
+    def _step_b6_boost_a1_replay(self):
+        # 182 (T-B6): replay the 2026-06-30 A1 event. OFF -> both boosts floor at 4001.61
+        # (+$105 each). ON -> neither boost exits on the 4001.61 bounce (rides with the
+        # parent anchor that went on to 3997.27). This is the +105-vs-rides divergence.
+        try:
+            b_off = self._b6_boost(parent_sl=4003.0)
+            self._b6_step(self._b6_cfg(False), b_off, 4001.61)
+            b_on = self._b6_boost(parent_sl=4003.0)
+            self._b6_step(self._b6_cfg(True), b_on, 4001.61)
+            pnl_off = (4004.61 - b_off.exit_price) * 35.0
+            ok = (b_off.closed and abs(pnl_off - 105.0) < 0.6 and not b_on.closed)
+            detail = (f"OFF: closed={b_off.closed} +${round(pnl_off,2)} | "
+                      f"ON: closed={b_on.closed} (rides past 4001.61 with parent)")
+        except Exception as e:
+            self._record(182, FAIL, f"raised: {e!r}"); return
+        self._record(182, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -5931,6 +6059,13 @@ class SelfTest:
             self._step_r4_rogue_loss_stop_trips()
             self._step_r5_rogue_eod_flag()
             self._step_r6_rogue_isolation()
+            # E-6 boost rides with parent (177-182; pure strategy/trails, no MT5)
+            self._step_b1_boost_rides_parent()
+            self._step_b2_boost_parent_closed()
+            self._step_b3_boost_ride_off_identical()
+            self._step_b4_boost_isolation()
+            self._step_b5_boost_rescue_unaffected()
+            self._step_b6_boost_a1_replay()
         finally:
             self._cleanup()
         return self._report(ts)

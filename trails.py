@@ -22,6 +22,36 @@ from mt5_adapter import _MT5_RETCODE_MAP
 log = logging.getLogger("AUREON")
 
 
+def _resolve_parent_sl(self, shadow):
+    """E-6: READ-ONLY resolve a boost's PARENT anchor-leg current trailing stop, from
+    shadow['parent_ticket'] -> self.shadow_positions[parent]['current_sl']. Returns None
+    unless ride-with-parent is ON, this is a boost, the parent_ticket is present, AND the
+    parent is STILL OPEN (membership in shadow_positions = open). A closed/missing parent
+    -> None -> the boost runs its own trail (edge cases #2/#3). A rescue-leg parent is still
+    read (its current_sl is a valid trailing stop). NEVER closes or mutates the parent
+    (isolation: read-only). Logs once (rate-limited) when parent_ticket is missing so a
+    boost that can't ride is visible, never silent. Any error -> None (own trail)."""
+    try:
+        if not bool(getattr(self.cfg, 'boost_ride_with_parent', False)):
+            return None
+        if not shadow.get('boost'):
+            return None
+        ptk = shadow.get('parent_ticket')
+        if ptk is None:
+            if self._rl_ok(f"e6_noparent:{shadow.get('boost_event')}", 300.0):
+                log.info(f"E-6: boost {shadow.get('anchor_label')} has no parent_ticket "
+                         f"-- running own trail (no ride-with-parent)")
+            return None
+        parent = self.shadow_positions.get(int(ptk))
+        if not parent:                 # parent already closed -> own trail (edge case #2)
+            return None
+        psl = parent.get('current_sl')
+        return float(psl) if psl is not None else None
+    except Exception as e:
+        log.warning(f"E-6 _resolve_parent_sl failed (own trail): {e!r}")
+        return None
+
+
 def _manage_trails_on_bar_close(self):
     if not self.shadow_positions:
         return
@@ -81,6 +111,12 @@ def _manage_trails_on_bar_close(self):
             # v3.2.8 Phase 1: thread the boost kind so a RALLY boost trails on the
             # tighter rally arm/lock/gap; defaults to RESCUE (byte-identical v3.2.7).
             boost_kind=shadow.get('boost_kind', 'RESCUE'),
+            # E-6: resolve this boost's PARENT anchor leg current stop READ-ONLY so a
+            # RALLY boost can ride with the parent (strategy._ride_with_parent_stop). Only
+            # for an open boost with a known parent_ticket still in shadow_positions; a
+            # closed/missing parent -> None -> the boost runs its own trail (unchanged).
+            # ISOLATION: this only READS the parent shadow; it never closes/mutates it.
+            parent_sl=_resolve_parent_sl(self, shadow),
         )
         old_max_fav = shadow.get('max_fav')
         # v3.3.0: pass the per-position tracer so MAXFAV_UPDATE / LOCK_ARM /
