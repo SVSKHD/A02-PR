@@ -3,7 +3,7 @@
 Mapped ONCE here so both kinds go through identical plumbing (the A3 fire-at-fill
 bug, the comment<=31 guard, the -$700 cap, the rescuestats journal write, the
 gapless telemetry trace -- all in one place). The kind-specific decisions live in
-rally.py (winning-side pyramid: $5 arm / $4 lock / $1.50 gap + break-and-hold gate)
+rally.py (winning-side pyramid: $5 arm / $3 floor / $2.00 gap + break-and-hold gate)
 and rescue.py (losing-side hedge: $10 arm, free-fire-on-commit, tick-hold>=3); the
 dispatcher (boosts_dispatch.py) routes by the sign of leg_fav. This module owns:
 

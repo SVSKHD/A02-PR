@@ -28,7 +28,7 @@ class Position:
     # boost is True; selects the breath-gap trail's arm/lock/gap. Defaults to
     # 'RESCUE' so every existing boost Position (and the v3.2.7 rescue path) keeps
     # the $8 arm / $8 lock / $3.50 gap byte-identical; a RALLY boost uses the
-    # tighter Phase-1 rally_lock_floor ($4) / rally_trail_gap ($1.50).
+    # tighter v3.3.0 rally_arm_fav ($5) / rally_lock_floor ($3) / rally_trail_gap ($2.00).
     parent_sl: Optional[float] = None  # E-6: the PARENT anchor leg's current trailing
     # stop, resolved READ-ONLY by the caller (trails) from this boost's parent_ticket.
     # Consulted ONLY for a RALLY boost when cfg.boost_ride_with_parent is ON, to hold the
@@ -115,13 +115,13 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     if pos.closed:
         return pos.outcome
     sgn = 1.0 if pos.side == 'BUY' else -1.0
-    # v3.2.8 Phase 1: RALLY boosts run a tighter breath-gap (arm/lock $4, gap $1.50)
-    # off their OWN dedicated keys; RESCUE boosts (and every legacy boost Position,
-    # which defaults boost_kind='RESCUE') keep the v3.2.7 $8 arm / $8 lock / $3.50 gap
-    # byte-identical. v3.3.3: the HARD backstop is now per-kind too -- RALLY $13
+    # v3.3.0 (corrected): RALLY boosts run a tighter breath-gap (arm $5 / floor $3,
+    # gap $2.00) off their OWN dedicated keys; RESCUE boosts (and every legacy boost
+    # Position, which defaults boost_kind='RESCUE') keep the v3.2.7 $8 arm / $8 lock /
+    # $3.50 gap byte-identical. v3.3.3: the HARD backstop is now per-kind too -- RALLY $13
     # (rally_boost_sl, owner-widened), RESCUE $10 (boost_sl_dollars, unchanged).
-    # Each kind OWNS its trail numbers (rally.py / rescue.py). RALLY -> $4 arm/lock,
-    # $1.50 gap; RESCUE -> $8 arm/lock, $3.50 gap. Lazy import keeps this precious
+    # Each kind OWNS its trail numbers (rally.py / rescue.py). RALLY -> $5 arm / $3 floor,
+    # $2.00 gap; RESCUE -> $8 arm/lock, $3.50 gap. Lazy import keeps this precious
     # module free of the order-placement stack.
     import rally as _rally, rescue as _rescue
     is_rally = getattr(pos, 'boost_kind', 'RESCUE') == 'RALLY'

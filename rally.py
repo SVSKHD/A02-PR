@@ -370,8 +370,20 @@ def break_and_hold_ok(self, shadow, plan):
                     except Exception:
                         pass
                 return True
-        self.tele.info(f"🚫 BREAK {result} ({reason}) {anchor} {plan.boost_side} "
-                       f"@edge ${edge:.2f} — no fire")
+        # E-11: throttle the human-facing "BREAK no fire" line to ONCE PER EPISODE.
+        # The boost trigger re-evaluates this gate every tick while the boost stays
+        # armed, so a persistent FAILED/CANDIDATE used to spam ~30x/90s. Log only when
+        # the (result, reason) changes (a genuine state transition); the PTRACE
+        # break_failed/break_candidate trace above stays gapless (unthrottled).
+        _nofire_key = f"{result}:{reason}"
+        if isinstance(shadow, dict):
+            if shadow.get('_break_nofire_key') != _nofire_key:
+                shadow['_break_nofire_key'] = _nofire_key
+                self.tele.info(f"🚫 BREAK {result} ({reason}) {anchor} {plan.boost_side} "
+                               f"@edge ${edge:.2f} — no fire")
+        else:
+            self.tele.info(f"🚫 BREAK {result} ({reason}) {anchor} {plan.boost_side} "
+                           f"@edge ${edge:.2f} — no fire")
         return False
     except Exception as e:
         # v3.3.3 FIX 1B: FAIL CLOSED. Do NOT fire the rally boost when the gate
