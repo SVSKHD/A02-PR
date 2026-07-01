@@ -257,21 +257,10 @@ STEP_NAMES = {
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
 
-# --- selftest auto-summary reporter (report-only; NO trading/test behavior change) ----
-# Coarse step groups for the one-line "Groups:" digest. Each group is ✅ unless any step
-# in its range is marked FAIL. Ranges are inclusive and cover 1..top contiguously.
-SUMMARY_GROUPS = [
-    ("Connection/orders", 1, 9),
-    ("Alerts/trails", 10, 54),
-    ("FP/stacks", 55, 73),
-    ("Ticks/incidents", 74, 105),
-    ("Overrides/pullback", 106, 131),
-    ("Rogue core", 132, 147),
-    ("v3.5 all-16", 148, 161),
-    ("Watchdog/ML", 162, 165),
-    ("Feed/brakes/boost-ride", 166, 182),
-    ("Fixes E5/F-B/Fix4", 183, 185),
-]
+# --- selftest auto-summary reporter v2 (report-only; NO trading/test behavior change) ---
+# End-of-run summary block + a SINGLE results table sorted FAILED-FIRST (then passed, each
+# in step order) so the owner sees problems immediately without scrolling. The .md file is
+# ASCII (PASS/FAIL, never ✅/❌) and written utf-8 -- fixes the Windows UnicodeEncodeError.
 
 
 def build_selftest_summary(results, step_names):
@@ -279,112 +268,90 @@ def build_selftest_summary(results, step_names):
     count reflects REAL failures ONLY -- a test is failed IFF the harness marked its status
     FAIL (the SAME signal that populates failed_tests=[]). Negative tests that intentionally
     log ERROR/violation lines but are RECORDED as PASS are counted as PASS (we never grep for
-    the word ERROR). Returns a dict: total/passed/failed/skipped/warned counts, failed[] list
-    of (step,name,detail), and groups[] of (label, lo, hi, mark). PURE."""
+    the word ERROR). Returns counts + `rows` = every test as (step, name, status, detail)
+    SORTED failed-first then step-ascending, and `failed_list` = (step,name,detail). PURE."""
     total = len(step_names)
     passed = failed = skipped = warned = 0
-    failed_list = []
+    rows = []
     for n in range(1, total + 1):
         status, detail = results.get(n, (FAIL, "did not run"))
+        name = step_names.get(n, f"step {n}")
         if status == PASS:
             passed += 1
         elif status == FAIL:
             failed += 1
-            failed_list.append((n, step_names.get(n, f"step {n}"), detail))
         elif status == SKIP:
             skipped += 1
         elif status == WARN:
             warned += 1
         else:
-            failed += 1                       # unknown status = treat as a failure
-            failed_list.append((n, step_names.get(n, f"step {n}"), f"status={status}"))
-    groups = []
-    for label, lo, hi in SUMMARY_GROUPS:
-        present = [n for n in range(lo, hi + 1) if n in results]
-        any_fail = any(results.get(n, (FAIL, ""))[0] == FAIL for n in present)
-        any_skip = any(results.get(n, ("", ""))[0] == SKIP for n in present)
-        if not present:
-            mark = "·"                        # no steps in range (below top) -> neutral
-        elif any_fail:
-            mark = "❌"
-        elif any_skip:
-            mark = "⚠"                         # ran clean but some market-steps skipped
-        else:
-            mark = "✅"
-        groups.append((label, lo, hi, mark))
+            status, detail = FAIL, f"status={status}"   # unknown = real failure
+            failed += 1
+        rows.append((n, name, status, detail))
+    # sort key: primary FAIL-before-everything-else, secondary step-number ascending.
+    rows.sort(key=lambda r: (0 if r[2] == FAIL else 1, r[0]))
+    failed_list = [(s, nm, d) for (s, nm, st, d) in rows if st == FAIL]
     return {'total': total, 'passed': passed, 'failed': failed, 'skipped': skipped,
-            'warned': warned, 'failed_list': failed_list, 'groups': groups}
+            'warned': warned, 'rows': rows, 'failed_list': failed_list}
 
 
-def render_summary_console(summary, meta):
-    """PURE: the fixed-width console SUMMARY block from build_selftest_summary + a meta dict
-    (build/ts/account/server/watchdog/rogue). Report-only text; never raises on missing meta."""
+def _summary_header(summary, meta):
+    """PURE: the 6-line summary header block (identical in console + file). Report-only."""
     m = meta or {}
     result = "PASS" if summary['failed'] == 0 else "FAIL"
-    L = []
-    L.append("=" * 20 + " AUREON SELFTEST SUMMARY " + "=" * 20)
-    L.append(f"Build: {m.get('build', '?')}   |   {m.get('ts', '?')}   |   "
-             f"Account: {m.get('account', '?')} {m.get('server', '')}".rstrip())
-    L.append(f"Result: {result}   —   {summary['passed']}/{summary['total']} passed, "
-             f"{summary['failed']} failed"
-             + (f", {summary['skipped']} skipped" if summary['skipped'] else "")
-             + (f", {summary['warned']} warned" if summary['warned'] else ""))
-    L.append(f"Watchdog: {m.get('watchdog', '?')}")
-    L.append(f"Rogue: {m.get('rogue', '?')}")
-    L.append("-" * 64)
-    if summary['failed_list']:
-        L.append(f"FAILED TESTS ({summary['failed']}):")
-        for step, name, detail in summary['failed_list']:
-            L.append(f"  {step} {name} — {detail}")
-        L.append("-" * 64)
-    groups_txt = " | ".join(f"{label} {lo}-{hi} {mark}"
-                            for (label, lo, hi, mark) in summary['groups'] if mark != "·")
-    L.append(f"Groups: {groups_txt}")
-    L.append("=" * 64)
+    return [
+        "=" * 20 + " AUREON SELFTEST SUMMARY " + "=" * 20,
+        f"Build: {m.get('build', '?')} | {m.get('ts', '?')} | "
+        f"Account: {m.get('account', '?')} {m.get('server', '')}".rstrip(),
+        f"Result: {result}",
+        f"Total: {summary['total']}   Passed: {summary['passed']}   Failed: {summary['failed']}",
+        f"Watchdog: {m.get('watchdog', '?')}   Rogue: {m.get('rogue', '?')}",
+        "=" * 64,
+    ]
+
+
+def _result_cell(status, emoji):
+    """The Result-column text. emoji=True (console) may prefix a glyph; emoji=False (the .md
+    FILE) is pure ASCII PASS/FAIL/SKIP/WARN -- the Windows-safe form."""
+    if not emoji:
+        return status                                   # ASCII: PASS / FAIL / SKIP / WARN
+    return {PASS: "✅ PASS", FAIL: "❌ FAIL", SKIP: "⏭ SKIP",
+            WARN: "⚠ WARN"}.get(status, status)
+
+
+def render_summary(summary, meta, *, emoji):
+    """PURE: header block + the SINGLE results table (FAILED rows first, then the rest in
+    step order). emoji=False -> ASCII PASS/FAIL (the .md file); emoji=True -> console glyphs.
+    When 0 failed, a 'No failures' line precedes the table. Never raises on missing meta."""
+    L = list(_summary_header(summary, meta))
+    L.append("")
+    if summary['failed'] == 0:
+        L.append(f"No failures -- all {summary['total']} passed.")
+    L.append("| # | Step | Name | Result | Detail |")
+    L.append("|---|------|------|--------|--------|")
+    for i, (step, name, status, detail) in enumerate(summary['rows'], 1):
+        d = str(detail).replace("|", "\\|")
+        L.append(f"| {i} | {step} | {name} | {_result_cell(status, emoji)} | {d} |")
     return "\n".join(L)
 
 
-def render_summary_markdown(summary, meta):
-    """PURE: the markdown report (logs/selftest_report.md content) -- a Metric table, a
-    FAILED-TESTS table (or 'None — all passed'), and a per-group table. Report-only."""
-    m = meta or {}
-    result = "PASS" if summary['failed'] == 0 else "FAIL"
-    L = []
-    L.append("# AUREON Selftest Summary")
-    L.append("")
-    L.append("| Metric | Value |")
-    L.append("| --- | --- |")
-    L.append(f"| Build | {m.get('build', '?')} |")
-    L.append(f"| Timestamp (UTC) | {m.get('ts', '?')} |")
-    L.append(f"| Account | {m.get('account', '?')} {m.get('server', '')} |".replace("  |", " |"))
-    L.append(f"| Result | **{result}** |")
-    L.append(f"| Passed | {summary['passed']} / {summary['total']} |")
-    L.append(f"| Failed | {summary['failed']} |")
-    L.append(f"| Skipped | {summary['skipped']} |")
-    L.append(f"| Warned | {summary['warned']} |")
-    L.append(f"| Watchdog | {m.get('watchdog', '?')} |")
-    L.append(f"| Rogue | {m.get('rogue', '?')} |")
-    L.append("")
-    L.append(f"## Failed tests ({summary['failed']})")
-    L.append("")
-    if summary['failed_list']:
-        L.append("| Step | Name | Detail |")
-        L.append("| --- | --- | --- |")
-        for step, name, detail in summary['failed_list']:
-            safe = str(detail).replace("|", "\\|")
-            L.append(f"| {step} | {name} | {safe} |")
-    else:
-        L.append("None — all passed. ✅")
-    L.append("")
-    L.append("## Groups")
-    L.append("")
-    L.append("| Group | Steps | Status |")
-    L.append("| --- | --- | --- |")
-    for label, lo, hi, mark in summary['groups']:
-        if mark != "·":
-            L.append(f"| {label} | {lo}-{hi} | {mark} |")
-    L.append("")
-    return "\n".join(L)
+def write_selftest_report(text, path):
+    """Write the report to `path` as UTF-8 (atomic temp+replace). FULLY GUARDED: returns
+    True on success, False on ANY error (never raises) -- a report-write failure must NEVER
+    fail the suite. JOB 1: utf-8 encoding + ASCII body together fix the Windows crash."""
+    try:
+        import os as _os
+        d = _os.path.dirname(path)
+        if d:
+            _os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        _os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log.warning(f"selftest report write non-fatal: {e!r}")
+        return False
 
 
 def classify_second_fill(twin_open: bool) -> str:
@@ -5806,52 +5773,77 @@ class SelfTest:
         self._record(184, PASS if ok else FAIL, detail)
 
     def _step_selftest_summary(self):
-        # 186 selftest auto-summary reporter (report-only; NO trading/test behavior change).
-        # KNOWN mix: 3 PASS + 1 FAIL, plus a NEGATIVE test (step 4) whose DETAIL contains an
-        # ERROR/violation string but is RECORDED PASS -> it must count as PASS (the summary
-        # keys on STATUS, never greps for the word ERROR). Asserts the summary counts
-        # total/passed/failed, lists the failed test BY NAME, the negative test is PASS, and
-        # the markdown file carries the SAME pass/fail counts as the console block.
+        # 186 selftest auto-summary reporter v2 (report-only; NO trading/test behavior change).
+        # KNOWN mix: 5 tests, 2 forced-FAIL (steps 2 + 4) + a NEGATIVE test (step 3) whose
+        # DETAIL contains an ERROR/violation string but is RECORDED PASS -> counts as PASS
+        # (keyed on STATUS, never grep 'ERROR'). Asserts: Total=5 Passed=3 Failed=2; the
+        # results table lists BOTH FAIL rows FIRST (step order) then the 3 PASS; a forced
+        # write-error is caught NON-FATALLY (returns False, no raise); the .md is utf-8 with
+        # ASCII PASS/FAIL (no glyphs).
         import selftest as _st, tempfile, os
         tmp = None
         try:
             results = {
-                1: (PASS, 'ok'),
-                2: (PASS, 'ok'),
-                3: (FAIL, 'boom detail'),
-                4: (PASS, 'DO-NOT-START verdict + TELEMETRY_VIOLATION ERROR logged (negative)'),
+                1: (PASS, 'ok one'),
+                2: (FAIL, 'boom two'),
+                3: (PASS, 'DO-NOT-START + TELEMETRY_VIOLATION ERROR logged (negative test)'),
+                4: (FAIL, 'boom four'),
+                5: (PASS, 'ok five'),
             }
-            names = {1: 'alpha', 2: 'beta', 3: 'gamma', 4: 'neg fail-open'}
-            summary = _st.build_selftest_summary(results, names)
-            counts_ok = (summary['total'] == 4 and summary['passed'] == 3
-                         and summary['failed'] == 1)
-            failed_names = [nm for (_s, nm, _d) in summary['failed_list']]
-            lists_failed = (failed_names == ['gamma'])          # the FAIL listed by name
-            neg_is_pass = ('neg fail-open' not in failed_names)  # ERROR-in-detail still PASS
+            names = {1: 'alpha', 2: 'beta', 3: 'neg fail-open', 4: 'delta', 5: 'epsilon'}
+            s = _st.build_selftest_summary(results, names)
+            counts_ok = (s['total'] == 5 and s['passed'] == 3 and s['failed'] == 2)
+            # FAILED FIRST (step order 2,4) then PASSED (step order 1,3,5)
+            order = [step for (step, _n, _st2, _d) in s['rows']]
+            statuses = [st2 for (_step, _n, st2, _d) in s['rows']]
+            sort_ok = (order == [2, 4, 1, 3, 5]
+                       and statuses[:2] == [FAIL, FAIL]
+                       and set(statuses[2:]) == {PASS})
+            # negative test (ERROR in detail) is PASS, never in failed_list
+            failed_steps = [step for (step, _n, _d) in s['failed_list']]
+            neg_is_pass = (3 not in failed_steps and failed_steps == [2, 4])
 
             meta = {'build': 5958, 'ts': '2026-07-01 01:00:00', 'account': 5051188745,
                     'server': 'Demo', 'watchdog': 'SAFE-TO-START', 'rogue': 'PROMOTED ON (demo)'}
-            console = _st.render_summary_console(summary, meta)
-            console_ok = ('3/4 passed, 1 failed' in console and 'gamma' in console
-                          and 'Result: FAIL' in console and 'AUREON SELFTEST SUMMARY' in console)
+            # FILE render is ASCII (no glyphs); the two FAIL rows appear before any PASS row.
+            md = _st.render_summary(s, meta, emoji=False)
+            header_ok = ('AUREON SELFTEST SUMMARY' in md and 'Result: FAIL' in md
+                         and 'Total: 5   Passed: 3   Failed: 2' in md)
+            i_fail2 = md.index('| beta |')
+            i_fail4 = md.index('| delta |')
+            i_pass1 = md.index('| alpha |')
+            failed_first = (i_fail2 < i_pass1 and i_fail4 < i_pass1)
+            ascii_only = ('PASS' in md and 'FAIL' in md
+                          and '✅' not in md and '❌' not in md and '⚠' not in md)
 
-            md = _st.render_summary_markdown(summary, meta)
+            # write the file utf-8 to a tempdir + read it back as utf-8; assert ASCII body.
             tmp = tempfile.mkdtemp(prefix='aureon_report_')
-            path = os.path.join(tmp, 'selftest_report.md')
-            with open(path, 'w') as f:
-                f.write(md)
-            body = open(path).read()
-            file_ok = (os.path.exists(path) and '| Passed | 3 / 4 |' in body
-                       and '| Failed | 1 |' in body and '| gamma |' in body
-                       and '**FAIL**' in body)
-            # console and file report the SAME pass/fail counts
-            same_counts = (console_ok and file_ok)
+            good_path = os.path.join(tmp, 'logs', 'selftest_report.md')
+            wrote = _st.write_selftest_report(md, good_path)
+            with open(good_path, encoding='utf-8') as f:
+                body = f.read()
+            file_ok = (wrote is True and 'Total: 5   Passed: 3   Failed: 2' in body
+                       and '| beta |' in body and '✅' not in body
+                       and body.encode('ascii', 'strict'))   # raises if non-ASCII slipped in
 
-            ok = (counts_ok and lists_failed and neg_is_pass and console_ok and file_ok
-                  and same_counts)
-            detail = (f"total=4 passed={summary['passed']} failed={summary['failed']} "
-                      f"lists_failed={lists_failed} neg_is_PASS={neg_is_pass} "
-                      f"console_ok={console_ok} md_file_ok={file_ok}")
+            # JOB 1: a forced write-ERROR is caught NON-FATALLY (returns False, never raises).
+            blocker = os.path.join(tmp, 'blocker')
+            with open(blocker, 'w') as f:
+                f.write('x')                          # a FILE where a dir is needed
+            bad_path = os.path.join(blocker, 'sub', 'selftest_report.md')
+            write_failed_safely = (_st.write_selftest_report(md, bad_path) is False)
+
+            # the 0-failed branch prints the "No failures" line above the table.
+            s_all_pass = _st.build_selftest_summary({1: (PASS, 'a'), 2: (PASS, 'b')},
+                                                    {1: 'a', 2: 'b'})
+            nofail_line = ('No failures -- all 2 passed.'
+                           in _st.render_summary(s_all_pass, meta, emoji=False))
+
+            ok = (counts_ok and sort_ok and neg_is_pass and header_ok and failed_first
+                  and ascii_only and file_ok and write_failed_safely and nofail_line)
+            detail = (f"Total=5 Passed={s['passed']} Failed={s['failed']} "
+                      f"failed_first={failed_first} order={order} neg_PASS={neg_is_pass} "
+                      f"ascii_file={bool(file_ok)} write_error_caught={write_failed_safely}")
         except Exception as e:
             self._record(186, FAIL, f"raised: {e!r}")
             if tmp:
@@ -6555,26 +6547,19 @@ class SelfTest:
                  else 'FORCED OFF (funded)')
         meta = {'build': build, 'ts': ts, 'account': account, 'server': server,
                 'watchdog': watchdog, 'rogue': rogue}
-        # --- console block ---
-        console = render_summary_console(summary, meta)
+        # --- console block (may use glyphs) ---
+        console = render_summary(summary, meta, emoji=True)
         print(console, flush=True)
         try:
             log.info("\n" + console)
         except Exception:
             pass
-        # --- markdown file (overwrite each run: latest only; history lives in aureon.log) ---
-        try:
-            import os as _os
-            md = render_summary_markdown(summary, meta)
-            log_dir = _os.path.join(".", "logs")
-            _os.makedirs(log_dir, exist_ok=True)
-            path = _os.path.join(log_dir, "selftest_report.md")
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(md)
-            _os.replace(tmp, path)               # atomic overwrite
-        except Exception as e:
-            log.warning(f"selftest report write non-fatal: {e!r}")
+        # --- .md file: SAME content, ASCII PASS/FAIL, utf-8, overwrite (latest only;
+        #     history lives in aureon.log). write_selftest_report is fully guarded so a
+        #     write failure logs ONE warning and can NEVER fail the suite. ---
+        import os as _os
+        md = render_summary(summary, meta, emoji=False)
+        write_selftest_report(md, _os.path.join(".", "logs", "selftest_report.md"))
 
 
 def run_selftest(cfg, force: bool = False) -> bool:
