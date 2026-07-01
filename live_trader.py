@@ -1235,6 +1235,12 @@ class LiveTrader:
 
     def _tick(self):
         self._tick_counter += 1
+        # 0. Inbound commands FIRST, every loop. Manual commands (flatten / pause / resume /
+        # today_summary / rogueseed) MUST be consumed even when the market-closed guard below
+        # early-returns -- otherwise a queued command (e.g. rogueseed after a mid-day restart,
+        # while the feed is briefly stale) sits UNREAD in commands.json and never fires. This
+        # is idempotent: _consume_commands clears the file, so a command runs exactly once.
+        self._handle_commands()
         # v3.0.0 commit 4: weekend/holiday self-sleep. If the market has closed
         # while we were running (Friday EOD onward), enter the SAME deep-sleep
         # used at startup and only return Monday when ticks are fresh again.
@@ -1277,8 +1283,8 @@ class LiveTrader:
         except Exception:
             pass
 
-        # 4. Handle inbound commands
-        self._handle_commands()
+        # 4. (inbound commands now handled at step 0, before the market-closed guard, so a
+        #     queued command is never stranded unread when the feed looks stale.)
 
         # 5. Kill switch?
         if self._check_kill_switch() and not self.state['kill_switch_locked']:

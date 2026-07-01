@@ -756,9 +756,15 @@ def enqueue_seed_command(cfg):
         cmds.append({"cmd": "rogueseed"})
         with open(path, "w") as f:
             _json.dump(cmds, f)
-        log.info(f"{ROGUE_ALERT_PREFIX} rogueseed queued -> {path}. The running bot will "
-                 f"plant the Rogue anchor at its current tick (DEMO-only; funded refuses; "
-                 f"requires rogue_a1_anchor_mode ON).")
+        # Log the ABSOLUTE path so a run_dir mismatch (the launcher and the running bot
+        # resolving AUREON_RUN_DIR / cwd differently) is immediately visible: this path MUST
+        # match the running bot's run_dir/commands.json, or the bot will never see it.
+        abspath = _os.path.abspath(path)
+        log.info(f"{ROGUE_ALERT_PREFIX} rogueseed queued -> {abspath} "
+                 f"(AUREON_RUN_DIR={_os.environ.get('AUREON_RUN_DIR', '<unset:./run>')}). "
+                 f"The running bot consumes this each tick and plants the Rogue anchor at its "
+                 f"current tick (DEMO-only; funded refuses; requires rogue_a1_anchor_mode ON). "
+                 f"If nothing happens, confirm this path matches the bot's run dir.")
         return 0
     except Exception as e:
         log.error(f"{ROGUE_ALERT_PREFIX} rogueseed enqueue failed: {e!r}")
