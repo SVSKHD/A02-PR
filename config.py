@@ -296,6 +296,18 @@ class Config:
     # of rally_boosts_enabled. Default True => current behavior unchanged. Gated in
     # boosts.plan_boost_event. NOTE: distinct from the pre-existing master
     # rescue_boost_enabled (No-OCO sibling-as-rescue scan switch) above.
+    # --- F-B: trapped-leg CAPPED late-rescue (No-OCO whipsaw), DEFAULT OFF -------
+    # Today a No-OCO LOSING straddle leg is boost_rally_only (allow_rescue=False) and
+    # rides NAKED to its full -$18 SL (-$630 @ 0.35). F-B lets that trapped leg arm a
+    # CAPPED late-rescue hedge (opposite direction) once it is trapped_rescue_arm_dollars
+    # adverse from its fill, so the slide to the SL is partly recovered. CRITICAL: the
+    # late hedge has its OWN hard SL (trapped_rescue_sl_dollars) + a per-event combined
+    # cap -- a naked late hedge would DOUBLE the loss on a reverse-whipsaw; this bounds
+    # it. Anchor-side ONLY (never touches a Rogue 20260626 ticket). DEFAULT OFF =>
+    # byte-identical (the losing leg still rides to -$630) until the owner flips it.
+    trapped_late_rescue_enabled: bool = False   # F-B master flag (DEFAULT OFF, freeze-safe)
+    trapped_rescue_arm_dollars: float = 10.0    # $ adverse from fill before the hedge arms
+    trapped_rescue_sl_dollars: float = 13.0     # the late hedge's OWN hard SL ($/leg)
     boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
     # armed from the instant the boost fills, alongside the $10 hard SL backstop
     # (both live; whichever hits first closes the boost). One-way ratchet; once a

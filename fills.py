@@ -601,6 +601,23 @@ def _check_boost_triggers(self):
         fill_px = float(shadow.get('leg_fill_price', shadow['entry_price']))
         rally_only = bool(shadow.get('boost_rally_only', False))
         leg_fav = (mid - fill_px) if side == 'BUY' else (fill_px - mid)
+        # F-B (flag-gated, DEFAULT OFF): a TRAPPED No-OCO losing straddle leg (rally_only ->
+        # rescue suppressed, normally rides naked to its -$18 SL) may arm a CAPPED late-
+        # rescue hedge (OPPOSITE dir, OWN $13 SL + per-event cap) once it is
+        # trapped_rescue_arm_dollars adverse. Flag OFF -> plan_trapped_late_rescue returns
+        # None -> this block is a no-op (byte-identical). Anchor-side only: Rogue legs
+        # (magic 20260626) are not in shadow_positions and are never boost_rally_only, so
+        # this can never touch a Rogue ticket. Fires once per trapped leg.
+        if (rally_only and not shadow.get('trapped_rescue_fired')
+                and bool(getattr(self.cfg, 'trapped_late_rescue_enabled', False))):
+            try:
+                _lr = boosts.plan_trapped_late_rescue(side, fill_px, mid, self.cfg)
+            except Exception:
+                _lr = None
+            if _lr is not None:
+                shadow['trapped_rescue_fired'] = True   # one late-rescue per trapped leg
+                self._fire_boost_event(ticket, shadow, _lr)
+                continue
         # winning side arms at the rally arm ($5); losing side at the rescue arm ($10).
         crossed = (leg_fav >= rally_arm) or (leg_fav <= -rescue_arm)
         try:
