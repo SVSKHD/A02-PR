@@ -255,6 +255,8 @@ STEP_NAMES = {
     186: "selftest summary",
     # Rogue manual current-tick seed command
     187: "rogue manual seed",
+    # rogueseed command consumed by the live loop (idempotent)
+    188: "rogueseed consume",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5969,6 +5971,83 @@ class SelfTest:
                 shutil.rmtree(tmp, ignore_errors=True)
         self._record(187, PASS if ok else FAIL, detail)
 
+    def _step_rogueseed_consume(self):
+        # 188 the RUNNING loop consumes a queued rogueseed (bugfix). Drives the REAL bound
+        # LiveTrader._handle_commands / _consume_commands against a commands.json holding
+        # [{"cmd":"rogueseed"}]:
+        #  (a) the loop CONSUMES it -> plants the anchor at the current tick + logs MANUAL SEED;
+        #  (b) the command is REMOVED from commands.json (cleared to []);
+        #  (c) a SECOND loop does NOT replant (idempotent -- fires exactly once);
+        #  (d) a FUNDED account refuses (no seed planted); and
+        #  (e) isolation: the anchor 20260522 ticket is never touched.
+        import live_trader as _lt, rogue as _r, dataclasses, types, os, json, tempfile
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_seedconsume_')
+
+            def _mk(demo, mid=4100.0):
+                closed = []
+                mt5 = types.SimpleNamespace(
+                    ACCOUNT_TRADE_MODE_DEMO=0,
+                    account_info=lambda: types.SimpleNamespace(trade_mode=(0 if demo else 2)),
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
+                        bid=mid - 0.1, ask=mid + 0.1))
+                ad = types.SimpleNamespace(
+                    mt5=mt5, close_position=lambda tk, dry_run=False: closed.append(int(tk)))
+                cfg = dataclasses.replace(self.cfg, rogue_enabled=True,
+                                          rogue_a1_anchor_mode=True)
+                cpath = os.path.join(tmp, f"commands_{'demo' if demo else 'funded'}.json")
+                json.dump([{"cmd": "rogueseed"}], open(cpath, "w"))   # launcher queued it
+                stub = types.SimpleNamespace(
+                    commands_path=cpath, adapter=ad, cfg=cfg, paper=True, _rogue=None,
+                    state={'last_broker_date': '2026-06-29'},
+                    tele=types.SimpleNamespace(info=lambda *a, **k: None,
+                                               warn=lambda *a, **k: None),
+                    shadow_positions={55: {'anchor_label': 'A1', 'magic': 20260522,
+                                           'leg_fill_price': 3980.0}})
+                # bind the REAL production consumer methods
+                stub._consume_commands = types.MethodType(
+                    _lt.LiveTrader._consume_commands, stub)
+                stub._handle_commands = types.MethodType(
+                    _lt.LiveTrader._handle_commands, stub)
+                return stub, cpath, closed
+
+            # DEMO: consume -> plant -> clear -> idempotent
+            tr, cpath, closed = _mk(True)
+            tr._handle_commands()                                   # (a) the per-tick poll
+            planted = (tr._rogue is not None
+                       and abs(tr._rogue.get('a1_last_close', 0) - 4100.0) < 1e-9)
+            cleared = (json.load(open(cpath)) == [])                # (b) command removed
+            # (c) idempotent: a second loop must NOT replant (file already empty)
+            tr._rogue['a1_last_close'] = None
+            tr._handle_commands()
+            idempotent = (tr._rogue.get('a1_last_close') is None)
+
+            # (d) FUNDED refuses -> no seed planted, but the command is still consumed once
+            trf, cpathf, _cf = _mk(False)
+            trf._handle_commands()
+            funded_refused = (trf._rogue is None
+                              or trf._rogue.get('a1_last_close') is None)
+
+            # (e) isolation: the anchor 20260522 ticket #55 was never closed
+            iso_ok = (55 not in closed and tr.shadow_positions[55]['magic'] == 20260522)
+
+            ok = planted and cleared and idempotent and funded_refused and iso_ok
+            detail = (f"(a)consumed+planted={planted} (b)file_cleared={cleared} "
+                      f"(c)idempotent_no_replant={idempotent} (d)funded_refused={funded_refused} "
+                      f"(e)isolation={iso_ok}")
+        except Exception as e:
+            self._record(188, FAIL, f"raised: {e!r}")
+            if tmp:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(188, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -6578,6 +6657,8 @@ class SelfTest:
             self._step_selftest_summary()
             # Rogue manual current-tick seed command
             self._step_rogue_manual_seed()
+            # rogueseed command consumed by the live loop (idempotent)
+            self._step_rogueseed_consume()
         finally:
             self._cleanup()
         return self._report(ts)
