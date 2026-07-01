@@ -257,6 +257,8 @@ STEP_NAMES = {
     187: "rogue manual seed",
     # rogueseed command consumed by the live loop (idempotent)
     188: "rogueseed consume",
+    # E-3 CHAIN: ANY Rogue close re-anchors the A1 redesign at the exit (no dormancy)
+    189: "rogue e3 chain",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -6048,6 +6050,122 @@ class SelfTest:
                 shutil.rmtree(tmp, ignore_errors=True)
         self._record(188, PASS if ok else FAIL, detail)
 
+    def _step_r7_rogue_e3_chain(self):
+        # 189 (E-3 CHAIN): on ANY Rogue close the A1 redesign clears st['open'], re-anchors at
+        # the EXIT price, and keeps hunting -> a fresh $10 move fires a SECOND entry (proves the
+        # chain, no dormancy). Verified for a TRAILING-profit close AND an init-SL close; brakes
+        # still gate the next entry; the anchor 20260522 ticket is NEVER touched.
+        import rogue as _r, dataclasses, types
+        try:
+            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
+                                      rogue_entry_confirm_redesign=10.0,
+                                      rogue_reversal_dollars=10.0, rogue_daily_loss_stop=-525.0)
+
+            def mk():
+                # a controllable A1-mode trader: env['book'] = live broker positions;
+                # env['deal'] = the close deal surfaced once the ticket leaves the book.
+                env = {'price': None, 'book': {}, 'deal': None, 'orders': [], 'logs': []}
+                def place_market_order(sym, side, lot, sl=None, tp=None, magic=None,
+                                       comment=None, dry_run=False):
+                    tk = 900000 + len(env['orders']) + 1
+                    env['orders'].append({'ticket': tk, 'side': side})
+                    env['book'][tk] = True
+                    return types.SimpleNamespace(order=tk, deal=tk, retcode=10009)
+                def positions_get(ticket=None):
+                    return [object()] if env['book'].get(int(ticket)) else []
+                def history_deals_get(position=None):
+                    d = env['deal']
+                    return ([types.SimpleNamespace(entry=1, profit=d['pnl'], price=d['price'],
+                                                   swap=0.0, commission=0.0)]
+                            if (d and int(position) == int(d['ticket'])) else [])
+                def close_position(tk, dry_run=False):
+                    env['book'].pop(int(tk), None)
+                mt5 = types.SimpleNamespace(
+                    positions_get=positions_get, history_deals_get=history_deals_get,
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
+                        bid=env['price'], ask=env['price']),
+                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
+                    ACCOUNT_TRADE_MODE_DEMO=0)
+                ad = types.SimpleNamespace(
+                    mt5=mt5, place_market_order=place_market_order,
+                    modify_position_sl=lambda tk, sl: None, close_position=close_position)
+                tr = types.SimpleNamespace(
+                    cfg=cfg, paper=True, adapter=ad, _last_boost_mid=None,
+                    state={'last_broker_date': '2026-07-01'},
+                    tele=types.SimpleNamespace(
+                        info=lambda *a, **k: env['logs'].append(a[0] if a else ''),
+                        warn=lambda *a, **k: None))
+                tr._rogue = {'day': '2026-07-01', 'gov': _r.new_day_state(), 'anchor': None,
+                             'leg_dir': None, 'open': None, 'a1_last_close': None,
+                             'a1_reverted': False}
+                return tr, env
+
+            def tick(tr, env, price, close=None):
+                env['price'] = float(price)
+                tr._last_boost_mid = float(price)
+                if close is not None:            # broker closes the open ticket at (pnl, exit)
+                    o = tr._rogue.get('open') or {}
+                    tk = o.get('ticket')
+                    if tk is not None:
+                        env['book'].pop(int(tk), None)
+                        env['deal'] = {'ticket': tk, 'pnl': close[0], 'price': close[1]}
+                _r._drive_a1(tr, tr._rogue)
+
+            # (A) TRAILING-profit close chains to a SECOND entry.
+            trA, envA = mk()
+            envA['book'][self._R_ANCHOR_TK] = True     # an anchor 20260522 leg is present
+            _r.manual_seed(trA, 3984.0)                # seed (mid-day restart, no A1 event)
+            tick(trA, envA, 3974.0)                    # -$10 -> ENTER SELL #1
+            entered1 = (trA._rogue.get('open') is not None
+                        and (trA._rogue['open'] or {}).get('side') == 'SELL')
+            tick(trA, envA, 3950.0, close=(206.50, 3953.0))    # trailing-profit CLOSE
+            closedA = trA._rogue.get('open') is None
+            reanchoredA = abs((trA._rogue.get('a1_last_close') or 0) - 3953.0) < 1e-9
+            dayA = abs(trA._rogue['gov']['day_pnl'] - 206.50) < 1e-9
+            chain_logged = any('CHAIN re-anchor' in str(m) and 'hunting $10 both dirs' in str(m)
+                               for m in envA['logs'])
+            tick(trA, envA, 3963.0)                    # +$10 off 3953 exit -> SECOND entry
+            entered2 = (trA._rogue.get('open') is not None
+                        and trA._rogue['gov']['reanchor_count'] == 2)
+            iso_A = self._R_ANCHOR_TK in envA['book']  # the anchor ticket was never closed
+            trailing_ok = (entered1 and closedA and reanchoredA and dayA and chain_logged
+                           and entered2 and iso_A)
+
+            # (B) init-SL close ALSO chains to a SECOND entry (fail streak advances, still trades).
+            trB, envB = mk()
+            _r.manual_seed(trB, 4000.0)
+            tick(trB, envB, 4010.0)                    # +$10 -> ENTER BUY #1
+            tick(trB, envB, 4005.0, close=(-5.0, 4005.0))      # init-SL fake-out CLOSE
+            closedB = trB._rogue.get('open') is None
+            reanchoredB = abs((trB._rogue.get('a1_last_close') or 0) - 4005.0) < 1e-9
+            failB = trB._rogue['gov']['consec_fails'] == 1
+            tick(trB, envB, 4015.0)                    # +$10 off 4005 exit -> SECOND entry
+            entered2B = (trB._rogue.get('open') is not None
+                         and trB._rogue['gov']['reanchor_count'] == 2)
+            sl_ok = (closedB and reanchoredB and failB and entered2B)
+
+            # (C) brakes still gate: after a loss past the daily stop, the chain does NOT re-enter.
+            trC, envC = mk()
+            _r.manual_seed(trC, 4000.0)
+            tick(trC, envC, 4008.0)                    # +$8 -> no entry yet (holds)
+            tick(trC, envC, 4010.0)                    # +$10 -> ENTER BUY #1
+            tick(trC, envC, 4002.0, close=(-600.0, 4002.0))    # catastrophic CLOSE (< -$525)
+            stoppedC = trC._rogue['gov']['loss_stopped'] is True
+            cntC = trC._rogue['gov']['reanchor_count']
+            tick(trC, envC, 4012.0)                    # +$10 off 4002 exit, but brake blocks
+            braked = (trC._rogue.get('open') is None
+                      and trC._rogue['gov']['reanchor_count'] == cntC)
+            brake_ok = stoppedC and braked
+
+            ok = trailing_ok and sl_ok and brake_ok
+            detail = (f"trailing[e1={entered1} closed={closedA} reanchor@3953={reanchoredA} "
+                      f"day={dayA} chainlog={chain_logged} e2={entered2} iso={iso_A}] "
+                      f"sl[reanchor@4005={reanchoredB} fail={failB} e2={entered2B}] "
+                      f"brake[stopped={stoppedC} no_reentry={braked}]")
+        except Exception as e:
+            self._record(189, FAIL, f"raised: {e!r}"); return
+        self._record(189, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -6659,6 +6777,8 @@ class SelfTest:
             self._step_rogue_manual_seed()
             # rogueseed command consumed by the live loop (idempotent)
             self._step_rogueseed_consume()
+            # E-3 CHAIN: ANY Rogue close re-anchors the A1 redesign at the exit (no dormancy)
+            self._step_r7_rogue_e3_chain()
         finally:
             self._cleanup()
         return self._report(ts)

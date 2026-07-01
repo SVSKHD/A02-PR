@@ -578,11 +578,31 @@ def _rogue_close_pnl(trader, ticket):
         return None
 
 
+def _rogue_close_price(trader, ticket):
+    """Exit PRICE of a CLOSED Rogue position from its broker close deal (entry==1). Used to
+    re-anchor the A1 chain at the level Rogue actually got out. Returns None if the close deal
+    isn't in history yet (the caller then falls back to the last stop). READ-ONLY."""
+    try:
+        deals = trader.adapter.mt5.history_deals_get(position=int(ticket)) or []
+        cd = next((d for d in deals if getattr(d, 'entry', None) == 1), None)
+        if cd is None:
+            return None
+        return float(cd.price)
+    except Exception:
+        return None
+
+
 def detect_close(trader, st):
     """E-2/E-3: detect a BROKER-side close of the open Rogue position and book it ONCE --
     update the day-governor via record_close (day_pnl / consec_fails / loss_stopped /
     fail_paused) and clear st['open'] so Rogue can re-enter the same day AND the patternlog
     observe() close branch runs. Returns True if a close was booked.
+
+    E-3 CHAIN: the moment a close is booked, re-anchor the A1 redesign at the EXIT price
+    (st['a1_last_close']) so Rogue keeps hunting the next $10 move BOTH directions after ANY
+    close (SL / TP / trailing) instead of going dormant after one. A reversal-recovery leg
+    (a1_reverted) keeps its own entry-based anchor; the legacy monster path (a1 mode OFF) is
+    untouched. Gated on the existing brakes (can_enter) at the next-entry site.
 
     ISOLATION: only ever inspects st['open']'s OWN ticket and issues NO close (the broker
     SL/TP already closed it) -- it can NEVER touch an anchor (20260522) ticket. Rogue P&L
@@ -604,6 +624,20 @@ def detect_close(trader, st):
     was_fail = float(pnl) <= 0.0         # a non-winning close = init-SL fake-out (winner resets)
     record_close(st['gov'], pnl, was_fail, trader.cfg)
     st['open'] = None
+    # E-3 CHAIN re-anchor (A1 redesign only): plant the exit as the next chain target so the
+    # engine re-anchors there and hunts the next $10 move both ways. A reversal recovery keeps
+    # its own entry anchor (a1_reverted); legacy monster mode (flag OFF) is unaffected. Guarded.
+    try:
+        if bool(getattr(trader.cfg, 'rogue_a1_anchor_mode', False)) and not st.get('a1_reverted'):
+            exit_px = _rogue_close_price(trader, tk)
+            if exit_px is None:
+                exit_px = o.get('sl')          # trailing/init stop that fired ~= the exit
+            if exit_px is not None:
+                st['a1_last_close'] = float(exit_px)
+                trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} CHAIN re-anchor @ "
+                                 f"{float(exit_px):.2f} -> hunting $10 both dirs")
+    except Exception:
+        pass
     try:
         g = st['gov']
         brake = ('LOSS-STOP' if g.get('loss_stopped')
