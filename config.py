@@ -208,6 +208,25 @@ class Config:
     # flag is turned on. An untrained model / any predict error scores 1.0 (fail OPEN).
     rogue_model_gate_enabled: bool = False   # gate inert until proven
     rogue_model_threshold: float = 0.5       # min follow-through confidence to ENTER (when on)
+    # --- Fix 4: Rogue A1-ANCHORED REDESIGN (NEW ENGINE, DEFAULT OFF) -------------
+    # rogue_a1_anchor_mode OFF (default) -> the legacy monster-detection Rogue runs
+    # byte-identically. ON -> a NEW engine: ANCHOR seeds from the day's A1 anchor price
+    # (READ-ONLY cross-read from the anchor engine) and thereafter chains to the last
+    # CLOSED Rogue level (no monster-detection wait); ENTRY fires once price moves
+    # rogue_entry_confirm_redesign ($10) off the anchor, in the move direction, with a
+    # tight init SL; same-dir CONTINUATION rides via the existing trail/rally machinery;
+    # a confirmed REVERSAL (price crosses entry AND moves rogue_reversal_dollars ($10) PAST
+    # entry against the trade -- measured in DOLLARS, not candles) closes the wrong-way leg
+    # and recovers in the NEW direction (capped, NOT a two-way hedge). rogue_daily_soft_lock
+    # ($30) is a soft floor that is BANKED but NEVER a hard stop (keep hunting). The BRAKE
+    # is Fix 3's live daily loss stop + rogue_rescue_cap_dollars ($13) per recovery leg.
+    # Engine-gated keys: inert/no-op while rogue_a1_anchor_mode is OFF. Rogue-only
+    # (magic 20260626); the A1 read is READ-ONLY and never closes an anchor 20260522 leg.
+    rogue_a1_anchor_mode: bool = False          # Fix 4 master flag (DEFAULT OFF, freeze-safe)
+    rogue_entry_confirm_redesign: float = 10.0  # $ off the anchor to ENTER in the move dir
+    rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
+    rogue_daily_soft_lock: float = 30.0         # soft banked floor ($) -- NEVER a hard stop
+    rogue_rescue_cap_dollars: float = 13.0      # per-recovery-leg SL cap on a reversal
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose

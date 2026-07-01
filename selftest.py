@@ -249,6 +249,8 @@ STEP_NAMES = {
     183: "rogue stop -525",
     # F-B: trapped-leg capped late-rescue (No-OCO whipsaw), DEFAULT OFF
     184: "fb late rescue",
+    # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
+    185: "fix4 rogue a1",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5514,6 +5516,121 @@ class SelfTest:
             self._record(183, FAIL, f"raised: {e!r}"); return
         self._record(183, PASS if ok else FAIL, detail)
 
+    def _step_fix4_rogue_a1(self):
+        # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
+        # PURE cores + gating + isolation:
+        #  (a) OFF -> drive() does NOT call _drive_a1 (legacy byte-identical); ON -> it does.
+        #  (b) anchor SEEDS from A1 when no prior close; CHAINS to last close otherwise.
+        #  (c) entry fires at exactly $10 off the anchor in the correct direction; <$10 holds.
+        #  (d) reversal: $10 PAST entry against the trade -> confirmed; <$10 -> holds (pause).
+        #  (e) $30 soft lock is BANKED but does NOT block new entries (never a hard stop).
+        #  (f) whipsaw day: braked -> can_enter halts at rogue_daily_loss_stop (value-agnostic).
+        #  (g) per-rescue cap is finite (bounded recovery).
+        #  (h) isolation: the A1 read is READ-ONLY; a reversal closes ONLY the ROGUE ticket,
+        #      never an anchor 20260522 ticket.
+        import rogue as _r, dataclasses, types
+        try:
+            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True,
+                                      rogue_enabled=True,   # so should_run passes the gate
+                                      rogue_entry_confirm_redesign=10.0,
+                                      rogue_reversal_dollars=10.0,
+                                      rogue_daily_soft_lock=30.0,
+                                      rogue_rescue_cap_dollars=13.0)
+            # (b) seed / chain
+            seed_a1 = (_r.a1_seed_anchor(None, 4000.0) == 4000.0)
+            chain = (_r.a1_seed_anchor(4050.0, 4000.0) == 4050.0)
+            # (c) entry
+            e_buy = _r.a1_entry_decision(4000.0, 4010.0, cfg)   # +$10 -> BUY
+            e_sell = _r.a1_entry_decision(4000.0, 3990.0, cfg)  # -$10 -> SELL
+            e_hold = _r.a1_entry_decision(4000.0, 4005.0, cfg)  # +$5 -> none
+            entry_ok = (e_buy[:2] == (True, 'BUY') and abs(e_buy[2] - 4010.0) < 1e-9
+                        and abs(e_buy[3] - 4005.0) < 1e-9
+                        and e_sell[:2] == (True, 'SELL') and abs(e_sell[3] - 3995.0) < 1e-9
+                        and e_hold[0] is False)
+            # (d) reversal
+            rev_buy = _r.a1_reversal_confirmed(4010.0, 'BUY', 4000.0, cfg)   # -$10 -> True
+            hold_buy = _r.a1_reversal_confirmed(4010.0, 'BUY', 4004.0, cfg)  # -$6 -> False
+            rev_sell = _r.a1_reversal_confirmed(3990.0, 'SELL', 4000.0, cfg)  # +$10 -> True
+            reversal_ok = (rev_buy is True and hold_buy is False and rev_sell is True)
+            # (e) soft lock banks, does NOT block
+            gov = _r.new_day_state(); gov['day_pnl'] = 30.0
+            soft = (_r.a1_soft_lock_met(30.0, cfg) is True
+                    and _r.a1_soft_lock_met(29.0, cfg) is False
+                    and _r.can_enter(gov, cfg)[0] is True)   # +$30 day STILL trades
+            # (f) brake: a losing day halts at the daily loss stop (value-agnostic)
+            g2 = _r.new_day_state()
+            _r.record_close(g2, float(cfg.rogue_daily_loss_stop) - 1.0, True, cfg)
+            braked = (_r.can_enter(g2, cfg)[0] is False
+                      and _r.can_enter(g2, cfg)[1] == 'daily_loss_stop')
+            # (g) cap finite
+            cap = _r.a1_rescue_cap(cfg)
+            cap_ok = (cap > 0 and abs(cap - (int(cfg.rescue_boost_count) * 13.0
+                      * float(cfg.lot_size) * 100.0)) < 1e-6)
+
+            # (a) gating: drive() routes to _drive_a1 ONLY when the flag is ON.
+            sentinel = {'a1': 0}
+            orig = _r._drive_a1
+            _r._drive_a1 = lambda tr, st: sentinel.__setitem__('a1', sentinel['a1'] + 1)
+            def _mk(a1_on):
+                mt5 = types.SimpleNamespace(
+                    ACCOUNT_TRADE_MODE_DEMO=0,
+                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=4000.0, ask=4000.2),
+                    positions_get=lambda ticket=None: [])
+                ad = types.SimpleNamespace(mt5=mt5, get_latest_m5=lambda s, n: [],
+                                           close_position=lambda *a, **k: None)
+                c = dataclasses.replace(cfg, rogue_a1_anchor_mode=a1_on)
+                return types.SimpleNamespace(cfg=c, adapter=ad, paper=True,
+                                             state={'last_broker_date': '2026-06-29'},
+                                             _rogue=None, _last_boost_mid=4000.0,
+                                             tele=types.SimpleNamespace(info=lambda *a, **k: None))
+            try:
+                _r.drive(_mk(False)); off_legacy = (sentinel['a1'] == 0)
+                _r.drive(_mk(True));  on_a1 = (sentinel['a1'] == 1)
+            finally:
+                _r._drive_a1 = orig
+            gating_ok = off_legacy and on_a1
+
+            # (h) isolation: a reversal closes ONLY the ROGUE ticket; A1 read is read-only.
+            closed = []
+            mt5 = types.SimpleNamespace(
+                ACCOUNT_TRADE_MODE_DEMO=0,
+                account_info=lambda: types.SimpleNamespace(trade_mode=0),
+                symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=3998.0, ask=3998.2),
+                positions_get=lambda ticket=None: [],   # rogue ticket already gone
+                history_deals_get=lambda position=None: [
+                    types.SimpleNamespace(entry=1, profit=-175.0, swap=0.0, commission=0.0)])
+            ad = types.SimpleNamespace(
+                mt5=mt5, get_latest_m5=lambda s, n: [],
+                close_position=lambda tk, dry_run=False: closed.append(int(tk)))
+            tr = types.SimpleNamespace(
+                cfg=cfg, adapter=ad, paper=True, state={'last_broker_date': '2026-06-29'},
+                _last_boost_mid=4000.0,
+                tele=types.SimpleNamespace(info=lambda *a, **k: None),
+                # an ANCHOR leg (magic 20260522) is in the book; it must NOT be touched.
+                shadow_positions={55: {'anchor_label': 'A1', 'leg_fill_price': 3980.0,
+                                       'magic': 20260522}})
+            tr._rogue = {'day': '2026-06-29', 'gov': _r.new_day_state(),
+                         'anchor': 4010.0, 'leg_dir': 'BUY', 'open':
+                         {'ticket': 99, 'side': 'BUY', 'entry': 4010.0, 'sl': 4005.0,
+                          'peak': 4010.0, 'magic': _r.ROGUE_MAGIC,
+                          'leg_type': _r.ROGUE_LEG_TYPE}}
+            a1_read = _r._a1_anchor_price(tr)                    # read-only A1 price
+            _r._drive_a1(tr, tr._rogue)                          # price 4000 = -$10 -> reversal
+            iso_ok = (closed == [99]                             # ONLY the rogue ticket
+                      and 55 not in closed                       # NEVER the anchor 20260522
+                      and abs((a1_read or 0) - 3980.0) < 1e-9    # A1 read worked, read-only
+                      and tr.shadow_positions[55]['leg_fill_price'] == 3980.0)  # untouched
+
+            ok = (seed_a1 and chain and entry_ok and reversal_ok and soft and braked
+                  and cap_ok and gating_ok and iso_ok)
+            detail = (f"(a)gate_off={off_legacy}/on={on_a1} (b)seed={seed_a1}&chain={chain} "
+                      f"(c)entry={entry_ok} (d)reversal={reversal_ok} (e)soft_banks={soft} "
+                      f"(f)brake={braked} (g)cap=${cap:.0f} (h)isolation={iso_ok}")
+        except Exception as e:
+            self._record(185, FAIL, f"raised: {e!r}"); return
+        self._record(185, PASS if ok else FAIL, detail)
+
     def _step_fb_trapped_late_rescue(self):
         # 184 F-B: trapped-leg CAPPED late-rescue (No-OCO whipsaw), flag-gated DEFAULT OFF.
         # (a) flag OFF -> plan is None (byte-identical: the trapped loser rides to its full
@@ -6160,6 +6277,8 @@ class SelfTest:
             self._step_e5_rogue_stop_525()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
+            # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
+            self._step_fix4_rogue_a1()
         finally:
             self._cleanup()
         return self._report(ts)
