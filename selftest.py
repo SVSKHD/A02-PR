@@ -251,9 +251,140 @@ STEP_NAMES = {
     184: "fb late rescue",
     # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
     185: "fix4 rogue a1",
+    # selftest auto-summary reporter (report-only)
+    186: "selftest summary",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
+
+# --- selftest auto-summary reporter (report-only; NO trading/test behavior change) ----
+# Coarse step groups for the one-line "Groups:" digest. Each group is ✅ unless any step
+# in its range is marked FAIL. Ranges are inclusive and cover 1..top contiguously.
+SUMMARY_GROUPS = [
+    ("Connection/orders", 1, 9),
+    ("Alerts/trails", 10, 54),
+    ("FP/stacks", 55, 73),
+    ("Ticks/incidents", 74, 105),
+    ("Overrides/pullback", 106, 131),
+    ("Rogue core", 132, 147),
+    ("v3.5 all-16", 148, 161),
+    ("Watchdog/ML", 162, 165),
+    ("Feed/brakes/boost-ride", 166, 182),
+    ("Fixes E5/F-B/Fix4", 183, 185),
+]
+
+
+def build_selftest_summary(results, step_names):
+    """PURE: reduce the harness result dict {step:(status,detail)} to a summary. The FAILED
+    count reflects REAL failures ONLY -- a test is failed IFF the harness marked its status
+    FAIL (the SAME signal that populates failed_tests=[]). Negative tests that intentionally
+    log ERROR/violation lines but are RECORDED as PASS are counted as PASS (we never grep for
+    the word ERROR). Returns a dict: total/passed/failed/skipped/warned counts, failed[] list
+    of (step,name,detail), and groups[] of (label, lo, hi, mark). PURE."""
+    total = len(step_names)
+    passed = failed = skipped = warned = 0
+    failed_list = []
+    for n in range(1, total + 1):
+        status, detail = results.get(n, (FAIL, "did not run"))
+        if status == PASS:
+            passed += 1
+        elif status == FAIL:
+            failed += 1
+            failed_list.append((n, step_names.get(n, f"step {n}"), detail))
+        elif status == SKIP:
+            skipped += 1
+        elif status == WARN:
+            warned += 1
+        else:
+            failed += 1                       # unknown status = treat as a failure
+            failed_list.append((n, step_names.get(n, f"step {n}"), f"status={status}"))
+    groups = []
+    for label, lo, hi in SUMMARY_GROUPS:
+        present = [n for n in range(lo, hi + 1) if n in results]
+        any_fail = any(results.get(n, (FAIL, ""))[0] == FAIL for n in present)
+        any_skip = any(results.get(n, ("", ""))[0] == SKIP for n in present)
+        if not present:
+            mark = "·"                        # no steps in range (below top) -> neutral
+        elif any_fail:
+            mark = "❌"
+        elif any_skip:
+            mark = "⚠"                         # ran clean but some market-steps skipped
+        else:
+            mark = "✅"
+        groups.append((label, lo, hi, mark))
+    return {'total': total, 'passed': passed, 'failed': failed, 'skipped': skipped,
+            'warned': warned, 'failed_list': failed_list, 'groups': groups}
+
+
+def render_summary_console(summary, meta):
+    """PURE: the fixed-width console SUMMARY block from build_selftest_summary + a meta dict
+    (build/ts/account/server/watchdog/rogue). Report-only text; never raises on missing meta."""
+    m = meta or {}
+    result = "PASS" if summary['failed'] == 0 else "FAIL"
+    L = []
+    L.append("=" * 20 + " AUREON SELFTEST SUMMARY " + "=" * 20)
+    L.append(f"Build: {m.get('build', '?')}   |   {m.get('ts', '?')}   |   "
+             f"Account: {m.get('account', '?')} {m.get('server', '')}".rstrip())
+    L.append(f"Result: {result}   —   {summary['passed']}/{summary['total']} passed, "
+             f"{summary['failed']} failed"
+             + (f", {summary['skipped']} skipped" if summary['skipped'] else "")
+             + (f", {summary['warned']} warned" if summary['warned'] else ""))
+    L.append(f"Watchdog: {m.get('watchdog', '?')}")
+    L.append(f"Rogue: {m.get('rogue', '?')}")
+    L.append("-" * 64)
+    if summary['failed_list']:
+        L.append(f"FAILED TESTS ({summary['failed']}):")
+        for step, name, detail in summary['failed_list']:
+            L.append(f"  {step} {name} — {detail}")
+        L.append("-" * 64)
+    groups_txt = " | ".join(f"{label} {lo}-{hi} {mark}"
+                            for (label, lo, hi, mark) in summary['groups'] if mark != "·")
+    L.append(f"Groups: {groups_txt}")
+    L.append("=" * 64)
+    return "\n".join(L)
+
+
+def render_summary_markdown(summary, meta):
+    """PURE: the markdown report (logs/selftest_report.md content) -- a Metric table, a
+    FAILED-TESTS table (or 'None — all passed'), and a per-group table. Report-only."""
+    m = meta or {}
+    result = "PASS" if summary['failed'] == 0 else "FAIL"
+    L = []
+    L.append("# AUREON Selftest Summary")
+    L.append("")
+    L.append("| Metric | Value |")
+    L.append("| --- | --- |")
+    L.append(f"| Build | {m.get('build', '?')} |")
+    L.append(f"| Timestamp (UTC) | {m.get('ts', '?')} |")
+    L.append(f"| Account | {m.get('account', '?')} {m.get('server', '')} |".replace("  |", " |"))
+    L.append(f"| Result | **{result}** |")
+    L.append(f"| Passed | {summary['passed']} / {summary['total']} |")
+    L.append(f"| Failed | {summary['failed']} |")
+    L.append(f"| Skipped | {summary['skipped']} |")
+    L.append(f"| Warned | {summary['warned']} |")
+    L.append(f"| Watchdog | {m.get('watchdog', '?')} |")
+    L.append(f"| Rogue | {m.get('rogue', '?')} |")
+    L.append("")
+    L.append(f"## Failed tests ({summary['failed']})")
+    L.append("")
+    if summary['failed_list']:
+        L.append("| Step | Name | Detail |")
+        L.append("| --- | --- | --- |")
+        for step, name, detail in summary['failed_list']:
+            safe = str(detail).replace("|", "\\|")
+            L.append(f"| {step} | {name} | {safe} |")
+    else:
+        L.append("None — all passed. ✅")
+    L.append("")
+    L.append("## Groups")
+    L.append("")
+    L.append("| Group | Steps | Status |")
+    L.append("| --- | --- | --- |")
+    for label, lo, hi, mark in summary['groups']:
+        if mark != "·":
+            L.append(f"| {label} | {lo}-{hi} | {mark} |")
+    L.append("")
+    return "\n".join(L)
 
 
 def classify_second_fill(twin_open: bool) -> str:
@@ -5674,6 +5805,65 @@ class SelfTest:
             self._record(184, FAIL, f"raised: {e!r}"); return
         self._record(184, PASS if ok else FAIL, detail)
 
+    def _step_selftest_summary(self):
+        # 186 selftest auto-summary reporter (report-only; NO trading/test behavior change).
+        # KNOWN mix: 3 PASS + 1 FAIL, plus a NEGATIVE test (step 4) whose DETAIL contains an
+        # ERROR/violation string but is RECORDED PASS -> it must count as PASS (the summary
+        # keys on STATUS, never greps for the word ERROR). Asserts the summary counts
+        # total/passed/failed, lists the failed test BY NAME, the negative test is PASS, and
+        # the markdown file carries the SAME pass/fail counts as the console block.
+        import selftest as _st, tempfile, os
+        tmp = None
+        try:
+            results = {
+                1: (PASS, 'ok'),
+                2: (PASS, 'ok'),
+                3: (FAIL, 'boom detail'),
+                4: (PASS, 'DO-NOT-START verdict + TELEMETRY_VIOLATION ERROR logged (negative)'),
+            }
+            names = {1: 'alpha', 2: 'beta', 3: 'gamma', 4: 'neg fail-open'}
+            summary = _st.build_selftest_summary(results, names)
+            counts_ok = (summary['total'] == 4 and summary['passed'] == 3
+                         and summary['failed'] == 1)
+            failed_names = [nm for (_s, nm, _d) in summary['failed_list']]
+            lists_failed = (failed_names == ['gamma'])          # the FAIL listed by name
+            neg_is_pass = ('neg fail-open' not in failed_names)  # ERROR-in-detail still PASS
+
+            meta = {'build': 5958, 'ts': '2026-07-01 01:00:00', 'account': 5051188745,
+                    'server': 'Demo', 'watchdog': 'SAFE-TO-START', 'rogue': 'PROMOTED ON (demo)'}
+            console = _st.render_summary_console(summary, meta)
+            console_ok = ('3/4 passed, 1 failed' in console and 'gamma' in console
+                          and 'Result: FAIL' in console and 'AUREON SELFTEST SUMMARY' in console)
+
+            md = _st.render_summary_markdown(summary, meta)
+            tmp = tempfile.mkdtemp(prefix='aureon_report_')
+            path = os.path.join(tmp, 'selftest_report.md')
+            with open(path, 'w') as f:
+                f.write(md)
+            body = open(path).read()
+            file_ok = (os.path.exists(path) and '| Passed | 3 / 4 |' in body
+                       and '| Failed | 1 |' in body and '| gamma |' in body
+                       and '**FAIL**' in body)
+            # console and file report the SAME pass/fail counts
+            same_counts = (console_ok and file_ok)
+
+            ok = (counts_ok and lists_failed and neg_is_pass and console_ok and file_ok
+                  and same_counts)
+            detail = (f"total=4 passed={summary['passed']} failed={summary['failed']} "
+                      f"lists_failed={lists_failed} neg_is_PASS={neg_is_pass} "
+                      f"console_ok={console_ok} md_file_ok={file_ok}")
+        except Exception as e:
+            self._record(186, FAIL, f"raised: {e!r}")
+            if tmp:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(186, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -6279,6 +6469,8 @@ class SelfTest:
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
             self._step_fix4_rogue_a1()
+            # selftest auto-summary reporter (report-only)
+            self._step_selftest_summary()
         finally:
             self._cleanup()
         return self._report(ts)
@@ -6321,9 +6513,68 @@ class SelfTest:
         print(report, flush=True)   # v3.2.1: synchronous RESULT, always surfaces
         log.info(report)
         (self.tele.success if n_fail == 0 else self.tele.error)(report)
+        # AUREON auto-summary: emit a clean pass/fail digest to console + logs/
+        # selftest_report.md AFTER the full per-test dump above. Report-only, fully
+        # guarded -- it never changes the return value / exit code below.
+        try:
+            self._emit_summary(ts)
+        except Exception as e:
+            log.warning(f"selftest summary non-fatal: {e!r}")
         # v3.2.1: telemetry is drained in run()'s finally (single drain point) so
         # the async worker isn't double-stopped here.
         return n_fail == 0
+
+    def _emit_summary(self, ts: str):
+        """Emit the AUREON SELFTEST SUMMARY (report-only) from self.results -- to console
+        AND logs/selftest_report.md (overwrite; latest only). Taps the EXISTING result
+        stream (no re-run). The FAILED count is REAL failures only (status == FAIL); the
+        negative tests that log ERROR while PASSing are counted PASS. Live meta (build /
+        account / watchdog / rogue) is gathered guardedly; any missing piece degrades to '?'
+        and never blocks the summary. Never raises; never affects the exit code."""
+        summary = build_selftest_summary(self.results, STEP_NAMES)
+        # --- gather live meta, each guarded independently ---
+        build = account = server = '?'
+        try:
+            ti = self.adapter.mt5.terminal_info()
+            build = getattr(ti, 'build', '?')
+        except Exception:
+            pass
+        try:
+            ai = self.adapter.mt5.account_info()
+            account = getattr(ai, 'login', '?')
+            server = getattr(ai, 'server', '')
+        except Exception:
+            pass
+        watchdog = '?'
+        try:
+            import aureon_validator as _v          # the REAL boot check
+            watchdog = _v.validate(self.cfg).get('verdict', '?')
+        except Exception:
+            pass
+        rogue = ('PROMOTED ON (demo)' if getattr(self, 'is_demo', False)
+                 else 'FORCED OFF (funded)')
+        meta = {'build': build, 'ts': ts, 'account': account, 'server': server,
+                'watchdog': watchdog, 'rogue': rogue}
+        # --- console block ---
+        console = render_summary_console(summary, meta)
+        print(console, flush=True)
+        try:
+            log.info("\n" + console)
+        except Exception:
+            pass
+        # --- markdown file (overwrite each run: latest only; history lives in aureon.log) ---
+        try:
+            import os as _os
+            md = render_summary_markdown(summary, meta)
+            log_dir = _os.path.join(".", "logs")
+            _os.makedirs(log_dir, exist_ok=True)
+            path = _os.path.join(log_dir, "selftest_report.md")
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(md)
+            _os.replace(tmp, path)               # atomic overwrite
+        except Exception as e:
+            log.warning(f"selftest report write non-fatal: {e!r}")
 
 
 def run_selftest(cfg, force: bool = False) -> bool:
