@@ -644,3 +644,122 @@ def eod_flatten(trader):
     except Exception as e:
         log.warning(f"{ROGUE_ALERT_PREFIX} eod_flatten non-fatal: {e!r}")
         return False
+
+
+# --- manual current-tick seed (mid-day restart: no A1 event to seed the A1-mode engine) --
+def manual_seed_ok(cfg, is_demo):
+    """PURE gate for `rogueseed`. Returns (ok, reason). Valid ONLY when rogue_a1_anchor_mode
+    is ON (else 'disabled' -- tell the user to enable it) AND the account is DEMO (funded
+    refuses, FAIL-CLOSED -- the same gate as rogue promotion). No side effects."""
+    if not bool(getattr(cfg, 'rogue_a1_anchor_mode', False)):
+        return False, 'disabled'
+    if not bool(is_demo):
+        return False, 'funded'
+    return True, 'ok'
+
+
+def manual_seed(trader, price):
+    """Plant the Rogue A1-mode anchor at `price` (the current live tick) ON DEMAND, so a
+    mid-day restart (no A1 event) can seed the Fix 4 engine without waiting for A1. Sets the
+    engine's chain target (st['a1_last_close']) to the seed; from there the EXISTING _drive_a1
+    takes over UNCHANGED -- enters on a $10 move off the seed, reversal at $10 past entry,
+    the -$525 brake, the $13 rescue cap. Adds NO new trade logic. DEMO-only + a1-mode-only
+    (manual_seed_ok); ROGUE-only (never touches an anchor 20260522 ticket). Returns
+    (ok, reason, price). Guarded; never raises."""
+    try:
+        is_demo = account_is_demo(trader)
+        ok, reason = manual_seed_ok(trader.cfg, is_demo)
+        if not ok:
+            msg = ("enable rogue_a1_anchor_mode first" if reason == 'disabled'
+                   else "DEMO-only (funded refused)")
+            log.warning(f"{ROGUE_ALERT_PREFIX} MANUAL SEED refused ({reason}): {msg}")
+            try:
+                trader.tele.warn(f"{ROGUE_ALERT_PREFIX} 🌱 manual seed refused — {msg}")
+            except Exception:
+                pass
+            return False, reason, None
+        if price is None:
+            log.warning(f"{ROGUE_ALERT_PREFIX} MANUAL SEED refused (no_tick): no sane tick")
+            return False, 'no_tick', None
+        price = round(float(price), 2)
+        # ensure the per-day Rogue state exists (mirrors drive()'s init on a fresh restart).
+        today = ''
+        try:
+            today = str(trader.state.get('last_broker_date', ''))
+        except Exception:
+            today = ''
+        st = getattr(trader, '_rogue', None)
+        if st is None or st.get('day') != today:
+            st = {'day': today, 'gov': new_day_state(),
+                  'anchor': None, 'leg_dir': None, 'open': None}
+            trader._rogue = st
+        # plant the seed as the chain target the Fix 4 engine anchors from.
+        st['a1_last_close'] = price
+        st['a1_reverted'] = False
+        confirm = float(getattr(trader.cfg, 'rogue_entry_confirm_redesign', 10.0))
+        log.info(f"{ROGUE_ALERT_PREFIX} MANUAL SEED @ {price} (current tick) -> hunting "
+                 f"${confirm:.0f} move both directions")
+        try:
+            trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} MANUAL SEED @ {price} "
+                             f"(current tick) — hunting ${confirm:.0f} move both directions")
+        except Exception:
+            pass
+        return True, 'ok', price
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} manual_seed non-fatal: {e!r}")
+        return False, 'error', None
+
+
+def seed_tick_price(trader):
+    """Read a SANE current tick to seed at -- the same sane/held tick discipline A1's
+    tick-fallback uses: sample a few ticks and settle via tick_hold; fall back to the current
+    mid if it can't settle. Returns a price or None. Guarded, READ-ONLY."""
+    try:
+        import tick_hold as _th
+        prices = []
+        for _ in range(int(getattr(trader.cfg, 'a1_tick_fallback_samples', 6))):
+            try:
+                tk = trader.adapter.mt5.symbol_info_tick(trader.cfg.symbol)
+                prices.append((float(tk.bid) + float(tk.ask)) / 2.0)
+            except Exception:
+                pass
+        if prices:
+            try:
+                ok, price, _held, _reason = _th.settle_anchor_tick(prices, trader.cfg)
+                if ok and price is not None:
+                    return round(float(price), 2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return _mid(trader)   # fallback: the current mid (already guarded)
+
+
+def enqueue_seed_command(cfg):
+    """CLI `python bot.py rogueseed`: enqueue a 'rogueseed' command onto the RUNNING bot's
+    command channel (AUREON_RUN_DIR/commands.json) so the live loop plants the seed at ITS
+    current tick (where the live _rogue state + adapter live). Returns 0 on enqueue, 2 on
+    error. The DEMO-only / a1-mode gate is enforced by manual_seed when the bot handles it."""
+    import json as _json
+    import os as _os
+    try:
+        run_dir = _os.environ.get("AUREON_RUN_DIR", "./run")
+        _os.makedirs(run_dir, exist_ok=True)
+        path = _os.path.join(run_dir, "commands.json")
+        cmds = []
+        if _os.path.exists(path):
+            try:
+                with open(path) as f:
+                    cmds = _json.load(f) or []
+            except Exception:
+                cmds = []
+        cmds.append({"cmd": "rogueseed"})
+        with open(path, "w") as f:
+            _json.dump(cmds, f)
+        log.info(f"{ROGUE_ALERT_PREFIX} rogueseed queued -> {path}. The running bot will "
+                 f"plant the Rogue anchor at its current tick (DEMO-only; funded refuses; "
+                 f"requires rogue_a1_anchor_mode ON).")
+        return 0
+    except Exception as e:
+        log.error(f"{ROGUE_ALERT_PREFIX} rogueseed enqueue failed: {e!r}")
+        return 2

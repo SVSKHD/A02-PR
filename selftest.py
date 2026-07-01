@@ -253,6 +253,8 @@ STEP_NAMES = {
     185: "fix4 rogue a1",
     # selftest auto-summary reporter (report-only)
     186: "selftest summary",
+    # Rogue manual current-tick seed command
+    187: "rogue manual seed",
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5856,6 +5858,117 @@ class SelfTest:
                 shutil.rmtree(tmp, ignore_errors=True)
         self._record(186, PASS if ok else FAIL, detail)
 
+    def _step_rogue_manual_seed(self):
+        # 187 Rogue manual current-tick seed command (rogueseed). Mid-day restart has no A1
+        # event to seed Fix 4, so this plants the anchor at the current tick on demand.
+        #  (a) DEMO + a1-mode ON -> plants the anchor at the given tick (st['a1_last_close']).
+        #  (b) from that seed a $10 move triggers the EXISTING Fix 4 entry (ROGUE magic).
+        #  (c) DEMO-only gate: a FUNDED account refuses (fail-closed), no seed planted.
+        #  (d) a1-mode OFF -> refuses with 'disabled' (tells the user to enable it).
+        #  (e) isolation: never closes/touches an anchor 20260522 ticket.
+        #  (f) the CLI enqueue writes a 'rogueseed' command onto the command channel.
+        import rogue as _r, dataclasses, types, os, json, tempfile
+        tmp = None
+        try:
+            def _mk(demo, a1_on, mid=4000.0):
+                placed = []
+                closed = []
+                mt5 = types.SimpleNamespace(
+                    ACCOUNT_TRADE_MODE_DEMO=0,
+                    account_info=lambda: types.SimpleNamespace(trade_mode=(0 if demo else 2)),
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
+                        bid=mid - 0.1, ask=mid + 0.1),
+                    positions_get=lambda ticket=None: [],
+                    history_deals_get=lambda position=None: [])
+                def _place(symbol, side, lot, sl=None, tp=None, magic=None,
+                           comment=None, dry_run=False):
+                    placed.append({'side': side, 'magic': magic})
+                    return types.SimpleNamespace(retcode=10009, order=7001, deal=7001)
+                ad = types.SimpleNamespace(
+                    mt5=mt5, get_latest_m5=lambda s, n: [], place_market_order=_place,
+                    modify_position_sl=lambda *a, **k: types.SimpleNamespace(retcode=10009),
+                    close_position=lambda tk, dry_run=False: closed.append(int(tk)))
+                cfg = dataclasses.replace(
+                    self.cfg, rogue_enabled=True, rogue_a1_anchor_mode=a1_on,
+                    rogue_daywatch=True, rogue_entry_confirm_redesign=10.0,
+                    rogue_reversal_dollars=10.0, lot_size=0.01)
+                tr = types.SimpleNamespace(
+                    cfg=cfg, adapter=ad, paper=True, _rogue=None, _last_boost_mid=mid,
+                    state={'last_broker_date': '2026-06-29'},
+                    tele=types.SimpleNamespace(info=lambda *a, **k: None,
+                                               warn=lambda *a, **k: None),
+                    shadow_positions={55: {'anchor_label': 'A1', 'leg_fill_price': 3980.0,
+                                           'magic': 20260522}})   # an ANCHOR leg present
+                return tr, placed, closed
+
+            # gate (pure)
+            g_ok = (_r.manual_seed_ok(_mk(True, True)[0].cfg, True) == (True, 'ok'))
+            g_funded = (_r.manual_seed_ok(_mk(False, True)[0].cfg, False)[1] == 'funded')
+            g_disabled = (_r.manual_seed_ok(_mk(True, False)[0].cfg, True)[1] == 'disabled')
+
+            # (a) DEMO + a1-mode ON -> plants anchor at 4000
+            tr, placed, closed = _mk(True, True, mid=4000.0)
+            ok_seed, reason, seeded = _r.manual_seed(tr, 4000.0)
+            planted = (ok_seed is True and reason == 'ok' and abs(seeded - 4000.0) < 1e-9
+                       and abs(tr._rogue['a1_last_close'] - 4000.0) < 1e-9)
+
+            # (b) a $10 move off the seed -> EXISTING Fix 4 engine enters (ROGUE magic)
+            tr.adapter.mt5.symbol_info_tick = lambda s=None: types.SimpleNamespace(
+                bid=4009.9, ask=4010.1)   # mid 4010 = +$10 off the 4000 seed
+            tr._last_boost_mid = 4010.0
+            _r.drive(tr)
+            entered = (len(placed) == 1 and placed[0]['side'] == 'BUY'
+                       and placed[0]['magic'] == _r.ROGUE_MAGIC == 20260626)
+
+            # (c) FUNDED refuses, no seed planted
+            trf, placedf, closedf = _mk(False, True, mid=4000.0)
+            okf, reasonf, seededf = _r.manual_seed(trf, 4000.0)
+            funded_refused = (okf is False and reasonf == 'funded' and seededf is None
+                              and (trf._rogue is None
+                                   or trf._rogue.get('a1_last_close') is None))
+
+            # (d) a1-mode OFF refuses with 'disabled'
+            trd, _pd, _cd = _mk(True, False, mid=4000.0)
+            okd, reasond, _ = _r.manual_seed(trd, 4000.0)
+            disabled_refused = (okd is False and reasond == 'disabled')
+
+            # (e) isolation: the anchor 20260522 ticket #55 was NEVER closed/touched
+            iso_ok = (55 not in closed and tr.shadow_positions[55]['magic'] == 20260522
+                      and tr.shadow_positions[55]['leg_fill_price'] == 3980.0)
+
+            # (f) CLI enqueue writes a rogueseed command to AUREON_RUN_DIR/commands.json
+            tmp = tempfile.mkdtemp(prefix='aureon_seedcmd_')
+            _prev = os.environ.get('AUREON_RUN_DIR')
+            os.environ['AUREON_RUN_DIR'] = tmp
+            try:
+                rc = _r.enqueue_seed_command(tr.cfg)
+                with open(os.path.join(tmp, 'commands.json')) as f:
+                    cmds = json.load(f)
+            finally:
+                if _prev is None:
+                    os.environ.pop('AUREON_RUN_DIR', None)
+                else:
+                    os.environ['AUREON_RUN_DIR'] = _prev
+            cli_ok = (rc == 0 and any(c.get('cmd') == 'rogueseed' for c in cmds))
+
+            ok = (g_ok and g_funded and g_disabled and planted and entered
+                  and funded_refused and disabled_refused and iso_ok and cli_ok)
+            detail = (f"(a)planted={planted} (b)entry_ROGUE={entered} (c)funded_refused="
+                      f"{funded_refused} (d)disabled_refused={disabled_refused} "
+                      f"(e)isolation={iso_ok} (f)cli_enqueue={cli_ok} "
+                      f"gates(ok/funded/disabled)={g_ok}/{g_funded}/{g_disabled}")
+        except Exception as e:
+            self._record(187, FAIL, f"raised: {e!r}")
+            if tmp:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(187, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -6463,6 +6576,8 @@ class SelfTest:
             self._step_fix4_rogue_a1()
             # selftest auto-summary reporter (report-only)
             self._step_selftest_summary()
+            # Rogue manual current-tick seed command
+            self._step_rogue_manual_seed()
         finally:
             self._cleanup()
         return self._report(ts)
