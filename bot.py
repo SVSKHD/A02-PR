@@ -59,7 +59,7 @@ def main():
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
                                          'testfire', 'verifyfb', 'rescuestats',
-                                         'bescratchscan'])
+                                         'bescratchscan', 'rogueseed'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -184,6 +184,14 @@ def main():
         sys.exit(run_bescratchscan(
             start=args.start, end=args.end, run_dir=args.run_dir,
             m1csv=args.m1csv, horizon_min=args.horizon))
+
+    elif args.mode == 'rogueseed':
+        # Manual Rogue A1-mode seed: enqueue a 'rogueseed' command onto the RUNNING bot's
+        # command channel so the live loop plants the Rogue anchor at ITS current tick
+        # (mid-day restart has no A1 event to seed Fix 4). DEMO-only + rogue_a1_anchor_mode-
+        # only + ROGUE-only are enforced when the bot handles it. Adds NO trade logic.
+        from rogue import enqueue_seed_command
+        sys.exit(enqueue_seed_command(cfg))
 
 
 if __name__ == '__main__':

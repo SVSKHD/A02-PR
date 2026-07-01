@@ -670,6 +670,16 @@ class LiveTrader:
                 self.tele.info("▶️ Resumed — anchor processing back on")
             elif cmd == "today_summary":
                 self._send_today_summary()
+            elif cmd == "rogueseed":
+                # Manual Rogue A1-mode seed at the CURRENT live tick (mid-day restart has no
+                # A1 event to seed Fix 4). DEMO-only + rogue_a1_anchor_mode-only + ROGUE-only
+                # (never an anchor 20260522 ticket) -- all enforced inside rogue.manual_seed.
+                # Fully guarded: a seed error never breaks the tick loop.
+                try:
+                    import rogue as _rogue
+                    _rogue.manual_seed(self, _rogue.seed_tick_price(self))
+                except Exception:
+                    pass
 
     def _eod_reached(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
         eod = self._eod_datetime_utc(broker_date, self.cfg)
