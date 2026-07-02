@@ -168,6 +168,18 @@ def _flatten_all(self, reason: str = "Manual"):
         log.info(f"Flatten dropped deferred anchor: {self._deferred_anchor.get('label')}")
         self._deferred_anchor = None
 
+    # Fix 3 (E-15): a kill-switch / manual flatten must ALSO close any open Rogue ticket
+    # (magic 20260626). Rogue rides its own magic, so the anchor close loop above never
+    # touches it. EOD is EXCLUDED here: rogue.eod_flatten (gated on rogue_flatten_at_eod,
+    # default OFF) owns the EOD decision so a deliberate post-EOD ride is preserved.
+    # Rogue-scoped + guarded so it can never block the anchor flatten.
+    if str(reason) != "EOD":
+        try:
+            import rogue as _rogue
+            _rogue.force_close_open(self, reason=reason)
+        except Exception as e:
+            log.warning(f"rogue force_close_open during flatten failed (non-fatal): {e!r}")
+
     # Critical alert if anything failed to close — these are real money exposure
     if failed_closes or failed_cancels:
         self.tele.critical(

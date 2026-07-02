@@ -43,3 +43,124 @@ a subsequent $10 move fired a SECOND entry (chain restored); the same holds for 
 init-SL close; the -$525 brake still blocks re-entry after a catastrophic loss;
 the anchor `20260522` ticket is never closed. Self-test 189 (`rogue e3 chain`)
 PASS, and rogue steps 171-176 / 185 / 187 / 188 remain PASS.
+
+---
+
+## E-12 — Feed-death: bot went blind, never escalated — **EXTENDED (ladder)**
+
+**Status:** EXTENDED — P1 branch `claude/p1-integrity-and-feed` — Fix 4.
+
+**Symptom (live, 2026-06-30):** the XAUUSD subscription dropped for ~4h; the probe raised
+"symbol not subscribed" ~13,833 times. The original E-12 fix added Level-1 re-subscribe +
+one throttled FEED DOWN alert, but the live log still showed the re-subscribe counter
+running **past its cap** ("attempt 6/5"), and re-subscribe was the ONLY recovery — a stuck
+subscription stayed blind indefinitely.
+
+**Fix (escalation ladder in `feed_watchdog.FeedWatchdog` + `live_trader._feed_watchdog_fail`):**
+- **Level 1 (fixed):** the re-subscribe attempt counter now **STOPS at `feed_recover_max_tries`**
+  (no more "6/5") and fires exactly ONE FEED DOWN alert at the cap.
+- **Level 2 (new):** once re-subscribe is exhausted OR the feed has been blind past
+  `feed_reinit_blind_min` (3 min), a full **in-process MT5 reinit** runs
+  (`MT5Adapter.reinit`: `shutdown() → initialize() → symbol_select → verify a fresh tick
+  within 60s`), up to `feed_reinit_max_tries` (2). Posts `FEED REINIT attempt N`.
+- **Level 3 (new):** if both reinits fail, a **controlled self-restart** — persist state
+  (E-16), Discord `SELF-RESTART: feed dead`, `sys.exit(42)`; `run_aureon.bat` / Task
+  Scheduler relaunch on code 42. Gated by `feed_selfrestart_enabled` (default ON) and a
+  market-closed clock guard so it NEVER self-restarts on a weekend.
+
+**Files:** `feed_watchdog.py`, `mt5_adapter.py` (`reinit`), `live_trader.py`
+(`_feed_reinit` / `_feed_self_restart` / `_weekend_by_clock`), `config.py`
+(`feed_reinit_blind_min` / `feed_reinit_max_tries` / `feed_selfrestart_enabled`),
+`run_aureon.bat`, `TASK_SCHEDULER.md`. **Self-test:** 168 (counter capped + escalation),
+193 (reinit fresh/stale + ladder). `feed_watchdog_enabled=False` stays byte-identical.
+
+---
+
+## E-13 — No order rc-check / brick on a failed Rogue entry — **FIXED**
+
+**Status:** FIXED — P1 branch `claude/p1-integrity-and-feed` — Fix 1.
+
+**Symptom:** order sends were fire-and-forget. Rogue's market entry set `st['open']`
+(and consumed a governor slot) regardless of the broker retcode, so a rejected send left a
+**phantom open** the engine then "managed" forever — a brick — while a real fill was never
+placed. There was no shared retry/abort policy across the two engines.
+
+**Fix:** new SHARED `MT5Adapter.place_with_retry()` (+ `classify_retcode`) used by both the
+anchor stop orders and Rogue's market entries. RETRYABLE (≤3 attempts, 0.5/1/2s backoff,
+tick refreshed each try): `10004`/`10015`/`10021` (refresh), `10016` (recompute SL/TP vs
+`stops_level`), `10008`-class / `None` / `-1` (plain). NEVER-RETRY (abort + ONE alert with
+retcode + broker comment + params): `10014` **INVALID_VOLUME — the lot is NEVER resized**,
+`10019`/`10018`/`10017`, and any unrecognized retcode. **Brick fix:** Rogue's LIVE entry
+sets `st['open']` + consumes a slot **only on `rc==10009` with a real ticket**; on final
+failure the state stays clean (no phantom open), NO slot is consumed, an abort alert has
+fired, and the engine stays alive for the next signal. HARD RULE: the wrapper never touches
+lot size.
+
+**Files:** `mt5_adapter.py` (`place_with_retry` / `classify_retcode` / `_alert_order_abort`
+/ `reinit`), `rogue.py` (`_place_rogue_entry` / `_mark_rogue_open` / `_rogue_recompute_sl`).
+**Self-test:** 190 (classification + retry/abort + brick).
+
+---
+
+## E-14 — $0-P&L close booked as an init-SL fail — **FIXED**
+
+**Status:** FIXED — P1 branch `claude/p1-integrity-and-feed` — Fix 2.
+
+**Symptom:** when a Rogue close deal had not yet landed in history, `_rogue_close_pnl`
+returned `None`; the code booked `pnl=0` and — because `0 <= 0` — counted it as an init-SL
+**fail**, wrongly advancing `consec_fails` toward the 3-fail pause on a close that may have
+been a winner.
+
+**Fix:** `_resolve_close_pnl` retries the history fetch (3 tries, 1s apart) before booking.
+If still unresolved, `detect_close` books `pnl=0` but passes `was_fail=None` to
+`record_close` (new sentinel) so the fail streak is **left untouched** (neither incremented
+nor reset), logs `WARN pnl-unresolved ticket #X`, and posts a throttled Discord warning. An
+unresolvable P&L can no longer trip the fail-pause brake.
+
+**Files:** `rogue.py` (`_resolve_close_pnl`, `detect_close`, `record_close`). **Self-test:**
+191.
+
+---
+
+## E-15 — Rogue took new entries above the kill-switch / EOD gates — **FIXED**
+
+**Status:** FIXED — P1 branch `claude/p1-integrity-and-feed` — Fix 3.
+
+**Symptom:** `rogue.drive()` ran at tick step 3c — ABOVE the kill-switch lock gate and the
+EOD check — so a new Rogue entry could open on a kill-locked day or after EOD, and the
+kill-switch flatten never closed an open Rogue ticket (Rogue rides its own magic
+`20260626`).
+
+**Fix:** the entry-taking `drive()` now runs **below** both gates (both `return` above it),
+so a NEW entry can only open on a live, non-killed, pre-EOD tick. `_flatten_all` (kill /
+manual flatten, NOT EOD) now closes any open Rogue ticket via `rogue.force_close_open`. An
+EXISTING open Rogue position is still trail-managed post-EOD when `rogue_flatten_at_eod` is
+False (a `drive(allow_new_entries=False)` call in the EOD branch) — the owner's ride flag is
+preserved — but NEW entries (including reversal-recovery legs) are hard-blocked after EOD.
+
+**Files:** `live_trader.py` (`_tick`), `risk.py` (`_flatten_all`), `rogue.py` (`drive` /
+`_drive_a1` gain `allow_new_entries`; new `force_close_open`). **Self-test:** 192.
+
+---
+
+## E-16 — No state persistence / boot recovery (restart dormancy) — **FIXED**
+
+**Status:** FIXED — P1 branch `claude/p1-integrity-and-feed` — Fix 5 (supersedes
+restart-dormancy).
+
+**Symptom:** the in-memory Rogue state (`_rogue`: governors + chain anchor + open ticket)
+was rebuilt fresh on every restart, so a mid-day restart lost the day's Rogue governors and
+chain anchor (and `_a1_anchor_price` read state keys — `a1_anchor_price` etc. — that were
+never written). Anchors and open positions were not explicitly reconciled from a P1 snapshot.
+
+**Fix:** new `p1_state.py` persists a compact snapshot to `run/state.json` on every change
+(hooked into `state._save_state` + Rogue mutations, and forced before the Level-3 exit):
+`trading_date`, `processed_anchors_today`, per-anchor markers, Rogue anchor / `a1_last_close`
+/ open ticket / `day_pnl` / `consec_fails` / `reanchor_count` / latches, and boost trail
+peaks. On a SAME trading-day boot (`recover_on_boot`, one-shot after the first new-day
+reset): restore the Rogue governors + chain anchor, ADOPT an open Rogue position only if it
+is still open at the broker, skip anchors already placed today, and log `RESTART-RECOVERY OK
+…`. A NEW trading day ignores the stale file (fresh start).
+
+**Files:** `p1_state.py` (new), `live_trader.py` (`_tick` one-shot recovery), `state.py`
+(`_save_state` mirror), `rogue.py` (`_persist_state` hooks). **Self-test:** 194.

@@ -94,6 +94,14 @@ def _save_state(self):
     with open(tmp, 'w') as f:
         json.dump(self.state, f, indent=2, default=str)
     os.replace(tmp, self.state_path)
+    # Fix 5 (E-16): mirror the P1 snapshot to run/state.json on every state change (anchor
+    # placements, kill-switch, EOD, day reset) so a crash / feed self-restart can recover
+    # same-day. Guarded -- never blocks or fails the main state write.
+    try:
+        import p1_state as _p1
+        _p1.save(self)
+    except Exception:
+        pass
 
 
 def _acquire_pid_lock(self):

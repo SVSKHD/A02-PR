@@ -762,6 +762,97 @@ class LiveTrader:
                     f"trail until the feed returns. Check the MT5 terminal / Market Watch.")
             except Exception:
                 pass
+        # Fix 4 (E-12) LEVEL 2: re-subscribe exhausted (or blind > threshold) -> full MT5
+        # reinit in-process. A fresh tick ends the episode on the next probe (on_success).
+        if act.reinit:
+            self._feed_reinit(act)
+        # Fix 4 (E-12) LEVEL 3: reinit exhausted -> controlled self-restart (persist + exit 42).
+        # Gated on feed_selfrestart_enabled AND the market-closed guard inside _feed_self_restart.
+        if act.self_restart:
+            self._feed_self_restart(act)
+
+    def _feed_reinit(self, act):
+        """Fix 4 Level 2 (E-12): drive a full in-process MT5 reinit and announce it. A True
+        return means a fresh tick was confirmed; the next market-closed probe then reads a
+        tick and _feed_watchdog_ok posts FEED RECOVERED. Guarded."""
+        n_max = int(getattr(self.cfg, 'feed_reinit_max_tries', 2))
+        try:
+            self.tele.critical(
+                f"🔧 *FEED REINIT attempt {act.reinit_attempt}/{n_max}* — re-subscribe "
+                f"exhausted / blind ~{act.blind_s / 60.0:.0f} min. Full MT5 "
+                f"shutdown→initialize→select→verify-tick now.")
+        except Exception:
+            pass
+        ok = False
+        try:
+            ok = bool(self.adapter.reinit())
+        except Exception as e:
+            log.error(f"feed reinit raised: {e!r}")
+        log.warning(f"FEED REINIT attempt {act.reinit_attempt}/{n_max} -> "
+                    f"{'FRESH TICK' if ok else 'still dead'}")
+        if ok:
+            try:
+                self.tele.success("✅ *FEED REINIT OK* — MT5 reconnected and a fresh tick "
+                                  "is flowing. Resuming normal operation.")
+            except Exception:
+                pass
+
+    def _feed_self_restart(self, act):
+        """Fix 4 Level 3 (E-12): controlled self-restart when the feed is dead and both MT5
+        reinits failed. NEVER restarts when the market is closed (the weekend probe owns that
+        case) or when feed_selfrestart_enabled is False. Persists the P1 state, posts a
+        Discord notice, releases the PID lock, and exits with code 42 so run_aureon.bat /
+        Task Scheduler relaunches. Open positions stay protected by their broker SL."""
+        if not bool(getattr(self.cfg, 'feed_selfrestart_enabled', True)):
+            log.warning("FEED self-restart requested but feed_selfrestart_enabled=False — "
+                        "staying up; feed stays escalated at Level 2.")
+            return
+        if self._weekend_by_clock():
+            log.warning("FEED self-restart suppressed — market looks closed by clock "
+                        "(weekend). The weekend deep-sleep will handle the wake.")
+            return
+        try:
+            import p1_state as _p1
+            _p1.save(self, force=True)
+        except Exception:
+            pass
+        try:
+            self.tele.critical(
+                f"🔁 *SELF-RESTART: feed dead* — MT5 reinit failed after ~"
+                f"{act.blind_s / 60.0:.0f} min blind. Persisting state and exiting (42) so "
+                f"the launcher relaunches. Open positions stay protected by broker SL.")
+        except Exception:
+            pass
+        try:
+            self._release_pid_lock()
+        except Exception:
+            pass
+        try:
+            self.tele.stop()
+        except Exception:
+            pass
+        import sys as _sys
+        log.error("SELF-RESTART (feed dead): exiting with code 42 for the relaunch loop.")
+        _sys.exit(42)
+
+    def _weekend_by_clock(self, utc_now=None) -> bool:
+        """Coarse weekend guard for the Level-3 self-restart (used when the feed can't be
+        read so a tick-age probe is impossible): XAUUSD is closed Fri ~21:00 UTC → Sun
+        ~21:00 UTC. Returns True inside that window so a feed-death self-restart is
+        suppressed when the market is simply closed. Clock-only; guarded."""
+        try:
+            u = utc_now or pd.Timestamp.now(tz='UTC')
+            dow = int(u.dayofweek)       # Mon=0 .. Sat=5, Sun=6
+            h = int(u.hour)
+            if dow == 5:                 # Saturday: closed all day
+                return True
+            if dow == 6 and h < 21:      # Sunday before ~21:00 UTC open
+                return True
+            if dow == 4 and h >= 21:     # Friday after ~21:00 UTC close
+                return True
+            return False
+        except Exception:
+            return False
 
     def _validate_offset_on_wake(self, reason: str = "wake") -> bool:
         """Guard 1 (core fix): on wake/startup, force a fresh broker time-offset
@@ -1257,6 +1348,17 @@ class LiveTrader:
         # 2. New broker day?
         self._reset_if_new_day(broker_date)
 
+        # 2b. Fix 5 (E-16): ONE-SHOT boot recovery. Runs after the first new-day reset so the
+        # trading-date comparison is correct: a SAME-day restart restores the Rogue governors
+        # + chain anchor + adopts an open Rogue position; a NEW day ignores the stale file.
+        if not getattr(self, '_p1_recovered', False):
+            try:
+                import p1_state as _p1
+                _p1.recover_on_boot(self)
+            except Exception:
+                pass
+            self._p1_recovered = True
+
         # 3. Reconcile broker state
         self._reconcile_with_broker()
 
@@ -1264,14 +1366,11 @@ class LiveTrader:
         # once price is >= $10 from a lone leg's fill (never at fill); cap.
         self._check_boost_triggers()
 
-        # 3c. ROGUE per-tick driver (self-anchoring monster-rider). No-op unless
-        # rogue is ON (demo-promoted, never funded). Fully guarded -- a rogue error
-        # never breaks anchor management (the _tick except below also catches it).
-        try:
-            import rogue as _rogue
-            _rogue.drive(self)
-        except Exception:
-            pass
+        # 3c. ROGUE per-tick driver — MOVED (Fix 3 / E-15): the drive() call that can take
+        # NEW entries now runs BELOW the kill-switch lock gate AND the EOD check (see step
+        # 6b), so a new Rogue entry can never open on a kill-locked day or after EOD. An
+        # EXISTING open Rogue position is still trail-managed post-EOD when
+        # rogue_flatten_at_eod is False (the trail-only drive in the EOD branch).
 
         # 3d. ROGUE close watcher (Rogue-ONLY; logging/file-IO only, behavior-neutral --
         # reads broker state to record a closed Rogue ticket's realized $, never mutates
@@ -1327,6 +1426,13 @@ class LiveTrader:
             try:
                 import rogue as _rogue
                 _rogue.eod_flatten(self)
+                # Fix 3 (E-15): if Rogue is NOT flattened at EOD (default), keep trailing
+                # any EXISTING open Rogue position post-EOD — but with NEW entries hard-
+                # blocked (allow_new_entries=False). The kill-switch/EOD returns above mean
+                # the normal entry-taking drive() never runs here, so this is the only
+                # post-EOD Rogue call and it can only manage/close, never open.
+                if not bool(getattr(self.cfg, 'rogue_flatten_at_eod', False)):
+                    _rogue.drive(self, allow_new_entries=False)
             except Exception:
                 pass
             # v3.0.0 commit 3: Firebase EOD journal -- ONCE per broker day, after
@@ -1367,6 +1473,16 @@ class LiveTrader:
             if self._tick_counter % self.STATUS_EVERY_TICKS == 0:
                 self._write_status(broker_date)
             return
+
+        # 6b. ROGUE per-tick driver (Fix 3 / E-15): runs here — AFTER the kill-switch lock
+        # gate AND the EOD check, both of which `return` above — so a NEW Rogue entry can
+        # only open on a live, non-killed, pre-EOD tick. No-op unless rogue is ON (demo-
+        # promoted, never funded). Fully guarded (the _tick except below also catches it).
+        try:
+            import rogue as _rogue
+            _rogue.drive(self)
+        except Exception:
+            pass
 
         # 7. Anchor due?
         self._process_anchor_if_due(broker_date, utc_now)

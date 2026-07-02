@@ -664,27 +664,44 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     #         have forensic data on every rc=-1 (adapter swallows it
     #         internally during its built-in rc=-1 reconcile retry)
     retry_comment = f"_R{retry_count}" if retry_count > 0 else ""
+
+    # Fix 1 (E-13): route anchor stop orders through the SHARED place_with_retry wrapper --
+    # the same rc-classification + bounded retry + abort-alert Rogue uses (never resizes the
+    # lot). SUCCESS path is byte-identical (rc=10009 -> one send -> return); paper and
+    # order_retry_enabled=False keep the exact prior single-send path. The stop PRICE and
+    # SL/TP geometry are held fixed (no recompute) so anchor straddle math is untouched --
+    # only transient rejects are retried and never-retry rejects raise ONE alert.
+    def _send_stop(side, price, sl, tp, comment):
+        if self.paper or not bool(getattr(self.cfg, 'order_retry_enabled', True)):
+            return self.adapter.place_stop_order(
+                self.cfg.symbol, side, price, gap_lot, sl=sl, tp=tp,
+                comment=comment, dry_run=self.paper)
+        def _sender(attempt, recompute_stops):
+            return self.adapter.place_stop_order(
+                self.cfg.symbol, side, price, gap_lot, sl=sl, tp=tp,
+                comment=comment, dry_run=False)
+        describe = {'label': f'{label} {side}', 'side': side, 'symbol': self.cfg.symbol,
+                    'lot': gap_lot, 'price': price, 'sl': sl, 'tp': tp, 'magic': 20260522}
+        return self.adapter.place_with_retry(_sender, describe=describe,
+                                             tele=getattr(self, 'tele', None))
+
     buy_res = None
     sell_res = None
     buy_err = None
     sell_err = None
     if not skip_buy:
-        buy_res = self.adapter.place_stop_order(
-            self.cfg.symbol, 'BUY', buy_stop, gap_lot,
-            sl=sl_buy, tp=tp_buy,
-            comment=f"AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}",
-            dry_run=self.paper)
+        buy_res = _send_stop(
+            'BUY', buy_stop, sl_buy, tp_buy,
+            f"AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}")
         if not self.paper:
             try:
                 buy_err = self.adapter.mt5.last_error()
             except Exception:
                 buy_err = ('?', 'last_error read failed')
     if not skip_sell:
-        sell_res = self.adapter.place_stop_order(
-            self.cfg.symbol, 'SELL', sell_stop, gap_lot,
-            sl=sl_sell, tp=tp_sell,
-            comment=f"AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}",
-            dry_run=self.paper)
+        sell_res = _send_stop(
+            'SELL', sell_stop, sl_sell, tp_sell,
+            f"AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}")
         if not self.paper:
             try:
                 sell_err = self.adapter.mt5.last_error()

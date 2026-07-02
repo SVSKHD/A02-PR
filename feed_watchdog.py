@@ -31,13 +31,19 @@ from dataclasses import dataclass
 @dataclass
 class FeedAction:
     """What the caller must DO for one failed probe. All side effects are the caller's;
-    this object only decides which fire (so the decision is testable without MT5/Discord)."""
+    this object only decides which fire (so the decision is testable without MT5/Discord).
+
+    Fix 4 (E-12) escalation ladder: L1 re-subscribe -> L2 full MT5 reinit -> L3 controlled
+    self-restart. Exactly one of resubscribe / reinit / self_restart fires per failure."""
     warn: bool = False          # emit a (throttled) warning line this failure
-    resubscribe: bool = False   # attempt adapter.resubscribe() now
+    resubscribe: bool = False   # L1: attempt adapter.resubscribe() now
     alert: bool = False         # fire the hard FEED DOWN Discord alert now
+    reinit: bool = False        # L2: full in-process MT5 reinit now
+    self_restart: bool = False  # L3: persist state + sys.exit(42) (launcher relaunches)
     fails: int = 0              # consecutive failure count (for the log/alert text)
     blind_s: float = 0.0        # seconds since this feed-death episode began
-    attempt: int = 0            # re-subscribe attempt number (set when resubscribe True)
+    attempt: int = 0            # L1 re-subscribe attempt number (set when resubscribe True)
+    reinit_attempt: int = 0     # L2 reinit attempt number (set when reinit True)
 
 
 def enabled(cfg) -> bool:
@@ -59,6 +65,17 @@ def alert_cooldown_s(cfg) -> float:
     return max(0.0, float(getattr(cfg, "feed_alert_cooldown_min", 5.0)) * 60.0)
 
 
+def reinit_blind_s(cfg) -> float:
+    """L2 trigger (E-12): seconds blind after which a full MT5 reinit is escalated even if
+    the re-subscribe attempts have not all been spent yet ('blind > 3 min')."""
+    return max(0.0, float(getattr(cfg, "feed_reinit_blind_min", 3.0)) * 60.0)
+
+
+def reinit_max_tries(cfg) -> int:
+    """L2 reinit attempts that must fail before the L3 self-restart is escalated (>=1)."""
+    return max(1, int(getattr(cfg, "feed_reinit_max_tries", 2)))
+
+
 class FeedWatchdog:
     """Per-LiveTrader feed-death tracker. A single instance lives on the trader and is fed
     one outcome per market-closed probe: on_success() when the probe read a tick, on_failure()
@@ -66,7 +83,9 @@ class FeedWatchdog:
 
     def __init__(self):
         self.fails = 0                # consecutive failures in the CURRENT episode
-        self.attempts = 0             # re-subscribe attempts in the current episode
+        self.attempts = 0             # L1 re-subscribe attempts in the current episode
+        self.reinit_attempts = 0      # L2 full-reinit attempts in the current episode
+        self.restarted = False        # L3 self-restart requested (one-shot latch)
         self.episode_start_s = None   # monotonic seconds at the first failure of the episode
         self.last_alert_s = None      # monotonic seconds of the last FEED DOWN alert
 
@@ -77,6 +96,8 @@ class FeedWatchdog:
         recovered = self.fails > 0
         self.fails = 0
         self.attempts = 0
+        self.reinit_attempts = 0
+        self.restarted = False
         self.episode_start_s = None
         self.last_alert_s = None
         return recovered
@@ -84,7 +105,14 @@ class FeedWatchdog:
     def on_failure(self, cfg, now_s: float) -> FeedAction:
         """A probe FAILED ('not subscribed'). Advance the episode and return the side effects
         the caller must perform. `now_s` is a MONOTONIC seconds clock (live: time.monotonic();
-        test: a synthetic counter) so the cooldown is testable without a real clock."""
+        test: a synthetic counter) so the cooldown is testable without a real clock.
+
+        Fix 4 (E-12) escalation ladder, one step per n-th ('cadence') failure:
+          L1 RE-SUBSCRIBE -- up to recover_max_tries attempts. The counter STOPS at the cap
+             (bug fix: it used to run to 'attempt 6/5'); one FEED DOWN alert fires at the cap.
+          L2 FULL REINIT  -- once the L1 attempts are spent OR blind >= feed_reinit_blind_min,
+             up to feed_reinit_max_tries full MT5 reinits.
+          L3 SELF-RESTART -- once the L2 reinits are spent, request one controlled restart."""
         self.fails += 1
         if self.episode_start_s is None:
             self.episode_start_s = now_s
@@ -102,16 +130,38 @@ class FeedWatchdog:
         # produce ~1 + floor(1000/n) lines, never 1000).
         warn = (self.fails == 1) or (self.fails % n == 0)
         act = FeedAction(warn=warn, fails=self.fails, blind_s=blind_s)
-        # Re-subscribe on every n-th consecutive failure (the backoff cadence). The FIRST
-        # attempt lands at exactly n failures (T-F1: after n, not before).
-        if self.fails >= n and self.fails % n == 0:
-            self.attempts += 1
-            act.resubscribe = True
-            act.attempt = self.attempts
-            # After max_tries failed attempts: one alert, then cooldown-gated repeats.
-            if self.attempts >= recover_max_tries(cfg):
-                cd = alert_cooldown_s(cfg)
-                if self.last_alert_s is None or (float(now_s) - float(self.last_alert_s)) >= cd:
-                    act.alert = True
-                    self.last_alert_s = now_s
+
+        on_cadence = (self.fails >= n and self.fails % n == 0)
+        max_tries = recover_max_tries(cfg)
+        resub_exhausted = self.attempts >= max_tries
+        blind_reinit = blind_s >= reinit_blind_s(cfg)
+
+        # LEVEL 1 -- bounded re-subscribe. STOP at max_tries (the 'attempt 6/5' bug fix); skip
+        # straight to L2 once blind has already crossed the reinit threshold.
+        if not resub_exhausted and not blind_reinit:
+            if on_cadence:
+                self.attempts += 1
+                act.resubscribe = True
+                act.attempt = self.attempts
+                if self.attempts >= max_tries:            # at the cap: one FEED DOWN alert
+                    cd = alert_cooldown_s(cfg)
+                    if self.last_alert_s is None or (float(now_s) - float(self.last_alert_s)) >= cd:
+                        act.alert = True
+                        self.last_alert_s = now_s
+            return act
+
+        # LEVEL 2 -- full in-process MT5 reinit (bounded) after L1 spent OR blind > threshold.
+        if self.reinit_attempts < reinit_max_tries(cfg):
+            if on_cadence:
+                self.reinit_attempts += 1
+                act.reinit = True
+                act.reinit_attempt = self.reinit_attempts
+            return act
+
+        # LEVEL 3 -- controlled self-restart, one-shot (the caller gates on the market-closed
+        # guard + feed_selfrestart_enabled before actually exiting).
+        if not self.restarted:
+            if on_cadence:
+                self.restarted = True
+                act.self_restart = True
         return act

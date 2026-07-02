@@ -26,6 +26,18 @@ ROGUE_ALERT_PREFIX = "[ROGUE]"
 ROGUE_GLYPH = "🦏"               # chart glyph distinct from the anchor glyphs
 
 
+def _persist_state(trader):
+    """Fix 5 (E-16) hook: after any Rogue state change, persist the P1 snapshot to
+    run/state.json (anchor / a1_last_close / open ticket / governors / latches). Fully
+    guarded -- a persistence error never reaches the trading path. No-op if p1_state or
+    the trader run_dir is unavailable."""
+    try:
+        import p1_state as _p1
+        _p1.save(trader)
+    except Exception:
+        pass
+
+
 # --- the demo-default-ON / funded-OFF run gate (freeze-safe) ----------------------
 def funded_default(is_demo, is_funded):
     """The value the boot promotes rogue_enabled to per account type: ON for a demo
@@ -152,11 +164,15 @@ def record_entry(state):
 def record_close(state, pnl_dollars, was_fail, cfg):
     """A Rogue position closed: book its P&L, advance/reset the consecutive-fail streak,
     and latch the loss-stop / fail-pause brakes if tripped. was_fail = the init-SL was
-    hit (a fake-out). A winner resets the fail streak. PURE."""
+    hit (a fake-out); a winner resets the fail streak. Fix 2 (E-14): was_fail=None means
+    the P&L was UNRESOLVED after retries -> book the P&L but leave the fail streak UNCHANGED
+    (neither increment nor reset), so an unbooked close can't trip the fail-pause. PURE."""
     fail_stop = int(getattr(cfg, 'rogue_consecutive_fail_stop', 3))
     loss_stop = float(getattr(cfg, 'rogue_daily_loss_stop', -150.0))
     state['day_pnl'] = float(state.get('day_pnl', 0.0)) + float(pnl_dollars)
-    if was_fail:
+    if was_fail is None:
+        pass                                       # E-14: pnl-unresolved -> streak untouched
+    elif was_fail:
         state['consec_fails'] = int(state.get('consec_fails', 0)) + 1
     else:
         state['consec_fails'] = 0
@@ -305,12 +321,17 @@ def _a1_anchor_price(trader):
     return None
 
 
-def _drive_a1(trader, st):
+def _drive_a1(trader, st, allow_new_entries=True):
     """Fix 4 A1-ANCHORED driver (impure; runs ONLY when rogue_a1_anchor_mode is ON). Seeds
     from A1 (read-only) / chains to the last closed Rogue level, enters on a $10 move,
     rides continuation on the existing trail, and on a confirmed reversal closes the wrong-
     way leg + recovers in the new direction (capped). Brake = the live daily loss stop.
-    The $30 soft lock is banked but never halts. ROGUE-only (magic 20260626). Guarded."""
+    The $30 soft lock is banked but never halts. ROGUE-only (magic 20260626). Guarded.
+
+    Fix 3 (E-15): with allow_new_entries=False (the post-EOD trail-only call) an EXISTING
+    open position still rides the adaptive trail and still books its broker close, but no
+    reversal-recovery leg and no fresh $10-move entry are taken -- NEW entries are hard-
+    blocked after EOD (and, at the call site, on kill-locked days)."""
     # A1-mode keys live alongside the shared anchor/open keys.
     st.setdefault('a1_last_close', None)   # last CLOSED Rogue level (chain target)
     st.setdefault('a1_reverted', False)    # next entry is a capped recovery leg
@@ -321,8 +342,12 @@ def _drive_a1(trader, st):
     o_before = st.get('open')
     if o_before is not None:
         # REVERSAL: the open leg is known wrong -> close it (broker SL likely already did)
-        # and chain-recover in the NEW direction next.
-        if a1_reversal_confirmed(o_before.get('entry'), o_before.get('side'), price, trader.cfg):
+        # and chain-recover in the NEW direction next. A reversal-recovery is a NEW entry,
+        # so post-EOD (allow_new_entries=False) we skip it and let the broker SL / trail
+        # handle the position instead.
+        if (allow_new_entries
+                and a1_reversal_confirmed(o_before.get('entry'), o_before.get('side'),
+                                          price, trader.cfg)):
             tk = o_before.get('ticket')
             try:
                 if tk is not None:
@@ -342,6 +367,8 @@ def _drive_a1(trader, st):
         return
     # no open: book any pending close, then try a fresh entry off the (chained) anchor.
     detect_close(trader, st)
+    if not allow_new_entries:
+        return                              # Fix 3: no NEW entries post-EOD / kill-locked
     anchor = a1_seed_anchor(st.get('a1_last_close'), _a1_anchor_price(trader))
     if anchor is None:
         return
@@ -362,13 +389,19 @@ def _drive_a1(trader, st):
     st['a1_last_close'] = None
 
 
-def drive(trader):
+def drive(trader, allow_new_entries=True):
     """The per-tick Rogue driver. Runs ONLY when should_run (rogue_enabled AND not
     funded) and rogue_daywatch -- otherwise an immediate no-op (no watch/anchor/entry).
     Pipeline: watch recent M5 -> detect monster -> drop anchor -> (governor + cap + gate)
     -> early entry on confirmation -> manage the open winner on the adaptive trail. All
     decisions come from the PURE cores above; this only does the IO + telemetry +
-    placement (ROGUE-tagged via ROGUE_MAGIC). Fully guarded -- never raises onto _tick."""
+    placement (ROGUE-tagged via ROGUE_MAGIC). Fully guarded -- never raises onto _tick.
+
+    Fix 3 (E-15): the live loop now calls drive() only AFTER the kill-switch and EOD
+    gates, so NEW entries are hard-blocked on kill-locked days and post-EOD. `allow_new_
+    entries=False` (the post-EOD trail-only call, when rogue_flatten_at_eod is False) lets
+    an EXISTING open Rogue position keep trailing / booking its close while refusing any
+    new entry or reversal-recovery leg."""
     try:
         is_funded = not account_is_demo(trader)
         if not should_run(trader.cfg, is_funded=is_funded):
@@ -390,7 +423,12 @@ def drive(trader):
         # skips monster-detection. OFF (default) -> fall through to the legacy monster
         # pipeline below, byte-identical.
         if bool(getattr(trader.cfg, 'rogue_a1_anchor_mode', False)):
-            _drive_a1(trader, st)
+            # Keep the default (entry-taking) call 2-arg so a test/monkeypatch that binds a
+            # 2-arg _drive_a1 stays valid; only the trail-only path passes the kwarg.
+            if allow_new_entries:
+                _drive_a1(trader, st)
+            else:
+                _drive_a1(trader, st, allow_new_entries=False)
             return
         bars = _recent_m5(trader)
         if not bars:
@@ -404,9 +442,11 @@ def drive(trader):
             st['leg_dir'] = 'BUY' if mdir == 'SELL' else 'SELL'
             log.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} monster {mdir} -> anchor @ "
                      f"{completion}, hunting next leg {st['leg_dir']}")
-        # 2. ENTRY (gated): only on a NEW slot AND the setup gate (a live anchor).
+        # 2. ENTRY (gated): only on a NEW slot AND the setup gate (a live anchor). Fix 3:
+        # NEW entries are refused when allow_new_entries is False (post-EOD trail-only).
         price = _mid(trader)
-        if (st.get('open') is None and st.get('anchor') is not None and price is not None):
+        if (allow_new_entries and st.get('open') is None
+                and st.get('anchor') is not None and price is not None):
             ok, _why = can_enter(st['gov'], trader.cfg)
             enter, epx, sl = entry_decision(st['anchor'], st['leg_dir'], price, trader.cfg)
             if enter:
@@ -513,32 +553,107 @@ def _model_gate(trader, st, price, epx, sl, ok):
         return True   # FAIL OPEN: a gate error must never block Rogue
 
 
-def _place_rogue_entry(trader, st, entry_px, sl):
-    """Place ONE ROGUE-tagged market entry (own magic). Consumes a re-entry slot. The
-    rally/rescue reuse + the adaptive trail then manage it from the Rogue anchor."""
-    side = st['leg_dir']
-    tp = round(entry_px + (200.0 if side == 'BUY' else -200.0), 2)  # far TP; the trail governs
+def _rogue_recompute_sl(trader, side, sl):
+    """Fix 1 (E-13): on a 10016 INVALID_STOPS resend, push the init SL just BEYOND the
+    broker's minimum stops_level from the CURRENT market so the retry is accepted --
+    WITHOUT ever touching lot size. READ-ONLY on the market; returns the input SL
+    unchanged on any error. This only widens the stop distance; the position is untouched."""
     try:
-        res = trader.adapter.place_market_order(
-            trader.cfg.symbol, side, trader.cfg.lot_size, sl=sl, tp=tp,
-            magic=ROGUE_MAGIC, comment=f"AUR_ROGUE_{side[0]}", dry_run=trader.paper)
-        rc = getattr(res, 'retcode', None) if res is not None else None
-        tk = getattr(res, 'order', None) or getattr(res, 'deal', None)
-        st['open'] = {'ticket': tk, 'side': side, 'entry': entry_px, 'sl': sl,
-                      'peak': entry_px, 'magic': ROGUE_MAGIC, 'leg_type': ROGUE_LEG_TYPE}
-        record_entry(st['gov'])
-        try:
-            import boost_metrics as _bm
-            _bm.append_ledger(trader, {'ts': '', 'anchor': ROGUE_LABEL, 'kind': 'ROGUE',
-                                       'event': 'enter', 'arm_px': st.get('anchor'),
-                                       'entry_px': entry_px})
-        except Exception:
-            pass
+        mt5 = trader.adapter.mt5
+        info = mt5.symbol_info(trader.cfg.symbol)
+        tk = mt5.symbol_info_tick(trader.cfg.symbol)
+        point = float(getattr(info, 'point', 0.01)) or 0.01
+        stops_pts = float(getattr(info, 'trade_stops_level', 0) or 0)
+        min_dist = stops_pts * point
+        if min_dist <= 0:
+            return sl
+        px = float(tk.ask) if side == 'BUY' else float(tk.bid)
+        pad = min_dist + 2.0 * point
+        return round(px - pad, 2) if side == 'BUY' else round(px + pad, 2)
+    except Exception:
+        return sl
+
+
+def _mark_rogue_open(trader, st, entry_px, sl, tk, rc):
+    """Set st['open'] on a REAL fill + consume ONE governor slot + fire the enter side
+    effects. Called ONLY once a placement is confirmed (rc==10009 with a ticket, or the
+    paper shadow path). Never called on a failed live placement (the brick fix)."""
+    side = st['leg_dir']
+    st['open'] = {'ticket': tk, 'side': side, 'entry': entry_px, 'sl': sl,
+                  'peak': entry_px, 'magic': ROGUE_MAGIC, 'leg_type': ROGUE_LEG_TYPE}
+    record_entry(st['gov'])
+    try:
+        import boost_metrics as _bm
+        _bm.append_ledger(trader, {'ts': '', 'anchor': ROGUE_LABEL, 'kind': 'ROGUE',
+                                   'event': 'enter', 'arm_px': st.get('anchor'),
+                                   'entry_px': entry_px})
+    except Exception:
+        pass
+    try:
         trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ENTER {side} @ {entry_px} "
                          f"SL {sl} (slot {st['gov']['reanchor_count']}/"
                          f"{int(getattr(trader.cfg, 'rogue_max_reentries_per_day', 10))}) rc={rc}")
+    except Exception:
+        pass
+    _persist_state(trader)
+
+
+def _place_rogue_entry(trader, st, entry_px, sl):
+    """Place ONE ROGUE-tagged market entry (own magic). LIVE placements go through the
+    SHARED place_with_retry wrapper (Fix 1 / E-13): bounded retry on requote/price/stops,
+    abort+alert on volume/no-money/closed/disabled -- the lot is NEVER resized.
+
+    BRICK FIX (E-13): st['open'] is set (and ONE governor slot consumed) ONLY on a real
+    fill -- rc==10009 with a ticket. On final failure the state stays clean (no phantom
+    open), NO slot is consumed, an abort alert has already fired, and the engine stays
+    alive for the next signal -- it does not brick."""
+    side = st['leg_dir']
+    tp = round(entry_px + (200.0 if side == 'BUY' else -200.0), 2)  # far TP; the trail governs
+    if trader.paper:
+        # PAPER / dry-run: no real broker + no brick risk -- keep the prior shadow-entry
+        # behavior (single send; selftest stub adapters return a success object + ticket).
+        try:
+            res = trader.adapter.place_market_order(
+                trader.cfg.symbol, side, trader.cfg.lot_size, sl=sl, tp=tp,
+                magic=ROGUE_MAGIC, comment=f"AUR_ROGUE_{side[0]}", dry_run=True)
+            rc = getattr(res, 'retcode', None) if res is not None else None
+            tk = getattr(res, 'order', None) or getattr(res, 'deal', None)
+            _mark_rogue_open(trader, st, entry_px, sl, tk, rc)
+        except Exception as e:
+            log.warning(f"{ROGUE_ALERT_PREFIX} place entry (paper) non-fatal: {e!r}")
+        return
+    # LIVE: bounded-retry via the shared wrapper. sender re-reads the tick inside
+    # place_market_order every attempt; on 10016 it recomputes the SL vs stops_level.
+    def _send(attempt, recompute_stops):
+        _sl = _rogue_recompute_sl(trader, side, sl) if recompute_stops else sl
+        return trader.adapter.place_market_order(
+            trader.cfg.symbol, side, trader.cfg.lot_size, sl=_sl, tp=tp,
+            magic=ROGUE_MAGIC, comment=f"AUR_ROGUE_{side[0]}", dry_run=False)
+    describe = {'label': f'ROGUE {side}', 'side': side, 'symbol': trader.cfg.symbol,
+                'lot': trader.cfg.lot_size, 'price': 'mkt', 'sl': sl, 'tp': tp,
+                'magic': ROGUE_MAGIC}
+    try:
+        res = trader.adapter.place_with_retry(
+            _send, describe=describe, tele=getattr(trader, 'tele', None))
     except Exception as e:
         log.warning(f"{ROGUE_ALERT_PREFIX} place entry non-fatal: {e!r}")
+        res = None
+    rc = getattr(res, 'retcode', None) if res is not None else None
+    tk = (getattr(res, 'order', None) or getattr(res, 'deal', None)) if res is not None else None
+    if rc == 10009 and tk:
+        _mark_rogue_open(trader, st, entry_px, sl, tk, rc)
+    else:
+        # FINAL FAILURE: no phantom open, NO governor slot consumed, engine stays alive.
+        st['open'] = None
+        try:
+            trader.tele.warn(
+                f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ENTER {side} @ {entry_px} FAILED "
+                f"rc={rc} — no position, slot preserved "
+                f"({st['gov']['reanchor_count']}/"
+                f"{int(getattr(trader.cfg, 'rogue_max_reentries_per_day', 10))}); "
+                f"engine live for next signal")
+        except Exception:
+            pass
 
 
 def _manage_rogue_open(trader, st, price):
@@ -576,6 +691,24 @@ def _rogue_close_pnl(trader, ticket):
         return float(cd.profit) + float(cd.swap) + float(cd.commission)
     except Exception:
         return None
+
+
+def _resolve_close_pnl(trader, ticket, tries=3, delay=1.0):
+    """Fix 2 (E-14): resolve a CLOSED Rogue position's realized $ with a BOUNDED retry --
+    the close deal often lands in history a beat after the position leaves the book. Tries
+    _rogue_close_pnl up to `tries` times, `delay`s apart, and returns the first non-None
+    value; returns None only if it is STILL unavailable after every try. READ-ONLY."""
+    import time as _time
+    for i in range(max(1, int(tries))):
+        pnl = _rogue_close_pnl(trader, ticket)
+        if pnl is not None:
+            return pnl
+        if i < int(tries) - 1:
+            try:
+                _time.sleep(float(delay))
+            except Exception:
+                pass
+    return None
 
 
 def _rogue_close_price(trader, ticket):
@@ -618,12 +751,28 @@ def detect_close(trader, st):
         return False
     if still:
         return False                     # still open at the broker -> nothing to book
-    pnl = _rogue_close_pnl(trader, tk)
-    if pnl is None:
-        pnl = 0.0                        # close deal not in history yet -> book 0, still clear
-    was_fail = float(pnl) <= 0.0         # a non-winning close = init-SL fake-out (winner resets)
-    record_close(st['gov'], pnl, was_fail, trader.cfg)
+    # Fix 2 (E-14): the close-deal P&L can lag the position leaving the book. Retry the
+    # history fetch (3 tries, 1s apart) before booking so a real close is not mis-booked as
+    # $0 (which the old code then counted as an init-SL fail, tripping the fail-pause brake).
+    pnl = _resolve_close_pnl(trader, tk)
+    unresolved = (pnl is None)
+    if unresolved:
+        pnl = 0.0
+        # STILL None after retries: book $0 but do NOT increment consec_fails (was_fail=None
+        # leaves the fail streak intact) -- an unresolvable P&L must not pause the engine.
+        record_close(st['gov'], 0.0, None, trader.cfg)
+    else:
+        was_fail = float(pnl) <= 0.0     # a non-winning close = init-SL fake-out (winner resets)
+        record_close(st['gov'], pnl, was_fail, trader.cfg)
     st['open'] = None
+    _persist_state(trader)               # Fix 5 (E-16): governors changed -> persist
+    if unresolved:
+        try:
+            log.warning(f"{ROGUE_ALERT_PREFIX} WARN pnl-unresolved ticket #{tk}")
+            trader.tele.warn(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} WARN pnl-unresolved "
+                             f"ticket #{tk} — booked $0, fail-streak untouched")
+        except Exception:
+            pass
     # E-3 CHAIN re-anchor (A1 redesign only): plant the exit as the next chain target so the
     # engine re-anchors there and hunts the next $10 move both ways. A reversal recovery keeps
     # its own entry anchor (a1_reverted); legacy monster mode (flag OFF) is unaffected. Guarded.
@@ -680,6 +829,36 @@ def eod_flatten(trader):
         return False
 
 
+def force_close_open(trader, reason="flatten"):
+    """Fix 3 (E-15): close an OPEN Rogue ticket (magic 20260626) UNCONDITIONALLY -- the
+    kill-switch / manual-flatten path. Rogue rides its OWN magic, so the anchor flatten
+    loop never touches it; this closes st['open']'s own ticket, books it via the governor,
+    and clears st['open'] so no phantom open survives a kill. IGNORES rogue_flatten_at_eod
+    (that flag governs the EOD *ride* decision, not a kill). ROGUE-ONLY (never an anchor
+    20260522 ticket). Returns True if it closed one. Guarded; never raises."""
+    try:
+        st = getattr(trader, '_rogue', None)
+        if not st or not st.get('open') or st['open'].get('ticket') is None:
+            return False
+        tk = int(st['open']['ticket'])
+        trader.adapter.close_position(tk, dry_run=trader.paper)   # ROGUE ticket ONLY
+        pnl = _rogue_close_pnl(trader, tk)
+        if pnl is None:
+            pnl = 0.0
+        record_close(st['gov'], pnl, float(pnl) <= 0.0, trader.cfg)
+        st['open'] = None
+        _persist_state(trader)
+        try:
+            trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} {reason} flatten -> closed "
+                             f"#{tk} P&L ${float(pnl):+.2f}")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} force_close_open non-fatal: {e!r}")
+        return False
+
+
 # --- manual current-tick seed (mid-day restart: no A1 event to seed the A1-mode engine) --
 def manual_seed_ok(cfg, is_demo):
     """PURE gate for `rogueseed`. Returns (ok, reason). Valid ONLY when rogue_a1_anchor_mode
@@ -730,6 +909,7 @@ def manual_seed(trader, price):
         # plant the seed as the chain target the Fix 4 engine anchors from.
         st['a1_last_close'] = price
         st['a1_reverted'] = False
+        _persist_state(trader)             # Fix 5 (E-16): seed changed -> persist
         confirm = float(getattr(trader.cfg, 'rogue_entry_confirm_redesign', 10.0))
         log.info(f"{ROGUE_ALERT_PREFIX} MANUAL SEED @ {price} (current tick) -> hunting "
                  f"${confirm:.0f} move both directions")
