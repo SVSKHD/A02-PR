@@ -273,6 +273,8 @@ STEP_NAMES = {
     199: "rogue reversal exempt", # recovery leg: no cooldown, but chase-capped
     200: "rogue seeds exempt",    # A1 morning seed + manual rogueseed are NOT chained
     201: "rogue gates off",       # all three knobs 0 -> old unbounded behavior (freeze)
+    # Hotfix 2026-07-02: PTRACE BREAK_FAILED spam throttle (logging only)
+    202: "ptrace break spam",     # 1 line per episode + suppressed count; gate unchanged
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3612,6 +3614,69 @@ class SelfTest:
         except Exception as e:
             self._record(92, FAIL, f"raised: {e!r}"); return
         self._record(92, PASS if ok else FAIL, detail)
+
+    def _step_ptrace_break_spam(self):
+        # 202 (hotfix 2026-07-02): the live spam scenario. break_and_hold evaluated a
+        # persistent FAILED break once per second (A4 SELL @edge 4131.02) and the
+        # PTRACE emitter wrote 60+ identical BREAK_FAILED lines (17:10:29->17:11:32+);
+        # E-11 had already throttled the human alert to one. Drive the REAL gate with
+        # the REAL PositionTracer through 60 ticks of the same failed break. Asserts:
+        # (a) exactly ONE PTRACE BREAK_FAILED line (repeats suppressed); (b) the gate
+        # DECISION is unchanged -- blocked (False) on EVERY tick; (c) the single E-11
+        # telemetry alert behavior is unchanged; (d) a NEW break level starts a new
+        # episode (re-emits, carrying suppressed_repeats=59 for the closed one); (e) a
+        # CONFIRMED gate reset ends the episode (carries the count) and a following
+        # FAILED re-emits; (f) no telemetry violations.
+        import numpy as np
+        import rally as _rally
+        from position_telemetry import PositionTracer
+        try:
+            dt = [('high', 'f8'), ('low', 'f8'), ('close', 'f8')]
+            # SELL break of edge 100: cleared by $5 (low 95) but candle 2's high
+            # popped back above the edge -> FAILED 'reversed' on every re-evaluation.
+            failed_bars = np.array([(99.0, 95.0, 96.0),
+                                    (101.0, 96.0, 100.5)], dtype=dt)
+            lines = []
+            tr, sh, pl = self._break_gate_stub(lambda s, n: failed_bars, side='SELL')
+            tr.ptrace = PositionTracer(sink=lines.append)
+            blocked = all(_rally.break_and_hold_ok(tr, sh, pl) is False
+                          for _ in range(60))
+            n_failed = sum('PTRACE BREAK_FAILED' in l for l in lines)
+            one_line = (n_failed == 1)
+            one_alert = (sum('no fire' in str(m) for m in self._gate_tele_infos) == 1)
+            # (d) NEW BREAK LEVEL = new episode: same bars vs edge 101 classify
+            # FAILED 'retrace' -> still blocked, ONE new line, count of the 59
+            # suppressed repeats stamped on the line that ends the old episode.
+            sh['leg_fill_price'] = sh['entry_price'] = 101.0
+            blocked_new_edge = (_rally.break_and_hold_ok(tr, sh, pl) is False)
+            new_ep_lines = [l for l in lines if 'PTRACE BREAK_FAILED' in l
+                            and 'suppressed_repeats=59' in l]
+            new_ep_emitted = (sum('PTRACE BREAK_FAILED' in l for l in lines) == 2
+                              and len(new_ep_lines) == 1)
+            # repeats of the NEW episode suppress again...
+            for _ in range(5):
+                _rally.break_and_hold_ok(tr, sh, pl)
+            still_two = (sum('PTRACE BREAK_FAILED' in l for l in lines) == 2)
+            # (e) ...until a CONFIRMED gate reset ends it (carrying suppressed=5);
+            # the next FAILED for the SAME key then re-emits (fresh episode).
+            tr.ptrace.break_confirmed('A2', side='SELL', break_level=101.0)
+            confirm_carries = any('PTRACE BREAK_CONFIRMED' in l
+                                  and 'suppressed_repeats=5' in l for l in lines)
+            blocked_after_reset = (_rally.break_and_hold_ok(tr, sh, pl) is False)
+            reemits_after_reset = (sum('PTRACE BREAK_FAILED' in l for l in lines) == 3)
+            no_violation = (len(tr.ptrace.violations) == 0)
+            ok = (blocked and one_line and one_alert and blocked_new_edge
+                  and new_ep_emitted and still_two and confirm_carries
+                  and blocked_after_reset and reemits_after_reset and no_violation)
+            detail = (f"60_ticks_blocked={blocked} one_ptrace_line={one_line} "
+                      f"one_e11_alert={one_alert} new_edge_reemits+59={new_ep_emitted} "
+                      f"repeats_suppressed={still_two} confirm_carries+5={confirm_carries} "
+                      f"reset_reemits={reemits_after_reset} "
+                      f"decision_unchanged={blocked_new_edge and blocked_after_reset} "
+                      f"no_violation={no_violation}")
+        except Exception as e:
+            self._record(202, FAIL, f"raised: {e!r}"); return
+        self._record(202, PASS if ok else FAIL, detail)
 
     def _step_rally_sl13_cap910(self):
         # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
@@ -7450,6 +7515,8 @@ class SelfTest:
             self._step_p3_reversal_exempt()
             self._step_p3_seeds_exempt()
             self._step_p3_gates_off_freeze()
+            # Hotfix 2026-07-02: PTRACE BREAK_FAILED spam throttle (logging only)
+            self._step_ptrace_break_spam()
         finally:
             self._cleanup()
         return self._report(ts)
