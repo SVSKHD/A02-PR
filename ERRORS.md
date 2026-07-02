@@ -183,6 +183,65 @@ is still open at the broker, skip anchors already placed today, and log `RESTART
 
 ---
 
+## E-17 — Rogue chop/chase exposure (chain re-anchor buys exhausted moves) — **FIXED**
+
+**Status:** FIXED — 2026-07-02 — P3 branch `claude/p3-rogue-chop-chase`.
+
+**Symptom (live 2026-07-02 + audit):** Rogue's design intent is MONSTER-CATCHER — fire on
+real displacement, stay out of noise — but the A1-chain had no discipline on WHERE or WHEN
+it re-entered. Two exposures:
+1. **Chase (live trade 3):** after a close the chain re-anchored at 4058 MID-TREND; the
+   +$10 confirm then fired at **BUY 4068.07 — $24 past the ORIGINAL anchor (4044)** — buying
+   the exhausted extension. Init-SL'd for **−$178.50** (day finished +$72.10; without trade 3
+   it is +$250.60).
+2. **Chop grind (audit walk):** in a plain ±$12 ranging day, every $10 drift is a "confirm";
+   each init-SL close re-anchors INTO the range and the next $10 wiggle re-enters — a
+   3-strike grind to the **−$525** daily loss stop in ~12 minutes, with no requirement that
+   any move be fresh or catchable.
+
+**Fix (two protective gates, BOTH ON by default, each independently toggleable via 0;
+Rogue A1-mode only — the legacy monster path and the anchor engine are untouched):**
+- **GATE 1 — CHASE CAP** (`rogue_chase_cap_dollars = 20.0`): the A1-mode entry band is now
+  `$10 <= |move off the ACTIVE anchor| <= $20` (`a1_entry_decision`). Beyond the cap the
+  move is exhausted — no entry, NO governor slot consumed, one throttled
+  `CHASE-REJECT` log per episode. NO latch: the anchor stays planted and the gate
+  re-evaluates per tick, so a pullback inside the band enters normally. Mirrors the anchor
+  engine's catchable-zone cap on in-flight breakout recovery (`anchors.py` ~:807). Applies
+  to EVERY A1-mode entry including the reversal-recovery leg.
+- **GATE 2 — CHAIN COOLDOWN + DISPLACEMENT** (`rogue_chain_cooldown_sec = 300`,
+  `rogue_chain_min_displacement = 6.0`): an entry off a **CHAINED** anchor (a re-anchor
+  planted by `detect_close` after a close) requires BOTH the cooldown elapsed since the
+  close AND ≥ $6 of movement off the re-anchor price, in the entry direction, observed at
+  some point since planting — the $10 confirm must build from FRESH movement, not the tail
+  of the move that just closed. Blocked entries log one throttled `CHAIN-COOLDOWN Xs
+  remaining` / `CHAIN-DISPLACEMENT` per re-anchor and consume no slot. **Exemptions:** the
+  A1 morning seed, a manual `rogueseed`, and the reversal-recovery leg (time-critical by
+  design; still chase-capped) are NOT chained — the first trade of the day is unaffected.
+  Chain meta (`chain_time`/`chain_anchor`/displacement record) persists in the P1 snapshot
+  so a same-day restart cannot bypass the cooldown.
+
+**Replay evidence (real engine driven through the recorded/audit scenarios):** live
+2026-07-02 replay — trades 1, 2, 4 fire identically, trade 3 is rejected by
+`CHAIN-COOLDOWN (140s remaining)` and the extension dies before the cooldown expires; day
+recomputed **+$72.10 → +$250.60**. Audit chop walk (fast, $10 leg / 2 min): the old path's
+3-strike −$525 grind is broken (strike 1 only; 9 cooldown blocks). Monster day (one-way
+$40): entries, trail closes, chain re-anchor and the post-cooldown second leg are
+**byte-identical** with gates on. **Known residual (stated, not hidden):** a SLOW grind
+(legs ≥ the 5-min cooldown) passes both gates — each move genuinely is "fresh" — and still
+bottoms out at the existing −$525 loss stop / 3-fail pause. A displacement-QUALITY filter
+(thrust, not just distance) remains the P3 follow-on candidate if the demo shows slow-chop
+entries surviving these gates.
+
+**Files:** `rogue.py` (`a1_entry_decision` band, `chase_rejected`, `chain_entry_allowed`,
+`_drive_a1` gate wiring, `detect_close` chain stamp, `manual_seed` exemption, throttled
+logs, `_epoch` seam), `config.py` (3 new keys), `p1_state.py` (chain meta persisted).
+**Self-test:** 196 (chase band + re-allow + no slot), 197 (cooldown block→allow), 198
+(displacement, incl. spike-records-then-pullback-enters), 199 (reversal exempt from
+cooldown, still capped), 200 (A1 seed + rogueseed exempt), 201 (all knobs 0 = old behavior,
+defaults pinned ON); 189 re-verified with gates ON (timing warped, assertions unchanged).
+
+---
+
 ## Decision Log — dated config decisions (NOT bugs)
 
 ### D-1 — A3 anchor CUT — 2026-07-02
