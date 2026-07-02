@@ -265,6 +265,7 @@ STEP_NAMES = {
     192: "fix3 rogue gated",      # E-15 rogue under kill/EOD gates + kill flatten
     193: "fix4 feed reinit/L3",   # E-12 L2 MT5 reinit + L3 self-restart guard
     194: "fix5 restart-recovery", # E-16 persist + same-day boot recovery
+    195: "wd exit42 only",        # watchdog relaunches ONLY on exit 42; else stop
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -6486,6 +6487,30 @@ class SelfTest:
             self._record(194, FAIL, f"raised: {e!r}"); return
         self._record(194, PASS if ok else FAIL, detail)
 
+    def _step_watchdog_exit_policy(self):
+        # 195 (watchdog relaunch policy): the watchdog relaunches bot.py ONLY on exit code
+        # 42 (the controlled feed self-restart) and STOPS on every other exit code (crash /
+        # clean /stop / clock-drift abort exit 0) -- so a crashing bot can never crash-loop
+        # and spam-place orders on each boot. A runaway 42-loop (>= the cap, feed
+        # unrecoverable) also stops for a human. PURE (watchdog.relaunch_policy).
+        import watchdog as _wd
+        try:
+            cap = _wd.MAX_CONSECUTIVE_SELFRESTARTS
+            relaunch_42 = (_wd.relaunch_policy(42, 1) == 'relaunch'
+                           and _wd.relaunch_policy(42, cap - 1) == 'relaunch')
+            runaway = (_wd.relaunch_policy(42, cap) == 'stop_runaway'
+                       and _wd.relaunch_policy(42, cap + 5) == 'stop_runaway')
+            # every non-42 exit code STOPS (no relaunch): clean stop, generic crash,
+            # segfault, negative signal codes, and a near-miss (43) that must not count.
+            stop_others = all(_wd.relaunch_policy(rc, 0) == 'stop'
+                              for rc in (0, 1, 2, 43, 139, -1, 255))
+            ok = relaunch_42 and runaway and stop_others
+            detail = (f"only42_relaunches={relaunch_42} runaway@{cap}_stops={runaway} "
+                      f"all_other_codes_stop={stop_others}")
+        except Exception as e:
+            self._record(195, FAIL, f"raised: {e!r}"); return
+        self._record(195, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -7105,6 +7130,8 @@ class SelfTest:
             self._step_fix3_rogue_gated()
             self._step_fix4_feed_reinit_l3()
             self._step_fix5_restart_recovery()
+            # watchdog relaunch policy — relaunch ONLY on exit 42, stop on any other code
+            self._step_watchdog_exit_policy()
         finally:
             self._cleanup()
         return self._report(ts)

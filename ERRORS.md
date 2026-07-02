@@ -64,15 +64,28 @@ subscription stayed blind indefinitely.
   (`MT5Adapter.reinit`: `shutdown() → initialize() → symbol_select → verify a fresh tick
   within 60s`), up to `feed_reinit_max_tries` (2). Posts `FEED REINIT attempt N`.
 - **Level 3 (new):** if both reinits fail, a **controlled self-restart** — persist state
-  (E-16), Discord `SELF-RESTART: feed dead`, `sys.exit(42)`; `run_aureon.bat` / Task
-  Scheduler relaunch on code 42. Gated by `feed_selfrestart_enabled` (default ON) and a
-  market-closed clock guard so it NEVER self-restarts on a weekend.
+  (E-16), Discord `SELF-RESTART: feed dead`, `sys.exit(42)`. Gated by
+  `feed_selfrestart_enabled` (default ON) and a market-closed clock guard so it NEVER
+  self-restarts on a weekend.
+
+**Launch chain (P1 follow-up):** `watchdog.py` is the active supervised launcher and now
+owns the exit-code relaunch policy — it **relaunches the bot ONLY on exit code 42** (the
+controlled self-restart) and, on **any other exit code** (crash / clean `/stop` /
+clock-drift abort exit 0), **alerts Discord and STOPS** rather than relaunching. This fixes
+the prior bug where the supervisor relaunched on every exit (crash + code-0 respawn), which
+could crash-loop and re-place orders on each boot. A runaway 42-loop
+(`MAX_CONSECUTIVE_SELFRESTARTS`) also stops for a human; heartbeat-hung and manual
+`/restart` remain separate controlled restarts. The E-16 same-day recovery means a 42
+relaunch never re-places orders. `run_aureon.bat` is a documented **alternative** launcher
+(same exit-42-only contract, direct `bot.py` launch) for setups not using the watchdog.
 
 **Files:** `feed_watchdog.py`, `mt5_adapter.py` (`reinit`), `live_trader.py`
-(`_feed_reinit` / `_feed_self_restart` / `_weekend_by_clock`), `config.py`
-(`feed_reinit_blind_min` / `feed_reinit_max_tries` / `feed_selfrestart_enabled`),
-`run_aureon.bat`, `TASK_SCHEDULER.md`. **Self-test:** 168 (counter capped + escalation),
-193 (reinit fresh/stale + ladder). `feed_watchdog_enabled=False` stays byte-identical.
+(`_feed_reinit` / `_feed_self_restart` / `_weekend_by_clock`), `watchdog.py`
+(`relaunch_policy` + supervisor exit block), `config.py` (`feed_reinit_blind_min` /
+`feed_reinit_max_tries` / `feed_selfrestart_enabled`), `run_aureon.bat`, `TASK_SCHEDULER.md`.
+**Self-test:** 168 (counter capped + escalation), 193 (reinit fresh/stale + ladder), 195
+(watchdog relaunches only on 42, stops otherwise). `feed_watchdog_enabled=False` stays
+byte-identical.
 
 ---
 
