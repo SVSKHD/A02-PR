@@ -82,9 +82,12 @@ watching), and **E-4** is answered by the 2026-07-02 EOD-flatten default flip.
 
 ## 5. Current queue
 
-- **P3 — Rogue displacement/chop filter + chase cap.** Stop entering on
-  chop-grade $10 drifts (displacement/impulse quality gate) and cap how far a
-  chain entry may chase away from its anchor.
+- **P3 — Rogue chop/chase gates — SHIPPED 2026-07-02** (branch
+  `claude/p3-rogue-chop-chase`, E-17): chase cap $10–$20 entry band + chain
+  cooldown 300s + $6 fresh displacement on chained anchors. Known residual: a
+  SLOW grind (legs ≥ the cooldown) still bottoms at the −$525 brake — a
+  displacement-QUALITY filter (thrust, not distance) is the follow-on candidate
+  if the demo shows slow-chop entries surviving these gates.
 - **P4 — dead-code verdicts.** Rule on and remove-or-wire: `a1_soft_lock_met`,
   `a1_rescue_cap`, and the other confirmed-dead flags (the flag-OFF experiments
   that will never flip). Subtraction pass, selftest-proven.

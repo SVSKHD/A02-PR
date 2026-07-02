@@ -89,6 +89,12 @@ def snapshot(trader):
                 'leg_dir': r.get('leg_dir'),
                 'a1_last_close': r.get('a1_last_close'),
                 'a1_reverted': bool(r.get('a1_reverted', False)),
+                # P3 (E-17): chain-gate meta -- a restart mid-cooldown must NOT bypass
+                # the chain cooldown/displacement gate on the chained anchor.
+                'chain_time': r.get('chain_time'),
+                'chain_anchor': r.get('chain_anchor'),
+                'chain_disp_up': float(r.get('chain_disp_up', 0.0) or 0.0),
+                'chain_disp_dn': float(r.get('chain_disp_dn', 0.0) or 0.0),
                 'open': ({'ticket': o.get('ticket'), 'side': o.get('side'),
                           'entry': o.get('entry'), 'sl': o.get('sl'), 'peak': o.get('peak'),
                           'magic': o.get('magic'), 'leg_type': o.get('leg_type')}
@@ -199,7 +205,13 @@ def recover_on_boot(trader):
             st = {'day': today, 'gov': gov, 'anchor': r.get('anchor'),
                   'leg_dir': r.get('leg_dir'), 'open': None,
                   'a1_last_close': r.get('a1_last_close'),
-                  'a1_reverted': bool(r.get('a1_reverted', False))}
+                  'a1_reverted': bool(r.get('a1_reverted', False)),
+                  # P3 (E-17): restore the chain-gate meta so the cooldown survives
+                  # a same-day restart (absent in an older file -> None = not chained).
+                  'chain_time': r.get('chain_time'),
+                  'chain_anchor': r.get('chain_anchor'),
+                  'chain_disp_up': float(r.get('chain_disp_up', 0.0) or 0.0),
+                  'chain_disp_dn': float(r.get('chain_disp_dn', 0.0) or 0.0)}
             o = r.get('open')
             if o and o.get('ticket') is not None and _position_open_at_broker(trader, o.get('ticket')):
                 # ADOPT the already-open Rogue position instead of ignoring it.

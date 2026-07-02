@@ -234,6 +234,35 @@ class Config:
     rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
     rogue_daily_soft_lock: float = 30.0         # soft banked floor ($) -- NEVER a hard stop
     rogue_rescue_cap_dollars: float = 13.0      # per-recovery-leg SL cap on a reversal
+    # --- P3 (E-17): Rogue monster-catcher discipline -- chop/chase gates ----------
+    # Rogue's design intent is MONSTER-CATCHER: fire on real displacement, stay out of
+    # noise. Live 2026-07-02 trade 3 (BUY 4068.07) entered after the move had already
+    # run $24 off the ORIGINAL anchor -- the chain re-anchored at 4058 mid-trend and
+    # bought the extension (-$178.50); the audit's chop walk shows a plain ranging day
+    # grinding to -$525 via chain-re-anchor-into-range. Both gates are ON by default
+    # (they are protective) and each is independently toggleable (0 disables).
+    # A1-mode only; the legacy monster path and the anchor engine are untouched.
+    # GATE 1 -- CHASE CAP: reject an A1-mode entry when the move off the ACTIVE anchor
+    # exceeds this ($). Entry band becomes confirm <= |move| <= cap ($10..$20). Mirrors
+    # the anchor engine's catchable-zone cap on in-flight breakout recovery
+    # (anchors.py ~:807, slip capped at $15): never enter an exhausted move after boot
+    # lag / feed recovery / a mid-trend chain re-anchor. NO latch -- the gate
+    # re-evaluates per tick, so a pullback inside the band allows entry again; a
+    # chase-reject consumes NO governor slot. Applies to EVERY A1-mode entry,
+    # including the reversal-recovery leg. 0 disables (old unbounded behavior).
+    rogue_chase_cap_dollars: float = 20.0
+    # GATE 2 -- CHAIN COOLDOWN + DISPLACEMENT: an entry off a CHAINED anchor (a
+    # re-anchor planted by detect_close after a close -- NOT the A1 morning seed, NOT
+    # a manual rogueseed, NOT a reversal-recovery) requires BOTH (a) this many seconds
+    # elapsed since the close, AND (b) price to have displaced >= the min displacement
+    # ($) from the re-anchor price at some point since planting, in the direction of
+    # the eventual entry signal. Together they force the $10 confirm to build from
+    # FRESH movement instead of the tail of the move that just closed (with defaults,
+    # the $10 confirm itself satisfies (b) -- the knob exists to be tuned above the
+    # confirm). The reversal-recovery leg is EXEMPT from the cooldown (time-critical
+    # by design) but still chase-capped. 0 disables each check independently.
+    rogue_chain_cooldown_sec: float = 300.0
+    rogue_chain_min_displacement: float = 6.0
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose

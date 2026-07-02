@@ -243,20 +243,76 @@ def a1_seed_anchor(last_close_level, a1_price):
 def a1_entry_decision(anchor_price, current_price, cfg):
     """Fix 4 ENTRY: once price has moved rogue_entry_confirm_redesign ($10) off the anchor,
     ENTER in the MOVE direction (up -> BUY / down -> SELL) with a tight init SL
-    (rogue_init_sl on the wrong side). Returns (enter, side, entry_price, init_sl). PURE."""
+    (rogue_init_sl on the wrong side). Returns (enter, side, entry_price, init_sl). PURE.
+
+    P3 GATE 1 (E-17 CHASE CAP): the entry band is confirm <= |move| <=
+    rogue_chase_cap_dollars ($10..$20 default). Beyond the cap the move is EXHAUSTED --
+    entering there is chasing (live 2026-07-02 trade 3: chain re-anchored mid-trend,
+    bought the $24 extension, -$178.50). Mirrors the anchor engine's catchable-zone cap
+    on in-flight breakout recovery (anchors.py ~:807). NO latch: this re-evaluates per
+    tick, so if price pulls back inside the band later the entry is allowed again.
+    Cap <= 0 disables (old unbounded behavior). Applies to every A1-mode entry,
+    including the reversal-recovery leg (the cooldown exemption is separate)."""
     confirm = float(getattr(cfg, 'rogue_entry_confirm_redesign', 10.0))
     init_sl = float(getattr(cfg, 'rogue_init_sl', 5.0))
+    cap = float(getattr(cfg, 'rogue_chase_cap_dollars', 0.0) or 0.0)
     try:
         a = float(anchor_price)
         p = float(current_price)
     except (TypeError, ValueError):
         return False, None, None, None
     move = p - a
+    if cap > 0 and abs(move) > cap:
+        return False, None, None, None       # GATE 1: exhausted move -> no chase
     if move >= confirm:
         return True, 'BUY', round(p, 2), round(p - init_sl, 2)
     if move <= -confirm:
         return True, 'SELL', round(p, 2), round(p + init_sl, 2)
     return False, None, None, None
+
+
+def chase_rejected(anchor_price, current_price, cfg):
+    """P3 GATE 1 (E-17) telemetry helper: is the current tick a CHASE reject -- |move| off
+    the anchor beyond rogue_chase_cap_dollars? Returns (rejected, move) where move is
+    SIGNED (+ above the anchor / - below). Cap <= 0 -> never rejected. PURE (the decision
+    itself lives inside a1_entry_decision; this exists so the driver can log the reject
+    without re-deriving the band)."""
+    cap = float(getattr(cfg, 'rogue_chase_cap_dollars', 0.0) or 0.0)
+    if cap <= 0:
+        return False, 0.0
+    try:
+        move = float(current_price) - float(anchor_price)
+    except (TypeError, ValueError):
+        return False, 0.0
+    return (abs(move) > cap), move
+
+
+def chain_entry_allowed(chain_time, now_epoch, disp_in_dir, cfg):
+    """P3 GATE 2 (E-17 CHAIN COOLDOWN + DISPLACEMENT): may an entry fire off a CHAINED
+    anchor (a detect_close re-anchor)? Requires BOTH (a) rogue_chain_cooldown_sec elapsed
+    since the close that planted it, AND (b) the observed displacement from the re-anchor
+    price, in the entry direction, to have reached rogue_chain_min_displacement at some
+    point since planting -- the $10 confirm must build from FRESH movement, not the tail
+    of the move that just closed. Returns (ok, reason, cooldown_remaining_sec); reason is
+    'ok' / 'cooldown' / 'displacement'. Each check independently disabled by <= 0. NOT
+    applied to the A1 morning seed, a manual rogueseed, or a reversal-recovery leg (the
+    driver decides what is chained). PURE."""
+    cool = float(getattr(cfg, 'rogue_chain_cooldown_sec', 0.0) or 0.0)
+    disp_req = float(getattr(cfg, 'rogue_chain_min_displacement', 0.0) or 0.0)
+    if cool > 0 and chain_time is not None:
+        try:
+            remaining = cool - (float(now_epoch) - float(chain_time))
+        except (TypeError, ValueError):
+            remaining = 0.0
+        if remaining > 0:
+            return False, 'cooldown', remaining
+    if disp_req > 0:
+        try:
+            if float(disp_in_dir) < disp_req:
+                return False, 'displacement', 0.0
+        except (TypeError, ValueError):
+            return False, 'displacement', 0.0
+    return True, 'ok', 0.0
 
 
 def a1_reversal_confirmed(entry_price, side, current_price, cfg):
@@ -356,6 +412,12 @@ def _drive_a1(trader, st, allow_new_entries=True):
                 pass
             st['a1_last_close'] = float(o_before.get('entry'))
             st['a1_reverted'] = True
+            # P3 (E-17): a reversal-recovery anchor is NOT a chained anchor -- the recovery
+            # is time-critical by design, so the chain cooldown must not delay it (the
+            # chase cap still applies inside a1_entry_decision). Clear the chain meta so
+            # the gate can't mistake the entry-based anchor for a re-anchor.
+            st['chain_time'] = None
+            st['chain_anchor'] = None
             detect_close(trader, st)        # book P&L + clear st['open'] (guarded)
             return
         # CONTINUATION: ride the winner on the proven adaptive trail.
@@ -372,12 +434,42 @@ def _drive_a1(trader, st, allow_new_entries=True):
     anchor = a1_seed_anchor(st.get('a1_last_close'), _a1_anchor_price(trader))
     if anchor is None:
         return
+    # P3 (E-17): this anchor is CHAINED iff it is the re-anchor detect_close planted
+    # after a close (chain_anchor matches the active chain target). The A1 morning seed,
+    # a manual rogueseed, and a reversal-recovery anchor all leave chain_anchor unset ->
+    # not chained -> Gate 2 never touches them (first trade of the day is unaffected).
+    chained = (st.get('chain_anchor') is not None
+               and st.get('a1_last_close') is not None
+               and abs(float(st['chain_anchor']) - float(anchor)) < 1e-9)
+    if chained:
+        # Track the running per-direction displacement off the re-anchor since planting
+        # ("at some point since planting" -- a spike that later pulls back still counts).
+        d = float(price) - float(anchor)
+        st['chain_disp_up'] = max(float(st.get('chain_disp_up', 0.0)), d)
+        st['chain_disp_dn'] = max(float(st.get('chain_disp_dn', 0.0)), -d)
     ok, _why = can_enter(st['gov'], trader.cfg)   # BRAKE: daily loss stop / cap / fail-pause
     if not ok:
         return
     enter, side, epx, sl = a1_entry_decision(anchor, price, trader.cfg)
     if not enter:
+        # P3 GATE 1 (E-17): if this no-enter is a CHASE reject (|move| > cap), say so --
+        # once per episode. NO slot is consumed (slots are only consumed on a real fill
+        # in _mark_rogue_open) and NO latch is set: the anchor stays planted and the gate
+        # re-evaluates per tick, so a pullback inside the band allows entry again.
+        _log_chase_reject(trader, st, anchor, price)
         return
+    # P3 GATE 2 (E-17): a CHAINED anchor additionally needs the cooldown elapsed AND the
+    # $6 fresh displacement in the entry direction. The reversal-recovery leg is exempt
+    # (never chained: the reversal path cleared the chain meta above); rejection consumes
+    # no slot and the gate re-evaluates per tick.
+    if chained:
+        disp = float(st.get('chain_disp_up', 0.0)) if side == 'BUY' \
+            else float(st.get('chain_disp_dn', 0.0))
+        allowed, why2, remaining = chain_entry_allowed(
+            st.get('chain_time'), _epoch(), disp, trader.cfg)
+        if not allowed:
+            _log_chain_block(trader, st, why2, remaining)
+            return
     # a reversal-recovery leg uses the wider per-rescue cap as its SL (still bounded).
     if st.get('a1_reverted'):
         cap = float(getattr(trader.cfg, 'rogue_rescue_cap_dollars', 13.0))
@@ -387,6 +479,10 @@ def _drive_a1(trader, st, allow_new_entries=True):
     st['anchor'] = anchor
     _place_rogue_entry(trader, st, epx, sl)
     st['a1_last_close'] = None
+    # P3 (E-17): the chained anchor is consumed by this entry -- clear the chain meta so
+    # a later, unrelated anchor can never inherit a stale cooldown/displacement record.
+    st['chain_time'] = None
+    st['chain_anchor'] = None
 
 
 def drive(trader, allow_new_entries=True):
@@ -503,6 +599,62 @@ def _now_ts():
         return _pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S')
     except Exception:
         return ''
+
+
+def _epoch():
+    """Wall clock in epoch seconds for the P3 chain cooldown. A separate seam (not inline
+    time.time()) so tests can pin/patch it. Guarded; 0.0 on any error."""
+    try:
+        import time as _t
+        return float(_t.time())
+    except Exception:
+        return 0.0
+
+
+def _log_chase_reject(trader, st, anchor, price):
+    """P3 GATE 1 (E-17) telemetry: log a CHASE-REJECT once per episode -- an episode ends
+    when the tick is no longer beyond the cap (pullback inside the band / below confirm),
+    which re-arms the log. The GATE itself has no latch (a1_entry_decision re-evaluates
+    per tick); only this LOG is throttled so a persistent extension can't spam. Guarded."""
+    try:
+        rejected, move = chase_rejected(anchor, price, trader.cfg)
+        if not rejected:
+            if st.get('_chase_log_key') is not None:
+                st['_chase_log_key'] = None      # back inside the band -> re-arm the log
+            return
+        key = f"{round(float(anchor), 2)}:{'UP' if move > 0 else 'DN'}"
+        if st.get('_chase_log_key') == key:
+            return                               # same episode -> already logged
+        st['_chase_log_key'] = key
+        cap = float(getattr(trader.cfg, 'rogue_chase_cap_dollars', 0.0) or 0.0)
+        msg = (f"{ROGUE_ALERT_PREFIX} CHASE-REJECT move ${abs(move):.2f} > cap ${cap:.0f} "
+               f"(anchor {float(anchor):.2f})")
+        log.info(msg)
+        trader.tele.info(msg)
+    except Exception:
+        pass
+
+
+def _log_chain_block(trader, st, reason, remaining):
+    """P3 GATE 2 (E-17) telemetry: log a chain-gate block ONCE per (reason, re-anchor) --
+    the gate itself re-evaluates every tick; only the log is throttled. Guarded."""
+    try:
+        key = f"{reason}:{st.get('chain_time')}"
+        if st.get('_chain_log_key') == key:
+            return
+        st['_chain_log_key'] = key
+        if reason == 'cooldown':
+            msg = (f"{ROGUE_ALERT_PREFIX} CHAIN-COOLDOWN {max(0.0, float(remaining)):.0f}s "
+                   f"remaining (re-anchor {float(st.get('chain_anchor') or 0):.2f})")
+        else:
+            need = float(getattr(trader.cfg, 'rogue_chain_min_displacement', 0.0) or 0.0)
+            msg = (f"{ROGUE_ALERT_PREFIX} CHAIN-DISPLACEMENT < ${need:.0f} fresh off "
+                   f"re-anchor {float(st.get('chain_anchor') or 0):.2f} -- waiting for a "
+                   f"NEW move, not the closed one's tail")
+        log.info(msg)
+        trader.tele.info(msg)
+    except Exception:
+        pass
 
 
 def _spread(trader):
@@ -783,6 +935,14 @@ def detect_close(trader, st):
                 exit_px = o.get('sl')          # trailing/init stop that fired ~= the exit
             if exit_px is not None:
                 st['a1_last_close'] = float(exit_px)
+                # P3 (E-17) GATE 2: this re-anchor is a CHAINED anchor -- stamp when and
+                # where it was planted and reset the per-direction displacement record.
+                # The next entry off it must wait out rogue_chain_cooldown_sec AND show
+                # rogue_chain_min_displacement of fresh movement (chain_entry_allowed).
+                st['chain_time'] = _epoch()
+                st['chain_anchor'] = float(exit_px)
+                st['chain_disp_up'] = 0.0
+                st['chain_disp_dn'] = 0.0
                 trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} CHAIN re-anchor @ "
                                  f"{float(exit_px):.2f} -> hunting $10 both dirs")
     except Exception:
@@ -909,6 +1069,10 @@ def manual_seed(trader, price):
         # plant the seed as the chain target the Fix 4 engine anchors from.
         st['a1_last_close'] = price
         st['a1_reverted'] = False
+        # P3 (E-17): a manual seed is NOT a chained anchor -- no cooldown/displacement
+        # gate on the first entry off it (same exemption as the A1 morning seed).
+        st['chain_time'] = None
+        st['chain_anchor'] = None
         _persist_state(trader)             # Fix 5 (E-16): seed changed -> persist
         confirm = float(getattr(trader.cfg, 'rogue_entry_confirm_redesign', 10.0))
         log.info(f"{ROGUE_ALERT_PREFIX} MANUAL SEED @ {price} (current tick) -> hunting "
