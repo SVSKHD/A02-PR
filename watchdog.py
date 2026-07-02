@@ -64,7 +64,33 @@ HEARTBEAT_STALE_SECONDS = 180        # bot is unhealthy if heartbeat older than 
 CRASH_BACKOFF_BASE      = 5          # 5s, 10s, 20s, ... up to MAX
 CRASH_BACKOFF_MAX       = 600        # cap backoff at 10 minutes
 MAX_CONSECUTIVE_CRASHES = 8          # give up after 8 in a row
-CRASH_RESET_AFTER_S     = 600        # 10 min of stability = forget crash count
+CRASH_RESET_AFTER_S     = 600        # 10 min of stability = forget crash/self-restart counts
+
+# Exit-code relaunch policy (Fix 4 / E-12 L3): the ONLY exit code that triggers an
+# auto-relaunch is 42 (the bot's controlled feed self-restart). Any other exit code
+# (crash, clean /stop, clock-drift abort) STOPS the watchdog + alerts -- a crashing bot
+# must never crash-loop and spam-place orders on each boot.
+FEED_SELFRESTART_EXIT_CODE   = 42    # bot's controlled feed-death self-restart (sys.exit(42))
+FEED_RESTART_PAUSE_S         = 5     # brief settle before relaunching on a 42 exit
+MAX_CONSECUTIVE_SELFRESTARTS = 12    # runaway 42-loop guard (feed unrecoverable -> stop + alert)
+
+
+def relaunch_policy(exit_code, consecutive_selfrestarts,
+                    max_selfrestarts=MAX_CONSECUTIVE_SELFRESTARTS):
+    """PURE exit-code relaunch policy (Fix 4 / E-12 Level 3). Returns:
+      'relaunch'     -> exit 42 (controlled feed self-restart) under the runaway cap.
+      'stop_runaway' -> exit 42 but the self-restart has looped >= max_selfrestarts with no
+                        stable run in between (feed looks unrecoverable) -> stop for a human.
+      'stop'         -> ANY OTHER exit code (crash / clean /stop / clock-drift abort exit 0)
+                        -> do NOT relaunch.
+    Only exit 42 ever relaunches; everything else stops so a crashing bot can never
+    crash-loop and spam-place orders on each boot. `consecutive_selfrestarts` is the count
+    INCLUDING the exit being judged (increment before calling)."""
+    if exit_code == FEED_SELFRESTART_EXIT_CODE:
+        if consecutive_selfrestarts >= max_selfrestarts:
+            return 'stop_runaway'
+        return 'relaunch'
+    return 'stop'
 ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
                     "resume","today","help","start"}
 
@@ -103,6 +129,7 @@ class Watchdog:
         self.shutdown_requested = False
         self.restart_requested = False
         self.consecutive_crashes = 0
+        self.consecutive_selfrestarts = 0    # consecutive exit-42 feed self-restarts
         self.last_start_ts = 0.0
 
         # Auto-deploy (INFRA, default OFF). When ON, poll master, pull+validate,
@@ -540,40 +567,57 @@ class Watchdog:
                     exit_code = self.bot_proc.returncode
                     runtime = time.time() - self.last_start_ts
 
-                    # Stable run resets crash counter
+                    # A stable run clears both restart counters.
                     if runtime > CRASH_RESET_AFTER_S:
                         self.consecutive_crashes = 0
+                        self.consecutive_selfrestarts = 0
 
-                    # Code-0 (clean exit) should NOT count as a crash.
-                    # Common case: bot exits during weekend/market-closed because
-                    # weekend-detection code finishes its checks and returns clean.
-                    # We still want to restart it, but without burning the budget.
-                    if exit_code == 0 and runtime < 30:
-                        self.tele.info(
-                            f"Bot clean-exited after {runtime:.0f}s "
-                            f"(market probably closed). Restarting in 60s without counting as crash.")
-                        time.sleep(60)
+                    # RELAUNCH ONLY on the controlled feed self-restart (exit 42, Fix 4 /
+                    # E-12 Level 3). The bot persisted its state (E-16) before exiting and
+                    # recovers the SAME trading day on boot -- anchors already placed are
+                    # SKIPPED and open positions are adopted -- so a 42 relaunch cannot
+                    # re-place orders. A short pause keeps a reinit loop from hammering; a
+                    # runaway (feed unrecoverable) stops the watchdog for a human. Any other
+                    # exit code STOPS the watchdog (no crash-loop). Count 42s BEFORE deciding
+                    # so the runaway cap includes this exit.
+                    if exit_code == FEED_SELFRESTART_EXIT_CODE:
+                        self.consecutive_selfrestarts += 1
+                    action = relaunch_policy(exit_code, self.consecutive_selfrestarts)
+
+                    if action == 'relaunch':
+                        self.tele.warn(
+                            f"🔁 Bot exited 42 (controlled feed self-restart "
+                            f"#{self.consecutive_selfrestarts}, ran {runtime:.0f}s) — "
+                            f"relaunching in {FEED_RESTART_PAUSE_S}s. State persisted; "
+                            f"same-day recovery on boot (no re-placed orders).")
+                        time.sleep(FEED_RESTART_PAUSE_S)
                         self._spawn_bot()
                         continue
 
-                    self.consecutive_crashes += 1
-                    sev = Severity.CRITICAL if exit_code != 0 else Severity.INFO
-                    self.tele.send(
-                        f"Bot exited (code `{exit_code}`, ran {runtime:.0f}s, "
-                        f"crash #{self.consecutive_crashes})", sev)
-
-                    if self.consecutive_crashes >= MAX_CONSECUTIVE_CRASHES:
+                    if action == 'stop_runaway':
                         self.tele.critical(
-                            f"🚨 Hit {MAX_CONSECUTIVE_CRASHES} consecutive crashes — "
-                            f"giving up. Watchdog exiting. Investigate before restarting.")
+                            f"🚨 *Feed self-restart looped {self.consecutive_selfrestarts}x* "
+                            f"(exit 42) with no stable run — feed looks unrecoverable. "
+                            f"Watchdog STOPPING; check the MT5 terminal / Market Watch, "
+                            f"then restart manually.")
                         break
 
-                    backoff = min(CRASH_BACKOFF_BASE * (2 ** (self.consecutive_crashes - 1)),
-                                  CRASH_BACKOFF_MAX)
-                    self.tele.info(f"Restarting bot in {backoff}s...")
-                    time.sleep(backoff)
-                    self._spawn_bot()
-                    continue
+                    # action == 'stop': ANY other exit code -> do NOT relaunch. A crashing
+                    # bot that respawns on every boot re-arms anchors and could spam-place
+                    # orders; a clean /stop or a clock-drift abort (exit 0) should also stay
+                    # down. Alert loudly and STOP so a human investigates before it trades
+                    # again. (Heartbeat-hung + manual /restart below are separate controlled
+                    # paths and still restart; only the exit-code path stops here.)
+                    self.tele.send(
+                        f"🛑 *Bot exited (code `{exit_code}`, ran {runtime:.0f}s) — NOT "
+                        f"relaunching.*\nOnly exit 42 (controlled feed self-restart) triggers "
+                        f"an auto-relaunch. Any other exit (crash / clean `/stop` / clock-drift "
+                        f"abort) stops the watchdog so a crashing bot can never crash-loop and "
+                        f"spam-place orders on each boot.\nInvestigate the logs, then restart "
+                        f"manually with `python watchdog.py ...`. Open positions remain "
+                        f"protected by their broker-side SL.",
+                        Severity.CRITICAL)
+                    break
 
                 # 2. Heartbeat watchdog
                 hb_age = self._heartbeat_age()
