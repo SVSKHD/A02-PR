@@ -259,7 +259,9 @@ def break_and_hold_ok(self, shadow, plan):
     """v3.2.4 Feature D gate (live): stack ONLY on a CONFIRMED break (cleared edge +
     held N M5 candles + retrace < Y), via the shared break_hold.classify on the
     recent M5 bars. Disabled / not enough data -> True (legacy: don't block).
-    Emits BREAK_CONFIRMED / BREAK_CANDIDATE / BREAK_FAILED(reason).
+    Emits BREAK_CONFIRMED / BREAK_CANDIDATE / BREAK_FAILED(reason); the PTRACE
+    BREAK_FAILED line is throttled by PositionTracer to once per
+    (anchor, side, break_level) episode (2026-07-02 hotfix).
 
     v3.3.3 FIX 1B -- FAIL CLOSED: if the gate raises for ANY reason it now BLOCKS the
     fire (returns False) and logs loudly, instead of the old 'non-fatal, allowing'
@@ -373,8 +375,10 @@ def break_and_hold_ok(self, shadow, plan):
         # E-11: throttle the human-facing "BREAK no fire" line to ONCE PER EPISODE.
         # The boost trigger re-evaluates this gate every tick while the boost stays
         # armed, so a persistent FAILED/CANDIDATE used to spam ~30x/90s. Log only when
-        # the (result, reason) changes (a genuine state transition); the PTRACE
-        # break_failed/break_candidate trace above stays gapless (unthrottled).
+        # the (result, reason) changes (a genuine state transition). The PTRACE
+        # BREAK_FAILED line is episode-throttled too since the 2026-07-02 hotfix
+        # (once per (anchor, side, break_level), suppressed repeats counted) --
+        # that throttle lives in PositionTracer.break_failed, not here.
         _nofire_key = f"{result}:{reason}"
         if isinstance(shadow, dict):
             if shadow.get('_break_nofire_key') != _nofire_key:

@@ -242,6 +242,35 @@ defaults pinned ON); 189 re-verified with gates ON (timing warped, assertions un
 
 ---
 
+## Watch Ledger — patterns under observation (NOT confirmed bugs, NO lever pulled)
+
+### W-7 — break_and_hold false negative on a real continuation — **WATCH** — opened 2026-07-02
+
+**Instance (2026-07-02, A4 SELL @edge 4131.02):** the break-and-hold gate
+classified the break **reversed** (4 M5 candles) while price continued **+$17.7**
+in the break direction — rally boosts stayed blocked the whole way and an
+estimated **~$300–400 was forfeited**. The parent leg was only **+$10–16**
+favorable during the window, just UNDER the $20 `parent_established_dollars`
+CASE 2 override, so the override never engaged.
+
+**Candidate lever (if repeated):** lower the override threshold to **~$12–15**.
+**Status:** NEEDS more instances before ANY change — the gate exists because of
+the −$701 fake-break loss and is not loosened on a single counter-example.
+(Same-episode side effect — 60+ identical PTRACE `BREAK_FAILED` lines, one per
+second — fixed by the 2026-07-02 spam-throttle hotfix: once per
+(anchor, side, break_level) episode with a `suppressed_repeats` count. Logging
+only; the gate decision is untouched.)
+
+### W-2 — evidence append — 2026-07-02
+
+**A4 BUY:** no-hold shadow **+$36.75** vs actual **−$630** (held 33.9m).
+
+### W-4 — evidence append — 2026-07-02
+
+**A4 BUY:** rode a **$27 collapse naked** (rescue suppressed by design).
+
+---
+
 ## Decision Log — dated config decisions (NOT bugs)
 
 ### D-1 — A3 anchor CUT — 2026-07-02

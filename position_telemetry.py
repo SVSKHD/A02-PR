@@ -167,6 +167,9 @@ class PositionTracer:
         self._sink = sink or (lambda line: log.info(line))
         self._history: Dict[object, List[Dict]] = {}
         self._violations: List[str] = []
+        # Hotfix 2026-07-02: per-anchor BREAK_FAILED suppression episode
+        # {anchor: {'key': (side, break_level), 'suppressed': N}} -- see break_failed.
+        self._break_fail_episode: Dict[object, Dict] = {}
 
     # ---- core emit -------------------------------------------------------
     def emit(self, event_type: str, ticket=None, anchor=None, *,
@@ -219,9 +222,48 @@ class PositionTracer:
     def reconcile(self, ticket=None, **kw): return self.emit(RECONCILE, ticket, "SYS", **kw)
     def reconcile_summary(self, **kw):     return self.emit(RECONCILE_SUMMARY, None, "SYS", **kw)
     def break_eval(self, anchor, **kw):    return self.emit(BREAK_EVAL, None, anchor, **kw)
-    def break_candidate(self, anchor, **kw): return self.emit(BREAK_CANDIDATE, None, anchor, **kw)
-    def break_confirmed(self, anchor, **kw): return self.emit(BREAK_CONFIRMED, None, anchor, **kw)
-    def break_failed(self, anchor, **kw):  return self.emit(BREAK_FAILED, None, anchor, **kw)
+    def break_candidate(self, anchor, **kw):
+        # A CANDIDATE classification is a gate-state reset: it ends any running
+        # BREAK_FAILED suppression episode (and carries its suppressed count).
+        return self.emit(BREAK_CANDIDATE, None, anchor,
+                         **self._end_break_fail_episode(anchor, kw))
+
+    def break_confirmed(self, anchor, **kw):
+        # A CONFIRMED classification is a gate-state reset (same as CANDIDATE).
+        return self.emit(BREAK_CONFIRMED, None, anchor,
+                         **self._end_break_fail_episode(anchor, kw))
+
+    def break_failed(self, anchor, **kw):
+        """Hotfix 2026-07-02: throttle the PTRACE BREAK_FAILED line to ONCE per
+        (anchor, side, break_level) episode. The rally break-and-hold gate
+        re-evaluates every tick while a boost trigger stays armed, so a persistent
+        FAILED classification wrote one identical line per second (60+ during the
+        live A4 SELL @edge 4131.02 episode, 17:10:29->17:11:32+). E-11 already
+        throttles the human-facing telemetry alert; this is the PTRACE mirror.
+        The first classification of an episode emits; identical repeats are
+        counted, not written. The episode ends on a NEW break level, a NEW side,
+        or a gate-state reset (a CONFIRMED/CANDIDATE classification for the same
+        anchor) -- the line that ends it carries suppressed_repeats=<N>
+        ("suppressed N repeats") so the spam volume stays auditable.
+        LOGGING ONLY: both call sites ignore the return value and the gate
+        decision is computed before this is called, so no trade path changes."""
+        key = (kw.get('side'), kw.get('break_level'))
+        ep = self._break_fail_episode.get(anchor)
+        if ep is not None and ep['key'] == key:
+            ep['suppressed'] += 1
+            return None
+        kw = self._end_break_fail_episode(anchor, kw)
+        self._break_fail_episode[anchor] = {'key': key, 'suppressed': 0}
+        return self.emit(BREAK_FAILED, None, anchor, **kw)
+
+    def _end_break_fail_episode(self, anchor, kw: Dict) -> Dict:
+        """Close the anchor's BREAK_FAILED suppression episode (if any). When
+        repeats were suppressed, stamp suppressed_repeats=<N> onto the kwargs of
+        the line that ends the episode so the count is never dropped silently."""
+        ep = self._break_fail_episode.pop(anchor, None)
+        if ep and ep.get('suppressed'):
+            kw.setdefault('suppressed_repeats', ep['suppressed'])
+        return kw
     def break_override_parent_established(self, anchor, **kw):
         return self.emit(BREAK_OVERRIDE_PARENT_ESTABLISHED, None, anchor, **kw)
     def override_entry_armed(self, anchor, **kw):
