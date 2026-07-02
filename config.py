@@ -222,7 +222,11 @@ class Config:
     # is Fix 3's live daily loss stop + rogue_rescue_cap_dollars ($13) per recovery leg.
     # Engine-gated keys: inert/no-op while rogue_a1_anchor_mode is OFF. Rogue-only
     # (magic 20260626); the A1 read is READ-ONLY and never closes an anchor 20260522 leg.
-    rogue_a1_anchor_mode: bool = False          # Fix 4 master flag (DEFAULT OFF, freeze-safe)
+    # DEFAULT ON (P1): the A1-anchored engine is the live Rogue engine. This is still
+    # freeze-safe -- the all-flags-off==master freeze is gated by rogue_enabled (raw default
+    # OFF), so with rogue OFF this key is never reached. (Closes the E-1 ghost: the stale
+    # "DEFAULT OFF / legacy monster is live" comment no longer matched the live config.)
+    rogue_a1_anchor_mode: bool = True           # Fix 4 master flag (DEFAULT ON, live engine)
     rogue_entry_confirm_redesign: float = 10.0  # $ off the anchor to ENTER in the move dir
     rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
     rogue_daily_soft_lock: float = 30.0         # soft banked floor ($) -- NEVER a hard stop
@@ -499,6 +503,19 @@ class Config:
     feed_recover_after_fails: int = 30    # consecutive 'not subscribed' failures before a re-subscribe
     feed_recover_max_tries: int = 5       # failed re-subscribe attempts before the first FEED DOWN alert
     feed_alert_cooldown_min: float = 5.0  # min minutes between FEED DOWN alerts (then it keeps retrying)
+    # Fix 4 (E-12) escalation ladder beyond re-subscribe: L2 full in-process MT5 reinit
+    # (shutdown->initialize->select->verify fresh tick) once re-subscribe is exhausted OR the
+    # feed has been blind past feed_reinit_blind_min; L3 controlled self-restart (persist
+    # state + sys.exit(42), relaunched by run_aureon.bat / Task Scheduler) once the reinits
+    # fail. Never self-restarts when the market is closed. All ON by default (safety nets).
+    feed_reinit_blind_min: float = 3.0    # blind minutes that escalate straight to a full reinit
+    feed_reinit_max_tries: int = 2        # full-reinit attempts before the self-restart escalation
+    feed_selfrestart_enabled: bool = True # L3 controlled self-restart (exit 42) when the feed is dead
+    # Fix 1 (E-13): route order sends through the SHARED place_with_retry wrapper (rc-check +
+    # bounded retry + abort-alert; never resizes the lot). ON by default; False falls back to
+    # the prior single-send path per order (an escape hatch; the wrapper never touches
+    # geometry or lot size on the success path, so ON is byte-identical when orders fill).
+    order_retry_enabled: bool = True
 
     # Operational
     log_level: str = "INFO"

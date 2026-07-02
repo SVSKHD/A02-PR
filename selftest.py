@@ -226,7 +226,7 @@ STEP_NAMES = {
     # E-12 feed-death watchdog (re-subscribe + throttled FEED DOWN alert)
     166: "feed resub @N",
     167: "feed resub reset",
-    168: "feed alert+cooldn",
+    168: "feed alert+ladder",
     169: "feed warn throttle",
     170: "feed wd disabled",
     # E-2/E-3/E-4 Rogue brakes (NOTE: 171-176 collide with fix2's T-B 171-176 --
@@ -259,6 +259,12 @@ STEP_NAMES = {
     188: "rogueseed consume",
     # E-3 CHAIN: ANY Rogue close re-anchors the A1 redesign at the exit (no dormancy)
     189: "rogue e3 chain",
+    # --- P1 "never blind, never brick" (E-13..E-16 + E-12 ladder) --------------
+    190: "fix1 rc-retry+brick",   # E-13 shared place_with_retry + Rogue brick fix
+    191: "fix2 pnl-unresolved",   # E-14 retry history, book $0 without a fail
+    192: "fix3 rogue gated",      # E-15 rogue under kill/EOD gates + kill flatten
+    193: "fix4 feed reinit/L3",   # E-12 L2 MT5 reinit + L3 self-restart guard
+    194: "fix5 restart-recovery", # E-16 persist + same-day boot recovery
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -5258,28 +5264,34 @@ class SelfTest:
         self._record(167, PASS if ok else FAIL, detail)
 
     def _step_f3_feed_alert_then_cooldown(self):
-        # 168 (T-F3): after feed_recover_max_tries (5) failed re-subscribes EXACTLY ONE
-        # FEED DOWN alert fires (at attempt 5 / fail 150); further alerts wait for the
-        # feed_alert_cooldown_min (5m=300s) cooldown to elapse on the monotonic clock.
+        # 168 (Fix 4 ladder): after feed_recover_max_tries (5) failed re-subscribes EXACTLY
+        # ONE FEED DOWN alert fires (at attempt 5 / fail 150) and the re-subscribe counter
+        # STOPS at 5 (the 'attempt 6/5' bug fix -- it must never exceed the cap). The episode
+        # then ESCALATES: Level 2 full reinit (up to feed_reinit_max_tries=2) then Level 3 a
+        # single self-restart -- no endless re-alert loop.
         import feed_watchdog as fw
         try:
             cfg = self._feed_wd_cfg()
             wd = fw.FeedWatchdog()
-            alerts = []
-            for i in range(300):                 # 1s apart
+            alerts = []; resub_attempts = []; reinits = []; restarts = 0
+            for i in range(1, 400):              # 1s apart; blind grows with i
                 a = wd.on_failure(cfg, float(i))
                 if a.alert:
                     alerts.append((i, a.attempt, a.fails))
+                if a.resubscribe:
+                    resub_attempts.append(a.attempt)
+                if a.reinit:
+                    reinits.append(a.reinit_attempt)
+                if a.self_restart:
+                    restarts += 1
             one_alert = (len(alerts) == 1 and alerts[0][1] == 5 and alerts[0][2] == 150)
-            second = None
-            for i in range(300, 700):
-                a = wd.on_failure(cfg, float(i))
-                if a.alert:
-                    second = i; break
-            cooldown_respected = (second is not None and (second - alerts[0][0]) >= 300)
-            ok = one_alert and cooldown_respected
-            detail = (f"alerts_in_first300={len(alerts)} first@fail={alerts[0][2] if alerts else None} "
-                      f"attempt={alerts[0][1] if alerts else None} 2nd_after_cooldown={cooldown_respected}")
+            # THE bug fix: the re-subscribe attempt counter never runs past the cap (no 6/5).
+            counter_capped = (resub_attempts == [1, 2, 3, 4, 5])
+            escalates = (reinits == [1, 2] and restarts == 1)
+            ok = one_alert and counter_capped and escalates
+            detail = (f"one_alert@attempt5/fail150={one_alert} "
+                      f"resub_attempts={resub_attempts}(capped@5={counter_capped}) "
+                      f"reinits={reinits} restarts={restarts}")
         except Exception as e:
             self._record(168, FAIL, f"raised: {e!r}"); return
         self._record(168, PASS if ok else FAIL, detail)
@@ -6166,6 +6178,314 @@ class SelfTest:
             self._record(189, FAIL, f"raised: {e!r}"); return
         self._record(189, PASS if ok else FAIL, detail)
 
+    # === P1 "never blind, never brick" — E-13..E-16 + E-12 ladder ==============
+    def _step_fix1_rc_retry_brick(self):
+        # 190 (Fix 1 / E-13): the SHARED place_with_retry classifies retcodes (retry vs abort,
+        # NEVER resizing the lot), and Rogue's LIVE entry sets st['open'] + consumes ONE slot
+        # ONLY on rc==10009 -- a final failure leaves NO phantom open and NO slot consumed
+        # (the engine does not brick; it stays alive for the next signal).
+        import mt5_adapter as _mad, rogue as _r, dataclasses, types, tempfile
+        try:
+            cls = _mad.classify_retcode
+            classify_ok = (cls(10009) == 'done' and cls(10004) == 'refresh'
+                           and cls(10015) == 'refresh' and cls(10021) == 'refresh'
+                           and cls(10016) == 'stops' and cls(10008) == 'plain'
+                           and cls(None) == 'plain' and cls(-1) == 'plain'
+                           and cls(10014) == 'abort' and cls(10019) == 'abort'
+                           and cls(10018) == 'abort' and cls(10017) == 'abort'
+                           and cls(99999) == 'abort')
+
+            class _FS:
+                def __init__(s): s.aborts = 0
+                def _alert_order_abort(s, *a, **k): s.aborts += 1
+            fs = _FS()
+            r1 = _mad.MT5Adapter.place_with_retry(
+                fs, lambda a, rc: types.SimpleNamespace(retcode=10009, order=1),
+                describe={'label': 't'}, tele=None, backoffs=(0, 0, 0))
+            seq = [types.SimpleNamespace(retcode=10016, comment='x'),
+                   types.SimpleNamespace(retcode=10009, order=2)]
+            seen = []
+            r2 = _mad.MT5Adapter.place_with_retry(
+                fs, lambda a, rc: (seen.append(rc) or seq[a - 1]),
+                describe={'label': 't'}, tele=None, backoffs=(0, 0, 0))
+            fs2 = _FS()   # 10014 volume -> abort on the FIRST try (lot never resized)
+            vcalls = []
+            r3 = _mad.MT5Adapter.place_with_retry(
+                fs2, lambda a, rc: (vcalls.append(a) or types.SimpleNamespace(retcode=10014, comment='v')),
+                describe={'label': 't', 'lot': 0.35}, tele=None, backoffs=(0, 0, 0))
+            fs3 = _FS()   # 10004 requote -> retries to exhaustion (3 calls) then abort-alert
+            rcalls = []
+            _mad.MT5Adapter.place_with_retry(
+                fs3, lambda a, rc: (rcalls.append(a) or types.SimpleNamespace(retcode=10004, comment='rq')),
+                describe={'label': 't'}, tele=None, max_attempts=3, backoffs=(0, 0, 0))
+            pwr_ok = (r1.retcode == 10009 and r2.retcode == 10009 and seen == [False, True]
+                      and r3.retcode == 10014 and len(vcalls) == 1 and fs2.aborts == 1
+                      and len(rcalls) == 3 and fs3.aborts == 1)
+
+            # BRICK fix on the LIVE Rogue entry path.
+            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True)
+
+            def mk(fail_rc=None):
+                env = {'orders': []}
+                def pmo(sym, side, lot, sl=None, tp=None, magic=None, comment=None, dry_run=False):
+                    if fail_rc is not None:
+                        return types.SimpleNamespace(retcode=fail_rc, comment='rej', order=None, deal=None)
+                    tk = 800000 + len(env['orders']) + 1; env['orders'].append(tk)
+                    return types.SimpleNamespace(order=tk, deal=tk, retcode=10009)
+                mt5 = types.SimpleNamespace(
+                    symbol_info=lambda s=None: types.SimpleNamespace(point=0.01, trade_stops_level=0),
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=4000.0, ask=4000.0))
+                ad = types.SimpleNamespace(mt5=mt5, place_market_order=pmo)
+                ad.place_with_retry = _mad.MT5Adapter.place_with_retry.__get__(ad)
+                ad._alert_order_abort = _mad.MT5Adapter._alert_order_abort.__get__(ad)
+                tr = types.SimpleNamespace(
+                    cfg=cfg, paper=False, adapter=ad, run_dir=tempfile.mkdtemp(),
+                    state={'last_broker_date': '2026-07-02'},
+                    tele=types.SimpleNamespace(info=lambda *a, **k: None,
+                                               warn=lambda *a, **k: None,
+                                               critical=lambda *a, **k: None))
+                tr._rogue = {'day': '2026-07-02', 'gov': _r.new_day_state(), 'anchor': 4000.0,
+                             'leg_dir': 'BUY', 'open': None, 'a1_last_close': 4000.0,
+                             'a1_reverted': False}
+                return tr
+            trS = mk(); _r._place_rogue_entry(trS, trS._rogue, 4010.0, 4005.0)
+            succ = (trS._rogue['open'] is not None and trS._rogue['gov']['reanchor_count'] == 1)
+            trF = mk(fail_rc=10019); _r._place_rogue_entry(trF, trF._rogue, 4010.0, 4005.0)
+            brick = (trF._rogue['open'] is None and trF._rogue['gov']['reanchor_count'] == 0)
+            ok = classify_ok and pwr_ok and succ and brick
+            detail = (f"classify={classify_ok} pwr[retry/abort/no-resize]={pwr_ok} "
+                      f"live_success[open+1slot]={succ} final_fail[no_phantom+no_slot]={brick}")
+        except Exception as e:
+            self._record(190, FAIL, f"raised: {e!r}"); return
+        self._record(190, PASS if ok else FAIL, detail)
+
+    def _step_fix2_pnl_unresolved(self):
+        # 191 (Fix 2 / E-14): a close whose P&L is None retries the history fetch; if STILL
+        # unresolved it books $0 but does NOT increment consec_fails (was_fail=None) and logs
+        # a WARN -- an unresolvable P&L can never trip the fail-pause. A resolved close books
+        # normally. _resolve_close_pnl returns the first non-None and stops.
+        import rogue as _r, dataclasses, types
+        try:
+            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True)
+            # (a) record_close None-sentinel: streak untouched, P&L booked.
+            g = _r.new_day_state(); g['consec_fails'] = 2
+            _r.record_close(g, 0.0, None, cfg)
+            sentinel_ok = (g['consec_fails'] == 2 and g['day_pnl'] == 0.0)
+            # (b) _resolve_close_pnl: resolves on first hit (no wait); None after tries=1.
+            hits = {'n': 0}
+            class _Ad:
+                class mt5:
+                    @staticmethod
+                    def history_deals_get(position=None):
+                        hits['n'] += 1
+                        return ([types.SimpleNamespace(entry=1, profit=7.0, swap=0, commission=0)]
+                                if hits['n'] >= 1 else [])
+            tr = types.SimpleNamespace(adapter=_Ad())
+            resolved = _r._resolve_close_pnl(tr, 1, tries=3, delay=0)
+            resolve_ok = (abs(resolved - 7.0) < 1e-9)
+            # (c) detect_close unresolved branch (monkeypatch _resolve to None -> no real sleep).
+            logs = []
+            orig = _r._resolve_close_pnl
+            _r._resolve_close_pnl = lambda *a, **k: None
+            try:
+                env = {'book': {}}   # ticket already gone -> closed at broker
+                ad = types.SimpleNamespace(mt5=types.SimpleNamespace(
+                    positions_get=lambda ticket=None: [],
+                    history_deals_get=lambda position=None: []))
+                trx = types.SimpleNamespace(
+                    cfg=cfg, paper=True, adapter=ad, run_dir='.',
+                    state={'last_broker_date': '2026-07-02'},
+                    tele=types.SimpleNamespace(info=lambda *a, **k: None,
+                                               warn=lambda *a, **k: logs.append(a[0] if a else '')))
+                trx._rogue = {'day': '2026-07-02', 'gov': _r.new_day_state(), 'anchor': None,
+                              'leg_dir': None, 'a1_reverted': False, 'a1_last_close': None,
+                              'open': {'ticket': 5001, 'side': 'BUY', 'entry': 4000.0,
+                                       'sl': 3995.0, 'peak': 4000.0, 'magic': _r.ROGUE_MAGIC,
+                                       'leg_type': 'rogue'}}
+                trx._rogue['gov']['consec_fails'] = 2
+                booked = _r.detect_close(trx, trx._rogue)
+            finally:
+                _r._resolve_close_pnl = orig
+            unresolved_ok = (booked is True and trx._rogue['open'] is None
+                             and trx._rogue['gov']['consec_fails'] == 2      # NOT incremented
+                             and trx._rogue['gov']['day_pnl'] == 0.0
+                             and any('pnl-unresolved' in str(m) for m in logs))
+            ok = sentinel_ok and resolve_ok and unresolved_ok
+            detail = (f"sentinel[streak_untouched]={sentinel_ok} resolve_first_hit={resolve_ok} "
+                      f"detect_close[book0+no_fail+warn]={unresolved_ok}")
+        except Exception as e:
+            self._record(191, FAIL, f"raised: {e!r}"); return
+        self._record(191, PASS if ok else FAIL, detail)
+
+    def _step_fix3_rogue_gated(self):
+        # 192 (Fix 3 / E-15): with allow_new_entries=False (the post-EOD trail-only call) a
+        # NEW Rogue entry is REFUSED while an EXISTING open position still trails; and
+        # force_close_open (the kill-switch path) closes the Rogue ticket + books the governor.
+        import rogue as _r, dataclasses, types
+        try:
+            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
+                                      rogue_entry_confirm_redesign=10.0)
+
+            def mk():
+                env = {'book': {}, 'orders': [], 'deal': None, 'price': None}
+                def pmo(sym, side, lot, sl=None, tp=None, magic=None, comment=None, dry_run=False):
+                    tk = 700000 + len(env['orders']) + 1; env['orders'].append(tk); env['book'][tk] = True
+                    return types.SimpleNamespace(order=tk, deal=tk, retcode=10009)
+                def hist(position=None):
+                    d = env['deal']
+                    return ([types.SimpleNamespace(entry=1, profit=d['pnl'], price=d['price'],
+                                                   swap=0, commission=0)]
+                            if (d and int(position) == int(d['ticket'])) else [])
+                mt5 = types.SimpleNamespace(
+                    positions_get=lambda ticket=None: [object()] if env['book'].get(int(ticket)) else [],
+                    history_deals_get=hist,
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=env['price'], ask=env['price']),
+                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
+                    ACCOUNT_TRADE_MODE_DEMO=0)   # DEMO so manual_seed is accepted
+                ad = types.SimpleNamespace(mt5=mt5, place_market_order=pmo,
+                                           modify_position_sl=lambda tk, sl: None,
+                                           close_position=lambda tk, dry_run=False: env['book'].pop(int(tk), None))
+                tr = types.SimpleNamespace(cfg=cfg, paper=True, adapter=ad, _last_boost_mid=None,
+                                           state={'last_broker_date': '2026-07-02'},
+                                           tele=types.SimpleNamespace(info=lambda *a, **k: None,
+                                                                      warn=lambda *a, **k: None))
+                tr._rogue = {'day': '2026-07-02', 'gov': _r.new_day_state(), 'anchor': None,
+                             'leg_dir': None, 'open': None, 'a1_last_close': None, 'a1_reverted': False}
+                return tr, env
+
+            # (a) post-EOD (allow_new_entries=False) BLOCKS a fresh entry.
+            trA, envA = mk(); _r.manual_seed(trA, 4000.0)
+            envA['price'] = 4010.0; trA._last_boost_mid = 4010.0
+            _r._drive_a1(trA, trA._rogue, allow_new_entries=False)   # +$10 but blocked
+            blocked_new = (trA._rogue['open'] is None and trA._rogue['gov']['reanchor_count'] == 0)
+
+            # (b) post-EOD still TRAILS an existing open position.
+            trB, envB = mk(); _r.manual_seed(trB, 4000.0)
+            envB['price'] = 4010.0; trB._last_boost_mid = 4010.0
+            _r._drive_a1(trB, trB._rogue)                            # ENTER BUY @4010 (open)
+            entered = trB._rogue['open'] is not None
+            envB['price'] = 4035.0; trB._last_boost_mid = 4035.0
+            _r._drive_a1(trB, trB._rogue, allow_new_entries=False)   # trail-only manage
+            trailed = (trB._rogue['open'] is not None and trB._rogue['open']['peak'] >= 4035.0)
+
+            # (c) force_close_open (kill-switch) closes the Rogue ticket + books it.
+            trC, envC = mk(); _r.manual_seed(trC, 4000.0)
+            envC['price'] = 4010.0; trC._last_boost_mid = 4010.0
+            _r._drive_a1(trC, trC._rogue)
+            tkC = trC._rogue['open']['ticket']
+            envC['deal'] = {'ticket': tkC, 'pnl': 40.0, 'price': 4010.0}
+            fc = _r.force_close_open(trC, reason='KillSwitch')
+            killed = (fc is True and trC._rogue['open'] is None
+                      and abs(trC._rogue['gov']['day_pnl'] - 40.0) < 1e-9 and tkC not in envC['book'])
+
+            ok = blocked_new and entered and trailed and killed
+            detail = (f"post_eod_blocks_new={blocked_new} trails_existing={trailed} "
+                      f"kill_force_close[closed+booked]={killed}")
+        except Exception as e:
+            self._record(192, FAIL, f"raised: {e!r}"); return
+        self._record(192, PASS if ok else FAIL, detail)
+
+    def _step_fix4_feed_reinit_l3(self):
+        # 193 (Fix 4 / E-12): Level 2 MT5Adapter.reinit() confirms a FRESH tick (fresh->True,
+        # stale/init-fail->False), and the FeedWatchdog ladder escalates re-subscribe (capped)
+        # -> reinit -> ONE self-restart (Level 3). The self-restart is the caller's to gate on
+        # feed_selfrestart_enabled + the market-closed guard (covered live; the flag defaults ON).
+        import mt5_adapter as _mad, feed_watchdog as _fw, types, time as _time
+        try:
+            now = _time.time()
+
+            class _MT5:
+                def __init__(s, tick_time, init_ok=True):
+                    s._tt = tick_time; s._init_ok = init_ok
+                def shutdown(s): pass
+                def initialize(s): return s._init_ok
+                def symbol_select(s, sym, on): return True
+                def symbol_info_tick(s, sym): return types.SimpleNamespace(time=s._tt, bid=1.0, ask=1.0)
+                def last_error(s): return (0, 'ok')
+
+            def fake(tick_time, init_ok=True):
+                return types.SimpleNamespace(mt5=_MT5(tick_time, init_ok), symbol='XAUUSD',
+                                             tick_time_offset_hours=0)
+            fresh = _mad.MT5Adapter.reinit(fake(now)) is True
+            stale = _mad.MT5Adapter.reinit(fake(now - 4000.0)) is False
+            init_fail = _mad.MT5Adapter.reinit(fake(now, init_ok=False)) is False
+            reinit_ok = fresh and stale and init_fail
+
+            cfg = self._feed_wd_cfg()
+            wd = _fw.FeedWatchdog()
+            resub = []; reinits = []; restarts = 0
+            for i in range(1, 400):
+                a = wd.on_failure(cfg, float(i))
+                if a.resubscribe: resub.append(a.attempt)
+                if a.reinit: reinits.append(a.reinit_attempt)
+                if a.self_restart: restarts += 1
+            ladder_ok = (resub == [1, 2, 3, 4, 5]      # capped -- no 'attempt 6/5'
+                         and reinits == [1, 2] and restarts == 1)
+            ok = reinit_ok and ladder_ok
+            detail = (f"reinit[fresh={fresh} stale={stale} init_fail={init_fail}] "
+                      f"ladder[resub={resub} reinit={reinits} restarts={restarts}]")
+        except Exception as e:
+            self._record(193, FAIL, f"raised: {e!r}"); return
+        self._record(193, PASS if ok else FAIL, detail)
+
+    def _step_fix5_restart_recovery(self):
+        # 194 (Fix 5 / E-16): a simulated MID-DAY restart restores the Rogue governors +
+        # chain anchor from run/state.json (anchors already placed are NOT re-placed -- the
+        # snapshot keeps processed_anchors_today), ADOPTS an open Rogue position only if it is
+        # still open at the broker, and a NEW trading day ignores the stale file.
+        import p1_state as _p1, rogue as _r, types, tempfile
+        try:
+            run_dir = tempfile.mkdtemp()
+
+            def mk(day, book_open=True, ticket=7007):
+                env = {'book': {}}
+                if book_open and ticket is not None:
+                    env['book'][ticket] = True
+                ad = types.SimpleNamespace(mt5=types.SimpleNamespace(
+                    positions_get=lambda ticket=None: [object()] if env['book'].get(int(ticket)) else []))
+                tr = types.SimpleNamespace(adapter=ad, run_dir=run_dir, paper=False,
+                                           shadow_positions={}, state={'last_broker_date': day},
+                                           tele=types.SimpleNamespace(info=lambda *a, **k: None))
+                return tr
+
+            # write a snapshot for 2026-07-02 with 2 placed anchors + rogue governors + open.
+            src = mk('2026-07-02')
+            src.state['processed_anchors_today'] = ['A1_0500', 'A2_1230']
+            src._rogue = {'day': '2026-07-02', 'gov': _r.new_day_state(), 'anchor': None,
+                          'leg_dir': 'SELL', 'open': {'ticket': 7007, 'side': 'SELL',
+                          'entry': 3950.0, 'sl': 3955.0, 'peak': 3940.0, 'magic': _r.ROGUE_MAGIC,
+                          'leg_type': 'rogue'}, 'a1_last_close': 3953.0, 'a1_reverted': False}
+            src._rogue['gov'].update({'reanchor_count': 4, 'day_pnl': 123.45, 'consec_fails': 1})
+            _p1.save(src, force=True)
+
+            # SAME-day restart -> governors + anchor restored; open (still at broker) adopted.
+            r1 = mk('2026-07-02', book_open=True); r1._rogue = None
+            s1 = _p1.recover_on_boot(r1)
+            g = (r1._rogue or {}).get('gov', {})
+            same_day_ok = (s1['recovered'] and g.get('reanchor_count') == 4
+                           and abs(g.get('day_pnl', 0) - 123.45) < 1e-9 and g.get('consec_fails') == 1
+                           and r1._rogue.get('a1_last_close') == 3953.0
+                           and r1._rogue.get('open') and r1._rogue['open']['ticket'] == 7007
+                           and s1['anchors'] == 2)   # 2 placed anchors carried (skipped on re-fire)
+
+            # ticket NO LONGER open at broker -> governors restored, open NOT adopted.
+            r2 = mk('2026-07-02', book_open=False); r2._rogue = None
+            _p1.recover_on_boot(r2)
+            not_adopt_ok = (r2._rogue.get('open') is None
+                            and r2._rogue['gov']['reanchor_count'] == 4)
+
+            # NEW trading day -> stale file ignored (fresh start).
+            r3 = mk('2026-07-03'); r3._rogue = None
+            s3 = _p1.recover_on_boot(r3)
+            new_day_ok = (not s3['recovered'] and 'new-day' in s3['reason'] and r3._rogue is None)
+
+            ok = same_day_ok and not_adopt_ok and new_day_ok
+            detail = (f"same_day[gov+anchor+adopt+anchors_kept]={same_day_ok} "
+                      f"not_open->no_adopt={not_adopt_ok} new_day_ignored={new_day_ok}")
+        except Exception as e:
+            self._record(194, FAIL, f"raised: {e!r}"); return
+        self._record(194, PASS if ok else FAIL, detail)
+
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
     def _step_f8_pullback_log(self):
@@ -6779,6 +7099,12 @@ class SelfTest:
             self._step_rogueseed_consume()
             # E-3 CHAIN: ANY Rogue close re-anchors the A1 redesign at the exit (no dormancy)
             self._step_r7_rogue_e3_chain()
+            # P1 "never blind, never brick" — E-13..E-16 + E-12 ladder (pure; no MT5 needed)
+            self._step_fix1_rc_retry_brick()
+            self._step_fix2_pnl_unresolved()
+            self._step_fix3_rogue_gated()
+            self._step_fix4_feed_reinit_l3()
+            self._step_fix5_restart_recovery()
         finally:
             self._cleanup()
         return self._report(ts)

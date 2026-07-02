@@ -56,6 +56,42 @@ def mt5_comment(s):
     return (str(s) if s is not None else "")[:31]
 
 
+# --- Fix 1 (E-13): shared order rc-check + bounded-retry classification -----------
+# Retcode buckets consumed by MT5Adapter.place_with_retry(). RETRYABLE -> bounded
+# re-send (refresh the tick / recompute the stops / plain resend). NEVER_RETRY -> abort
+# with ONE alert (retcode + broker comment + the params attempted). HARD RULE: the
+# wrapper NEVER modifies lot size -- 10014 INVALID_VOLUME is alert-only, never a resize.
+RETRY_REFRESH_RCS = frozenset({10004, 10015, 10021})   # requote / invalid price / price off
+RETRY_STOPS_RCS   = frozenset({10016})                 # invalid stops -> recompute SL/TP
+RETRY_PLAIN_RCS   = frozenset({10008, 10012, 10020, 10024, 10031})  # placed/timeout/changed/busy/conn
+NEVER_RETRY_RCS   = frozenset({10014, 10019, 10018, 10017})  # volume / no-money / closed / disabled
+RETRY_BACKOFFS_S  = (0.5, 1.0, 2.0)
+
+
+def classify_retcode(rc):
+    """PURE bucket for a broker retcode, used by place_with_retry:
+      'done'    -> rc == 10009 (success)
+      'refresh' -> 10004/10015/10021: refresh the tick + resend
+      'stops'   -> 10016: recompute SL/TP vs the symbol stops_level + resend
+      'plain'   -> transient (10008/10012/10020/10024/10031) OR result None OR rc == -1
+      'abort'   -> NEVER retry: 10014 volume / 10019 no-money / 10018 closed / 10017
+                   disabled / ANY unrecognized retcode (fail-closed -> alert only)
+    A None/-1 result is a lost ack, treated as 'plain' (safe to re-probe)."""
+    if rc == 10009:
+        return 'done'
+    if rc in (None, -1):
+        return 'plain'
+    if rc in NEVER_RETRY_RCS:
+        return 'abort'
+    if rc in RETRY_REFRESH_RCS:
+        return 'refresh'
+    if rc in RETRY_STOPS_RCS:
+        return 'stops'
+    if rc in RETRY_PLAIN_RCS:
+        return 'plain'
+    return 'abort'   # unrecognized retcode -> NEVER retry (fail closed, alert)
+
+
 class MT5Adapter:
     """
     Optional MT5 integration. Imports MetaTrader5 lazily so the backtest
@@ -228,6 +264,42 @@ class MT5Adapter:
             return bool(self.mt5.symbol_select(self.symbol, True))
         except Exception as e:
             log.warning(f"resubscribe({self.symbol}) raised: {e!r}")
+            return False
+
+    def reinit(self, fresh_tol_s: float = 60.0) -> bool:
+        """Fix 4 Level 2 (E-12): full IN-PROCESS MT5 reconnect after a feed-death episode --
+        mt5.shutdown() -> mt5.initialize() -> symbol_select(symbol, True) -> verify a FRESH
+        tick (tick.time within fresh_tol_s of now, decoded with the detected offset). Returns
+        True IFF a fresh tick is confirmed. Guarded -- never raises onto the feed loop. Does
+        NOT change the detected offset (the wake path re-validates that separately)."""
+        import time as _time
+        from datetime import datetime as _dt, timezone as _tz
+        try:
+            try:
+                self.mt5.shutdown()
+            except Exception as e:
+                log.warning(f"reinit shutdown raised (continuing): {e!r}")
+            _time.sleep(0.5)
+            if not self.mt5.initialize():
+                log.error(f"reinit: MT5 initialize failed: {self.mt5.last_error()}")
+                return False
+            try:
+                self.mt5.symbol_select(self.symbol, True)
+            except Exception as e:
+                log.warning(f"reinit symbol_select raised: {e!r}")
+            tick = self.mt5.symbol_info_tick(self.symbol)
+            if tick is None or getattr(tick, "time", 0) <= 0:
+                log.warning("reinit: no usable tick after re-init (feed still dead).")
+                return False
+            now = _dt.now(_tz.utc).timestamp()
+            off = self.tick_time_offset_hours or 0
+            age = abs((float(tick.time) - off * 3600.0) - now)
+            fresh = age <= float(fresh_tol_s)
+            log.warning(f"reinit: fresh-tick check age={age:.0f}s tol={fresh_tol_s:.0f}s "
+                        f"-> {'FRESH' if fresh else 'STALE'}")
+            return bool(fresh)
+        except Exception as e:
+            log.error(f"reinit raised: {e!r}")
             return False
 
     def shutdown(self):
@@ -552,3 +624,83 @@ class MT5Adapter:
                     pass
             log.error(f"❌ MARKET {side} REJECTED: retcode={rc} ({rc_name}) {err}")
         return result
+
+    def place_with_retry(self, sender, *, describe=None, tele=None,
+                         max_attempts=3, backoffs=RETRY_BACKOFFS_S):
+        """Fix 1 (E-13): SHARED bounded-retry order sender for BOTH engines -- the anchor
+        stop orders AND Rogue's market entries route their order_send through here so ONE
+        rc-classification rule governs every order (never-blind, never-brick).
+
+        `sender(attempt:int, recompute_stops:bool) -> result` MUST (re)read a fresh tick,
+        (re)build the request, and call order_send, returning the raw result (or None). It
+        is called once per attempt, so 'refresh the tick each try' and 'recompute SL/TP on
+        10016' happen INSIDE it. `describe` is a params dict for the abort alert; `tele`
+        (optional) is the telemetry sink for the ABORT/EXHAUSTED alert.
+
+        RETRYABLE (<= max_attempts, 0.5/1/2s backoff): 10004/10015/10021 (refresh tick),
+        10016 (recompute stops), 10008-class / None / -1 (plain). NEVER RETRY (abort + ONE
+        alert with retcode + broker comment + params): 10014 INVALID_VOLUME (the lot is
+        NEVER resized), 10019 / 10018 / 10017, and ANY unrecognized retcode.
+
+        HARD RULE: this wrapper never touches volume -- position size is sacred. Returns the
+        final result object (rc==10009 on success, else the last failing result or None).
+        Guarded per attempt so a sender raise becomes a plain None result (retryable)."""
+        import time as _time
+        result = None
+        recompute_stops = False
+        max_attempts = max(1, int(max_attempts))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = sender(attempt, recompute_stops)
+            except Exception as e:
+                log.error(f"place_with_retry sender raised (attempt {attempt}): {e!r}")
+                result = None
+            rc = getattr(result, 'retcode', None) if result is not None else None
+            bucket = classify_retcode(rc)
+            if bucket == 'done':
+                return result
+            rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
+            if bucket == 'abort':
+                self._alert_order_abort(tele, rc, result, describe, attempt)
+                return result
+            recompute_stops = (bucket == 'stops')   # next attempt recomputes SL/TP
+            if attempt >= max_attempts:
+                log.error(f"place_with_retry EXHAUSTED {attempt}/{max_attempts} "
+                          f"rc={rc} ({rc_name}) [{(describe or {}).get('label', 'order')}]")
+                self._alert_order_abort(tele, rc, result, describe, attempt, exhausted=True)
+                return result
+            delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+            log.warning(f"place_with_retry rc={rc} ({rc_name}) -> {bucket} retry "
+                        f"{attempt + 1}/{max_attempts} in {delay}s "
+                        f"[{(describe or {}).get('label', 'order')}]")
+            _time.sleep(delay)
+        return result
+
+    def _alert_order_abort(self, tele, rc, result, describe, attempt, exhausted=False):
+        """Fire ONE alert for a NEVER-RETRY (or retry-exhausted) order: retcode + the
+        broker comment + the params attempted. ALERT ONLY -- never resizes/modifies the
+        order. The Discord dedup/throttle in the telemetry layer collapses repeats of the
+        identical alert (1/type). Fully guarded."""
+        rc_name = _MT5_RETCODE_MAP.get(rc, f"UNKNOWN_{rc}")
+        try:
+            broker_comment = (getattr(result, 'comment', '') or '') if result is not None else ''
+        except Exception:
+            broker_comment = ''
+        d = describe or {}
+        kind = 'EXHAUSTED' if exhausted else 'ABORT'
+        volnote = ' (lot NOT resized)' if rc == 10014 else ''
+        params = (f"{d.get('side', '?')} {d.get('symbol', '?')} lot={d.get('lot', '?')} "
+                  f"@ {d.get('price', 'mkt')} SL={d.get('sl', '?')} TP={d.get('tp', '?')} "
+                  f"magic={d.get('magic', '?')}")
+        log.error(f"ORDER {kind} rc={rc} ({rc_name}){volnote} comment='{broker_comment}' "
+                  f"params[{params}] after {attempt} attempt(s)")
+        if tele is not None:
+            try:
+                tele.critical(
+                    f"🚫 *ORDER {kind}* — `{d.get('label', 'order')}`\n"
+                    f"retcode `{rc}` ({rc_name}){volnote}\n"
+                    f"broker: `{broker_comment or '—'}`\n"
+                    f"params: `{params}`\n"
+                    f"No retry — check the terminal if this repeats.")
+            except Exception:
+                pass
