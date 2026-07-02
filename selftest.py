@@ -145,13 +145,13 @@ STEP_NAMES = {
     96: "case2 override fires",
     97: "case1 still blocks",
     98: "override dir/rescue",
-    # v3.3.6 telemetry-truth display fixes + A3 reschedule 16:20 -> 17:00 IST
+    # v3.3.6 telemetry-truth display fixes; 100 repurposed 2026-07-02 for the A3 cut
     99: "readiness resolver",
-    100: "a3 1700 reschedule",
+    100: "a3 cut from list",
     101: "v336 no logic chg",
     102: "monday gate strict",
-    # v3.3.8 5th anchor A5 at 22:00 IST (identical structure; journal-isolated)
-    103: "five anchors times",
+    # anchor-list validation (dynamic since the 2026-07-02 A3 cut; was hard-5 A1-A5)
+    103: "anchor list valid",
     104: "anchor no collide",
     105: "a5 identical + fp5",
     # v3.4.0 RALLY override pullback-entry (flag-gated, DEFAULT OFF)
@@ -3892,25 +3892,26 @@ class SelfTest:
         self._record(99, PASS if ok else FAIL, detail)
 
     def _step_a3_scheduled_1700(self):
-        # 100: A3 reschedule -- the A3 anchor in cfg fires at 17:00 IST (broker 14:30),
-        # retimed from 16:20, with the label re-encoded (A3_1430_Overlap) so the
-        # journal isolates the trial. label[:2] stays 'A3'. A1/A2/A4 are UNCHANGED.
+        # 100 (repurposed 2026-07-02): A3 CUT. A3_1430_Overlap was removed from
+        # cfg.anchors per its per-anchor P&L (June -$2,255 PF 0.68, July -$385 --
+        # both months negative; the v3.3.6 17:00-IST retime did not fix it).
+        # Assert NO A3-prefixed anchor remains configured, and that the survivors
+        # A1/A2/A4/A5 keep their exact broker + IST times (the cut changed the
+        # list only). The stale DEFER_WAIT_BY_ANCHOR['A3_1430_Overlap'] key is
+        # deliberate (harmless lookup-only; kept for a possible restore).
         import anchors as _anchors
         try:
             amap = {lbl: (h, m) for (lbl, h, m) in self.cfg.anchors}
-            a3 = [(lbl, h, m) for (lbl, h, m) in self.cfg.anchors if lbl[:2] == 'A3']
-            a3_lbl, a3_h, a3_m = a3[0]
-            ih, im = _anchors.anchor_ist_hm(a3_h, a3_m, self.cfg)
-            a3_1700 = ((a3_h, a3_m) == (14, 30) and (ih, im) == (17, 0))
-            a3_tagged = (a3_lbl == 'A3_1430_Overlap' and a3_lbl[:2] == 'A3')
+            a3_gone = not any(lbl[:2] == 'A3' for lbl in amap)
             def ist(lbl):
                 h, m = amap[lbl]; return _anchors.anchor_ist_hm(h, m, self.cfg)
-            a1_ok = amap.get('A1_02h_Asia') == (2, 30)
+            a1_ok = amap.get('A1_02h_Asia') == (2, 30) and ist('A1_02h_Asia') == (5, 0)
             a2_ok = amap.get('A2_10h_London') == (10, 0) and ist('A2_10h_London') == (12, 30)
             a4_ok = amap.get('A4_1640_NYopen') == (16, 40) and ist('A4_1640_NYopen') == (19, 10)
-            ok = a3_1700 and a3_tagged and a1_ok and a2_ok and a4_ok
-            detail = (f"A3_1700IST_broker1430={a3_1700} A3_label_tag={a3_tagged} "
-                      f"A1/A2/A4_unchanged={a1_ok and a2_ok and a4_ok}")
+            a5_ok = amap.get('A5_1930_LateUS') == (19, 30) and ist('A5_1930_LateUS') == (22, 0)
+            ok = a3_gone and a1_ok and a2_ok and a4_ok and a5_ok
+            detail = (f"a3_cut={a3_gone} "
+                      f"A1/A2/A4/A5_unchanged={a1_ok and a2_ok and a4_ok and a5_ok}")
         except Exception as e:
             self._record(100, FAIL, f"raised: {e!r}"); return
         self._record(100, PASS if ok else FAIL, detail)
@@ -3974,46 +3975,57 @@ class SelfTest:
                 _os.environ['AUREON_TEST_FORCE_MONDAY_A1'] = prev
         self._record(102, PASS if ok else FAIL, detail)
 
-    # --- v3.3.8 5th anchor A5 @ 22:00 IST ------------------------------------
+    # --- anchor-list validation (dynamic) -------------------------------------
     def _step_five_anchors_times(self):
-        # 103: the anchor list is exactly 5 (A1-A5) at the correct broker + IST times:
-        # A1 02:30/05:00 (Mon 03:30/06:00), A2 10:00/12:30, A3 14:30/17:00,
-        # A4 16:40/19:10, A5 19:30/22:00. A5 is the new one; A1-A4 unchanged.
-        import anchors as _anchors
+        # 103 (rewritten 2026-07-02, A3 cut): validate the CONFIGURED anchor list
+        # dynamically instead of hard-asserting len==5 / prefixes A1-A5 -- the cut
+        # rule (v2.9.4: persistent losers get cut on the live record) means the
+        # list may shrink or grow again. Asserts, for WHATEVER is configured:
+        # labels well-formed ('A<n>_' tag + non-empty suffix, so label[:2] per-
+        # anchor logic and mt5_comment prefixes keep working), broker times valid
+        # (0-23h / 0-59m), NO duplicate labels / prefixes / times, the IST
+        # converter is pure for every entry, chronological order, and the Monday
+        # override shifts ONLY A1 (every other anchor resolves unchanged).
+        import anchors as _anchors, re as _re
         from datetime import date as _date, timedelta as _td
         try:
-            amap = {lbl: (h, m) for (lbl, h, m) in self.cfg.anchors}
-            labels = [lbl for (lbl, _, _) in self.cfg.anchors]
+            entries = list(self.cfg.anchors)
+            labels = [lbl for (lbl, _, _) in entries]
             prefixes = [l[:2] for l in labels]
-            five = (len(self.cfg.anchors) == 5 and prefixes == ['A1', 'A2', 'A3', 'A4', 'A5'])
-            def by(p): return next(l for l in labels if l[:2] == p)
-            a1, a2, a3, a4, a5 = by('A1'), by('A2'), by('A3'), by('A4'), by('A5')
-            def ist(lbl):
-                h, m = amap[lbl]; return _anchors.anchor_ist_hm(h, m, self.cfg)
-            times_ok = (amap[a1] == (2, 30) and ist(a1) == (5, 0)
-                        and amap[a2] == (10, 0) and ist(a2) == (12, 30)
-                        and amap[a3] == (14, 30) and ist(a3) == (17, 0)
-                        and amap[a4] == (16, 40) and ist(a4) == (19, 10)
-                        and amap[a5] == (19, 30) and ist(a5) == (22, 0))
-            a5_2200 = (a5 == 'A5_1930_LateUS' and amap[a5] == (19, 30) and ist(a5) == (22, 0))
-            a3_1700 = (amap[a3] == (14, 30) and ist(a3) == (17, 0))
-            # Monday: only A1 shifts to 03:30/06:00; A5 stays 19:30/22:00.
+            non_empty = len(entries) >= 1
+            labels_ok = all(bool(_re.fullmatch(r'A\d_[A-Za-z0-9_]+', l)) for l in labels)
+            times_valid = all(0 <= h <= 23 and 0 <= m <= 59 for (_, h, m) in entries)
+            no_dupes = (len(set(labels)) == len(labels)
+                        and len(set(prefixes)) == len(prefixes)
+                        and len({(h, m) for (_, h, m) in entries}) == len(entries))
+            ordered = all((entries[i][1], entries[i][2]) < (entries[i + 1][1], entries[i + 1][2])
+                          for i in range(len(entries) - 1))
+            ist_pure = all(
+                (lambda ih_im: 0 <= ih_im[0] <= 23 and 0 <= ih_im[1] <= 59)
+                (_anchors.anchor_ist_hm(h, m, self.cfg)) for (_, h, m) in entries)
+            # Monday: ONLY A1 gets the cold-start cushion; everyone else unchanged.
             base = _date(2026, 6, 24); monday = base - _td(days=base.weekday())
-            mon_a1 = _anchors.resolved_anchor_hm(a1, monday, amap[a1][0], amap[a1][1], self.cfg)
-            mon_a5 = _anchors.resolved_anchor_hm(a5, monday, amap[a5][0], amap[a5][1], self.cfg)
-            monday_ok = (mon_a1 == (3, 30) and mon_a5 == (19, 30))
-            ok = five and times_ok and a5_2200 and a3_1700 and monday_ok
-            detail = (f"five_anchors={five} times_ok={times_ok} a5_2200IST={a5_2200} "
-                      f"a3_still_1700={a3_1700} monday(A1=0330,A5=1930)={monday_ok}")
+            mon_ok = True
+            for (lbl, h, m) in entries:
+                res = _anchors.resolved_anchor_hm(lbl, monday, h, m, self.cfg)
+                want = (tuple(self.cfg.monday_a1_override)
+                        if lbl[:2] == 'A1' and self.cfg.monday_a1_override else (h, m))
+                mon_ok = mon_ok and (res == want)
+            ok = (non_empty and labels_ok and times_valid and no_dupes and ordered
+                  and ist_pure and mon_ok)
+            detail = (f"n={len(entries)} labels_ok={labels_ok} times_valid={times_valid} "
+                      f"no_dupes={no_dupes} ordered={ordered} ist_pure={ist_pure} "
+                      f"monday_only_A1={mon_ok}")
         except Exception as e:
             self._record(103, FAIL, f"raised: {e!r}"); return
         self._record(103, PASS if ok else FAIL, detail)
 
     def _step_anchor_no_collision(self):
-        # 104: NO collision among the 5 anchors -- the minimum pairwise gap (with the
-        # 24h wrap, on BOTH a weekday and Monday) is well clear of testfire_collision_
-        # min; A4<->A5 is 2h50m. The rail-4 guard (testfire.minutes_to_nearest_anchor)
-        # handles all 5 without error. If any pair collided this FAILS loudly.
+        # 104: NO collision among the CONFIGURED anchors -- the minimum pairwise gap
+        # (with the 24h wrap, on BOTH a weekday and Monday) is well clear of testfire_
+        # collision_min; A4<->A5 is 2h50m. The rail-4 guard (testfire.minutes_to_
+        # nearest_anchor) handles the full list without error. Anchor-count agnostic
+        # (2026-07-02 A3 cut). If any pair collided this FAILS loudly.
         import anchors as _anchors, testfire as _tf
         from datetime import date as _date, timedelta as _td
         try:
@@ -4036,7 +4048,7 @@ class SelfTest:
             rail4_ok = (_tf.minutes_to_nearest_anchor(self.cfg, pd.Timestamp('2026-06-24T12:00:00Z')) is not None)
             ok = no_collision and a4a5_ok and rail4_ok
             detail = (f"min_gap_weekday={min_wk}m monday={min_mon}m (>{COLL}) "
-                      f"A4<->A5={a4a5}m(2h50m)={a4a5_ok} rail4_guard_5anchors={rail4_ok}")
+                      f"A4<->A5={a4a5}m(2h50m)={a4a5_ok} rail4_guard_all_anchors={rail4_ok}")
         except Exception as e:
             self._record(104, FAIL, f"raised: {e!r}"); return
         self._record(104, PASS if ok else FAIL, detail)
@@ -4068,7 +4080,9 @@ class SelfTest:
             fp_allowed_bound = (0 <= g5[3] <= 5)
             fp_ok_iff_within = ((g5[0] == _fp.OK) == (g5[1] <= g5[2]))  # OK iff worst-case <= limit
             # invariant to anchor count: the guard ignores the anchor list entirely.
-            cfg4 = dataclasses.replace(self.cfg, anchors=list(self.cfg.anchors[:4]))
+            # (a PROPER subset -- since the 2026-07-02 A3 cut the full list is 4, so
+            # slice to 3 to keep the invariance check non-trivial.)
+            cfg4 = dataclasses.replace(self.cfg, anchors=list(self.cfg.anchors[:3]))
             fp_invariant = (_fp.guard_cfg(5, cfg4, bal) == g5)
             fp_handles_5 = (fp_wc_ok and fp_action_valid and fp_allowed_bound
                             and fp_ok_iff_within and fp_invariant)
@@ -5433,20 +5447,27 @@ class SelfTest:
         self._record(174, PASS if ok else FAIL, detail)
 
     def _step_r5_rogue_eod_flag(self):
-        # 175 (T-R5): rogue_flatten_at_eod OFF -> eod_flatten is a no-op (rides; default);
-        # ON -> it closes the open Rogue ticket and clears st['open'].
+        # 175 (T-R5): rogue_flatten_at_eod OFF -> eod_flatten is a no-op (rides);
+        # ON -> it closes the open Rogue ticket and clears st['open']. The DEFAULT
+        # flipped OFF -> ON 2026-07-02 (overnight/weekend gap risk), so the OFF leg
+        # now forces the flag False explicitly, and the default itself is asserted ON.
         import rogue as _R, dataclasses
         try:
-            tr_off, closes_off = self._r_trader(open_at_broker=True, pnl=30.0, cfg=self.cfg)
+            default_on = (self.cfg.rogue_flatten_at_eod is True)
+            tr_off, closes_off = self._r_trader(
+                open_at_broker=True, pnl=30.0,
+                cfg=dataclasses.replace(self.cfg, rogue_flatten_at_eod=False))
             did_off = _R.eod_flatten(tr_off)
             tr_on, closes_on = self._r_trader(
                 open_at_broker=True, pnl=30.0,
                 cfg=dataclasses.replace(self.cfg, rogue_flatten_at_eod=True))
             did_on = _R.eod_flatten(tr_on)
-            ok = (did_off is False and closes_off == [] and tr_off._rogue['open'] is not None
+            ok = (default_on
+                  and did_off is False and closes_off == [] and tr_off._rogue['open'] is not None
                   and did_on is True and closes_on == [self._R_ROGUE_TK]
                   and tr_on._rogue['open'] is None)
-            detail = f"OFF: did={did_off} closes={closes_off} rides={tr_off._rogue['open'] is not None} | ON: did={did_on} closes={closes_on}"
+            detail = (f"default_ON={default_on} | OFF: did={did_off} closes={closes_off} "
+                      f"rides={tr_off._rogue['open'] is not None} | ON: did={did_on} closes={closes_on}")
         except Exception as e:
             self._record(175, FAIL, f"raised: {e!r}"); return
         self._record(175, PASS if ok else FAIL, detail)

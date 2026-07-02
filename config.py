@@ -192,10 +192,13 @@ class Config:
     # strikes, the 3-fail pause (and small-fakeout streaks) can fire BEFORE the daily halt,
     # while a genuine whipsaw day still hard-stops at -$525.
     rogue_consecutive_fail_stop: int = 3    # 3 init-SL fake-outs in a row -> pause new entries
-    # E-4: at EOD, flatten an OPEN Rogue position instead of letting it ride overnight on
-    # its own SL/TP. DEFAULT OFF = current behavior (rides). Rogue-scoped (closes ONLY the
-    # Rogue ticket; never an anchor 20260522 ticket).
-    rogue_flatten_at_eod: bool = False
+    # E-4: at EOD, flatten an OPEN Rogue position instead of letting it ride overnight
+    # on its own SL/TP. DEFAULT ON since 2026-07-02 (owner decision): an overnight /
+    # weekend gap can jump straight past the resting SL, and E-15's gating already
+    # blocks NEW Rogue entries post-EOD -- flipping this ON closes the existing-
+    # position side of the same hole. Rogue-scoped (closes ONLY the Rogue ticket;
+    # never an anchor 20260522 ticket). Set False to restore the overnight ride.
+    rogue_flatten_at_eod: bool = True
     # E-5 (surfaced by E-2): one init-SL fake-out books -$175 (rogue_init_sl $5 x 0.35 x
     # 100 = 175) which already trips this -$150 daily stop -> a SINGLE strike halts Rogue
     # for the day, so the 3-consecutive-fail pause can essentially never fire. Left at -150
@@ -431,13 +434,13 @@ class Config:
         # weeks -- persistent losers get cut based on the journal, not sims.
         ("A1_02h_Asia", 2, 30),
         ("A2_10h_London", 10, 0),
-        # v3.3.6: A3 rescheduled 16:20 -> 17:00 IST (broker 13:50 -> 14:30; owner
-        # trial). The label re-encodes the new broker time (1430) so the journal
-        # ISOLATES A3-at-17:00 trades from the prior A3-at-16:20 record for a clean
-        # post-trial verdict. Trade logic / sizing / straddle / boosts / rescue are
-        # all UNCHANGED -- this is a schedule + identity-tag change only. label[:2]
-        # stays 'A3' so all per-anchor logic is unaffected.
-        ("A3_1430_Overlap", 14, 30),
+        # A3 CUT 2026-07-02 (owner decision, per-anchor P&L): A3_1430_Overlap removed
+        # after two negative months on the journal -- June -$2,255 (PF 0.68), July
+        # -$385. This executes the v2.9.4 rule above: persistent losers get cut on
+        # the live record. The v3.3.6 retime (16:20 -> 17:00 IST) did not fix it.
+        # Schedule-list change ONLY -- A1/A2/A4/A5 and all trade logic / sizing /
+        # straddle / boost / rescue knobs are UNCHANGED. To restore, re-add
+        # ("A3_1430_Overlap", 14, 30) here.
         ("A4_1640_NYopen", 16, 40),
         # v3.3.8: 5th anchor A5 at 22:00 IST = 19:30 broker (UTC+3; IST = broker +
         # 2:30). A NORMAL anchor -- identical structure to A1-A4 (straddle +/-$5,

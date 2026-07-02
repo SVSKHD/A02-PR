@@ -3,6 +3,9 @@
 Tracked defects and their status. Rogue = the A1-anchored redesign engine
 (magic `20260626`); it never touches the anchor engine (magic `20260522`).
 
+Config **decisions** (not bugs) are date-stamped in the Decision Log at the
+bottom so the "why" survives the commit message.
+
 ---
 
 ## E-3 — Rogue goes dormant after ONE close (no chain re-anchor) — **FIXED**
@@ -177,3 +180,45 @@ is still open at the broker, skip anchors already placed today, and log `RESTART
 
 **Files:** `p1_state.py` (new), `live_trader.py` (`_tick` one-shot recovery), `state.py`
 (`_save_state` mirror), `rogue.py` (`_persist_state` hooks). **Self-test:** 194.
+
+---
+
+## Decision Log — dated config decisions (NOT bugs)
+
+### D-1 — A3 anchor CUT — 2026-07-02
+
+**Decision:** `A3_1430_Overlap` removed from `cfg.anchors` (`config.py`). Branch
+`claude/p2-anchor-cut-eod-vo0an6` (P2).
+
+**Rationale (per-anchor P&L, journal record):** June −$2,255 with PF 0.68; July
+−$385 — both months negative. The v3.3.6 retime (16:20 → 17:00 IST) did not fix
+it. This executes the v2.9.4 rule: each anchor is judged on its own live record
+and persistent losers get cut based on the journal, not sims.
+
+**Scope:** schedule-list change ONLY — A1/A2/A4/A5 and every trade-logic /
+sizing / straddle / boost / rescue knob unchanged; no engine logic touched.
+`DEFER_WAIT_BY_ANCHOR['A3_1430_Overlap']` (`live_trader.py`) is deliberately
+left as a stale, harmless lookup-only key (comment marks it) for a possible
+restore. Self-test 100 now asserts the cut; 103 validates the anchor list
+dynamically (well-formed labels, valid times, no duplicates) instead of
+hard-asserting five anchors.
+
+**Restore path:** re-add `("A3_1430_Overlap", 14, 30)` in `config.py`.
+
+### D-2 — `rogue_flatten_at_eod` default False → True — 2026-07-02
+
+**Decision:** the E-4 flag now defaults ON (`config.py`): at EOD an OPEN Rogue
+position is flattened instead of riding overnight on its own SL/TP. Same branch
+as D-1.
+
+**Rationale:** overnight/weekend gap risk — a gap can jump straight past the
+resting SL, so the "ride" exposure is unbounded in practice. E-15's gating
+already hard-blocks NEW Rogue entries post-EOD; this closes the
+existing-position side of the same hole. Rogue-scoped as before (closes ONLY
+the Rogue `20260626` ticket, never an anchor `20260522` ticket); the kill-switch
+path (`force_close_open`) is unaffected.
+
+**Scope:** default flip + comment only; `rogue.eod_flatten` logic unchanged.
+Self-test 175 asserts the new default ON and still proves both flag states
+(OFF now forced explicitly). Set `rogue_flatten_at_eod=False` to restore the
+overnight ride.

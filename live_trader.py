@@ -119,7 +119,7 @@ class LiveTrader:
     DEFER_WAIT_BY_ANCHOR = {
         'A1_02h_Asia': 15,
         'A2_10h_London': 30,
-        'A3_1430_Overlap': 15,   # v3.3.6: A3 retimed 16:20 -> 17:00 IST (label re-encoded)
+        'A3_1430_Overlap': 15,   # STALE (harmless): A3 cut from cfg.anchors 2026-07-02 per per-anchor P&L (Jun -$2,255 PF 0.68, Jul -$385) -- unreferenced lookup key, kept for a possible restore
         'A4_1640_NYopen': 30,
         'A5_1930_LateUS': 30,   # v3.3.8: 22:00 IST US-session anchor (like A4)
     }
