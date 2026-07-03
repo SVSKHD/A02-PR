@@ -924,18 +924,31 @@ def detect_close(trader, st):
                 st['chain_anchor'] = float(exit_px)
                 st['chain_disp_up'] = 0.0
                 st['chain_disp_dn'] = 0.0
-                trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} CHAIN re-anchor @ "
-                                 f"{float(exit_px):.2f} -> hunting $10 both dirs")
+                _reanchor_msg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} CHAIN re-anchor @ "
+                                f"{float(exit_px):.2f} -> hunting $10 both dirs")
+                # P4 (daily P&L report): mirror to aureon.log like the sibling
+                # CHASE-REJECT/CHAIN-COOLDOWN/CHAIN-DISPLACEMENT lines already do
+                # (rogue._log_chase_reject / _log_chain_block) -- this line was
+                # Discord/Telegram-only before, so "chain re-anchors today" was
+                # NOT recoverable from the log for a historical report. Logging
+                # only; no decision changes.
+                log.info(_reanchor_msg)
+                trader.tele.info(_reanchor_msg)
     except Exception:
         pass
     try:
         g = st['gov']
         brake = ('LOSS-STOP' if g.get('loss_stopped')
                  else ('FAIL-PAUSE' if g.get('fail_paused') else 'live'))
-        trader.tele.info(
+        _close_msg = (
             f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} CLOSE {o.get('side')} #{tk} "
             f"P&L ${float(pnl):+.2f} | day ${float(g.get('day_pnl', 0.0)):+.2f} | "
             f"fails {int(g.get('consec_fails', 0))} | {brake}")
+        # P4 (daily P&L report): same mirror -- the brake tag (LOSS-STOP/FAIL-
+        # PAUSE/live) was Discord/Telegram-only, so "brake events today" was not
+        # greppable from aureon.log. Logging only.
+        log.info(_close_msg)
+        trader.tele.info(_close_msg)
     except Exception:
         pass
     return True

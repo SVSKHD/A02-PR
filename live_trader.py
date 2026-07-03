@@ -1446,6 +1446,15 @@ class LiveTrader:
                     _bm.run_daily_report(self)
                 except Exception:
                     pass
+                # P4: full per-engine/per-anchor daily P&L report (markdown + CSV
+                # ledger + Discord card). Read-only on MT5 HISTORY only; guarded by
+                # util_daily_pnl_report + its own try/except so it can never block
+                # the EOD path (same once-per-broker-day gate as the block above).
+                try:
+                    import pnl_report as _pnl
+                    _pnl.run_eod_report(self, broker_date)
+                except Exception:
+                    pass
                 # ROGUE dated EOD archive: freeze this day's rogue_patterns.csv +
                 # rogue_trades.csv (+ today_trades / price_log) into
                 # logs/archive/{broker_date}/ (copy, not move). Logging/file-IO only.

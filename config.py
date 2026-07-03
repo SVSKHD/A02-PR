@@ -138,6 +138,10 @@ class Config:
     util_boost_ledger: bool = True    # 9: every boost event (arm/fire/skip px, P&L) -> ledger.csv
     util_daily_report: bool = True    # 10: per-anchor markdown report from the trades CSV (read-only)
     util_preflight: bool = True       # 11: boot self-check (offset detected / anchors / flags / market)
+    util_daily_pnl_report: bool = True  # P4: full per-engine/per-anchor daily P&L report
+    #   (net/PF/win%/whipsaw/boost-vs-original/F-B split + Rogue section + month roll-up)
+    #   from MT5 history deals -- markdown + CSV ledger + Discord card, once/broker-day at
+    #   EOD (pnl_report.run_eod_report). READ-ONLY: no order flow, no trading-state reads.
     # STRATEGY EXTRAS (12-14): WIRED but DEFAULT OFF -- owner flips post-trial, one at a
     # time, measured against the logged baseline. OFF -> v3.5.0 core behavior unchanged.
     entry_confirm_candle: bool = False  # 12: require an M5 close in the entry direction

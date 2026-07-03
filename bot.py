@@ -59,7 +59,7 @@ def main():
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
                                          'testfire', 'verifyfb', 'rescuestats',
-                                         'bescratchscan', 'rogueseed'])
+                                         'bescratchscan', 'rogueseed', 'dailyreport'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -92,6 +92,9 @@ def main():
                         help="bescratchscan: post-exit lookforward minutes (default 30)")
     parser.add_argument('--run-dir', default=None,
                         help="bescratchscan: run dir holding journal/ + price_log/ (default $AUREON_RUN_DIR or ./run)")
+    parser.add_argument('--date', default=None, metavar='YYYY-MM-DD|YYYY-MM',
+                        help="dailyreport: the day (or whole month) to report on. "
+                             "Default: today (UTC).")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
 
@@ -184,6 +187,14 @@ def main():
         sys.exit(run_bescratchscan(
             start=args.start, end=args.end, run_dir=args.run_dir,
             m1csv=args.m1csv, horizon_min=args.horizon))
+
+    elif args.mode == 'dailyreport':
+        # READ-ONLY: per-engine/per-anchor daily P&L report from MT5 history deals +
+        # rescue_events.csv + the journal CSV + aureon.log. Never touches the broker's
+        # order book (opens MT5 for HISTORY reads only). A YYYY-MM-DD date runs one
+        # day; YYYY-MM runs the whole month (each day + a month roll-up).
+        from pnl_report import run_dailyreport
+        sys.exit(run_dailyreport(date_arg=args.date))
 
     elif args.mode == 'rogueseed':
         # Manual Rogue A1-mode seed: enqueue a 'rogueseed' command onto the RUNNING bot's
