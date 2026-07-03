@@ -333,25 +333,6 @@ def a1_reversal_confirmed(entry_price, side, current_price, cfg):
     return False
 
 
-def a1_soft_lock_met(day_pnl, cfg):
-    """Fix 4 TARGET: the soft floor (rogue_daily_soft_lock, $30) is BANKED but is NEVER a
-    hard stop -- the engine keeps hunting after it is met. Returns True once met. PURE."""
-    try:
-        return float(day_pnl) >= float(getattr(cfg, 'rogue_daily_soft_lock', 30.0))
-    except (TypeError, ValueError):
-        return False
-
-
-def a1_rescue_cap(cfg):
-    """Fix 4 BRAKE (per-rescue): the combined cap ($) on a reversal recovery =
-    rescue_boost_count x rogue_rescue_cap_dollars x lot x contract -- bounds the recovery.
-    PURE."""
-    return (int(getattr(cfg, 'rescue_boost_count', 2))
-            * float(getattr(cfg, 'rogue_rescue_cap_dollars', 13.0))
-            * float(getattr(cfg, 'lot_size', 0.35))
-            * float(getattr(cfg, 'contract_size', 100.0)))
-
-
 def _a1_anchor_price(trader):
     """READ-ONLY cross-read of the day's A1 anchor price from the anchor engine. Tries the
     A1 shadow position / pending entry price, then a persisted state key. Returns None if

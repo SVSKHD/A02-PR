@@ -331,9 +331,11 @@ pullback-frequency data. RALLY override **only** — RESCUE, the +$5 rally arm, 
 immediately, byte-identical. The live demo trial keeps running on the OFF path. Proven by
 selftest 106 (freeze guard) plus the unchanged override tests 96/97/98.
 
-**Open numbers the trial will tune.** Band depth ($13), arm timeout (4 M5 candles), and
-first-touch-vs-confirm-candle (`override_entry_first_touch=True`; confirm-candle reserved,
-not implemented) are first guesses, not final.
+**Open numbers the trial will tune.** Band depth ($13) and arm timeout (4 M5 candles)
+are first guesses, not final. (v3.5.0 superseded the v3.4.0 first-touch entry with the
+shared adaptive `pullback_entry.step` machine; the dead `override_entry_first_touch`
+flag and the standalone `rally.override_pullback_step` state machine were removed P4
+2026-07-03.)
 
 > ⚠️ **May become DELETE, not SHIP.** This was built *before* the pullback-frequency data
 > exists. If the trial shows override-grade moves rarely pull back, the detector will skip

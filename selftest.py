@@ -157,9 +157,9 @@ STEP_NAMES = {
     # v3.4.0 RALLY override pullback-entry (flag-gated, DEFAULT OFF)
     106: "ovr freeze guard",
     107: "ovr arm no-fire",
-    108: "ovr pullback fire",
-    109: "ovr timeout skip",
-    110: "ovr parent-exit",
+    108: "retired(P4)",
+    109: "retired(P4)",
+    110: "retired(P4)",
     111: "ovr rescue unaff",
     112: "ovr $5arm unaff",
     113: "ovr no pb-collide",
@@ -275,6 +275,11 @@ STEP_NAMES = {
     201: "rogue gates off",       # all three knobs 0 -> old unbounded behavior (freeze)
     # Hotfix 2026-07-02: PTRACE BREAK_FAILED spam throttle (logging only)
     202: "ptrace break spam",     # 1 line per episode + suppressed count; gate unchanged
+    # P4 2026-07-03: W-7 (D-4), E-18, F-B (D-5) live verification
+    203: "d4 override re-eval",   # a FAILED verdict does not latch; re-crossing $12 fires
+    204: "e18 no-lock no-adv",    # a losing leg w/ no armed lock computes NO stop advance
+    205: "fb bypasses gate",      # F-B fires through break-and-hold entirely (never reached)
+    206: "fb default on",         # D-5: trapped_late_rescue_enabled defaults True
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3678,6 +3683,177 @@ class SelfTest:
             self._record(202, FAIL, f"raised: {e!r}"); return
         self._record(202, PASS if ok else FAIL, detail)
 
+    # --- P4 2026-07-03: W-7 (D-4), E-18, F-B (D-5) -----------------------------
+    def _step_d4_override_reevaluates(self):
+        # 203 D-4: a FAILED break-and-hold verdict must NOT permanently kill the
+        # episode -- the parent-profit override re-evaluates EVERY tick from the
+        # parent's live max_fav, so a parent that proves the move AFTER an earlier
+        # FAILED classification still fires. Live gap: 2026-07-03 A1 BUY BREAK
+        # FAILED(retrace) @4134.57, parent crossed +$20 later and (per the old $20
+        # threshold) it sat too close to the wire; no boost ever fired, ~$2,000+
+        # forfeited on a +$56 move. Source read (rally.py break_and_hold_ok /
+        # _override_grade): the gate stores NO per-episode "FAILED" state anywhere
+        # -- classify() and the parent-profit check both recompute fresh from the
+        # current M5 bars / shadow['max_fav'] on every call. This proves that
+        # property with the REAL gate: (a) parent at +$8 (< the new $12 threshold,
+        # D-4) on a FAILED shape -> blocked, no override logged; (b) the SAME
+        # shadow object, same FAILED bar shape, parent later marked +$15 (>= $12)
+        # -> fires on the very next call -- no latch survives the earlier FAILED.
+        import rally as _rally
+        try:
+            bars = self._case2_bars()
+            tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
+                                               parent_side='SELL', parent_max_fav=8.0)
+            blocked_first = (_rally.break_and_hold_ok(tr, sh, pl) is False)
+            no_override_yet = not any(e[0] == 'break_override_parent_established'
+                                      for e in self._gate_ptrace)
+            # the parent proves the move: max_fav advances past the $12 threshold
+            # (exactly what trails.py does on a genuine bar update) -- NO other
+            # state on `sh` or `tr` is touched, simulating pure time passing.
+            sh['max_fav'] = sh['entry_price'] - 15.0   # SELL: favorable = price DOWN
+            fires_now = (_rally.break_and_hold_ok(tr, sh, pl) is True)
+            override_logged = any(e[0] == 'break_override_parent_established'
+                                  for e in self._gate_ptrace)
+            ok = blocked_first and no_override_yet and fires_now and override_logged
+            detail = (f"blocked_at_$8={blocked_first} no_override_yet={no_override_yet} "
+                      f"fires_at_$15_same_episode={fires_now} "
+                      f"override_logged={override_logged}")
+        except Exception as e:
+            self._record(203, FAIL, f"raised: {e!r}"); return
+        self._record(203, PASS if ok else FAIL, detail)
+
+    def _e18_trapped_trader(self, entry=4123.10, bid=4137.0, ask=4137.2):
+        # Minimal LiveTrader-shaped stub driving the REAL trails._manage_trails_on_
+        # bar_close (not a stripped copy): a No-OCO SELL leg parked at EXACT
+        # breakeven (current_sl == entry -> lock_level_for == 0, "no armed lock")
+        # now $13.90 ADVERSE (bid above entry) -- the 2026-07-03 05:55-06:21 A1
+        # SELL live shape (computed stop 4123.10 vs bid ~4137).
+        import types
+        import strategy as _S
+        m1_bars = [{'open': bid, 'high': bid, 'low': bid, 'close': bid, 'time': 1000},
+                   {'open': bid, 'high': bid, 'low': bid, 'close': bid, 'time': 1060}]
+        mt5 = types.SimpleNamespace(
+            symbol_info_tick=lambda s: types.SimpleNamespace(bid=bid, ask=ask),
+            symbol_info=lambda s: types.SimpleNamespace(trade_stops_level=0, point=0.01),
+            positions_get=lambda ticket=None: [types.SimpleNamespace(sl=entry)])
+        modify_calls = []
+        adapter = types.SimpleNamespace(
+            mt5=mt5, symbol=self.cfg.symbol,
+            get_latest_m1=lambda s, n: m1_bars,
+            modify_position_sl=lambda tk, px: (modify_calls.append((tk, px)) or None))
+        shadow = {'anchor_label': 'A1', 'side': 'SELL', 'entry_price': entry,
+                  'current_sl': entry, 'tp_level': entry - 30.0, 'max_fav': entry,
+                  'role': 'normal'}
+        warns = []
+        ptrace_calls = []
+        class _PT:
+            def __getattr__(self, name):
+                def _rec(*a, **kw):
+                    if name == 'stop_through_rearm':
+                        ptrace_calls.append(kw)
+                    return None
+                return _rec
+        tr = types.SimpleNamespace(
+            cfg=self.cfg, adapter=adapter, paper=False,
+            shadow_positions={12345: shadow}, ptrace=_PT(),
+            tele=types.SimpleNamespace(warn=lambda m, *a, **k: warns.append(m),
+                                       info=lambda *a, **k: None),
+            _rl_ok=lambda *a, **k: True, _save_state=lambda: None,
+            _Position=_S.Position)
+        return tr, shadow, modify_calls, warns, ptrace_calls
+
+    def _step_e18_no_lock_no_advance(self):
+        # 204 E-18 (FIXED 2026-07-03): a losing leg with NO genuinely armed lock
+        # (current_sl at/behind its resting SL, lock_level_for == 0) must compute
+        # NO stop advance at all -- the pre-fix code recomputed an "advancing"
+        # STOP-THROUGH correction every bar it stayed adverse (27x/26min live,
+        # 05:55-06:21). Drives the REAL trails._manage_trails_on_bar_close across
+        # 3 consecutive bar-closes. Asserts: (a) current_sl is UNCHANGED after
+        # every bar (no advance, no chase); (b) modify_position_sl is NEVER called
+        # for this ticket (nothing sent to the broker); (c) exactly ONE
+        # STOP-THROUGH warning + ONE PTRACE line fire across all 3 bars (episode
+        # throttle), not one per bar.
+        from trails import _manage_trails_on_bar_close as _mtc
+        try:
+            tr, shadow, modify_calls, warns, ptrace_calls = self._e18_trapped_trader()
+            sl_before = shadow['current_sl']
+            for _ in range(3):
+                _mtc(tr)
+            sl_unchanged = (shadow['current_sl'] == sl_before == 4123.10)
+            never_modified = (len(modify_calls) == 0)
+            one_warn = (len(warns) == 1 and 'no armed lock' in warns[0].lower())
+            one_ptrace = (len(ptrace_calls) == 1
+                          and ptrace_calls[0].get('reason') == 'stop_through_no_armed_lock_no_advance')
+            ok = sl_unchanged and never_modified and one_warn and one_ptrace
+            detail = (f"sl_unchanged@{sl_before}={sl_unchanged} "
+                      f"never_modified={never_modified} one_warn_x3bars={one_warn} "
+                      f"one_ptrace_x3bars={one_ptrace}")
+        except Exception as e:
+            self._record(204, FAIL, f"raised: {e!r}"); return
+        self._record(204, PASS if ok else FAIL, detail)
+
+    def _step_fb_bypasses_gate(self):
+        # 205 F-B (D-5): a trapped No-OCO leg's late-rescue hedge fires THROUGH/PAST
+        # the break-and-hold gate -- it is never even offered to the gate. Source:
+        # fills.py _check_boost_triggers calls boosts.plan_trapped_late_rescue and,
+        # on a plan, fires + `continue`s (fills.py ~604-620) BEFORE the tick-hold
+        # streak and the `_break_and_hold_ok` call (~651-695) are ever reached. This
+        # asserts that end-to-end shape directly against the live method: with the
+        # break-and-hold gate stubbed to ALWAYS refuse (it must never even be asked),
+        # a trapped leg $14 adverse still fires the hedge.
+        import types, dataclasses
+        try:
+            cfg = dataclasses.replace(self.cfg, trapped_late_rescue_enabled=True,
+                                      trapped_rescue_arm_dollars=10.0,
+                                      rally_boosts_enabled=False, rescue_boosts_enabled=False)
+            fired = []
+            gate_asked = {'n': 0}
+            tk = types.SimpleNamespace(bid=4055.00, ask=4055.20)  # mid 4055.10: -$10.54 adverse
+            mt5 = types.SimpleNamespace(symbol_info_tick=lambda s: tk)
+            adapter = types.SimpleNamespace(mt5=mt5)
+            shadow = {'side': 'BUY', 'leg_fill_price': 4065.64, 'entry_price': 4065.64,
+                      'anchor_label': 'A1', 'boost': False, 'boost_fired': False,
+                      'boost_eligible': True, 'boost_rally_only': True}
+            tr = types.SimpleNamespace(
+                cfg=cfg, adapter=adapter, paper=False, symbol=cfg.symbol,
+                shadow_positions={777: shadow},
+                _last_boost_mid=None,
+                _break_and_hold_ok=lambda sh, pl: (gate_asked.__setitem__(
+                    'n', gate_asked['n'] + 1), False)[1],   # would ALWAYS refuse
+                _rescue_entry_ok=lambda sh, pl: False,
+                _fp_guard_ok=lambda sh, n: True,
+                _fire_boost_event=lambda tk_, sh, pl: fired.append(pl),
+                _enforce_boost_cap=lambda mid: None)
+            import fills as _fills
+            _fills._check_boost_triggers(tr)
+            hedge_fired = (len(fired) == 1 and fired[0].event_type == 'TRAPPED_LATE_RESCUE'
+                          and fired[0].boost_side == 'SELL')
+            gate_never_asked = (gate_asked['n'] == 0)
+            ok = hedge_fired and gate_never_asked
+            detail = (f"hedge_fired={hedge_fired} break_and_hold_never_asked={gate_never_asked} "
+                      f"(gate_would_have_refused=True)")
+        except Exception as e:
+            self._record(205, FAIL, f"raised: {e!r}"); return
+        self._record(205, PASS if ok else FAIL, detail)
+
+    def _step_fb_default_on(self):
+        # 206 D-5: trapped_late_rescue_enabled now DEFAULTS True (was False) -- flip
+        # rationale: 3 trapped-leg events in 2 days, all unhedged naked (2026-07-02
+        # A4 $27 collapse, 2026-07-02 A5 overnight, 2026-07-03 A1 $70 rally).
+        try:
+            default_on = (self.cfg.trapped_late_rescue_enabled is True)
+            still_toggleable = True
+            try:
+                import dataclasses
+                dataclasses.replace(self.cfg, trapped_late_rescue_enabled=False)
+            except Exception:
+                still_toggleable = False
+            ok = default_on and still_toggleable
+            detail = f"default_on={default_on} still_toggleable_off={still_toggleable}"
+        except Exception as e:
+            self._record(206, FAIL, f"raised: {e!r}"); return
+        self._record(206, PASS if ok else FAIL, detail)
+
     def _step_rally_sl13_cap910(self):
         # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
         # cap -$700 -- per-kind, never one shared value. Asserts the plan SL, the live
@@ -3850,10 +4026,11 @@ class SelfTest:
                 {'high': 99.0, 'low': 88.0, 'close': 89.0}]
 
     def _step_case2_override_fires(self):
-        # 96 CASE 2: parent SELL already +$25 favorable (>= $20 threshold), violent
-        # same-direction crash the candle gate FAILS ('reversed') -> the parent-profit
-        # override FIRES the boost (returns True) and logs BREAK_OVERRIDE_PARENT_
-        # ESTABLISHED carrying parent_max_fav / threshold / move_dollars for the trial.
+        # 96 CASE 2: parent SELL already +$25 favorable (>= the D-4 $12 threshold,
+        # lowered from $20 2026-07-03 -- W-7), violent same-direction crash the candle
+        # gate FAILS ('reversed') -> the parent-profit override FIRES the boost
+        # (returns True) and logs BREAK_OVERRIDE_PARENT_ESTABLISHED carrying
+        # parent_max_fav / threshold / move_dollars for the trial.
         import rally as _rally, break_hold as _bh
         try:
             bars = self._case2_bars()
@@ -3868,7 +4045,7 @@ class SelfTest:
             logged = len(ev) == 1
             kw = ev[0][1] if logged else {}
             fields_ok = (logged and abs(kw.get('parent_max_fav', 0) - 25.0) < 0.05
-                         and abs(kw.get('threshold', 0) - 20.0) < 0.05
+                         and abs(kw.get('threshold', 0) - 12.0) < 0.05
                          and abs(kw.get('move_dollars', 0) - 12.0) < 0.05)
             loud = any('OVERRIDE' in str(m) for m in self._gate_tele_infos)
             ok = gate_would_block and fired and logged and fields_ok and loud
@@ -3881,24 +4058,25 @@ class SelfTest:
 
     def _step_case1_still_blocks(self):
         # 97 CASE 1: the IDENTICAL violent shape, but the parent is NOT established
-        # (max_fav +$10 < $20) -> the override does NOT apply, the strict gate is fully
-        # in force, and the fresh spike STILL BLOCKS (returns False). This is the -$701
-        # fake-spike path: it must never fire just because the move looked violent.
+        # (max_fav +$8 < the D-4 $12 threshold) -> the override does NOT apply, the
+        # strict gate is fully in force, and the fresh spike STILL BLOCKS (returns
+        # False). This is the -$701 fake-spike path: it must never fire just because
+        # the move looked violent.
         import rally as _rally
         try:
             bars = self._case2_bars()
             tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
-                                               parent_side='SELL', parent_max_fav=10.0)
+                                               parent_side='SELL', parent_max_fav=8.0)
             blocked = (_rally.break_and_hold_ok(tr, sh, pl) is False)
             no_override = not any(e[0] == 'break_override_parent_established'
                                   for e in self._gate_ptrace)
-            # boundary: just below threshold ($19.99) still blocks (>= is the gate).
+            # boundary: just below threshold ($11.99) still blocks (>= is the gate).
             tr2, sh2, pl2 = self._break_gate_stub(lambda s, n: bars, side='SELL',
-                                                  parent_side='SELL', parent_max_fav=19.99)
+                                                  parent_side='SELL', parent_max_fav=11.99)
             boundary_blocks = (_rally.break_and_hold_ok(tr2, sh2, pl2) is False)
             ok = blocked and no_override and boundary_blocks
             detail = (f"fresh_spike_blocks={blocked} no_override_logged={no_override} "
-                      f"below_threshold_19.99_blocks={boundary_blocks}")
+                      f"below_threshold_11.99_blocks={boundary_blocks}")
         except Exception as e:
             self._record(97, FAIL, f"raised: {e!r}"); return
         self._record(97, PASS if ok else FAIL, detail)
@@ -4210,74 +4388,25 @@ class SelfTest:
             self._record(107, FAIL, f"raised: {e!r}"); return
         self._record(107, PASS if ok else FAIL, detail)
 
-    def _step_override_pullback_fire(self):
-        # 108 PULLBACK FIRE (pure state machine): armed, price runs then retraces the
-        # $13 band from the tracked extreme -> FIRE at extreme-/+13. SL stays $13 from
-        # that entry (rally_boost_sl). BUY and SELL mirror.
-        import rally as _rally, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, override_entry_enabled=True,
-                                      override_entry_pullback_dollars=13.0)
-            stb = {}
-            d0 = _rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 1, True)   # ARM
-            d1 = _rally.override_pullback_step(stb, cfg, 'BUY', 110.0, 1, True)   # extreme->110
-            d2 = _rally.override_pullback_step(stb, cfg, 'BUY', 96.0, 1, True)    # 96<=110-13=97 FIRE
-            buy_ok = (d0 == _rally.ARM_HOLD and d1 == _rally.ARM_HOLD
-                      and d2 == _rally.ARM_FIRE and abs(stb['fire_level'] - 97.0) < 1e-9)
-            sts = {}
-            _rally.override_pullback_step(sts, cfg, 'SELL', 100.0, 1, True)       # ARM
-            _rally.override_pullback_step(sts, cfg, 'SELL', 90.0, 1, True)        # extreme->90
-            ds = _rally.override_pullback_step(sts, cfg, 'SELL', 104.0, 1, True)  # 104>=90+13=103 FIRE
-            sell_ok = (ds == _rally.ARM_FIRE and abs(sts['fire_level'] - 103.0) < 1e-9)
-            sl_from_entry = abs(float(getattr(cfg, 'rally_boost_sl', 13.0)) - 13.0) < 1e-9
-            ok = buy_ok and sell_ok and sl_from_entry
-            detail = (f"BUY_fire@{stb.get('fire_level')}(=97)={buy_ok} "
-                      f"SELL_fire@{sts.get('fire_level')}(=103)={sell_ok} SL$13_from_entry={sl_from_entry}")
-        except Exception as e:
-            self._record(108, FAIL, f"raised: {e!r}"); return
-        self._record(108, PASS if ok else FAIL, detail)
+    def _step_retired_108(self):
+        # 108 RETIRED (P4, 2026-07-03): was "ovr pullback fire", the dedicated test for
+        # rally.override_pullback_step (v3.4.0 first-touch arm-then-pullback). That
+        # standalone state machine was DEAD CODE -- superseded by the shared
+        # pullback_entry.step adaptive machine (v3.5.0), which is fully covered by
+        # steps 114-121. Deleted with the function (P4 dead-code pass); the slot is
+        # kept (not renumbered) since _report()/STEP_NAMES require contiguous 1..N.
+        self._record(108, PASS, "retired: override_pullback_step deleted (dead, "
+                                "superseded by pullback_entry.step, see 114-121)")
 
-    def _step_override_timeout_skip(self):
-        # 109 TIMEOUT-SKIP (pure): armed, no $13 pullback within override_entry_arm_
-        # timeout_candles M5 closes -> SKIP, state cleared (skipped latched, never re-arms).
-        import rally as _rally, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, override_entry_enabled=True,
-                                      override_entry_arm_timeout_candles=4)
-            stb = {}
-            _rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 0, True)        # ARM @ bucket0
-            seq = [_rally.override_pullback_step(stb, cfg, 'BUY', 100.0, b, True)  # price never touches
-                   for b in (1, 2, 3, 4)]
-            skip_at_timeout = (seq[:3] == [_rally.ARM_HOLD] * 3 and seq[3] == _rally.ARM_SKIP)
-            cleared = (stb.get('skipped') is True)
-            latched = (_rally.override_pullback_step(stb, cfg, 'BUY', 96.0, 5, True) == _rally.ARM_SKIP)
-            ok = skip_at_timeout and cleared and latched
-            detail = (f"hold_x3_then_skip@4candles={skip_at_timeout} cleared={cleared} "
-                      f"skip_latched_even_on_touch={latched}")
-        except Exception as e:
-            self._record(109, FAIL, f"raised: {e!r}"); return
-        self._record(109, PASS if ok else FAIL, detail)
+    def _step_retired_109(self):
+        # 109 RETIRED (P4, 2026-07-03): was "ovr timeout skip" -- see 108's note.
+        self._record(109, PASS, "retired: override_pullback_step deleted (dead, "
+                                "superseded by pullback_entry.step, see 114-121)")
 
-    def _step_override_parent_exit_clear(self):
-        # 110 PARENT-EXIT CLEAR (pure): armed, then parent_alive=False (parent hit TP/SL)
-        # -> SKIP, state cleared. Latched: a later touch does NOT fire. (At runtime this
-        # is also structural -- a closed parent is removed from the scan and its shadow,
-        # so shadow['override_arm'] vanishes with it.)
-        import rally as _rally, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, override_entry_enabled=True)
-            stb = {}
-            _rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 0, True)        # ARM
-            exit_skip = (_rally.override_pullback_step(stb, cfg, 'BUY', 100.0, 0,
-                         parent_alive=False) == _rally.ARM_SKIP)
-            cleared = (stb.get('skipped') is True)
-            no_fire_after = (_rally.override_pullback_step(stb, cfg, 'BUY', 80.0, 0, True)
-                             == _rally.ARM_SKIP)   # a deep touch still does NOT fire
-            ok = exit_skip and cleared and no_fire_after
-            detail = (f"parent_exit_skips={exit_skip} cleared={cleared} no_fire_after_exit={no_fire_after}")
-        except Exception as e:
-            self._record(110, FAIL, f"raised: {e!r}"); return
-        self._record(110, PASS if ok else FAIL, detail)
+    def _step_retired_110(self):
+        # 110 RETIRED (P4, 2026-07-03): was "ovr parent-exit" -- see 108's note.
+        self._record(110, PASS, "retired: override_pullback_step deleted (dead, "
+                                "superseded by pullback_entry.step, see 114-121)")
 
     def _step_override_rescue_unaffected(self):
         # 111 RESCUE-UNAFFECTED: with override_entry_enabled ON, the RESCUE plan is
@@ -4326,7 +4455,7 @@ class SelfTest:
         from strategy import update_position_on_bar
         try:
             entry_keys = {'override_entry_enabled', 'override_entry_pullback_dollars',
-                          'override_entry_arm_timeout_candles', 'override_entry_first_touch'}
+                          'override_entry_arm_timeout_candles'}
             exit_keys = {'rally_pullback_enabled', 'rally_pullback_tol_dollars',
                          'rally_pullback_time_bound_min'}
             disjoint = (entry_keys.isdisjoint(exit_keys)
@@ -5733,9 +5862,7 @@ class SelfTest:
         #  (b) anchor SEEDS from A1 when no prior close; CHAINS to last close otherwise.
         #  (c) entry fires at exactly $10 off the anchor in the correct direction; <$10 holds.
         #  (d) reversal: $10 PAST entry against the trade -> confirmed; <$10 -> holds (pause).
-        #  (e) $30 soft lock is BANKED but does NOT block new entries (never a hard stop).
         #  (f) whipsaw day: braked -> can_enter halts at rogue_daily_loss_stop (value-agnostic).
-        #  (g) per-rescue cap is finite (bounded recovery).
         #  (h) isolation: the A1 read is READ-ONLY; a reversal closes ONLY the ROGUE ticket,
         #      never an anchor 20260522 ticket.
         import rogue as _r, dataclasses, types
@@ -5762,20 +5889,11 @@ class SelfTest:
             hold_buy = _r.a1_reversal_confirmed(4010.0, 'BUY', 4004.0, cfg)  # -$6 -> False
             rev_sell = _r.a1_reversal_confirmed(3990.0, 'SELL', 4000.0, cfg)  # +$10 -> True
             reversal_ok = (rev_buy is True and hold_buy is False and rev_sell is True)
-            # (e) soft lock banks, does NOT block
-            gov = _r.new_day_state(); gov['day_pnl'] = 30.0
-            soft = (_r.a1_soft_lock_met(30.0, cfg) is True
-                    and _r.a1_soft_lock_met(29.0, cfg) is False
-                    and _r.can_enter(gov, cfg)[0] is True)   # +$30 day STILL trades
             # (f) brake: a losing day halts at the daily loss stop (value-agnostic)
             g2 = _r.new_day_state()
             _r.record_close(g2, float(cfg.rogue_daily_loss_stop) - 1.0, True, cfg)
             braked = (_r.can_enter(g2, cfg)[0] is False
                       and _r.can_enter(g2, cfg)[1] == 'daily_loss_stop')
-            # (g) cap finite
-            cap = _r.a1_rescue_cap(cfg)
-            cap_ok = (cap > 0 and abs(cap - (int(cfg.rescue_boost_count) * 13.0
-                      * float(cfg.lot_size) * 100.0)) < 1e-6)
 
             # (a) gating: drive() routes to _drive_a1 ONLY when the flag is ON.
             sentinel = {'a1': 0}
@@ -5832,11 +5950,11 @@ class SelfTest:
                       and abs((a1_read or 0) - 3980.0) < 1e-9    # A1 read worked, read-only
                       and tr.shadow_positions[55]['leg_fill_price'] == 3980.0)  # untouched
 
-            ok = (seed_a1 and chain and entry_ok and reversal_ok and soft and braked
-                  and cap_ok and gating_ok and iso_ok)
+            ok = (seed_a1 and chain and entry_ok and reversal_ok and braked
+                  and gating_ok and iso_ok)
             detail = (f"(a)gate_off={off_legacy}/on={on_a1} (b)seed={seed_a1}&chain={chain} "
-                      f"(c)entry={entry_ok} (d)reversal={reversal_ok} (e)soft_banks={soft} "
-                      f"(f)brake={braked} (g)cap=${cap:.0f} (h)isolation={iso_ok}")
+                      f"(c)entry={entry_ok} (d)reversal={reversal_ok} "
+                      f"(f)brake={braked} (h)isolation={iso_ok}")
         except Exception as e:
             self._record(185, FAIL, f"raised: {e!r}"); return
         self._record(185, PASS if ok else FAIL, detail)
@@ -5850,9 +5968,11 @@ class SelfTest:
         # -- combined worst case = n x $13 x lot x 100 (trapped_rescue_cap), finite, never the
         # naked unbounded double-loss. Pure decision (boosts.plan_trapped_late_rescue) -- the
         # live fills.py hook is a thin wrapper gated by the SAME flag, so flag OFF is a no-op.
+        # D-5 (2026-07-03): the flag now DEFAULTS ON, so "flag OFF" is forced explicitly here
+        # (both states are still proven; 187 asserts the new default separately).
         import boosts as _b, dataclasses
         try:
-            cfg_off = self.cfg                                  # default: flag OFF
+            cfg_off = dataclasses.replace(self.cfg, trapped_late_rescue_enabled=False)
             cfg_on = dataclasses.replace(self.cfg, trapped_late_rescue_enabled=True,
                                          trapped_rescue_arm_dollars=10.0,
                                          trapped_rescue_sl_dollars=13.0)
@@ -7399,9 +7519,9 @@ class SelfTest:
             # v3.4.0 — RALLY override pullback-entry (flag-gated, DEFAULT OFF)
             self._step_override_freeze_guard()
             self._step_override_arm_no_fire()
-            self._step_override_pullback_fire()
-            self._step_override_timeout_skip()
-            self._step_override_parent_exit_clear()
+            self._step_retired_108()
+            self._step_retired_109()
+            self._step_retired_110()
             self._step_override_rescue_unaffected()
             self._step_override_5arm_unaffected()
             self._step_override_no_pullback_collision()
@@ -7517,6 +7637,11 @@ class SelfTest:
             self._step_p3_gates_off_freeze()
             # Hotfix 2026-07-02: PTRACE BREAK_FAILED spam throttle (logging only)
             self._step_ptrace_break_spam()
+            # P4 2026-07-03: W-7 (D-4), E-18, F-B (D-5)
+            self._step_d4_override_reevaluates()
+            self._step_e18_no_lock_no_advance()
+            self._step_fb_bypasses_gate()
+            self._step_fb_default_on()
         finally:
             self._cleanup()
         return self._report(ts)

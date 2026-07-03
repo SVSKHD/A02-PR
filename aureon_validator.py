@@ -25,7 +25,7 @@ _EXPECTED_FLAGS = (
     'override_entry_enabled', 'rescue_entry_enabled', 'override_entry_smooth_confirm',
     'rescue_entry_smooth_confirm', 'override_entry_dynamic_sl',
     'parent_profit_override_enabled', 'rally_pullback_enabled',
-    'rogue_enabled', 'rogue_daywatch', 'rogue_reuse_rally', 'rogue_reuse_rescue',
+    'rogue_enabled', 'rogue_daywatch',
 )
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',

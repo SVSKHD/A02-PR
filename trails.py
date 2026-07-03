@@ -67,7 +67,7 @@ def _manage_trails_on_bar_close(self):
     })
     bar_time = pd.Timestamp(closed_bar['time'], unit='s', tz='UTC')
 
-    from strategy import update_position_on_bar  # late import
+    from strategy import update_position_on_bar, lock_level_for  # late import
 
     for ticket, shadow in list(self.shadow_positions.items()):
         old_sl = shadow['current_sl']
@@ -234,39 +234,91 @@ def _manage_trails_on_bar_close(self):
                     else:
                         min_legal = round(ctk.ask + floor, 2)
                         _through = intended < min_legal
+                    if not _through:
+                        # episode over -- the next through-event gets a fresh warning.
+                        shadow.pop('_stopthru_episode_warned', None)
                     if _through:
-                        # Keep the PREVIOUS valid stop if it is still below market
-                        # (long) / above market (short); else clamp to the closest
-                        # legal level. Either way we re-arm a VALID stop -- never dump.
-                        if shadow['side'] == 'BUY':
-                            corrected = round(min(old_sl, max_legal), 2)
-                        else:
-                            corrected = round(max(old_sl, min_legal), 2)
+                        # E-18 (2026-07-03): a losing leg with NO genuinely armed lock
+                        # (lock_level_for == 0 -- either never armed, or parked at exact
+                        # breakeven, the "no small locks" role-2.9 case) has nothing above
+                        # its resting SL worth protecting. The pre-fix code chased the
+                        # market with an "advancing" corrected stop every bar it stayed
+                        # through -- 27x/26min on a 2026-07-03 trapped A1 SELL, $14
+                        # underwater, computed stop 4123.10 vs bid ~4137. Root cause: the
+                        # STOP-THROUGH re-arm didn't distinguish a real profit-lock (worth
+                        # re-arming near market) from a phantom/breakeven one (worth
+                        # nothing) -- it advanced BOTH. Fix: a no-armed-lock leg computes
+                        # NO stop advance at all; the resting original SL is left exactly
+                        # as-is (guard already correctly refuses to SEND the invalid
+                        # value, this stops it being RECOMPUTED every bar).
+                        _lock_now = 0
                         try:
-                            if getattr(self, 'ptrace', None) is not None:
-                                self.ptrace.stop_through_rearm(
-                                    ticket, shadow['anchor_label'],
-                                    side=shadow['side'], bid=ctk.bid,
-                                    ask=ctk.ask,
-                                    position_price=shadow.get('entry_price'),
-                                    max_fav=shadow.get('max_fav'),
-                                    rejected_stop=round(intended, 2),
-                                    stop_price=corrected,
-                                    reason="stop_through_replaced_not_closed")
+                            _lock_now = lock_level_for(pos, self.cfg)
                         except Exception:
-                            pass
-                        # Section D #4: ⛔ re-arm alert, rate-limited to 1/60s/ticket.
-                        if self._rl_ok(f"stopthru:{ticket}", 60.0):
-                            self.tele.warn(
-                                f"⛔ STOP-THROUGH re-armed, NOT closed | "
-                                f"{shadow['anchor_label']} {shadow['side']} | kept "
-                                f"stop ${corrected:.2f} | rides on (computed "
-                                f"${intended:.2f} was through bid ${ctk.bid:.2f})")
-                        # Re-arm the corrected (valid) stop and continue managing
-                        # this leg normally on the next bars.
-                        pos.current_sl = corrected
-                        shadow['current_sl'] = corrected
-                        intended = corrected
+                            _lock_now = 0
+                        if _lock_now == 0:
+                            if not shadow.get('_stopthru_episode_warned'):
+                                shadow['_stopthru_episode_warned'] = True
+                                try:
+                                    if getattr(self, 'ptrace', None) is not None:
+                                        self.ptrace.stop_through_rearm(
+                                            ticket, shadow['anchor_label'],
+                                            side=shadow['side'], bid=ctk.bid,
+                                            ask=ctk.ask,
+                                            position_price=shadow.get('entry_price'),
+                                            max_fav=shadow.get('max_fav'),
+                                            rejected_stop=round(intended, 2),
+                                            stop_price=round(old_sl, 2),
+                                            reason="stop_through_no_armed_lock_no_advance")
+                                except Exception:
+                                    pass
+                                self.tele.warn(
+                                    f"⛔ STOP-THROUGH (no armed lock), NO advance | "
+                                    f"{shadow['anchor_label']} {shadow['side']} | "
+                                    f"kept stop ${old_sl:.2f} unchanged (computed "
+                                    f"${intended:.2f} was through bid/ask) | further "
+                                    f"repeats this episode are suppressed")
+                            # NO advance: current_sl/shadow stay exactly as they were.
+                            intended = round(old_sl, 2)
+                            pos.current_sl = old_sl
+                        else:
+                            # A genuinely armed lock (tier 2/3) IS worth protecting --
+                            # keep the PREVIOUS valid stop if it is still below market
+                            # (long) / above market (short); else clamp to the closest
+                            # legal level. Either way we re-arm a VALID stop -- never dump.
+                            if shadow['side'] == 'BUY':
+                                corrected = round(min(old_sl, max_legal), 2)
+                            else:
+                                corrected = round(max(old_sl, min_legal), 2)
+                            if not shadow.get('_stopthru_episode_warned'):
+                                shadow['_stopthru_episode_warned'] = True
+                                try:
+                                    if getattr(self, 'ptrace', None) is not None:
+                                        self.ptrace.stop_through_rearm(
+                                            ticket, shadow['anchor_label'],
+                                            side=shadow['side'], bid=ctk.bid,
+                                            ask=ctk.ask,
+                                            position_price=shadow.get('entry_price'),
+                                            max_fav=shadow.get('max_fav'),
+                                            rejected_stop=round(intended, 2),
+                                            stop_price=corrected,
+                                            reason="stop_through_replaced_not_closed")
+                                except Exception:
+                                    pass
+                                # Section D #4 re-arm alert -- throttled to once/episode
+                                # (was rate-limited 1/60s, which still spammed a slow
+                                # multi-minute through-episode; E-18 hardens it further).
+                                self.tele.warn(
+                                    f"⛔ STOP-THROUGH re-armed, NOT closed | "
+                                    f"{shadow['anchor_label']} {shadow['side']} | kept "
+                                    f"stop ${corrected:.2f} | rides on (computed "
+                                    f"${intended:.2f} was through bid ${ctk.bid:.2f}) | "
+                                    f"further repeats this episode are suppressed")
+                            # Re-arm the corrected (valid) stop and continue managing
+                            # this leg normally on the next bars.
+                            pos.current_sl = corrected
+                            shadow['current_sl'] = corrected
+                            intended = corrected
             except Exception as e:
                 log.warning(f"SL clamp check failed for {ticket}: {e}")
 
