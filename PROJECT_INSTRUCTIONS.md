@@ -113,6 +113,29 @@ re-evaluates continuously, no code-level latch) and D-5 (F-B flipped LIVE) in
   `rally_pullback_*` (still OFF), and the sl_dist 18 → 14 question. F-B moved
   off this list 2026-07-03 (D-5, now live — see §4). Journal evidence first; no
   further config motion until a month-end read.
+- **P6 — daily P&L report — SHIPPED 2026-07-04** (branch
+  `claude/daily-pnl-report`, new `pnl_report.py`): automates the CSV analysis
+  that drove the A3 cut. Per-anchor net/PF/win%/whipsaw + original-vs-boost-
+  vs-F-B P&L split + a Rogue section + a month-to-date cut/keep roll-up, from
+  MT5 history deals (never from live trading state) — markdown to
+  `run/reports/daily_<date>.md`, a stable-schema CSV row appended to
+  `run/reports/pnl_ledger.csv`, and a Discord card, once per broker day at EOD
+  (`cfg.util_daily_pnl_report`, default ON) or on demand via
+  `python bot.py dailyreport [YYYY-MM-DD|YYYY-MM]`. READ-ONLY: no order flow,
+  no `shadow_positions`/governor reads. **Flagged, not guessed:** the boost
+  order comment (`AUR_{anchor}_{side}_B{n}`) is IDENTICAL for a RALLY pyramid,
+  a RESCUE hedge, and the F-B trapped-late-rescue hedge — `boosts.py`'s
+  `kind`/`event_type` is never written to the broker. The report joins boost
+  tickets against `rescue_events.csv`'s `event_type` column to split them; a
+  ticket with no matching row (fleet event not finalized yet) is reported as
+  `BOOST_UNCLASSIFIED`, never guessed as RALLY/RESCUE. The minimal fix, if this
+  ever matters at scale, is a 4th comment character (`_B1R`/`_B1S`/`_B1F`) —
+  proposed, not implemented (out of scope for a read-only reporting branch).
+  Also added ONE missing `log.info` mirror in `rogue.py` (`detect_close`) for
+  the CHAIN re-anchor / CLOSE-brake lines, which were Discord/Telegram-only
+  before — pure additive logging, makes "chain re-anchors" and "brake events"
+  greppable from `aureon.log` like their CHASE-REJECT/CHAIN-COOLDOWN siblings
+  already were.
 
 ## 6. Config decisions in effect (2026-07-03, this branch)
 

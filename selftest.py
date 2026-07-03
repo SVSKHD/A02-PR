@@ -280,6 +280,15 @@ STEP_NAMES = {
     204: "e18 no-lock no-adv",    # a losing leg w/ no armed lock computes NO stop advance
     205: "fb bypasses gate",      # F-B fires through break-and-hold entirely (never reached)
     206: "fb default on",         # D-5: trapped_late_rescue_enabled defaults True
+    # P4 2026-07-04: daily P&L report (pnl_report.py) -- fixture-based, no MT5 needed
+    207: "pnl classify",          # comment/magic -> engine/anchor/side/leg_class
+    208: "pnl boost join",        # BOOST_UNCLASSIFIED -> RALLY/RESCUE/F-B via rescue_events.csv
+    209: "pnl whipsaw",           # both-legs-open overlap detection
+    210: "pnl pf math",           # PF/win% computed from raw sums, never averaged
+    211: "pnl month rollup",      # multi-day roll-up sums raw fields before one PF/win% calc
+    212: "pnl empty day",         # zero deals -> empty, well-formed result (never raises)
+    213: "pnl render+ledger",     # markdown + CSV ledger rows are well-formed and stable-schema
+    214: "pnl ledger idempotent", # re-running a day's report never duplicates ledger rows
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3853,6 +3862,267 @@ class SelfTest:
         except Exception as e:
             self._record(206, FAIL, f"raised: {e!r}"); return
         self._record(206, PASS if ok else FAIL, detail)
+
+    # --- P4 2026-07-04: daily P&L report (pnl_report.py) -----------------------
+    def _step_pnl_classify(self):
+        # 207 classification (PURE, no MT5): comment+magic -> engine/anchor/side/
+        # leg_class for every family the report needs to tell apart -- anchor
+        # original (BUY/SELL, incl. _G/_RCV/_CFM/_R{n} suffixes), an anchor boost
+        # fleet member (comment alone can't say RALLY vs RESCUE vs F-B -- see 208),
+        # rogue (by magic AND by comment), and an unrecognized comment (UNKNOWN,
+        # never silently dropped).
+        import pnl_report as _pr
+        try:
+            orig_buy = _pr.classify_comment('AUR_A1_BUY', 20260522)
+            orig_sell_gap = _pr.classify_comment('AUR_A2_SELL_G', 20260522)
+            orig_retry = _pr.classify_comment('AUR_A4_BUY_R1', 20260522)
+            orig_rcv = _pr.classify_comment('AUR_A5_SELL_RCV', 20260522)
+            boost = _pr.classify_comment('AUR_A1_B_B1', 20260522)
+            rogue_by_magic = _pr.classify_comment('anything', 20260626)
+            rogue_by_comment = _pr.classify_comment('AUR_ROGUE_S', None)
+            garbage = _pr.classify_comment('not_a_real_comment', 12345)
+            none_comment = _pr.classify_comment(None, 20260522)
+
+            orig_ok = (orig_buy == {'engine': 'ANCHOR', 'anchor2': 'A1', 'side': 'BUY',
+                                    'leg_class': _pr.ORIGINAL, 'boost_seq': None}
+                      and orig_sell_gap['anchor2'] == 'A2' and orig_sell_gap['side'] == 'SELL'
+                      and orig_sell_gap['leg_class'] == _pr.ORIGINAL
+                      and orig_retry['anchor2'] == 'A4' and orig_retry['leg_class'] == _pr.ORIGINAL
+                      and orig_rcv['anchor2'] == 'A5' and orig_rcv['side'] == 'SELL'
+                      and orig_rcv['leg_class'] == _pr.ORIGINAL)
+            boost_ok = (boost['engine'] == 'ANCHOR' and boost['anchor2'] == 'A1'
+                       and boost['side'] == 'BUY' and boost['boost_seq'] == 1
+                       and boost['leg_class'] == _pr.BOOST_UNCLASSIFIED)
+            rogue_ok = (rogue_by_magic['engine'] == 'ROGUE'
+                       and rogue_by_magic['leg_class'] == _pr.ROGUE_LEG
+                       and rogue_by_comment['engine'] == 'ROGUE'
+                       and rogue_by_comment['side'] == 'SELL')
+            unknown_ok = (garbage['leg_class'] == _pr.UNKNOWN and garbage['engine'] is None
+                         and none_comment['leg_class'] == _pr.UNKNOWN)
+            ok = orig_ok and boost_ok and rogue_ok and unknown_ok
+            detail = (f"originals(BUY/SELL_G/retry/RCV)={orig_ok} "
+                      f"boost_unclassified_by_default={boost_ok} "
+                      f"rogue(magic+comment)={rogue_ok} unknown_never_dropped={unknown_ok}")
+        except Exception as e:
+            self._record(207, FAIL, f"raised: {e!r}"); return
+        self._record(207, PASS if ok else FAIL, detail)
+
+    def _step_pnl_boost_join(self):
+        # 208 the ONE flagged ambiguity: AUR_{A}_{side}_B{n} is IDENTICAL for a
+        # RALLY pyramid, a RESCUE hedge, and the new F-B TRAPPED_LATE_RESCUE hedge
+        # -- boosts.BoostPlan.kind/event_type is never written to the broker
+        # comment. Verifies the join against rescue_events.csv's event_type (by
+        # ticket) correctly splits all three, and that an UNMATCHED boost ticket
+        # (event not finalized / file doesn't reach back) stays
+        # BOOST_UNCLASSIFIED -- never guessed as RALLY or RESCUE.
+        import pnl_report as _pr
+        try:
+            idx = {101: 'RALLY_BOOST', 102: 'RESCUE_BOOST', 103: 'TRAPPED_LATE_RESCUE'}
+            rally = _pr.resolve_boost_leg_class(101, idx)
+            rescue = _pr.resolve_boost_leg_class(102, idx)
+            fb = _pr.resolve_boost_leg_class(103, idx)
+            unmatched = _pr.resolve_boost_leg_class(999, idx)
+            deals = [
+                {'position_id': 101, 'entry': 0, 'comment': 'AUR_A1_B_B1', 'magic': 20260522, 'time': 1, 'price': 4000.0},
+                {'position_id': 101, 'entry': 1, 'comment': 'AUR_A1_B_B1', 'magic': 20260522, 'time': 2, 'price': 4010.0, 'profit': 100.0, 'swap': 0, 'commission': 0},
+                {'position_id': 999, 'entry': 0, 'comment': 'AUR_A1_S_B2', 'magic': 20260522, 'time': 1, 'price': 4000.0},
+                {'position_id': 999, 'entry': 1, 'comment': 'AUR_A1_S_B2', 'magic': 20260522, 'time': 2, 'price': 3995.0, 'profit': -25.0, 'swap': 0, 'commission': 0},
+            ]
+            trades = _pr.build_trades(deals, idx)
+            by_tk = {t['ticket']: t for t in trades}
+            end_to_end_ok = (by_tk[101]['leg_class'] == _pr.RALLY_BOOST
+                             and by_tk[999]['leg_class'] == _pr.BOOST_UNCLASSIFIED)
+            ok = (rally == _pr.RALLY_BOOST and rescue == _pr.RESCUE_BOOST
+                 and fb == _pr.TRAPPED_LATE_RESCUE
+                 and unmatched == _pr.BOOST_UNCLASSIFIED and end_to_end_ok)
+            detail = (f"rally={rally} rescue={rescue} fb={fb} "
+                      f"unmatched_stays_unclassified={unmatched} "
+                      f"end_to_end_via_build_trades={end_to_end_ok}")
+        except Exception as e:
+            self._record(208, FAIL, f"raised: {e!r}"); return
+        self._record(208, PASS if ok else FAIL, detail)
+
+    def _step_pnl_whipsaw(self):
+        # 209 whipsaw = an opposite-side pair of ORIGINAL anchor trades whose
+        # [open,close] windows overlap (both legs genuinely live at the broker at
+        # once -- the same structural signature fills.py's `_twin_open` checks
+        # live). Two SEPARATE, non-overlapping same-anchor opposite-side trades
+        # (e.g. a morning SELL and an evening BUY) must NOT count as a whipsaw.
+        import pnl_report as _pr
+        try:
+            overlapping = [
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'side': 'BUY', 'leg_class': _pr.ORIGINAL,
+                 'open_time': 100, 'close_time': 300},
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'side': 'SELL', 'leg_class': _pr.ORIGINAL,
+                 'open_time': 200, 'close_time': 400},
+            ]
+            separate = [
+                {'engine': 'ANCHOR', 'anchor2': 'A2', 'side': 'SELL', 'leg_class': _pr.ORIGINAL,
+                 'open_time': 100, 'close_time': 200},
+                {'engine': 'ANCHOR', 'anchor2': 'A2', 'side': 'BUY', 'leg_class': _pr.ORIGINAL,
+                 'open_time': 500, 'close_time': 600},
+            ]
+            boost_ignored = [
+                {'engine': 'ANCHOR', 'anchor2': 'A4', 'side': 'BUY', 'leg_class': _pr.RALLY_BOOST,
+                 'open_time': 100, 'close_time': 300},
+                {'engine': 'ANCHOR', 'anchor2': 'A4', 'side': 'SELL', 'leg_class': _pr.ORIGINAL,
+                 'open_time': 100, 'close_time': 300},
+            ]
+            wc = _pr.detect_whipsaws(overlapping + separate + boost_ignored)
+            ok = (wc.get('A1') == 1 and wc.get('A2', 0) == 0 and wc.get('A4', 0) == 0)
+            detail = f"overlap_counts_1={wc.get('A1')} separate_counts_0={wc.get('A2', 0)} boost_never_pairs={wc.get('A4', 0)}"
+        except Exception as e:
+            self._record(209, FAIL, f"raised: {e!r}"); return
+        self._record(209, PASS if ok else FAIL, detail)
+
+    def _step_pnl_pf_math(self):
+        # 210 PF = gross_win / gross_loss, win% = wins / (wins+losses) -- computed
+        # from RAW dollar sums, never as an average of per-trade ratios. All-
+        # winner (zero losers) -> PF renders as "inf", never a ZeroDivisionError
+        # or a silently wrong number.
+        import pnl_report as _pr
+        try:
+            trades = [
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.ORIGINAL, 'pnl': 300.0},
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.ORIGINAL, 'pnl': -100.0},
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.RALLY_BOOST, 'pnl': 100.0},
+                {'engine': 'ANCHOR', 'anchor2': 'A2', 'leg_class': _pr.ORIGINAL, 'pnl': 50.0},
+                {'engine': 'ANCHOR', 'anchor2': 'A2', 'leg_class': _pr.ORIGINAL, 'pnl': 25.0},
+            ]
+            pa = _pr.per_anchor_stats(trades)
+            a1, a2 = pa['A1'], pa['A2']
+            # A1: gross_win 300+100=400, gross_loss 100 -> PF 4.0; wins=2 (the +300
+            # original AND the +100 boost each count as a trade), losses=1 -> 66.7%.
+            a1_ok = (abs(a1['pf'] - 4.0) < 1e-9 and abs(a1['win_pct'] - 66.7) < 0.05
+                    and abs(a1['net'] - 300.0) < 1e-9 and abs(a1['orig_pnl'] - 200.0) < 1e-9
+                    and abs(a1['rally_pnl'] - 100.0) < 1e-9)
+            a2_ok = (a2['pf'] == float('inf') and abs(a2['win_pct'] - 100.0) < 1e-9
+                    and _pr._fmt_pf(a2['pf']) == 'inf')
+            ok = a1_ok and a2_ok
+            detail = f"A1(pf={a1['pf']},win%={a1['win_pct']})={a1_ok} A2_all_win_inf={a2_ok}"
+        except Exception as e:
+            self._record(210, FAIL, f"raised: {e!r}"); return
+        self._record(210, PASS if ok else FAIL, detail)
+
+    def _step_pnl_month_rollup(self):
+        # 211 month roll-up sums RAW fields (gross_win/gross_loss/wins/losses)
+        # across days and recomputes PF/win% ONCE at the end -- never averages
+        # already-computed per-day ratios (the classic PF-of-PFs bug). A 2-day
+        # fixture: day 1 PF=3.0 (300/100), day 2 PF=0.5 (50/100) -- naively
+        # averaging those PFs gives 1.75; the correct combined PF from raw sums
+        # (350/200) is 1.75 too by coincidence here, so the fixture also checks
+        # win% and net, which WOULD differ under a naive per-day average.
+        import pnl_report as _pr
+        try:
+            day1 = _pr.per_anchor_stats([
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.ORIGINAL, 'pnl': 300.0},
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.ORIGINAL, 'pnl': -100.0},
+            ])
+            day2 = _pr.per_anchor_stats([
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.ORIGINAL, 'pnl': 50.0},
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.ORIGINAL, 'pnl': -100.0},
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'leg_class': _pr.ORIGINAL, 'pnl': -20.0},
+            ])
+            month = _pr.rollup_period([day1, day2])
+            a1 = month['A1']
+            trades_ok = (a1['trades'] == 5 and a1['wins'] == 2 and a1['losses'] == 3)
+            net_ok = abs(a1['net'] - 130.0) < 1e-9
+            pf_ok = abs(a1['pf'] - round(350.0 / 220.0, 2)) < 1e-9
+            win_pct_ok = abs(a1['win_pct'] - 40.0) < 1e-9
+            ok = trades_ok and net_ok and pf_ok and win_pct_ok
+            detail = (f"trades=5/wins=2/losses=3={trades_ok} net=$130={net_ok} "
+                      f"pf_from_raw_sums={pf_ok} win%=40={win_pct_ok}")
+        except Exception as e:
+            self._record(211, FAIL, f"raised: {e!r}"); return
+        self._record(211, PASS if ok else FAIL, detail)
+
+    def _step_pnl_empty_day(self):
+        # 212 a day with zero deals must produce a well-formed EMPTY result
+        # (never raise, never a KeyError on render) -- the CLI/EOD hook runs this
+        # unconditionally every broker day, including weekends/holidays.
+        import pnl_report as _pr
+        try:
+            trades = _pr.build_trades([], {})
+            pa = _pr.per_anchor_stats(trades)
+            wc = _pr.detect_whipsaws(trades)
+            rg = _pr.rogue_stats(trades, {})
+            md = _pr.render_markdown('2026-01-04', pa, rg, whipsaw_counts=wc)
+            rows = _pr.ledger_rows('2026-01-04', pa, rg)
+            ok = (trades == [] and pa == {} and wc == {}
+                 and rg['entries'] == 0 and rg['day_pnl'] == 0.0
+                 and isinstance(md, str) and 'AUREON daily P&L report' in md
+                 and len(rows) == 2  # TOTAL + ROGUE rows, no anchor rows
+                 and rows[0]['scope'] == 'TOTAL' and rows[1]['scope'] == 'ROGUE')
+            detail = f"trades=[]{trades == []} per_anchor={{}}={pa == {}} rogue_zeroed={rg['entries'] == 0} md_ok={'AUREON' in md} rows={len(rows)}"
+        except Exception as e:
+            self._record(212, FAIL, f"raised: {e!r}"); return
+        self._record(212, PASS if ok else FAIL, detail)
+
+    def _step_pnl_render_and_ledger(self):
+        # 213 markdown renders every section without raising, and the CSV ledger
+        # rows carry the STABLE PNL_LEDGER_COLUMNS schema (task requirement:
+        # "stable schema for later analysis") regardless of which anchors traded
+        # -- adding/cutting an anchor (e.g. the A3 cut) never changes the column
+        # set, only which `scope` values appear.
+        import pnl_report as _pr
+        try:
+            trades = [
+                {'engine': 'ANCHOR', 'anchor2': 'A1', 'side': 'BUY', 'leg_class': _pr.ORIGINAL,
+                 'pnl': 300.0, 'ticket': 1, 'open_time': 1, 'close_time': 2},
+                {'engine': 'ROGUE', 'anchor2': None, 'side': 'BUY', 'leg_class': _pr.ROGUE_LEG,
+                 'pnl': 175.0, 'ticket': 2, 'open_time': 1, 'close_time': 2},
+            ]
+            pa = _pr.per_anchor_stats(trades)
+            rg = _pr.rogue_stats(trades, {'chain_reanchors': 2})
+            md = _pr.render_markdown('2026-07-04', pa, rg,
+                                     w2={'A1': {'n': 1, 'avg_actual_exit': 4010.0,
+                                                'avg_nohold_exit': 4005.0, 'avg_delta': 5.0}},
+                                     month_rollup_stats=pa, month_str='2026-07')
+            sections_ok = all(s in md for s in ('## Per anchor', '## W-2 tracking',
+                                                '## Rogue', '## Month-to-date'))
+            rows = _pr.ledger_rows('2026-07-04', pa, rg)
+            cols_ok = all(set(r.keys()) == set(_pr.PNL_LEDGER_COLUMNS) for r in rows)
+            scopes = {r['scope'] for r in rows}
+            scopes_ok = scopes == {'A1', 'TOTAL', 'ROGUE'}
+            rogue_row = next(r for r in rows if r['scope'] == 'ROGUE')
+            rogue_ok = (rogue_row['rogue_chain_reanchors'] == 2 and rogue_row['net'] == '')
+            ok = sections_ok and cols_ok and scopes_ok and rogue_ok
+            detail = (f"sections={sections_ok} stable_columns={cols_ok} "
+                      f"scopes={sorted(scopes)}={scopes_ok} rogue_row_ok={rogue_ok}")
+        except Exception as e:
+            self._record(213, FAIL, f"raised: {e!r}"); return
+        self._record(213, PASS if ok else FAIL, detail)
+
+    def _step_pnl_ledger_idempotent(self):
+        # 214 re-running a day's report (manual CLI re-run, or the EOD hook
+        # somehow firing twice) must NEVER duplicate rows in pnl_ledger.csv --
+        # upsert_ledger_rows replaces that date's rows in place, leaving every
+        # OTHER date's rows untouched.
+        import pnl_report as _pr, tempfile, os as _os, csv as _csv
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_pnl_ledger_')
+            csv_path = _os.path.join(tmp, 'pnl_ledger.csv')
+            rows_d1 = [{**{c: '' for c in _pr.PNL_LEDGER_COLUMNS},
+                       'date': '2026-07-01', 'scope': 'A1', 'net': 10.0}]
+            rows_d2_v1 = [{**{c: '' for c in _pr.PNL_LEDGER_COLUMNS},
+                          'date': '2026-07-02', 'scope': 'A1', 'net': 20.0}]
+            rows_d2_v2 = [{**{c: '' for c in _pr.PNL_LEDGER_COLUMNS},
+                          'date': '2026-07-02', 'scope': 'A1', 'net': 999.0}]
+            _pr.upsert_ledger_rows(csv_path, '2026-07-01', rows_d1)
+            _pr.upsert_ledger_rows(csv_path, '2026-07-02', rows_d2_v1)
+            _pr.upsert_ledger_rows(csv_path, '2026-07-02', rows_d2_v1)  # re-run, same data
+            _pr.upsert_ledger_rows(csv_path, '2026-07-02', rows_d2_v2)  # re-run, CHANGED data
+            with open(csv_path, newline='') as f:
+                final = list(_csv.DictReader(f))
+            d1_rows = [r for r in final if r['date'] == '2026-07-01']
+            d2_rows = [r for r in final if r['date'] == '2026-07-02']
+            ok = (len(final) == 2 and len(d1_rows) == 1 and len(d2_rows) == 1
+                 and d1_rows[0]['net'] == '10.0' and d2_rows[0]['net'] == '999.0')
+            detail = (f"total_rows=2={len(final) == 2} d1_untouched={d1_rows[0]['net'] if d1_rows else None} "
+                      f"d2_replaced_not_duplicated=({len(d2_rows)}row,net={d2_rows[0]['net'] if d2_rows else None})")
+        except Exception as e:
+            self._record(214, FAIL, f"raised: {e!r}"); return
+        self._record(214, PASS if ok else FAIL, detail)
 
     def _step_rally_sl13_cap910(self):
         # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
@@ -7642,6 +7912,15 @@ class SelfTest:
             self._step_e18_no_lock_no_advance()
             self._step_fb_bypasses_gate()
             self._step_fb_default_on()
+            # P4 2026-07-04: daily P&L report (pnl_report.py)
+            self._step_pnl_classify()
+            self._step_pnl_boost_join()
+            self._step_pnl_whipsaw()
+            self._step_pnl_pf_math()
+            self._step_pnl_month_rollup()
+            self._step_pnl_empty_day()
+            self._step_pnl_render_and_ledger()
+            self._step_pnl_ledger_idempotent()
         finally:
             self._cleanup()
         return self._report(ts)
