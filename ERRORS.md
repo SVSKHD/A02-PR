@@ -242,32 +242,51 @@ defaults pinned ON); 189 re-verified with gates ON (timing warped, assertions un
 
 ---
 
+## E-18 — STOP-THROUGH spam on a trapped leg with no armed lock — **FIXED**
+
+**Status:** FIXED — 2026-07-03 — P4 branch `claude/p4-boosts-trapped-leg-gbn54a`.
+
+**Symptom (live, 2026-07-03 05:55–06:21, 27x/~26min):** a trapped A1 SELL, ~$14
+underwater (software computed stop 4123.10 vs bid ~4137), fired the
+`⛔ STOP-THROUGH re-armed` warning once per M1 bar for the full episode. The
+guard **correctly refused** to send the invalid (through-market) stop to the
+broker each time — but something kept **recomputing an advancing/impossible
+stop** for a deep-underwater leg once per minute.
+
+**Root cause:** `trails._manage_trails_on_bar_close`'s STOP-THROUGH re-arm
+(v3.3.0, Part 2 #3/#4) treated EVERY through-market stop identically — it never
+distinguished a genuinely armed profit lock (tier 2/3, worth protecting with a
+market-chasing correction) from a leg parked at (or behind) its resting SL with
+NO meaningfully armed lock (`strategy.lock_level_for(pos, cfg) == 0` — this
+covers both "never armed" and "armed only at exact breakeven", per the v2.9
+"role-aware exits ... no small locks" design intent). For the latter, there is
+nothing above the resting SL worth protecting, yet the old code still computed
+a fresh market-pegged `corrected` value and re-armed it EVERY bar the position
+stayed adverse, producing the recurring warning (the guard blocked the SEND
+every time, but the RECOMPUTE never stopped).
+
+**Fix:** `trails.py` (`_manage_trails_on_bar_close`, the STOP-THROUGH block)
+now branches on `lock_level_for(pos, cfg)`: `== 0` (no armed lock) → **NO stop
+advance at all** — `current_sl`/`shadow['current_sl']` are left exactly as they
+were, nothing is sent to the broker; `>= 1` (a genuine tier-2/3 profit lock) →
+the existing re-arm-near-market correction is unchanged. Both branches now
+throttle their warning + PTRACE `stop_through_rearm` line to **once per
+episode** (`shadow['_stopthru_episode_warned']`, cleared the moment `_through`
+goes False again) instead of the old 1-per-60s rate limit, which still spammed
+a slow multi-minute through-episode.
+
+**Files:** `trails.py` (`_manage_trails_on_bar_close`). **Self-test:** 204
+(`e18 no-lock no-adv` — drives the REAL method across 3 consecutive bar-closes;
+asserts no stop advance, `modify_position_sl` never called, exactly one warning
++ one PTRACE line across all 3 bars).
+
+---
+
 ## Watch Ledger — patterns under observation (NOT confirmed bugs, NO lever pulled)
-
-### W-7 — break_and_hold false negative on a real continuation — **WATCH** — opened 2026-07-02
-
-**Instance (2026-07-02, A4 SELL @edge 4131.02):** the break-and-hold gate
-classified the break **reversed** (4 M5 candles) while price continued **+$17.7**
-in the break direction — rally boosts stayed blocked the whole way and an
-estimated **~$300–400 was forfeited**. The parent leg was only **+$10–16**
-favorable during the window, just UNDER the $20 `parent_established_dollars`
-CASE 2 override, so the override never engaged.
-
-**Candidate lever (if repeated):** lower the override threshold to **~$12–15**.
-**Status:** NEEDS more instances before ANY change — the gate exists because of
-the −$701 fake-break loss and is not loosened on a single counter-example.
-(Same-episode side effect — 60+ identical PTRACE `BREAK_FAILED` lines, one per
-second — fixed by the 2026-07-02 spam-throttle hotfix: once per
-(anchor, side, break_level) episode with a `suppressed_repeats` count. Logging
-only; the gate decision is untouched.)
 
 ### W-2 — evidence append — 2026-07-02
 
 **A4 BUY:** no-hold shadow **+$36.75** vs actual **−$630** (held 33.9m).
-
-### W-4 — evidence append — 2026-07-02
-
-**A4 BUY:** rode a **$27 collapse naked** (rescue suppressed by design).
 
 ---
 
@@ -310,3 +329,70 @@ path (`force_close_open`) is unaffected.
 Self-test 175 asserts the new default ON and still proves both flag states
 (OFF now forced explicitly). Set `rogue_flatten_at_eod=False` to restore the
 overnight ride.
+
+### D-4 — W-7 DECIDED: `parent_established_dollars` 20 → 12 + override widened — 2026-07-03
+
+**Decision:** the CASE 2 break-and-hold override threshold (`config.py`,
+`parent_established_dollars`) is lowered **$20 → $12**. Branch
+`claude/p4-boosts-trapped-leg-gbn54a` (P4). W-7 is now DECIDED, not WATCH.
+
+**Rationale (2 instances in 2 days, journal + live logs):**
+- 2026-07-02 A4 SELL @edge 4131.02: BREAK FAILED(reversed), price continued
+  **+$17.7** in the break direction, parent only +$10–16 favorable (under the
+  old $20 line) — **~$300–400 forfeited**.
+- 2026-07-03 A1 BUY @4134.57: BREAK FAILED(retrace), price ran **+$56**, parent
+  crossed the old $20 line only well into the move — **~$2,000+ forfeited**.
+
+**Source-verified answer to the latch question:** `rally.break_and_hold_ok` /
+`_override_grade` store **no per-episode FAILED state** — `break_hold.classify`
+re-evaluates fresh from the current M5 bars every call, and the CASE 2 check
+reads `shadow['max_fav']` (the position's live, monotonic peak) fresh every
+call too. There is **no code-level latch**: a parent that later proves the
+move (crosses the threshold) fires on the very next tick's gate evaluation,
+even after an earlier FAILED verdict for the same episode — proven directly
+against the live gate in self-test 203 (`d4 override re-eval`: blocked at
+parent +$8, then the SAME shadow/episode fires at parent +$15 with no reset).
+The forfeiture in both live instances is explained by the parent staying
+under the (old, higher) threshold long enough for the move to run away
+untouched, not by a latch bug.
+
+**Scope:** `parent_established_dollars` 20.0 → 12.0 (config value only; the
+override mechanism, the gate itself, and RESCUE's bypass are unchanged — this
+widens CASE 2's escape hatch, it does not touch the strict gate that blocks
+real fakeouts, tests 55-59). Self-test 96/97 boundary fixtures updated to the
+new $12 line (was $19.99/$20.0, now $11.99/$12.0); new self-test 203 proves
+continuous re-evaluation post-FAILED.
+
+**Restore path:** set `parent_established_dollars=20.0` in `config.py`.
+
+### D-5 — F-B (`trapped_late_rescue_enabled`) flipped LIVE — 2026-07-03
+
+**Decision:** the F-B trapped-leg capped late-rescue flag (`config.py`,
+`trapped_late_rescue_enabled`) defaults **False → True**. Same branch as D-4.
+W-4 is now DECIDED, not WATCH.
+
+**Rationale (3 trapped-leg events in 2 days, all unhedged naked):** 2026-07-02
+A4 rode a $27 collapse naked; 2026-07-02 A5 rode naked overnight; 2026-07-03 A1
+rode a $70 rally naked. In each case the No-OCO losing leg (`boost_rally_only`)
+had rescue suppressed by design and rode to its full SL with no hedge offered.
+
+**Gate check (source-verified, file:line):** F-B does **NOT** pass through
+break-and-hold — it bypasses it entirely, structurally, the same way
+`rescue_bypass_break_and_hold` bypasses RESCUE. `fills._check_boost_triggers`
+calls `boosts.plan_trapped_late_rescue` and, on a plan, fires
+(`self._fire_boost_event`) and `continue`s (`fills.py` ~604–620) **before**
+the tick-hold streak check and the `_break_and_hold_ok` call are ever reached
+(`fills.py` ~651–695) — the gate is never even asked. No code change was
+needed for this: F-B already bypasses the gate by construction (a hedge
+armed $10+ underwater IS the confirmation). Self-test 205 (`fb bypasses gate`)
+proves this end-to-end against the real `_check_boost_triggers`: with the
+break-and-hold seam stubbed to ALWAYS refuse, the hedge still fires and the
+gate is never called.
+
+**Scope:** default flip only; `boosts.plan_trapped_late_rescue` /
+`trapped_rescue_cap` logic unchanged. Anchor-side only (never touches a Rogue
+`20260626` ticket). Self-test 184 (`fb late rescue`) now forces the OFF case
+explicitly (was reading the old default); self-test 206 (`fb default on`)
+asserts the new default.
+
+**Restore path:** set `trapped_late_rescue_enabled=False` in `config.py`.

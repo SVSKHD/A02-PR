@@ -77,61 +77,6 @@ def _has_rows(bars):
 # -> enter on first touch (or skip on timeout). RALLY override ONLY. The state machine
 # core is PURE (no IO/clock/orders) so it is exhaustively testable; the wrapper does the
 # price/clock read + telemetry. Distinct from the rally_pullback_* EXIT detector.
-ARM_HOLD = 'ARM'    # registered / waiting -- do NOT fire this tick
-ARM_FIRE = 'FIRE'   # pullback level touched -- fire the boost NOW (at this price)
-ARM_SKIP = 'SKIP'   # timeout candles elapsed or parent gone -- cleared, never fire
-
-
-def override_pullback_step(state, cfg, parent_side, current_price, m5_bucket,
-                           parent_alive):
-    """PURE arm-then-pullback-entry state machine for the RALLY override (v3.4.0).
-
-    `state` is a per-parent mutable dict (lives in the parent shadow as
-    shadow['override_arm']); called once per tick while the parent is override-grade.
-    Returns ARM_HOLD (registered/holding, do NOT fire), ARM_FIRE (pullback level
-    touched -> fire NOW at current_price), or ARM_SKIP (timeout elapsed or parent gone
-    -> cleared, no fire; latched so the event never re-arms). Mutates `state` in place.
-    NO IO, NO clock, NO order placement -- m5_bucket (a 5-min bucket id) is supplied by
-    the caller so the timeout is countable without an M5-close hook."""
-    pull = float(getattr(cfg, 'override_entry_pullback_dollars', 13.0))
-    timeout = int(getattr(cfg, 'override_entry_arm_timeout_candles', 4))
-    # SKIP latches: once skipped (timeout/parent-exit) the event never re-arms.
-    if state.get('skipped'):
-        return ARM_SKIP
-    if not parent_alive:
-        state['skipped'] = True
-        return ARM_SKIP
-    if not state.get('armed'):
-        # ARM: register and seed the tracked extreme at the current price.
-        state['armed'] = True
-        state['side'] = parent_side
-        state['extreme'] = float(current_price)
-        state['m5_bucket'] = m5_bucket
-        state['arm_m5_count'] = 0
-        return ARM_HOLD
-    # advance the M5 timeout counter once per new 5-min bucket (an M5 close).
-    if m5_bucket != state.get('m5_bucket'):
-        state['arm_m5_count'] = int(state.get('arm_m5_count', 0)) + 1
-        state['m5_bucket'] = m5_bucket
-    # track the running extreme; entry triggers on a `pull`-dollar retrace from it.
-    if parent_side == 'BUY':
-        state['extreme'] = max(float(state['extreme']), float(current_price))
-        level = float(state['extreme']) - pull
-        touched = float(current_price) <= level
-    else:
-        state['extreme'] = min(float(state['extreme']), float(current_price))
-        level = float(state['extreme']) + pull
-        touched = float(current_price) >= level
-    # touch wins over a same-tick timeout (we got the pullback in time).
-    if touched:
-        state['fire_level'] = round(level, 2)
-        return ARM_FIRE
-    if timeout > 0 and int(state.get('arm_m5_count', 0)) >= timeout:
-        state['skipped'] = True
-        return ARM_SKIP
-    return ARM_HOLD
-
-
 def _override_grade(cfg, shadow, plan):
     """PURE: is this parent OVERRIDE-GRADE (same direction as the boost AND already
     >= parent_established_dollars favorable)? Returns (is_grade, parent_fav, threshold,

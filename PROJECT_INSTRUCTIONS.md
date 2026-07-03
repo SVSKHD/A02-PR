@@ -1,6 +1,6 @@
 # AUREON — Project Instructions
 
-**Regenerated 2026-07-02 from current HEAD.** This file is the standing brief for
+**Regenerated 2026-07-03 from current HEAD.** This file is the standing brief for
 working on this repo (and the text to prime a fresh chat with). It states what is
 true *now* — the ledger status, the queue, and the discipline — so nobody has to
 re-derive it from the commit history. When it drifts from HEAD, regenerate it;
@@ -74,31 +74,50 @@ Closed and verified (details + self-test numbers in `ERRORS.md`):
 - **E-15** — Rogue entries gated under kill-switch + EOD; kill flatten closes
   the Rogue ticket.
 - **E-16** — P1 state snapshot + same-day boot recovery (restart dormancy dead).
+- **E-18** — trapped-leg STOP-THROUGH spam: a losing leg with no armed lock
+  now computes NO stop advance; the warning is throttled to once/episode.
 - **Chain LIVE-PROVEN 2026-07-02:** 4 trades, 3 chain re-anchors, day
   **+$72.10** — the E-3 fix held in production.
 
 Still open on the ledger: **E-12** is EXTENDED (feed escalation ladder shipped;
 watching), and **E-4** is answered by the 2026-07-02 EOD-flatten default flip.
 
+**OPEN #1 CLOSED (2026-07-03):** the P3 (E-17) "slow grind survives the gates"
+residual — Rogue day **+$918.05**, chain cooldown fired at **06:50:39**, and
+the post-cooldown re-entry was a **win**. P3 is now **live-proven**, not just
+selftest-proven; the displacement-quality follow-on stays a candidate only if
+a FUTURE slow-chop day actually bleeds through, not a standing worry.
+
+**OPEN #2 CLOSED (2026-07-03):** the W-7 / W-4 Watch Ledger items are now
+DECIDED, not watched — see D-4 (`parent_established_dollars` 20→12, override
+re-evaluates continuously, no code-level latch) and D-5 (F-B flipped LIVE) in
+`ERRORS.md`.
+
 ## 5. Current queue
 
-- **P3 — Rogue chop/chase gates — SHIPPED 2026-07-02** (branch
-  `claude/p3-rogue-chop-chase`, E-17): chase cap $10–$20 entry band + chain
-  cooldown 300s + $6 fresh displacement on chained anchors. Known residual: a
-  SLOW grind (legs ≥ the cooldown) still bottoms at the −$525 brake — a
-  displacement-QUALITY filter (thrust, not distance) is the follow-on candidate
-  if the demo shows slow-chop entries surviving these gates.
-- **P4 — dead-code verdicts.** Rule on and remove-or-wire: `a1_soft_lock_met`,
-  `a1_rescue_cap`, and the other confirmed-dead flags (the flag-OFF experiments
-  that will never flip). Subtraction pass, selftest-proven.
+- **P3 — Rogue chop/chase gates — SHIPPED 2026-07-02, LIVE-PROVEN 2026-07-03**
+  (branch `claude/p3-rogue-chop-chase`, E-17): chase cap $10–$20 entry band +
+  chain cooldown 300s + $6 fresh displacement on chained anchors. The known
+  slow-grind residual closed itself out on 2026-07-03 (see OPEN #1 above) — no
+  further lever pulled; a displacement-QUALITY filter stays a candidate only if
+  future demo days show slow-chop entries surviving these gates.
+- **P4 — dead-code verdicts — SHIPPED 2026-07-03** (branch
+  `claude/p4-boosts-trapped-leg-gbn54a`): deleted `a1_soft_lock_met`,
+  `a1_rescue_cap` (`rogue.py`), `lock_confirm` (`config.py`, zero readers),
+  `override_entry_first_touch` (`config.py`, superseded by v3.5.0's shared
+  pullback_entry.step), `rogue_reuse_rally`/`rogue_reuse_rescue` (`config.py` +
+  the `aureon_validator._EXPECTED_FLAGS` whitelist), and
+  `rally.override_pullback_step` (the v3.4.0 state machine, superseded by the
+  same shared helper). Subtraction pass, selftest-proven (full suite green).
 - **P5 — watch list (data before action):** rung-2 of the ladder, TSTOP value,
-  F-B, `rally_pullback_*` (still OFF), and the sl_dist 18 → 14 question. Journal
-  evidence first; no config motion until a month-end read.
+  `rally_pullback_*` (still OFF), and the sl_dist 18 → 14 question. F-B moved
+  off this list 2026-07-03 (D-5, now live — see §4). Journal evidence first; no
+  further config motion until a month-end read.
 
-## 6. Config decisions in effect (2026-07-02, this branch)
+## 6. Config decisions in effect (2026-07-03, this branch)
 
-Both are **decisions, not bugs** — dated in the `ERRORS.md` Decision Log
-(D-1/D-2) with the numbers:
+All are **decisions, not bugs** — dated in the `ERRORS.md` Decision Log
+(D-1..D-5) with the numbers:
 
 1. **A3 CUT.** `A3_1430_Overlap` removed from `cfg.anchors`. June **−$2,255
    (PF 0.68)**, July **−$385** — both months negative; the 17:00-IST retime
@@ -106,6 +125,14 @@ Both are **decisions, not bugs** — dated in the `ERRORS.md` Decision Log
    commented) for a possible restore.
 2. **`rogue_flatten_at_eod` False → True.** Overnight/weekend gap risk; E-15
    already blocks post-EOD *entries*, this closes the existing-position side.
+3. **`parent_established_dollars` 20 → 12 (D-4).** W-7: two forfeited
+   continuations in 2 days (~$350, ~$2,000+) sat under the old $20 line long
+   enough to run away untouched. Source-verified: no code-level latch — the
+   override already re-evaluates every tick from the parent's live max_fav.
+4. **`trapped_late_rescue_enabled` False → True (D-5, F-B live).** Three
+   trapped-leg events in 2 days, all unhedged naked. Verified F-B already
+   structurally bypasses break-and-hold (fires+continues before the gate is
+   ever reached, `fills.py` ~604-620) — no gate change needed, only the flip.
 
 ## 7. Start-of-chat prompt shape
 

@@ -42,9 +42,6 @@ class Config:
     # garbage tick), so a phantom spike can never inflate max_fav and arm a lock
     # off a price that never traded. $25 in one M1 bar is far beyond any normal
     # XAUUSD move; legitimate fast markets stay well under it. 0 disables.
-    lock_confirm: bool = True  # master switch for the confirmed-price lock gate:
-    # a lock level N may advance ONLY when max_fav has truly reached level_N's
-    # price. Never on a timer, tick count, loop iteration, or default value.
     # --- v3.2.4 Feature D: break-and-hold filter (the profit decider) -----------
     # Do NOT fire boosts on the FIRST/weak break. Stack ONLY if price clears the
     # range edge by >= break_dist_x AND holds hold_candles_n M5 candles AND retraces
@@ -78,10 +75,14 @@ class Config:
     # break-and-hold entirely). Live A2 2026-06-24: parent rode +$892 on a ~$32 plunge
     # while the gate returned BREAK_FAILED the whole way down -> no boost fired.
     parent_profit_override_enabled: bool = True
-    parent_established_dollars: float = 20.0  # TRIAL-CALIBRATED, NOT FINAL. Parent must
-    #   be >= +$20 favorable (max_fav vs entry, same units as the $5/$3/$13 knobs) for
-    #   the override to apply. Tunable WITHOUT a rebuild -- calibrate from trial data
-    #   (the BREAK_OVERRIDE_PARENT_ESTABLISHED PTRACE lines show every time it fired).
+    parent_established_dollars: float = 12.0  # D-4 (2026-07-03): was $20 -- W-7 showed TWO
+    #   forfeited continuations (A4 SELL 2026-07-02 ~$350, A1 BUY 2026-07-03 ~$2,000+)
+    #   where the parent was favorable but stayed UNDER $20 long enough for the move to
+    #   run away untouched. Lowered to $12 (still above ordinary $5-8 noise, per the
+    #   -$701 Case-1 fake-spike this gate exists to block). Parent must be >= this
+    #   favorable (max_fav vs entry, same units as the $5/$3/$13 knobs) for the override
+    #   to apply. Tunable WITHOUT a rebuild -- calibrate from trial data (the
+    #   BREAK_OVERRIDE_PARENT_ESTABLISHED PTRACE lines show every time it fired).
     # --- v3.4.0 RALLY OVERRIDE PULLBACK-ENTRY (flag-gated, DEFAULT OFF) ----------
     # The override (above) fires the instant the parent is +$20 same-direction -- i.e.
     # at the EXTREME of the move, which got knifed by the natural breath (Jun 25 A3:
@@ -100,9 +101,6 @@ class Config:
     #   that arms-then-enters the boost on first touch (entry = extreme -/+ this).
     override_entry_arm_timeout_candles: int = 4  # M5 candles (~20 min) to wait for the
     #   pullback before SKIPPING the boost. Owner's suggested default; trial-tunable.
-    override_entry_first_touch: bool = True  # v1 = enter on first touch of the level.
-    #   RESERVED: False (a confirm-candle close) is a later refinement, NOT implemented
-    #   in v3.4.0 -- the gate uses first-touch regardless of this flag for now.
     # --- v3.5.0 ADAPTIVE PULLBACK ENTRY (extends the override_entry_* path) ------
     # When override_entry_enabled is ON, v3.5.0 upgrades the rally override entry from
     # v3.4.0 first-touch to the ADAPTIVE rule (pullback turn / smooth break-and-hold
@@ -172,8 +170,6 @@ class Config:
     # all OTHER strategy flags stay default OFF.
     rogue_enabled: bool = False        # MASTER SWITCH (raw default OFF; demo boot promotes ON)
     rogue_daywatch: bool = True        # continuous M5 vision (only meaningful when rogue_enabled)
-    rogue_reuse_rally: bool = True     # ride/pyramid via RALLY logic on strong continuation
-    rogue_reuse_rescue: bool = True    # hedge via RESCUE logic when the catch goes against
     rogue_max_reentries_per_day: int = 10   # HARD ceiling on NEW entries/day (the cap)
     rogue_min_candles: int = 4         # strong-move trigger: >= this many same-dir M5 closes
     rogue_min_range: float = 15.0      # ... AND total range >= $15
@@ -358,9 +354,14 @@ class Config:
     # adverse from its fill, so the slide to the SL is partly recovered. CRITICAL: the
     # late hedge has its OWN hard SL (trapped_rescue_sl_dollars) + a per-event combined
     # cap -- a naked late hedge would DOUBLE the loss on a reverse-whipsaw; this bounds
-    # it. Anchor-side ONLY (never touches a Rogue 20260626 ticket). DEFAULT OFF =>
-    # byte-identical (the losing leg still rides to -$630) until the owner flips it.
-    trapped_late_rescue_enabled: bool = False   # F-B master flag (DEFAULT OFF, freeze-safe)
+    # it. Anchor-side ONLY (never touches a Rogue 20260626 ticket).
+    # D-5 (2026-07-03): flipped LIVE. Three trapped-leg events in 2 days, all unhedged
+    # naked (2026-07-02 A4 $27 collapse, 2026-07-02 A5 overnight, 2026-07-03 A1 $70
+    # rally) -- the naked-ride cost is real and repeated. A hedge armed $14+ underwater
+    # bypasses break-and-hold entirely (fills.py fires it before the gate is ever
+    # reached -- see boosts.plan_trapped_late_rescue call site) because the adverse
+    # distance itself IS the confirmation.
+    trapped_late_rescue_enabled: bool = True    # F-B master flag (D-5: LIVE 2026-07-03)
     trapped_rescue_arm_dollars: float = 10.0    # $ adverse from fill before the hedge arms
     trapped_rescue_sl_dollars: float = 13.0     # the late hedge's OWN hard SL ($/leg)
     boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
