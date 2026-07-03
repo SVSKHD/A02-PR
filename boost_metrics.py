@@ -53,10 +53,15 @@ def ledger_row(event: dict) -> list:
 
 
 # ---- 10: daily analysis report (PURE) -------------------------------------------
-def daily_report_md(trades_rows, date_str) -> str:
+def daily_report_md(trades_rows, date_str, rogue_rows=None, open_anchors=None) -> str:
     """Build a per-anchor markdown report from trades rows (dicts with 'anchor' and a
     numeric 'pnl'/'realized_pnl_usd'/'max_favorable'... we read 'anchor' + 'pnl').
-    Read-only: it only formats what it is given. PURE."""
+    `rogue_rows` (optional): closed Rogue events (dicts with a numeric 'pnl') rendered
+    as their own "Rogue" section, since Rogue is a separate engine never mixed into
+    the per-anchor table. `open_anchors` (optional): anchor codes with a position
+    still open at report time -- listed as "pending-open" so a zero-leg anchor can't
+    be misread as "no trades" when it simply hasn't closed yet. Read-only: it only
+    formats what it is given. PURE."""
     per = {}
     for r in (trades_rows or []):
         a = str(r.get('anchor', '?'))[:2] or '?'
@@ -74,7 +79,22 @@ def daily_report_md(trades_rows, date_str) -> str:
         agg = per[a]
         day_net += agg['net']
         lines.append(f"| {a} | {agg['legs']} | ${agg['net']:+.2f} |")
+    for a in sorted(set(open_anchors or ()) - set(per)):
+        lines.append(f"| {a} | pending-open | — |")
     lines += ["", f"**Day net: ${day_net:+.2f}**  ({sum(v['legs'] for v in per.values())} legs)"]
+
+    rogue_rows = rogue_rows or []
+    rg_net = 0.0
+    for r in rogue_rows:
+        try:
+            rg_net += float(r.get('pnl', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+    lines += ["", "## Rogue", "",
+              f"**Rogue: {len(rogue_rows)} closes ${rg_net:+.2f}**"]
+
+    if open_anchors:
+        lines += ["", f"Open (not yet closed): {', '.join(sorted(open_anchors))}"]
     return "\n".join(lines)
 
 
@@ -168,8 +188,9 @@ def run_preflight(trader):
 
 
 def run_daily_report(trader, date_str=None):
-    """feature 10 live hook: read the month's trades CSV and write a per-anchor markdown
-    report. Read-only on the trades data; guarded by util_daily_report; never raises."""
+    """feature 10 live hook: read the day's rows out of the month's trades CSV and the
+    boost ledger, and write a per-anchor + Rogue markdown report. Read-only on the
+    trades/ledger data; guarded by util_daily_report; never raises."""
     try:
         if not bool(getattr(trader.cfg, 'util_daily_report', True)):
             return None
@@ -183,9 +204,14 @@ def run_daily_report(trader, date_str=None):
         if os.path.exists(src):
             with open(src) as f:
                 for r in _csv.DictReader(f):
+                    if r.get('date_ist') != date_str:
+                        continue
                     rows.append({'anchor': r.get('anchor'),
                                  'pnl': r.get('realized_pnl_usd', r.get('pnl', 0))})
-        md = daily_report_md(rows, date_str)
+        rogue_rows = load_rogue_closes(jdir, date_str)
+        open_anchors = open_position_anchors(trader)
+        md = daily_report_md(rows, date_str, rogue_rows=rogue_rows,
+                             open_anchors=open_anchors)
         out = os.path.join(jdir, f"daily_report_{date_str}.md")
         with open(out, 'w') as f:
             f.write(md)
@@ -193,6 +219,48 @@ def run_daily_report(trader, date_str=None):
     except Exception as e:
         log.warning(f"util_daily_report non-fatal: {e!r}")
         return None
+
+
+def load_rogue_closes(jdir, date_str):
+    """Impure: closed Rogue events (kind=ROGUE, event=exit) for `date_str` out of
+    boost_ledger.csv, as [{'pnl': float}, ...]. `ts` is an ISO-8601 UTC timestamp
+    (see append_ledger callers) so its date prefix is compared against `date_str`.
+    Missing file / rows -> []. Never raises."""
+    import csv as _csv
+    path = os.path.join(jdir, "boost_ledger.csv")
+    out = []
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path) as f:
+            for r in _csv.DictReader(f):
+                if r.get('kind') != 'ROGUE' or r.get('event') != 'exit':
+                    continue
+                ts = r.get('ts') or ''
+                if ts[:10] != date_str:
+                    continue
+                try:
+                    pnl = float(r.get('pnl_usd') or 0.0)
+                except (TypeError, ValueError):
+                    pnl = 0.0
+                out.append({'pnl': pnl})
+    except (OSError, _csv.Error) as e:
+        log.warning(f"util_daily_report: boost_ledger.csv read failed: {e!r}")
+        return []
+    return out
+
+
+def open_position_anchors(trader):
+    """Impure: 2-char anchor codes with a position still open on `trader` right now
+    (e.g. A4/A5 late-day anchors that haven't closed by report time) -- so the report
+    can mark them "pending-open" instead of silently showing zero legs. Reads
+    `trader.shadow_positions` only; never raises."""
+    try:
+        return sorted({str(sp.get('anchor_label', ''))[:2]
+                       for sp in getattr(trader, 'shadow_positions', {}).values()
+                       if sp.get('anchor_label')})
+    except Exception:
+        return []
 
 
 def append_ledger(trader, event: dict):

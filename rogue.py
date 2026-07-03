@@ -717,7 +717,9 @@ def _mark_rogue_open(trader, st, entry_px, sl, tk, rc):
     record_entry(st['gov'])
     try:
         import boost_metrics as _bm
-        _bm.append_ledger(trader, {'ts': '', 'anchor': ROGUE_LABEL, 'kind': 'ROGUE',
+        import pandas as _pd
+        _bm.append_ledger(trader, {'ts': _pd.Timestamp.now(tz='UTC').isoformat(),
+                                   'anchor': ROGUE_LABEL, 'kind': 'ROGUE',
                                    'event': 'enter', 'arm_px': st.get('anchor'),
                                    'entry_px': entry_px})
     except Exception:
@@ -897,6 +899,16 @@ def detect_close(trader, st):
     else:
         was_fail = float(pnl) <= 0.0     # a non-winning close = init-SL fake-out (winner resets)
         record_close(st['gov'], pnl, was_fail, trader.cfg)
+    try:
+        import boost_metrics as _bm
+        import pandas as _pd
+        _bm.append_ledger(trader, {'ts': _pd.Timestamp.now(tz='UTC').isoformat(),
+                                   'anchor': ROGUE_LABEL, 'kind': 'ROGUE',
+                                   'event': 'exit', 'entry_px': o.get('entry'),
+                                   'exit_px': _rogue_close_price(trader, tk),
+                                   'pnl_usd': round(float(pnl), 2)})
+    except Exception:
+        pass
     st['open'] = None
     _persist_state(trader)               # Fix 5 (E-16): governors changed -> persist
     if unresolved:

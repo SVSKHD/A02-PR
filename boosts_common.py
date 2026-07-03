@@ -127,6 +127,18 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
                                stop_price=round(b_fp - sgn * sl_d, 2))
             fleet.append({'ticket': int(b_tk) if b_tk else None, 'fill': b_fp,
                           'rc': rc, 'comment': cmt})
+            # feature 9 (boost_ledger.csv): the ledger's only prior writers were the
+            # optional pullback-entry paths in rally.py/rescue.py -- the actual fleet
+            # fire (this loop, SHARED by both kinds) never logged a row, so every
+            # immediate/non-pullback boost fill was silently absent from the ledger.
+            try:
+                import boost_metrics as _bm
+                _bm.append_ledger(self, {
+                    'ts': pd.Timestamp.now(tz='UTC').isoformat(), 'anchor': anchor,
+                    'kind': plan.kind, 'event': 'enter', 'arm_px': round(ref, 2),
+                    'entry_px': round(b_fp, 2)})
+            except Exception:
+                pass
         else:
             self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} rejected rc={rc} ({md_escape(rcn)})")
             fleet.append({'ticket': None, 'fill': None, 'rc': rc, 'comment': cmt})
