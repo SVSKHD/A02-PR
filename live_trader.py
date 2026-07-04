@@ -383,6 +383,7 @@ class LiveTrader:
             self.state['missed_anchors_today'] = []   # v3.0.5: reset late-window give-ups
             self._last_anchor_attempt = {}            # v3.0.5: clear late-retry throttle
             self.state['kill_switch_locked'] = False
+            self.state['friday_flatten_done'] = False  # Friday weekend-hold-ban gate, daily reset
             # v2.5.4: re-baseline the daily kill switch to TODAY's opening equity.
             # Prevents prior-day losses (and the start-of-day gap from a fixed
             # starting_balance) from bleeding into today's daily-loss budget.
@@ -684,6 +685,26 @@ class LiveTrader:
     def _eod_reached(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
         eod = self._eod_datetime_utc(broker_date, self.cfg)
         return utc_now >= eod
+
+    def _friday_flatten_reached(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
+        """Friday-only weekend-hold-ban cutoff (see config.py `friday_flatten_*`):
+        True once `utc_now` reaches `cfg.friday_flatten_broker_hour` (a decimal
+        broker hour, e.g. 22.5 = 22:30) on a Friday `broker_date`. False on any
+        other weekday, or when `friday_flatten_enabled` is off (restores plain
+        EOD-only behavior). The decimal hour is split into (hour, minute) and
+        run through the SAME `anchor_datetime_utc` conversion `_eod_reached`
+        uses, so this is not a new time-comparison idiom -- just a new cutoff
+        instant on the existing one."""
+        if not bool(getattr(self.cfg, 'friday_flatten_enabled', True)):
+            return False
+        if broker_date.weekday() != 4:  # Monday=0 .. Friday=4
+            return False
+        hour_f = float(getattr(self.cfg, 'friday_flatten_broker_hour', 22.5))
+        hour = int(hour_f)
+        minute = round((hour_f - hour) * 60)
+        threshold = self._anchor_datetime_utc(
+            broker_date, hour, self.cfg.broker_tz_offset_hours, minute)
+        return utc_now >= threshold
 
     # ------------------------------------------------------------------------
     # v3.0.0 commit 4: weekend self-sleep + Monday auto-resume
@@ -1068,7 +1089,23 @@ class LiveTrader:
             self.tele.warn(f"Could not verify broker time ({reason}): {e}")
             return True  # don't block; proceed as if open (original on-error path)
 
-        if tick_age_sec > 3600:
+        # E-19: server_time_utc() decodes tick.time with `tick_time_offset_hours or 0`
+        # (mt5_adapter.py), so while the offset is UNDETECTED (None -- a boot into a
+        # closed/quiet market where neither Tier 1 live-feed nor Tier 2 stale-consistency
+        # could confirm it) `tick_age_sec` is off by up to the real broker offset (3h =
+        # 10800s) and can land in the 120-3600s window below by pure arithmetic accident,
+        # even though the true cause is "closed market", not "clock drift". Live proof
+        # (2026-07-03 23:02): Tier 2 REJECT -> offset stayed None -> this miscalculation
+        # put a genuine Friday-night closed-market boot into the ABORT branch -> clean
+        # exit(0) -> watchdog never relaunches (exit-42-only) -> the bot silently never
+        # came back. An unconfirmed offset makes tick_age_sec UNRELIABLE by construction,
+        # so it can never safely justify the clock-drift abort below -- route it into the
+        # SAME sleep-probe loop as a confirmed closed market instead. The loop's own
+        # wake-detection re-validates the offset (Tier 1, now against LIVE ticks) before
+        # ever returning, so this can't mask a real drift once the market actually opens.
+        offset_unconfirmed = self.adapter.tick_time_offset_hours is None
+
+        if tick_age_sec > 3600 or offset_unconfirmed:
             hours = tick_age_sec / 3600
             # ONE Telegram line on ENTERING weekend sleep (announce-once: the
             # while-loop below blocks here until Monday, so this never repeats).
@@ -1076,10 +1113,13 @@ class LiveTrader:
                 _next_a1 = self._next_a1_display()   # v3.3.6: resolver-derived (Mon 06:00 IST)
             except Exception:
                 _next_a1 = "A1 (time unresolved)"
+            _age_note = (f"last tick {hours:.1f}h old" if not offset_unconfirmed
+                         else "broker offset UNDETECTED -- age unreliable, waiting for a "
+                              "live/consistent tick to re-detect it")
             self.tele.info(
                 f"💤 Weekend — market closed, sleeping, will auto-resume Monday. "
                 f"Next anchor {_next_a1}. "
-                f"(last tick {hours:.1f}h old; entered via {reason})")
+                f"({_age_note}; entered via {reason})")
             # Persist state before the long sleep so a mid-weekend VPS reboot
             # rehydrates cleanly and the relaunched process re-enters this wait.
             try:
@@ -1108,11 +1148,23 @@ class LiveTrader:
                     time.sleep(HB_EVERY_S)
                     slept += HB_EVERY_S
                 try:
-                    server_utc = self.adapter.server_time_utc()
-                    now_utc = pd.Timestamp.now(tz='UTC')
-                    tick_age_sec = (now_utc - server_utc).total_seconds()
-                    if tick_age_sec < 60:
-                        market_open = True
+                    if self.adapter.tick_time_offset_hours is None:
+                        # E-19: the offset was never confirmed (the boot-time Tier 1/2
+                        # detect failed too), so server_time_utc()'s age is unreliable --
+                        # do NOT trust a raw tick_age_sec<60 read here (it can read
+                        # "fresh" hours before the market genuinely reopens, per the
+                        # constant-bias math above). The only trustworthy wake signal
+                        # while unconfirmed is a detection actually succeeding: Tier 1
+                        # requires a LIVE advancing feed and Tier 2 requires the tick be
+                        # within 10min of true now -- neither can fire early.
+                        if self.adapter.ensure_time_offset(max_wait_s=5.0):
+                            market_open = True
+                    else:
+                        server_utc = self.adapter.server_time_utc()
+                        now_utc = pd.Timestamp.now(tz='UTC')
+                        tick_age_sec = (now_utc - server_utc).total_seconds()
+                        if tick_age_sec < 60:
+                            market_open = True
                 except Exception as e:
                     log.warning(f"Market-open check failed: {e}")
                 # Guard 4 - failsafe wake alarm: if the market SHOULD be open
@@ -1417,6 +1469,31 @@ class LiveTrader:
                 self._write_status(broker_date)
             return
 
+        # 5.5 Friday weekend-hold ban: flatten anchor + boost legs ONCE at
+        # cfg.friday_flatten_broker_hour (default 22:30 broker, 30min ahead of the
+        # normal 23:00 EOD), then block NEW anchor entries for the rest of the day
+        # (step 7 below checks the same 'friday_flatten_done' flag). FundingPips
+        # Zero (and prop-firm rules generally) treat ANY position held over the
+        # weekend as a hard breach / account termination -- this is deliberately
+        # earlier and separate from the daily EOD flatten. Rogue is UNTOUCHED here
+        # (reason="EOD" so risk._flatten_all does not also force-close it) --
+        # rogue_flatten_at_eod already flattens Rogue at eod_broker_hour every day,
+        # weekends included, and still will ~30min later via the EOD branch below.
+        if self._friday_flatten_reached(broker_date, utc_now) and not self.state.get('friday_flatten_done'):
+            if self.shadow_positions or self.shadow_pendings:
+                self._flatten_all(reason="EOD")
+            self.state['friday_flatten_done'] = True
+            self._save_state()
+            log.warning(
+                f"FRIDAY FLATTEN — anchor+boost legs closed at "
+                f"{self.cfg.friday_flatten_broker_hour} broker hour "
+                f"(weekend-hold ban); no new anchor entries until Monday.")
+            self.tele.warn(
+                f"🗓️ *Friday flatten* — anchor + boost legs closed at "
+                f"`{self.cfg.friday_flatten_broker_hour}` broker hour. "
+                f"No new anchor entries until Monday (Rogue unaffected; its own "
+                f"EOD flatten still applies at `{self.cfg.eod_broker_hour}:00`).")
+
         # 6. EOD?
         if self._eod_reached(broker_date, utc_now):
             if self.shadow_positions or self.shadow_pendings:
@@ -1493,8 +1570,10 @@ class LiveTrader:
         except Exception:
             pass
 
-        # 7. Anchor due?
-        self._process_anchor_if_due(broker_date, utc_now)
+        # 7. Anchor due? Skipped once the Friday flatten has fired today (5.5 above)
+        # -- no NEW anchor entry may open between the Friday cutoff and Monday.
+        if not self.state.get('friday_flatten_done'):
+            self._process_anchor_if_due(broker_date, utc_now)
 
         # 7b. v2.5: Complete any deferred anchor placement (settle window or retry)
         self._complete_deferred_anchor()
@@ -1591,6 +1670,7 @@ LiveTrader._warmup_trade_channel    = _anchors_mod._warmup_trade_channel
 LiveTrader._attempt_mt5_reconnect   = _anchors_mod._attempt_mt5_reconnect
 LiveTrader._confirm_a1_placement    = _anchors_mod._confirm_a1_placement
 LiveTrader._resolved_anchor_hm      = _anchors_mod._resolved_anchor_hm
+LiveTrader._anchor_skipped_today_friday = _anchors_mod._anchor_skipped_today_friday
 LiveTrader._resolved_anchor_ist_hm  = _anchors_mod._resolved_anchor_ist_hm  # v3.3.6 display
 LiveTrader._next_a1_display         = _anchors_mod._next_a1_display          # v3.3.6 display
 LiveTrader._await_fresh_tick_for_placement = _anchors_mod._await_fresh_tick_for_placement

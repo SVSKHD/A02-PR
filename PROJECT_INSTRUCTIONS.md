@@ -1,6 +1,6 @@
 # AUREON — Project Instructions
 
-**Regenerated 2026-07-03 from current HEAD.** This file is the standing brief for
+**Regenerated 2026-07-04 from current HEAD.** This file is the standing brief for
 working on this repo (and the text to prime a fresh chat with). It states what is
 true *now* — the ledger status, the queue, and the discipline — so nobody has to
 re-derive it from the commit history. When it drifts from HEAD, regenerate it;
@@ -76,6 +76,11 @@ Closed and verified (details + self-test numbers in `ERRORS.md`):
 - **E-16** — P1 state snapshot + same-day boot recovery (restart dormancy dead).
 - **E-18** — trapped-leg STOP-THROUGH spam: a losing leg with no armed lock
   now computes NO stop advance; the warning is throttled to once/episode.
+- **E-19** — boot with an undetected offset (dead/quiet feed) exited clean
+  (code 0) instead of surviving to market open; the watchdog only relaunches
+  on exit 42, so this left the bot down. Fixed: an unconfirmed offset now
+  routes into the SAME sleep-probe loop the running bot already uses to
+  survive weekends, never the clock-drift ABORT path.
 - **Chain LIVE-PROVEN 2026-07-02:** 4 trades, 3 chain re-anchors, day
   **+$72.10** — the E-3 fix held in production.
 
@@ -136,11 +141,37 @@ re-evaluates continuously, no code-level latch) and D-5 (F-B flipped LIVE) in
   before — pure additive logging, makes "chain re-anchors" and "brake events"
   greppable from `aureon.log` like their CHASE-REJECT/CHAIN-COOLDOWN siblings
   already were.
+- **P6b — daily report bugfixes — SHIPPED 2026-07-04** (branch
+  `claude/daily-pnl-report-bugs-k8ip20`, `boost_metrics.py`'s separate feature-10
+  `run_daily_report`, hand-verified against 2026-07-03): fixed 4 bugs found by
+  reading the ACTUAL 07-03 numbers against the report's output — (a) the
+  "daily" report was summing every row in the whole month's journal file (no
+  `date_ist` filter), reading as month-to-date under a "daily" label; (b) Rogue
+  closes were entirely unreported (never written to the anchor trades journal
+  at all); (c) `boost_ledger.csv` only ever got Rogue ENTER rows with a blank
+  `ts`, and zero actual RALLY/RESCUE boost fills — the real fleet-fire path
+  (`boosts_common.place_fleet`, shared by both kinds) never wrote a ledger row,
+  only the optional pullback-entry paths did; (d) anchors with a position still
+  open at report time now print `pending-open` instead of reading as zero
+  legs/no-activity. `python bot.py dailyreport 2026-07-03` output format is
+  unchanged from P6/pnl_report.py — this branch's fixes are isolated to the
+  OTHER (older, simpler) `boost_metrics.py` report.
+- **P7 — weekend survival + Friday policy — SHIPPED 2026-07-04** (branch
+  `claude/weekend-report-boot-friday`): E-19 (boot-time undetected-offset exit,
+  see §4) fixed, plus the new Friday weekend-hold-ban policy (D-6 below) —
+  anchor+boost flatten cutoff ahead of the normal daily EOD, and A5 (default)
+  / A4 (funded-profile opt-in) skipped outright on Fridays. Also re-verified
+  the FPZERO_1PCT worst-case floating math at a reduced 0.10 lot: even at
+  0.10, a 3-leg stack (`profile_stack_cap`'s nominal cap) breaches the 1%
+  floating limit at a $50k balance (worst-case $558 effective-SL / $540
+  bare-SL vs a $500 cap) — `fp_guard.guard_cfg`'s own per-trade worst-case
+  check already independently REDUCEs any such request to 2 legs, so this is a
+  confirmation the live gate is already safe, not a new bug or a code change.
 
-## 6. Config decisions in effect (2026-07-03, this branch)
+## 6. Config decisions in effect (2026-07-04, this branch)
 
 All are **decisions, not bugs** — dated in the `ERRORS.md` Decision Log
-(D-1..D-5) with the numbers:
+(D-1..D-6) with the numbers:
 
 1. **A3 CUT.** `A3_1430_Overlap` removed from `cfg.anchors`. June **−$2,255
    (PF 0.68)**, July **−$385** — both months negative; the 17:00-IST retime
@@ -156,6 +187,12 @@ All are **decisions, not bugs** — dated in the `ERRORS.md` Decision Log
    trapped-leg events in 2 days, all unhedged naked. Verified F-B already
    structurally bypasses break-and-hold (fires+continues before the gate is
    ever reached, `fills.py` ~604-620) — no gate change needed, only the flip.
+5. **Friday weekend-hold ban (D-6):** `friday_flatten_enabled=True` +
+   `friday_flatten_broker_hour=22.5` (anchor+boost flatten cutoff ahead of the
+   normal 23:00 EOD; Rogue untouched — its own EOD flatten still applies) +
+   `a5_skip_friday=True` (A5 never fires on Friday) + `a4_skip_friday=False`
+   (demo default; a funded deploy should flip it True). FundingPips Zero
+   treats ANY weekend hold as a hard breach / account termination.
 
 ## 7. Start-of-chat prompt shape
 

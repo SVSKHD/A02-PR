@@ -501,6 +501,30 @@ class Config:
     EXPECTED_BROKER_OFFSET_HOURS: int = 3
     eod_broker_hour: int = 23  # close all at 23:00 broker
 
+    # --- Friday weekend-hold ban -------------------------------------------------
+    # FundingPips Zero (and prop-firm rules generally) treat ANY position held over
+    # the weekend as a hard breach / account termination -- a Friday gap is not just
+    # bad P&L risk, it can end the account. The normal EOD flatten (eod_broker_hour,
+    # 23:00) is a DAILY mechanism; this is a Friday-ONLY earlier cutoff so anchor +
+    # boost legs are flat well before the Friday close, not right at it.
+    friday_flatten_enabled: bool = True
+    # Decimal broker hour (22.5 = 22:30 broker), 30 min ahead of the normal 23:00
+    # EOD so there is margin before the week genuinely closes. Rogue is
+    # deliberately NOT scoped here -- rogue_flatten_at_eod already flattens Rogue
+    # at eod_broker_hour (23:00) every day, weekends included; this flag only
+    # covers the anchor engine (magic 20260522) + its boost/rescue/rally legs.
+    friday_flatten_broker_hour: float = 22.5
+    # A5 (19:30 broker, the latest-firing normal anchor) never fires on Friday --
+    # its fill would sit for barely ~3h before the friday_flatten cutoff closes it
+    # again, all fee/spread cost and no time to develop. Demo default ON.
+    a5_skip_friday: bool = True
+    # A4 (16:40 broker) has more runway before the Friday cutoff than A5, so it
+    # stays ON by default (demo). A funded (FundingPips Zero) deploy should flip
+    # this True explicitly in cfg -- the weekend-hold ban makes ANY Friday anchor
+    # that might still be open going into a slow-closing week not worth the risk
+    # of a hard account breach, even with friday_flatten_enabled as a backstop.
+    a4_skip_friday: bool = False
+
     # Risk
     starting_balance: float = 50000.0
     # --- v3.2.9 manual TESTFIRE collision guard ---------------------------------

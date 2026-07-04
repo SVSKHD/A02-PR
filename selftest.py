@@ -289,6 +289,10 @@ STEP_NAMES = {
     212: "pnl empty day",         # zero deals -> empty, well-formed result (never raises)
     213: "pnl render+ledger",     # markdown + CSV ledger rows are well-formed and stable-schema
     214: "pnl ledger idempotent", # re-running a day's report never duplicates ledger rows
+    # Weekend branch 2026-07-04: E-19 boot-survives-closed-market + Friday policy
+    215: "e19 boot survives",     # unconfirmed offset -> sleep-probe, never the clock-drift abort
+    216: "friday flatten gate",   # Friday cutoff flattens anchor+boost, Rogue untouched, blocks entries
+    217: "friday a4 a5 skip",     # a5_skip_friday/a4_skip_friday skip placement outright on Friday
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -772,6 +776,8 @@ class SelfTest:
             s._broker_date = lambda utc: utc.date()
             s._mark_anchor_placed = types.MethodType(_a._mark_anchor_placed, s)
             s._anchor_missed = types.MethodType(_a._anchor_missed, s)
+            s._anchor_skipped_today_friday = types.MethodType(
+                _a._anchor_skipped_today_friday, s)
 
             def _proc(label, anchor_utc):
                 delta_min = (s._now - anchor_utc).total_seconds() / 60.0
@@ -4123,6 +4129,183 @@ class SelfTest:
         except Exception as e:
             self._record(214, FAIL, f"raised: {e!r}"); return
         self._record(214, PASS if ok else FAIL, detail)
+
+    def _step_e19_boot_survives(self):
+        # 215 E-19: boot with a dead/quiet feed -> offset Tier 2 REJECT ->
+        # tick_time_offset_hours stays None -> server_time_utc()'s age is computed
+        # with the "or 0" fallback, which can land in the false 120-3600s "clock
+        # drift ABORT" window purely by arithmetic accident (2026-07-03 23:02 live
+        # incident: exit code 0, watchdog never relaunches since it only relaunches
+        # on 42). wait_until_market_open() must route an UNCONFIRMED offset into
+        # the SAME sleep-probe loop as a confirmed closed market -- never abort --
+        # and only "wake" once a detection genuinely succeeds (Tier 1/2, which
+        # require a live/consistent tick and so cannot fire early).
+        import live_trader as _lt, types as _types
+        try:
+            class _Stub(_lt.LiveTrader):
+                def __init__(self):
+                    pass  # skip the real (MT5-needing) __init__
+
+            real_now = pd.Timestamp.now(tz='UTC')
+            # Mimics the live incident: real broker offset +3h undetected (decoded
+            # as 0h) skews the computed age into the 120-3600s window (here
+            # -3480s) instead of the >3600s "obviously closed" window a CONFIRMED
+            # offset would show for the same true elapsed time.
+            skewed_server_utc = real_now + pd.Timedelta(seconds=3480)
+
+            class _StubAdapter:
+                def __init__(self):
+                    self.tick_time_offset_hours = None
+                    self.ensure_calls = 0
+                def server_time_utc(self):
+                    return skewed_server_utc
+                def ensure_time_offset(self, max_wait_s=90.0):
+                    self.ensure_calls += 1
+                    self.tick_time_offset_hours = 3.0   # detection just succeeded
+                    return True
+
+            class _StubTele:
+                def __init__(self):
+                    self.lines = []
+                def info(self, m): self.lines.append(('info', m))
+                def warn(self, m): self.lines.append(('warn', m))
+                def success(self, m): self.lines.append(('success', m))
+                def critical(self, m): self.lines.append(('critical', m))
+
+            t = _Stub()
+            t.adapter = _StubAdapter()
+            t.tele = _StubTele()
+            t.state = {}
+            t.ptrace = _types.SimpleNamespace(weekend_wake=lambda **k: None)
+            t._next_a1_display = lambda: "A1 03:30 broker"
+            t._save_state = lambda: None
+            t._touch_heartbeat = lambda: None
+            t._write_status = lambda *a, **k: None
+            t._expected_market_open_utc = lambda now: None
+            t._validate_offset_on_wake = lambda reason='wake': True
+            t._post_readiness = lambda reason='wake': None
+
+            orig_sleep = _lt.time.sleep
+            _lt.time.sleep = lambda s: None   # collapse the 30s heartbeat sleeps for the test
+            try:
+                result = t.wait_until_market_open(reason="startup")
+            finally:
+                _lt.time.sleep = orig_sleep
+
+            never_aborted = not any(lvl == 'critical' and 'ABORTING' in m
+                                    for lvl, m in t.tele.lines)
+            entered_sleep = any(lvl == 'info' and 'Weekend' in m for lvl, m in t.tele.lines)
+            woke_on_detect = (t.adapter.ensure_calls >= 1
+                             and t.adapter.tick_time_offset_hours == 3.0)
+            ok = (result is True) and never_aborted and entered_sleep and woke_on_detect
+            detail = (f"result={result} never_aborted={never_aborted} "
+                      f"entered_sleep_probe={entered_sleep} woke_on_offset_detect={woke_on_detect}")
+        except Exception as e:
+            self._record(215, FAIL, f"raised: {e!r}"); return
+        self._record(215, PASS if ok else FAIL, detail)
+
+    def _step_friday_flatten_gate(self):
+        # 216 Friday weekend-hold ban: _friday_flatten_reached fires ONLY on
+        # Friday once cfg.friday_flatten_broker_hour is reached (a decimal broker
+        # hour split into (hour,minute) through the SAME anchor_datetime_utc
+        # conversion _eod_reached uses -- not a new time idiom); _flatten_all
+        # (reason="EOD") flattens the anchor+boost shadow stack but must NOT
+        # force-close an open Rogue ticket (risk.py's `reason != "EOD"` gate) --
+        # Rogue's own EOD-hour flatten owns that, ~30min later.
+        import live_trader as _lt, risk as _risk, dataclasses, types
+        from datetime import date as _date
+        from utils import anchor_datetime_utc as _adu
+        try:
+            cfg = dataclasses.replace(self.cfg, friday_flatten_enabled=True,
+                                      friday_flatten_broker_hour=22.5,
+                                      broker_tz_offset_hours=3)
+
+            class _Stub:
+                pass
+            t = _Stub()
+            t.cfg = cfg
+            t._anchor_datetime_utc = _adu
+
+            friday = _date(2026, 7, 3)      # a real Friday
+            saturday = _date(2026, 7, 4)
+            before = pd.Timestamp('2026-07-03 18:59:00', tz='UTC')   # 21:59 broker
+            after = pd.Timestamp('2026-07-03 19:31:00', tz='UTC')    # 22:31 broker
+            not_yet = _lt.LiveTrader._friday_flatten_reached(t, friday, before) is False
+            reached = _lt.LiveTrader._friday_flatten_reached(t, friday, after) is True
+            not_on_saturday = _lt.LiveTrader._friday_flatten_reached(t, saturday, after) is False
+
+            # _flatten_all(reason="EOD") flattens the anchor stack, never Rogue.
+            rogue_force_close_calls = []
+            import rogue as _rogue
+            orig_fc = _rogue.force_close_open
+            _rogue.force_close_open = lambda *a, **k: rogue_force_close_calls.append(1)
+            try:
+                closed = []
+                ft = types.SimpleNamespace(
+                    tele=types.SimpleNamespace(warn=lambda *a, **k: None,
+                                               critical=lambda *a, **k: None),
+                    shadow_positions={11: {}, 12: {}}, shadow_pendings={},
+                    paper=True, _deferred_anchor=None,
+                    adapter=types.SimpleNamespace(
+                        close_position=lambda tk, dry_run=False: closed.append(tk),
+                        cancel_order=lambda tk, dry_run=False: None,
+                        mt5=types.SimpleNamespace(positions_get=lambda ticket=None: [],
+                                                  orders_get=lambda ticket=None: [])))
+                _risk._flatten_all(ft, reason="EOD")
+                anchor_flattened = (sorted(closed) == [11, 12] and ft.shadow_positions == {})
+                rogue_untouched = (len(rogue_force_close_calls) == 0)
+            finally:
+                _rogue.force_close_open = orig_fc
+
+            ok = (not_yet and reached and not_on_saturday
+                 and anchor_flattened and rogue_untouched)
+            detail = (f"not_yet_before_cutoff={not_yet} reached_after_cutoff={reached} "
+                      f"friday_only={not_on_saturday} anchor_flattened={anchor_flattened} "
+                      f"rogue_untouched_on_EOD_reason={rogue_untouched}")
+        except Exception as e:
+            self._record(216, FAIL, f"raised: {e!r}"); return
+        self._record(216, PASS if ok else FAIL, detail)
+
+    def _step_friday_a4_a5_skip(self):
+        # 217 a5_skip_friday (default True) / a4_skip_friday (default False, a
+        # funded deploy flips it True) skip an anchor's placement OUTRIGHT for
+        # the whole Friday -- distinct from friday_flatten_broker_hour, which
+        # only closes whatever IS open later in the day. Other anchors (A1/A2)
+        # are never Friday-skipped by this check, on Friday or any other day.
+        import anchors as _an, dataclasses
+        from datetime import date as _date
+        try:
+            friday = _date(2026, 7, 3)
+            saturday = _date(2026, 7, 4)
+
+            class _Stub:
+                pass
+            t = _Stub()
+            t.cfg = dataclasses.replace(self.cfg, a5_skip_friday=True, a4_skip_friday=False)
+
+            a5_skipped_friday = _an._anchor_skipped_today_friday(
+                t, 'A5_1930_LateUS', friday) is True
+            a4_default_not_skipped = _an._anchor_skipped_today_friday(
+                t, 'A4_1640_NYopen', friday) is False
+            a1_never_skipped = _an._anchor_skipped_today_friday(
+                t, 'A1_02h_Asia', friday) is False
+            a5_not_skipped_saturday = _an._anchor_skipped_today_friday(
+                t, 'A5_1930_LateUS', saturday) is False
+
+            t.cfg = dataclasses.replace(self.cfg, a5_skip_friday=True, a4_skip_friday=True)
+            a4_funded_skipped_friday = _an._anchor_skipped_today_friday(
+                t, 'A4_1640_NYopen', friday) is True
+
+            ok = (a5_skipped_friday and a4_default_not_skipped and a1_never_skipped
+                 and a5_not_skipped_saturday and a4_funded_skipped_friday)
+            detail = (f"a5_friday_skipped={a5_skipped_friday} "
+                      f"a4_demo_default_not_skipped={a4_default_not_skipped} "
+                      f"a1_never_skipped={a1_never_skipped} "
+                      f"a5_weekday_unaffected={a5_not_skipped_saturday} "
+                      f"a4_funded_flag_skips={a4_funded_skipped_friday}")
+        except Exception as e:
+            self._record(217, FAIL, f"raised: {e!r}"); return
+        self._record(217, PASS if ok else FAIL, detail)
 
     def _step_rally_sl13_cap910(self):
         # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
@@ -7921,6 +8104,9 @@ class SelfTest:
             self._step_pnl_empty_day()
             self._step_pnl_render_and_ledger()
             self._step_pnl_ledger_idempotent()
+            self._step_e19_boot_survives()
+            self._step_friday_flatten_gate()
+            self._step_friday_a4_a5_skip()
         finally:
             self._cleanup()
         return self._report(ts)
