@@ -282,6 +282,66 @@ asserts no stop advance, `modify_position_sl` never called, exactly one warning
 
 ---
 
+## E-19 — boot with an undetected offset exits clean instead of surviving to market open — **FIXED**
+
+**Status:** FIXED — 2026-07-04 — weekend branch `claude/weekend-report-boot-friday`.
+
+**Symptom (live, 2026-07-03 23:02):** the bot booted into a dead/quiet Friday-
+night feed; the offset detector's Tier 2 stale-consistency check REJECTed (no
+usable tick to confirm the constant +3h broker offset against), so
+`tick_time_offset_hours` stayed `None`; `mt5_adapter.py` logged "Proceeding;
+will re-detect on market open" (by design, not a crash) — but the process then
+exited with code **0** about 4 seconds after `LiveTrader` init. `watchdog.py`
+only relaunches on exit code 42 (the controlled feed-death self-restart), so a
+clean exit-0 during a boot-time closed-market condition left the bot down for
+the rest of the weekend with no alert loop to bring it back.
+
+**Root cause:** `MT5Adapter.server_time_utc()` decodes `tick.time` using
+`self.tick_time_offset_hours or 0` — a deliberate fallback for the coarse
+market-closed probe, but it means that while the offset is genuinely
+UNCONFIRMED, the computed tick age is off by up to the real broker offset (3h
+= 10800s). `LiveTrader.wait_until_market_open()` classifies that age into
+three buckets: `>3600s` → enter the weekend sleep-probe loop (correct, and
+already reused by both the boot path and the running `_tick()` loop); `<120s`
+→ market genuinely open; the remaining `120s < |age| < 3600s` band → **ABORT**
+("Broker server time drifts >2min... ABORTING", `return False`) on the
+assumption that ticks are fresh but the OS clock has drifted. With the real
+offset undetected and Friday close true-age ≈7320s, the mis-decoded age landed
+at ≈−3480s — squarely in the ABORT band by pure arithmetic accident, even
+though the true cause was "closed market, offset never confirmed," not "OS
+clock drift." `wait_until_market_open()` returning `False` made `run()` return
+early (a clean, intentional `return`, not an exception) → `run_live()`'s
+`finally: adapter.shutdown()` → `main()` fell off the end → process exit 0.
+The existing running-loop survival path (`_tick()` → `_market_closed_now()` →
+the same `wait_until_market_open()`) never hit this because by the time the
+bot is already running, the offset has almost always already been confirmed at
+least once — it's specifically a FIRST-BOOT-into-a-dead-feed condition.
+
+**Fix (`live_trader.py`, `wait_until_market_open`):** an UNCONFIRMED offset
+(`adapter.tick_time_offset_hours is None`) now routes into the SAME sleep-probe
+loop as a confirmed `>3600s` closed market, never into the clock-drift ABORT
+branch (which is now only reachable once the offset IS confirmed, since it is
+computed by construction from unreliable data otherwise). Inside the sleep
+loop, the wake check itself branches the same way: while unconfirmed, the loop
+does not trust a raw `tick_age_sec<60` read (which the same offset bias could
+also read "fresh" long before the market genuinely reopens) — it instead calls
+`adapter.ensure_time_offset()` each recheck, which can only succeed once Tier 1
+(a genuinely LIVE, advancing feed) or Tier 2 (a tick within 10min of true now)
+actually confirms, so it cannot wake early. Once real ticks resume, detection
+succeeds quickly and the existing wake path (`_validate_offset_on_wake`,
+already there pre-fix) re-derives and asserts the offset before any anchor
+logic runs, exactly as it always has for a normal weekend wake. Never touches
+the exit-42-only watchdog relaunch policy — this is purely about not exiting
+in the first place.
+
+**Files:** `live_trader.py` (`wait_until_market_open`). **Self-test:** 215
+(`e19 boot survives` — drives the REAL bound method against a stub adapter
+that reproduces the exact skewed-age arithmetic from the live incident;
+asserts the ABORT/"ABORTING" alert never fires, the sleep-probe entry log
+fires, and it wakes only once offset detection succeeds).
+
+---
+
 ## Watch Ledger — patterns under observation (NOT confirmed bugs, NO lever pulled)
 
 ### W-2 — evidence append — 2026-07-02
@@ -396,3 +456,60 @@ explicitly (was reading the old default); self-test 206 (`fb default on`)
 asserts the new default.
 
 **Restore path:** set `trapped_late_rescue_enabled=False` in `config.py`.
+
+### D-6 — Friday weekend-hold ban: flatten cutoff + A4/A5 Friday skip — 2026-07-04
+
+**Decision:** four new `config.py` flags (weekend branch
+`claude/weekend-report-boot-friday`): `friday_flatten_enabled=True`,
+`friday_flatten_broker_hour=22.5`, `a5_skip_friday=True`,
+`a4_skip_friday=False`.
+
+**Rationale:** FundingPips Zero (and prop-firm rules generally) treat ANY
+position held over the weekend as a hard breach / account termination — a
+Friday gap is not an ordinary P&L risk to size around, it can end the account
+outright. The existing daily EOD flatten (`eod_broker_hour=23`) is a same-day
+mechanism with no Friday-specific margin; this adds an earlier, Friday-only
+cutoff (22:30 broker, 30min ahead of the normal 23:00 EOD) so anchor + boost
+legs are flat with margin before the week genuinely closes, not right at it.
+A5 (19:30 broker, the latest-firing normal anchor) is skipped outright every
+Friday — its fill would sit for barely ~3h before the flatten cutoff closes it
+again, all fee/spread cost for no time to develop. A4 (16:40 broker) has more
+runway and stays ON by default on demo; a funded (FundingPips Zero) deploy
+should flip `a4_skip_friday=True` explicitly, since that profile's weekend-hold
+rule makes any Friday anchor that might still be open into a slow-closing week
+not worth the risk of a hard account breach.
+
+**Scope (source-verified, file:line):**
+- `live_trader.py` `_friday_flatten_reached(broker_date, utc_now)`: Friday-only
+  (`broker_date.weekday() == 4`), splits the decimal `friday_flatten_broker_hour`
+  into (hour, minute) and runs it through the SAME `anchor_datetime_utc`
+  conversion `_eod_reached` already uses — not a new time-comparison idiom.
+- `live_trader.py` `_tick()` step 5.5 (between the kill-switch gate and step 6
+  EOD): on the Friday cutoff, calls `_flatten_all(reason="EOD")` exactly once
+  per day (`state['friday_flatten_done']`, reset in `_reset_if_new_day`
+  alongside `processed_anchors_today`). **Rogue is deliberately untouched here**
+  — `reason="EOD"` is the SAME sentinel `risk._flatten_all` already checks
+  (`str(reason) != "EOD"` gates the `rogue.force_close_open` call, E-15) to
+  skip force-closing Rogue's ticket; `rogue_flatten_at_eod` already flattens
+  Rogue at `eod_broker_hour` (23:00) every day, weekends included, independent
+  of this flag. Step 7 (anchor processing) also checks
+  `state['friday_flatten_done']` so no NEW anchor entry can open between the
+  cutoff and the next broker day.
+- `anchors.py` `_anchor_skipped_today_friday(label, broker_date)`: a SEPARATE,
+  earlier-acting check wired into `_process_anchor_if_due`'s per-anchor loop
+  (alongside the existing `processed_anchors_today` / `missed_anchors_today`
+  skips) — this skips a Friday anchor's placement OUTRIGHT (so it never opens
+  a position that would need the later flatten at all), not just closes
+  whatever is open by the cutoff hour. A1/A2 are never Friday-skipped by this
+  check.
+
+**Self-test:** 215 covers E-19 (above); 216 (`friday flatten gate`) drives the
+real `_friday_flatten_reached` across before/after-cutoff and a non-Friday day,
+and drives the real `risk._flatten_all(reason="EOD")` to confirm it closes the
+anchor/boost stack while `rogue.force_close_open` is never called; 217
+(`friday a4 a5 skip`) drives the real `_anchor_skipped_today_friday` for the
+demo defaults (A5 skipped Friday, A4 not), the funded override
+(`a4_skip_friday=True`), A1 never skipped, and non-Friday days unaffected.
+
+**Restore path:** set `friday_flatten_enabled=False` and `a5_skip_friday=False`
+in `config.py` to fully restore pre-D-6 behavior (plain daily EOD only).

@@ -99,6 +99,25 @@ def _resolved_anchor_hm(self, label, broker_date, hour, minute):
     can reuse the EXACT same resolution without a LiveTrader instance."""
     return resolved_anchor_hm(label, broker_date, hour, minute, self.cfg)
 
+def _anchor_skipped_today_friday(self, label, broker_date):
+    """Friday weekend-hold-ban per-anchor skip (config.py `a5_skip_friday` /
+    `a4_skip_friday`) -- distinct from `friday_flatten_broker_hour` (which closes
+    whatever IS open later in the day): this skips an anchor's placement
+    OUTRIGHT for the whole Friday, so it never opens a position that would need
+    to survive the later cutoff at all. `a5_skip_friday` defaults True (A5's
+    19:30 broker fire leaves only ~3h before the flatten cutoff, all cost and no
+    time to develop); `a4_skip_friday` defaults False (demo) -- a funded
+    (FundingPips Zero) deploy should flip it True explicitly, since that profile
+    treats ANY weekend hold as a hard breach / account termination. Other
+    anchors are never Friday-skipped by this check."""
+    if broker_date.weekday() != 4:  # Monday=0 .. Friday=4
+        return False
+    if label.startswith('A5') and bool(getattr(self.cfg, 'a5_skip_friday', True)):
+        return True
+    if label.startswith('A4') and bool(getattr(self.cfg, 'a4_skip_friday', False)):
+        return True
+    return False
+
 def _anchor_sched_utc(self, label):
     """Resolve the scheduled UTC instant for an anchor label on the current broker
     date (Monday A1 shift applied). Used to print scheduled vs actual times on
@@ -181,6 +200,11 @@ def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
         if label in self.state['processed_anchors_today']:
             continue
         if label in self.state.get('missed_anchors_today', []):
+            continue
+        # Friday weekend-hold ban (config.py `a5_skip_friday` / `a4_skip_friday`):
+        # some anchors are skipped OUTRIGHT on Friday, not just after the later
+        # friday_flatten cutoff -- see _anchor_skipped_today_friday.
+        if self._anchor_skipped_today_friday(label, broker_date):
             continue
         # Monday-only A1 shift (cold-start cushion) resolved off the broker date.
         r_hour, r_minute = self._resolved_anchor_hm(label, broker_date, hour, minute)
