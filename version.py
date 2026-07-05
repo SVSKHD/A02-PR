@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.5.0"  # ROGUE on feature/rogue (branch only; not merged)
+__version__ = "3.6.0"  # engine switches (/anchors /rogue) + Rogue seed independence
 CODENAME = "Astra Hawk"
 
 

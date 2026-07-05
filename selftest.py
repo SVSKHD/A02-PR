@@ -183,7 +183,7 @@ STEP_NAMES = {
     130: "R5 smooth runner",
     131: "R6 chop skip",
     # ROGUE — self-anchoring monster-rider (flag-gated; demo default ON, funded OFF)
-    132: "rogue freeze/gate",
+    132: "rogue boot gate",       # v3.6.0: boot default ON; explicit-off kills; funded forced off
     133: "rogue detect monster",
     134: "rogue weak no-slot",
     135: "rogue cap blocks @10",
@@ -299,7 +299,17 @@ STEP_NAMES = {
 
     220: "d6 a4 default true",     # a4_skip_friday now defaults True (was False pre-D-6)
     221: "d6 poll until flat",     # poll loop retries a failed pass; latches only on verified flat
-    222: "d6 entries blocked",     # anchor + Rogue entries both gated on _friday_entries_blocked
+    222: "d6 entries blocked",     # anchor + Rogue entries both gated on the shared per-engine seams
+    # v3.6.0 ENGINE SWITCHES + ROGUE SEED INDEPENDENCE
+    223: "engine defaults wired",  # non_oco/rogue boot defaults ON + seed knob validator-wired + seed_source schema
+    224: "anchors off manage-only",# no straddle at anchor time; boost family blocked on restored leg; trail/SL-close continue
+    225: "rogue off manage-only",  # drive() takes no entry; restored open Rogue leg still trails/books its close
+    226: "engine persist+override",# toggle survives a simulated restart; restored!=default fires ENGINE STATE OVERRIDE
+    227: "seed fallback modes",    # anchors off -> Rogue seeds via A1-time snapshot (default) / market_open; chain runs
+    228: "seed a1 regression",     # both engines ON -> seeds via the REAL A1 anchor read, byte-identical to master
+    229: "no mid-day re-seed",     # toggling anchors mid-day never re-seeds/orphans an existing seed or chain
+    230: "switch+friday compose",  # per-engine seam blocks on EITHER (engine off OR friday window)
+    231: "scoped flatten confirm", # /anchors|/rogue flatten touch only their magic and require confirm
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4626,8 +4636,10 @@ class SelfTest:
         # _friday_entries_blocked is a live wrapper around _friday_flatten_reached
         # (True post-cutoff Friday, False pre-cutoff Friday, False any other
         # day) and (b) BOTH _tick() call sites (Rogue drive(), anchor-due) are
-        # wired through that SAME shared seam by inspecting the real method's
-        # source -- so the two call sites can never silently drift apart.
+        # wired through the shared per-engine seams (v3.6.0:
+        # _rogue_entries_blocked / _anchor_entries_blocked, each = the SAME
+        # _friday_entries_blocked OR its engine switch) by inspecting the real
+        # methods' source -- so the call sites can never silently drift apart.
         import inspect
         import live_trader as _lt
         import dataclasses
@@ -4646,6 +4658,12 @@ class SelfTest:
             t._friday_flatten_reached = (
                 lambda broker_date, utc_now: _lt.LiveTrader._friday_flatten_reached(
                     t, broker_date, utc_now))
+            t._friday_entries_blocked = (
+                lambda broker_date, utc_now: _lt.LiveTrader._friday_entries_blocked(
+                    t, broker_date, utc_now))
+            t._engine_enabled = (
+                lambda engine: _lt.LiveTrader._engine_enabled(t, engine))
+            t.engines = {'anchors': True, 'rogue': True}   # both switches ON here
 
             friday = _date(2026, 7, 3)
             saturday = _date(2026, 7, 4)
@@ -4655,20 +4673,688 @@ class SelfTest:
             blocked_after_cutoff = _lt.LiveTrader._friday_entries_blocked(t, friday, after) is True
             not_blocked_before_cutoff = _lt.LiveTrader._friday_entries_blocked(t, friday, before) is False
             not_blocked_other_day = _lt.LiveTrader._friday_entries_blocked(t, saturday, after) is False
+            # the per-engine seams inherit the Friday window (switches ON here).
+            seams_follow_friday = (
+                _lt.LiveTrader._anchor_entries_blocked(t, friday, after) is True
+                and _lt.LiveTrader._rogue_entries_blocked(t, friday, after) is True
+                and _lt.LiveTrader._anchor_entries_blocked(t, friday, before) is False
+                and _lt.LiveTrader._rogue_entries_blocked(t, friday, before) is False)
 
             src = inspect.getsource(_lt.LiveTrader._tick)
-            rogue_gated = ('allow_new_entries=not self._friday_entries_blocked(' in src)
-            anchor_gated = ('if not self._friday_entries_blocked(broker_date, utc_now):' in src)
+            rogue_gated = ('allow_new_entries=not self._rogue_entries_blocked(' in src)
+            anchor_gated = ('if not self._anchor_entries_blocked(broker_date, utc_now):' in src)
+            # both per-engine seams route through the ONE Friday wrapper.
+            seam_src = (inspect.getsource(_lt.LiveTrader._anchor_entries_blocked)
+                        + inspect.getsource(_lt.LiveTrader._rogue_entries_blocked))
+            shared_wrapper = (seam_src.count('self._friday_entries_blocked(') == 2)
 
             ok = (blocked_after_cutoff and not_blocked_before_cutoff
-                 and not_blocked_other_day and rogue_gated and anchor_gated)
+                 and not_blocked_other_day and seams_follow_friday
+                 and rogue_gated and anchor_gated and shared_wrapper)
             detail = (f"blocked_after_cutoff={blocked_after_cutoff} "
                       f"not_blocked_before_cutoff={not_blocked_before_cutoff} "
                       f"not_blocked_other_day={not_blocked_other_day} "
-                      f"rogue_drive_gated={rogue_gated} anchor_due_gated={anchor_gated}")
+                      f"seams_follow_friday={seams_follow_friday} "
+                      f"rogue_drive_gated={rogue_gated} anchor_due_gated={anchor_gated} "
+                      f"shared_wrapper={shared_wrapper}")
         except Exception as e:
             self._record(222, FAIL, f"raised: {e!r}"); return
         self._record(222, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
+    # v3.6.0 ENGINE SWITCHES + ROGUE SEED INDEPENDENCE (223-231)
+    # ------------------------------------------------------------------------
+
+    def _mk_rogue_a1_trader(self, *, anchors_on=True, rogue_on=True, price=4000.0,
+                            a1_leg_px=None, run_dir=None, **cfg_over):
+        """v3.6.0 shared fixture: a stub A1-mode Rogue trader with a controllable
+        tick/book/close-deal env. Returns (tr, env, placed, modified, closed)."""
+        import types, dataclasses
+        import rogue as _r
+        env = {'price': float(price), 'book': {}, 'deal': None, 'deal_px': None,
+               'logs': []}
+        placed, modified, closed = [], [], []
+        mt5 = types.SimpleNamespace(
+            ACCOUNT_TRADE_MODE_DEMO=0,
+            account_info=lambda: types.SimpleNamespace(trade_mode=0),   # demo
+            symbol_info_tick=lambda s=None: types.SimpleNamespace(
+                bid=env['price'] - 0.1, ask=env['price'] + 0.1),
+            positions_get=lambda ticket=None, symbol=None: (
+                [types.SimpleNamespace(ticket=ticket)]
+                if ticket is not None and env['book'].get(int(ticket)) else []),
+            history_deals_get=lambda position=None: (
+                [types.SimpleNamespace(entry=1, profit=env['deal'], swap=0.0,
+                                       commission=0.0, price=env['deal_px'])]
+                if env['deal'] is not None else []))
+
+        def _place(symbol, side, lot, sl=None, tp=None, magic=None,
+                   comment=None, dry_run=False):
+            placed.append({'side': side, 'magic': magic, 'sl': sl})
+            tk = 900 + len(placed)
+            env['book'][tk] = True
+            return types.SimpleNamespace(retcode=10009, order=tk, deal=tk)
+
+        adapter = types.SimpleNamespace(
+            mt5=mt5, place_market_order=_place,
+            modify_position_sl=lambda tk, sl: modified.append((int(tk), sl)),
+            close_position=lambda tk, dry_run=False: (
+                closed.append(int(tk)), env['book'].pop(int(tk), None)))
+        over = dict(rogue_enabled=True, rogue_a1_anchor_mode=True,
+                    rogue_daywatch=True, rogue_chain_cooldown_sec=0.0,
+                    rogue_chain_min_displacement=0.0, util_boost_ledger=False,
+                    lot_size=0.01)
+        over.update(cfg_over)
+        cfg = dataclasses.replace(self.cfg, **over)
+        shadows = {}
+        if a1_leg_px is not None:
+            shadows[55] = {'anchor_label': 'A1_02h_Asia', 'side': 'BUY',
+                           'leg_fill_price': float(a1_leg_px),
+                           'entry_price': float(a1_leg_px), 'magic': 20260522}
+        tr = types.SimpleNamespace(
+            cfg=cfg, adapter=adapter, paper=True, _last_boost_mid=env['price'],
+            engines={'anchors': bool(anchors_on), 'rogue': bool(rogue_on)},
+            state={'last_broker_date': '2026-07-06', 'missed_anchors_today': []},
+            shadow_positions=shadows, shadow_pendings={}, _rogue=None,
+            tele=types.SimpleNamespace(
+                info=lambda m, **k: env['logs'].append(('info', str(m))),
+                warn=lambda m, **k: env['logs'].append(('warn', str(m))),
+                error=lambda m, **k: env['logs'].append(('error', str(m)))))
+        if run_dir:
+            tr.run_dir = run_dir
+            tr._journal_dir = lambda: run_dir
+        return tr, env, placed, modified, closed
+
+    def _step_engine_defaults_wired(self):
+        # 223 v3.6.0 boot defaults + validator wiring + seed_source schema:
+        # (a) non_oco_enabled / rogue_enabled default True, rogue_seed_fallback
+        # defaults 'a1_time_snapshot'; (b) the validator carries the new flags +
+        # the seed-mode validity check + the three new LiveTrader seams, all
+        # passing on the real cfg; (c) a typo'd seed mode is a WIRING FAILURE
+        # (DO-NOT-START); (d) seed_source is the LAST column of the boost ledger
+        # and present in both pattern-log schemas (append-safe for old files).
+        import aureon_validator as _v, dataclasses
+        import boost_metrics as _bm, rogue_patternlog as _pl
+        try:
+            defaults_ok = (getattr(self.cfg, 'non_oco_enabled', None) is True
+                           and getattr(self.cfg, 'rogue_enabled', None) is True
+                           and getattr(self.cfg, 'rogue_seed_fallback', None)
+                           == 'a1_time_snapshot')
+            rep = _v.validate(self.cfg)
+            names_ok = {c['name'] for c in rep['wiring_ok']}
+            wired = ({'flag:non_oco_enabled', 'flag:rogue_seed_fallback',
+                      'rogue:seed_fallback_valid',
+                      'seam:LiveTrader._engine_enabled',
+                      'seam:LiveTrader._anchor_entries_blocked',
+                      'seam:LiveTrader._rogue_entries_blocked'} <= names_ok
+                     and rep['verdict'] == 'SAFE-TO-START')
+            bad = _v.validate(dataclasses.replace(self.cfg, rogue_seed_fallback='typo'))
+            typo_blocks = (bad['verdict'] == 'DO-NOT-START'
+                           and any(c['name'] == 'rogue:seed_fallback_valid'
+                                   for c in bad['wiring_failures']))
+            schema_ok = (_bm.LEDGER_COLUMNS[-1] == 'seed_source'
+                         and _pl.PATTERN_COLUMNS[-1] == 'seed_source'
+                         and _pl.TRADE_COLUMNS[-1] == 'seed_source'
+                         and _bm.ledger_row({'ts': 't'})[-1] == '')
+            ok = defaults_ok and wired and typo_blocks and schema_ok
+            detail = (f"defaults_on={defaults_ok} validator_wired={wired} "
+                      f"typo_mode_do_not_start={typo_blocks} "
+                      f"seed_source_schema={schema_ok}")
+        except Exception as e:
+            self._record(223, FAIL, f"raised: {e!r}"); return
+        self._record(223, PASS if ok else FAIL, detail)
+
+    def _step_anchors_off_manage_only(self):
+        # 224 (spec i) anchors OFF = MANAGE-ONLY:
+        # (a) a DUE anchor does not place (the per-pass due-check gate) and flips
+        # back on with the switch; (b) the boost family (F-B trapped late-rescue,
+        # the immediate-fire path) never fires on a leg RESTORED into
+        # shadow_positions while OFF -- but the whipsaw-cap enforcement still runs;
+        # (c) wiring: trails / EOD / kill-switch / Friday poll-flatten in _tick are
+        # OUTSIDE the engine gates (the ONLY engine-gated lines are the two entry
+        # seams), so OFF can never orphan an open leg.
+        import types, dataclasses, inspect
+        import anchors as _anch, fills as _fills, live_trader as _lt
+        from datetime import date as _date
+        from utils import anchor_datetime_utc as _adu
+        try:
+            # --- (a) due-check gate ---
+            def mk_due(anchors_on):
+                processed, missed = [], []
+                t = types.SimpleNamespace(
+                    cfg=self.cfg, paused=False,
+                    engines={'anchors': anchors_on, 'rogue': True},
+                    state={'processed_anchors_today': [],
+                           'missed_anchors_today': []},
+                    _deferred_anchor=None, _last_anchor_attempt={},
+                    _anchor_datetime_utc=_adu,
+                    _save_state=lambda: None,
+                    _process_anchor=lambda lbl, at: processed.append(lbl),
+                    _anchor_missed=lambda lbl, at, now: missed.append(lbl))
+                t._resolved_anchor_hm = (
+                    lambda lbl, bd, h, m: _anch.resolved_anchor_hm(
+                        lbl, bd, h, m, self.cfg))
+                t._anchor_skipped_today_friday = (
+                    lambda lbl, bd: _anch._anchor_skipped_today_friday(t, lbl, bd))
+                return t, processed
+            tuesday = _date(2026, 7, 7)
+            at_a2 = pd.Timestamp('2026-07-07 07:00:30', tz='UTC')   # 10:00:30 broker
+            t_off, proc_off = mk_due(False)
+            _anch._process_anchor_if_due(t_off, tuesday, at_a2)
+            t_on, proc_on = mk_due(True)
+            _anch._process_anchor_if_due(t_on, tuesday, at_a2)
+            no_place_off = (proc_off == [])
+            places_on = ('A2_10h_London' in proc_on)
+
+            # --- (b) boost family blocked on a RESTORED leg ---
+            def mk_boost(anchors_on):
+                fired, capped = [], []
+                mt5 = types.SimpleNamespace(
+                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
+                        bid=4051.54, ask=4051.74))   # mid 4051.64 = -$14 vs 4065.64
+                # a trapped No-OCO leg exactly as restored from state.json
+                shadow = {'anchor_label': 'A4_1640_NYopen', 'side': 'BUY',
+                          'entry_price': 4065.64, 'leg_fill_price': 4065.64,
+                          'boost_eligible': True, 'boost_rally_only': True}
+                t = types.SimpleNamespace(
+                    cfg=dataclasses.replace(self.cfg,
+                                            trapped_late_rescue_enabled=True,
+                                            trapped_rescue_arm_dollars=10.0),
+                    paper=False, adapter=types.SimpleNamespace(mt5=mt5),
+                    engines={'anchors': anchors_on, 'rogue': True},
+                    shadow_positions={77: shadow},
+                    tele=types.SimpleNamespace(info=lambda *a, **k: None),
+                    _fire_boost_event=lambda tk, sh, plan: fired.append(plan.kind),
+                    _enforce_boost_cap=lambda mid: capped.append(mid))
+                return t, shadow, fired, capped
+            tb_off, sh_off, fired_off, capped_off = mk_boost(False)
+            _fills._check_boost_triggers(tb_off)
+            tb_on, sh_on, fired_on, capped_on = mk_boost(True)
+            _fills._check_boost_triggers(tb_on)
+            boosts_blocked_off = (fired_off == [] and len(capped_off) == 1
+                                  and not sh_off.get('trapped_rescue_fired'))
+            boosts_fire_on = (len(fired_on) == 1
+                              and sh_on.get('trapped_rescue_fired') is True)
+
+            # --- (c) manage paths outside the gates ---
+            src = inspect.getsource(_lt.LiveTrader._tick)
+            manage_ungated = (
+                src.count('self._anchor_entries_blocked(') == 1
+                and src.count('self._rogue_entries_blocked(') == 1
+                and 'self._manage_trails_on_bar_close()' in src
+                and '_flatten_all(reason="EOD")' in src
+                and 'self._friday_poll_flatten(broker_date, utc_now)' in src)
+
+            ok = (no_place_off and places_on and boosts_blocked_off
+                  and boosts_fire_on and manage_ungated)
+            detail = (f"due_check_blocked_off={no_place_off} places_on={places_on} "
+                      f"boost_family_blocked_off={boosts_blocked_off} "
+                      f"cap_still_enforced={len(capped_off) == 1} "
+                      f"boosts_fire_on={boosts_fire_on} "
+                      f"manage_paths_ungated={manage_ungated}")
+        except Exception as e:
+            self._record(224, FAIL, f"raised: {e!r}"); return
+        self._record(224, PASS if ok else FAIL, detail)
+
+    def _step_rogue_off_manage_only(self):
+        # 225 (spec ii) rogue OFF = MANAGE-ONLY: with allow_new_entries=False (the
+        # _rogue_entries_blocked wiring), drive() still (a) advances the adaptive
+        # trail on a restored OPEN Rogue leg and (b) books its broker close into
+        # the governor -- but (c) takes NO fresh entry off the chain; (d) the same
+        # env WITH entries allowed does enter (the block is the switch, nothing
+        # else); (e) the seam blocks on the switch alone (a plain Tuesday).
+        import rogue as _r, live_trader as _lt, types
+        from datetime import date as _date
+        try:
+            tr, env, placed, modified, closed = self._mk_rogue_a1_trader(
+                anchors_on=True, rogue_on=False, price=4010.0)
+            env['book'][900] = True
+            tr._rogue = {'day': '2026-07-06', 'gov': _r.new_day_state(),
+                         'anchor': 4000.0, 'leg_dir': 'BUY', 'a1_last_close': None,
+                         'a1_reverted': False,
+                         'open': {'ticket': 900, 'side': 'BUY', 'entry': 4000.0,
+                                  'sl': 3995.0, 'peak': 4000.0,
+                                  'magic': _r.ROGUE_MAGIC,
+                                  'leg_type': _r.ROGUE_LEG_TYPE}}
+            _r.drive(tr, allow_new_entries=False)          # +$10: trail must advance
+            trail_advanced = (modified == [(900, 4007.0)])
+            env['book'].pop(900, None)                     # broker trail-out at 4007
+            env['deal'], env['deal_px'] = 7.0, 4007.0
+            _r.drive(tr, allow_new_entries=False)          # close books, no new entry
+            close_booked = (tr._rogue['open'] is None
+                            and abs(tr._rogue['gov']['day_pnl'] - 7.0) < 1e-9
+                            and abs(tr._rogue['a1_last_close'] - 4007.0) < 1e-9)
+            env['price'] = 4017.2                          # +$10.2 off the chain
+            _r.drive(tr, allow_new_entries=False)
+            no_entry_off = (placed == [])
+            _r.drive(tr, allow_new_entries=True)           # control: flag is the block
+            entered_on = (len(placed) == 1
+                          and placed[0]['magic'] == _r.ROGUE_MAGIC)
+
+            class _Stub:
+                pass
+            t = _Stub(); t.engines = {'anchors': True, 'rogue': False}
+            t._friday_entries_blocked = lambda bd, un: False   # a plain Tuesday
+            t._engine_enabled = lambda e: _lt.LiveTrader._engine_enabled(t, e)
+            seam_blocks = (_lt.LiveTrader._rogue_entries_blocked(
+                t, _date(2026, 7, 7), pd.Timestamp('2026-07-07 07:00:00', tz='UTC'))
+                is True)
+
+            ok = (trail_advanced and close_booked and no_entry_off and entered_on
+                  and seam_blocks)
+            detail = (f"trail_advanced={trail_advanced} close_booked={close_booked} "
+                      f"no_entry_while_off={no_entry_off} control_enters={entered_on} "
+                      f"seam_blocks_on_switch={seam_blocks}")
+        except Exception as e:
+            self._record(225, FAIL, f"raised: {e!r}"); return
+        self._record(225, PASS if ok else FAIL, detail)
+
+    def _step_engine_persist_override(self):
+        # 226 (spec iii) toggle persists across a simulated restart + the
+        # override-vs-config alert: (a) /anchors off persists engines into
+        # run/state.json (force-saved, like the governors); (b) a SAME-day restart
+        # restores it (persisted wins) and fires "ENGINE STATE OVERRIDE" naming
+        # both values; (c) a NEW-day restart ignores the stale file (boot defaults,
+        # no alert).
+        import types, json, os, tempfile, shutil
+        import live_trader as _lt, p1_state as _p1
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_engswitch_')
+
+            def mk(day):
+                logs = []
+                t = types.SimpleNamespace(
+                    cfg=self.cfg, paper=True, run_dir=tmp,
+                    engines={'anchors': True, 'rogue': True},
+                    _engine_boot_defaults={'anchors': True, 'rogue': True},
+                    state={'last_broker_date': day},
+                    shadow_positions={}, shadow_pendings={}, _rogue=None,
+                    _post_engines_status=lambda note='': None,
+                    tele=types.SimpleNamespace(
+                        info=lambda m, **k: logs.append(('info', str(m))),
+                        warn=lambda m, **k: logs.append(('warn', str(m)))))
+                t._engine_enabled = lambda e: _lt.LiveTrader._engine_enabled(t, e)
+                return t, logs
+
+            t1, _logs1 = mk('2026-07-06')
+            _lt.LiveTrader._set_engine(t1, 'anchors', False, source='selftest')
+            with open(os.path.join(tmp, 'state.json')) as f:
+                snap = json.load(f)
+            persisted = (snap.get('engines') == {'anchors': False, 'rogue': True}
+                         and t1.engines['anchors'] is False)
+
+            t2, logs2 = mk('2026-07-06')                    # SAME-day restart
+            _p1.recover_on_boot(t2)
+            restored = (t2.engines == {'anchors': False, 'rogue': True})
+            alert = [m for k, m in logs2
+                     if k == 'warn' and 'ENGINE STATE OVERRIDE' in m]
+            alert_names_both = (len(alert) == 1 and 'OFF' in alert[0]
+                                and 'ON' in alert[0] and 'anchors' in alert[0])
+
+            t3, logs3 = mk('2026-07-07')                    # NEW-day restart
+            _p1.recover_on_boot(t3)
+            new_day_defaults = (t3.engines == {'anchors': True, 'rogue': True}
+                                and not any('ENGINE STATE OVERRIDE' in m
+                                            for _k, m in logs3))
+
+            ok = persisted and restored and alert_names_both and new_day_defaults
+            detail = (f"persisted={persisted} same_day_restored={restored} "
+                      f"override_alert_names_both={alert_names_both} "
+                      f"new_day_boot_defaults={new_day_defaults}")
+        except Exception as e:
+            self._record(226, FAIL, f"raised: {e!r}")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(226, PASS if ok else FAIL, detail)
+
+    def _step_seed_fallback_modes(self):
+        # 227 (spec iv) anchors OFF + rogue ON -> Rogue still seeds via the
+        # fallback and the chain runs: (a) a1_time_snapshot (DEFAULT) waits for
+        # A1's scheduled time, captures the tick, logs "ROGUE SEED via
+        # A1_TIME_SNAPSHOT @ px", enters on the $10 move and CHAINS after the
+        # close; (b) the boost-ledger rows carry seed_source; (c) market_open
+        # seeds off the first tick of the day without waiting for A1 time.
+        import rogue as _r, csv, os, tempfile, shutil
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_seedfb_')
+            orig_sched = _r._a1_sched_reached
+            a1_due = {'v': False}
+            _r._a1_sched_reached = lambda trader: a1_due['v']
+            try:
+                tr, env, placed, modified, closed = self._mk_rogue_a1_trader(
+                    anchors_on=False, rogue_on=True, price=4000.0, run_dir=tmp,
+                    util_boost_ledger=True)
+                _r.drive(tr)                       # pre-A1: day-open captured only
+                pre_a1_waits = (placed == [] and tr._rogue.get('a1_snap_px') is None
+                                and tr._rogue.get('day_open_px') == 4000.0
+                                and not any('ROGUE SEED' in m
+                                            for _k, m in env['logs']))
+                a1_due['v'] = True
+                env['price'] = 4005.0
+                _r.drive(tr)                       # A1 time: snapshot -> seed @ 4005
+                seed_logs = [m for _k, m in env['logs'] if 'ROGUE SEED' in m]
+                seeded_at_a1 = (tr._rogue.get('a1_snap_px') == 4005.0
+                                and tr._rogue.get('seed_px') == 4005.0
+                                and tr._rogue.get('seed_source') == 'A1_TIME_SNAPSHOT'
+                                and len(seed_logs) == 1
+                                and 'via A1_TIME_SNAPSHOT @ 4005.0' in seed_logs[0]
+                                and placed == [])   # move $0 -> no entry yet
+                env['price'] = 4015.2              # +$10.2 off the 4005 seed
+                _r.drive(tr)
+                entered = (len(placed) == 1 and placed[0]['side'] == 'BUY'
+                           and placed[0]['magic'] == _r.ROGUE_MAGIC)
+                tk = 900 + len(placed)
+                env['book'].pop(tk, None)          # broker closes it
+                env['deal'], env['deal_px'] = 4.9, 4020.1
+                _r.drive(tr)                       # books + CHAIN re-anchors @ exit
+                env['price'] = 4030.5              # +$10.4 off the 4020.1 chain
+                _r.drive(tr)
+                chain_ran = (len(placed) == 2
+                             and abs(tr._rogue['gov']['day_pnl'] - 4.9) < 1e-9)
+                with open(os.path.join(tmp, 'boost_ledger.csv')) as f:
+                    rows = [r for r in csv.DictReader(f) if r.get('kind') == 'ROGUE']
+                ledger_tagged = (len(rows) >= 2 and all(
+                    r.get('seed_source') == 'A1_TIME_SNAPSHOT' for r in rows))
+
+                # (c) market_open: seeds off the FIRST tick, no A1-time wait.
+                a1_due['v'] = False
+                tr2, env2, placed2, _m2, _c2 = self._mk_rogue_a1_trader(
+                    anchors_on=False, rogue_on=True, price=3990.0,
+                    rogue_seed_fallback='market_open')
+                _r.drive(tr2)                      # first tick = the seed
+                env2['price'] = 4000.2             # +$10.2 off 3990
+                _r.drive(tr2)
+                mo_logs = [m for _k, m in env2['logs'] if 'ROGUE SEED' in m]
+                market_open_seeds = (tr2._rogue.get('seed_source') == 'MARKET_OPEN'
+                                     and tr2._rogue.get('seed_px') == 3990.0
+                                     and len(placed2) == 1 and len(mo_logs) == 1
+                                     and 'via MARKET_OPEN @ 3990.0' in mo_logs[0])
+            finally:
+                _r._a1_sched_reached = orig_sched
+            ok = (pre_a1_waits and seeded_at_a1 and entered and chain_ran
+                  and ledger_tagged and market_open_seeds)
+            detail = (f"pre_a1_waits={pre_a1_waits} seeded_at_a1_time={seeded_at_a1} "
+                      f"entered={entered} chain_ran={chain_ran} "
+                      f"ledger_seed_source={ledger_tagged} "
+                      f"market_open_mode={market_open_seeds}")
+        except Exception as e:
+            self._record(227, FAIL, f"raised: {e!r}")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(227, PASS if ok else FAIL, detail)
+
+    def _step_seed_a1_regression(self):
+        # 228 (spec v, REGRESSION GUARD) both engines ON -> Rogue seeds off the
+        # REAL A1 anchor exactly as master: resolve_seed returns the live
+        # _a1_anchor_price read (source A1_ANCHOR), nothing latches (seed_px stays
+        # None -- the per-tick read is preserved), the entry price/SL are exactly
+        # a1_entry_decision off the A1 price, and a master-shape trader WITHOUT
+        # the engines dict resolves identically (guarded default = ON).
+        import rogue as _r, types
+        try:
+            tr, env, placed, _m, _c = self._mk_rogue_a1_trader(
+                anchors_on=True, rogue_on=True, price=3981.0, a1_leg_px=3980.0)
+            tr._rogue = None
+            _r.drive(tr)                            # +$1: seeds, no entry
+            st = tr._rogue
+            px, src = _r.resolve_seed(tr, st)
+            live_read = (px == 3980.0 and src == _r.SEED_A1_ANCHOR
+                         and px == _r._a1_anchor_price(tr)
+                         and st.get('seed_px') is None)
+            seed_logs = [m for _k, m in env['logs'] if 'ROGUE SEED' in m]
+            logged_a1 = (len(seed_logs) == 1
+                         and 'via A1_ANCHOR @ 3980.0' in seed_logs[0])
+            env['price'] = 3990.2                   # +$10.2 off the A1 anchor
+            _r.drive(tr)
+            exp_enter, exp_side, exp_px, exp_sl = _r.a1_entry_decision(
+                3980.0, 3990.2, tr.cfg)
+            entry_master = (exp_enter is True and len(placed) == 1
+                            and placed[0]['side'] == exp_side == 'BUY'
+                            and abs(placed[0]['sl'] - exp_sl) < 1e-9
+                            and abs(st['open']['entry'] - exp_px) < 1e-9)
+            # a master-shape trader (NO engines dict) resolves the same way.
+            tr2, _e2, _p2, _m2, _c2 = self._mk_rogue_a1_trader(
+                anchors_on=True, rogue_on=True, price=3981.0, a1_leg_px=3980.0)
+            del tr2.engines
+            st2 = {'day': '2026-07-06', 'gov': _r.new_day_state(), 'anchor': None,
+                   'leg_dir': None, 'open': None, 'a1_last_close': None}
+            px2, src2 = _r.resolve_seed(tr2, st2)
+            legacy_shape_same = (px2 == 3980.0 and src2 == _r.SEED_A1_ANCHOR)
+            ok = live_read and logged_a1 and entry_master and legacy_shape_same
+            detail = (f"live_a1_read_no_latch={live_read} seed_logged_a1={logged_a1} "
+                      f"entry_matches_master_decision={entry_master} "
+                      f"legacy_trader_shape_same={legacy_shape_same}")
+        except Exception as e:
+            self._record(228, FAIL, f"raised: {e!r}"); return
+        self._record(228, PASS if ok else FAIL, detail)
+
+    def _step_no_midday_reseed(self):
+        # 229 (spec vi) a mid-day toggle never double-seeds or orphans the day's
+        # seed/chain: (a) a FALLBACK seed is LATCHED -- flipping anchors back ON
+        # (with a live A1 leg at a DIFFERENT price) keeps the latched seed and
+        # logs NO second "ROGUE SEED"; (b) a day seeded via the REAL A1 read that
+        # then loses the anchor engine keeps the recorded A1 price (source stays
+        # A1_ANCHOR, never flips to the snapshot); (c) an existing CHAIN target
+        # always wins over any seed (a1_seed_anchor precedence).
+        import rogue as _r, types
+        try:
+            orig_sched = _r._a1_sched_reached
+            _r._a1_sched_reached = lambda trader: True
+            try:
+                # (a) fallback seed latches through an anchors-ON toggle
+                tr, env, placed, _m, _c = self._mk_rogue_a1_trader(
+                    anchors_on=False, rogue_on=True, price=4005.0)
+                _r.drive(tr)                        # seeds via snapshot @ 4005
+                st = tr._rogue
+                seeded = (st.get('seed_px') == 4005.0
+                          and st.get('seed_source') == 'A1_TIME_SNAPSHOT')
+                tr.engines['anchors'] = True        # mid-day toggle ON
+                tr.shadow_positions[55] = {'anchor_label': 'A1_02h_Asia',
+                                           'side': 'BUY', 'leg_fill_price': 3980.0,
+                                           'entry_price': 3980.0, 'magic': 20260522}
+                _r.drive(tr)
+                px, src = _r.resolve_seed(tr, st)
+                latched = (px == 4005.0 and src == 'A1_TIME_SNAPSHOT')
+                one_seed_log = (sum(1 for _k, m in env['logs']
+                                    if 'ROGUE SEED' in m) == 1)
+
+                # (b) A1-seeded day survives an anchors-OFF toggle unchanged
+                tr2, env2, _p2, _m2, _c2 = self._mk_rogue_a1_trader(
+                    anchors_on=True, rogue_on=True, price=3981.0, a1_leg_px=3980.0)
+                _r.drive(tr2)                       # seeds via the real A1 read
+                st2 = tr2._rogue
+                st2['a1_snap_px'] = 4005.0          # a snapshot also exists...
+                tr2.engines['anchors'] = False      # ...then the switch goes OFF
+                px2, src2 = _r.resolve_seed(tr2, st2)
+                a1_latched = (px2 == 3980.0 and src2 == _r.SEED_A1_ANCHOR
+                              and st2.get('seed_px') == 3980.0)
+                one_seed_log2 = (sum(1 for _k, m in env2['logs']
+                                     if 'ROGUE SEED' in m) == 1)
+
+                # (c) an existing chain target always wins over any seed
+                chain_wins = (_r.a1_seed_anchor(4020.0, 4005.0) == 4020.0
+                              and _r.a1_seed_anchor(4020.0, None) == 4020.0)
+            finally:
+                _r._a1_sched_reached = orig_sched
+            ok = (seeded and latched and one_seed_log and a1_latched
+                  and one_seed_log2 and chain_wins)
+            detail = (f"fallback_seeded={seeded} latched_through_toggle={latched} "
+                      f"single_seed_log={one_seed_log} a1_seed_survives_off="
+                      f"{a1_latched} single_seed_log_b={one_seed_log2} "
+                      f"chain_wins={chain_wins}")
+        except Exception as e:
+            self._record(229, FAIL, f"raised: {e!r}"); return
+        self._record(229, PASS if ok else FAIL, detail)
+
+    def _step_switch_friday_compose(self):
+        # 230 (spec vii) the per-engine seams compose with the Friday window:
+        # EITHER condition blocks (engine OFF on a plain Tuesday; engine ON past
+        # the Friday cutoff; both ON pre-cutoff Friday = not blocked), and each
+        # engine's switch only blocks ITS OWN seam.
+        import live_trader as _lt, dataclasses
+        from datetime import date as _date
+        from utils import anchor_datetime_utc as _adu
+        try:
+            cfg = dataclasses.replace(self.cfg, friday_flatten_enabled=True,
+                                      friday_flatten_broker_hour=22.5,
+                                      broker_tz_offset_hours=3)
+
+            def blocked(engine, *, anchors_on, rogue_on, day, when):
+                class _Stub:
+                    pass
+                t = _Stub(); t.cfg = cfg
+                t.engines = {'anchors': anchors_on, 'rogue': rogue_on}
+                t._anchor_datetime_utc = _adu
+                t._friday_flatten_reached = (
+                    lambda bd, un: _lt.LiveTrader._friday_flatten_reached(t, bd, un))
+                t._friday_entries_blocked = (
+                    lambda bd, un: _lt.LiveTrader._friday_entries_blocked(t, bd, un))
+                t._engine_enabled = lambda e: _lt.LiveTrader._engine_enabled(t, e)
+                fn = (_lt.LiveTrader._anchor_entries_blocked if engine == 'anchors'
+                      else _lt.LiveTrader._rogue_entries_blocked)
+                return fn(t, day, when)
+
+            tue = _date(2026, 7, 7)
+            tue_noon = pd.Timestamp('2026-07-07 09:00:00', tz='UTC')
+            fri = _date(2026, 7, 3)
+            fri_pre = pd.Timestamp('2026-07-03 18:59:00', tz='UTC')   # 21:59 broker
+            fri_post = pd.Timestamp('2026-07-03 19:31:00', tz='UTC')  # 22:31 broker
+
+            checks = {
+                'switch_blocks_tuesday_anchor': blocked(
+                    'anchors', anchors_on=False, rogue_on=True,
+                    day=tue, when=tue_noon) is True,
+                'switch_blocks_tuesday_rogue': blocked(
+                    'rogue', anchors_on=True, rogue_on=False,
+                    day=tue, when=tue_noon) is True,
+                'friday_blocks_switch_on_anchor': blocked(
+                    'anchors', anchors_on=True, rogue_on=True,
+                    day=fri, when=fri_post) is True,
+                'friday_blocks_switch_on_rogue': blocked(
+                    'rogue', anchors_on=True, rogue_on=True,
+                    day=fri, when=fri_post) is True,
+                'both_open_pre_cutoff_anchor': blocked(
+                    'anchors', anchors_on=True, rogue_on=True,
+                    day=fri, when=fri_pre) is False,
+                'both_open_pre_cutoff_rogue': blocked(
+                    'rogue', anchors_on=True, rogue_on=True,
+                    day=fri, when=fri_pre) is False,
+                'anchor_switch_not_cross_wired': blocked(
+                    'rogue', anchors_on=False, rogue_on=True,
+                    day=tue, when=tue_noon) is False,
+                'rogue_switch_not_cross_wired': blocked(
+                    'anchors', anchors_on=True, rogue_on=False,
+                    day=tue, when=tue_noon) is False,
+            }
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={v}" for k, v in checks.items())
+        except Exception as e:
+            self._record(230, FAIL, f"raised: {e!r}"); return
+        self._record(230, PASS if ok else FAIL, detail)
+
+    def _step_scoped_flatten_confirm(self):
+        # 231 (spec viii) the confirm-gated per-magic flatten commands:
+        # (a) bare `/rogue flatten` and `/anchors flatten` only REPLY with the
+        # open-position count + confirm hint (nothing closed/cancelled);
+        # (b) `/rogue flatten confirm` closes ONLY the Rogue 20260626 position +
+        # cancels ONLY the Rogue pending; (c) `/anchors flatten confirm` closes
+        # ONLY the 20260522 book (position + pending) and SKIPS the Rogue
+        # force-close inside risk._flatten_all (scope="ANCHORS").
+        import types
+        import live_trader as _lt, risk as _risk, rogue as _rogue
+        try:
+            env = {'positions': {501: 20260522, 900: _rogue.ROGUE_MAGIC},
+                   'pendings': {502: 20260522, 901: _rogue.ROGUE_MAGIC},
+                   'closed': [], 'cancelled': [], 'logs': []}
+            mt5 = types.SimpleNamespace(
+                positions_get=lambda ticket=None, symbol=None: (
+                    ([types.SimpleNamespace(ticket=ticket)]
+                     if int(ticket) in env['positions'] else [])
+                    if ticket is not None else
+                    [types.SimpleNamespace(ticket=tk, magic=mg, type=0,
+                                           price_open=4000.0, sl=3982.0, tp=4030.0)
+                     for tk, mg in env['positions'].items()]),
+                orders_get=lambda ticket=None, symbol=None: (
+                    ([types.SimpleNamespace(ticket=ticket)]
+                     if int(ticket) in env['pendings'] else [])
+                    if ticket is not None else
+                    [types.SimpleNamespace(ticket=tk, magic=mg, type=2,
+                                           price_open=4010.0)
+                     for tk, mg in env['pendings'].items()]))
+            adapter = types.SimpleNamespace(
+                mt5=mt5,
+                close_position=lambda tk, dry_run=False: (
+                    env['closed'].append(int(tk)),
+                    env['positions'].pop(int(tk), None)),
+                cancel_order=lambda tk, dry_run=False: (
+                    env['cancelled'].append(int(tk)),
+                    env['pendings'].pop(int(tk), None)))
+            tr = types.SimpleNamespace(
+                cfg=self.cfg, adapter=adapter, paper=True,
+                engines={'anchors': True, 'rogue': True},
+                shadow_positions={501: {'anchor_label': 'A1', 'side': 'BUY'}},
+                shadow_pendings={502: {'anchor_label': 'A1', 'side': 'BUY',
+                                       'sibling_ticket': None}},
+                _deferred_anchor=None, state={},
+                _rogue={'open': {'ticket': 900, 'side': 'BUY', 'entry': 4000.0,
+                                 'magic': _rogue.ROGUE_MAGIC},
+                        'gov': _rogue.new_day_state()},
+                tele=types.SimpleNamespace(
+                    info=lambda m, **k: env['logs'].append(('info', str(m))),
+                    warn=lambda m, **k: env['logs'].append(('warn', str(m))),
+                    error=lambda m, **k: env['logs'].append(('error', str(m))),
+                    critical=lambda m, **k: env['logs'].append(('critical', str(m)))),
+                _FRIDAY_ANCHOR_MAGIC=_lt.LiveTrader._FRIDAY_ANCHOR_MAGIC)
+            tr._friday_query_flat = lambda: _lt.LiveTrader._friday_query_flat(tr)
+            tr._open_counts_per_magic = (
+                lambda: _lt.LiveTrader._open_counts_per_magic(tr))
+            tr._flatten_all = (lambda reason="Manual", scope="ALL":
+                               _risk._flatten_all(tr, reason=reason, scope=scope))
+            orig_pnl, orig_persist = _rogue._rogue_close_pnl, _rogue._persist_state
+            _rogue._rogue_close_pnl = lambda *a, **k: 0.0
+            _rogue._persist_state = lambda *a, **k: None
+            try:
+                # (a) bare flatten: count + confirm hint, nothing touched
+                _lt.LiveTrader._handle_engine_flatten(tr, 'rogue', False)
+                _lt.LiveTrader._handle_engine_flatten(tr, 'anchors', False)
+                bare_asks = (env['closed'] == [] and env['cancelled'] == []
+                             and sum(1 for _k, m in env['logs']
+                                     if 'flatten confirm' in m) == 2)
+                # (b) rogue confirm: ONLY 900 closed + ONLY 901 cancelled
+                _lt.LiveTrader._handle_engine_flatten(tr, 'rogue', True)
+                rogue_scoped = (env['closed'] == [900] and env['cancelled'] == [901]
+                                and 501 in env['positions']
+                                and 502 in env['pendings']
+                                and tr._rogue['open'] is None)
+                # (c) anchors confirm: ONLY the 20260522 book; Rogue block skipped
+                env['positions'][900] = _rogue.ROGUE_MAGIC   # a NEW Rogue ticket...
+                tr._rogue['open'] = {'ticket': 900, 'side': 'BUY', 'entry': 4000.0,
+                                     'magic': _rogue.ROGUE_MAGIC}   # ...tracked open
+                _lt.LiveTrader._handle_engine_flatten(tr, 'anchors', True)
+                anchors_scoped = (env['closed'] == [900, 501]   # 900 from (b) only
+                                  and 900 in env['positions']    # Rogue untouched
+                                  and tr._rogue['open'] is not None
+                                  and 501 not in env['positions']
+                                  and 502 not in env['pendings'])
+            finally:
+                _rogue._rogue_close_pnl = orig_pnl
+                _rogue._persist_state = orig_persist
+            ok = bare_asks and rogue_scoped and anchors_scoped
+            detail = (f"bare_replies_and_asks_confirm={bare_asks} "
+                      f"rogue_confirm_scoped={rogue_scoped} "
+                      f"anchors_confirm_scoped={anchors_scoped}")
+        except Exception as e:
+            self._record(231, FAIL, f"raised: {e!r}"); return
+        self._record(231, PASS if ok else FAIL, detail)
 
     def _step_rally_sl13_cap910(self):
         # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
@@ -5632,18 +6318,22 @@ class SelfTest:
 
     # --- ROGUE: self-anchoring monster-rider --------------------------------
     def _step_rogue_freeze_gate(self):
-        # 132 FREEZE + GATE: rogue_enabled raw default FALSE -> should_run False ->
-        # master byte-identical (no watch/anchor/entry). A FUNDED account force-disables
-        # rogue even when the flag is ON (mandatory gate); demo (non-funded) runs it.
+        # 132 GATE (v3.6.0): rogue_enabled boot default is now TRUE (the engine-switch
+        # boot default; the old raw-False only existed to be demo-promoted anyway) ->
+        # should_run True on a non-funded account. The MANDATORY account gates are
+        # unchanged: a FUNDED account force-disables rogue even with the flag ON, and
+        # an EXPLICIT rogue_enabled=False still kills the whole mechanism (should_run
+        # False -> no watch/anchor/entry).
         import rogue as _rogue, dataclasses
         try:
-            off_raw = (bool(getattr(self.cfg, 'rogue_enabled', False)) is False
-                       and _rogue.should_run(self.cfg, is_funded=False) is False)
-            cfg_on = dataclasses.replace(self.cfg, rogue_enabled=True)
-            funded_gate = (_rogue.should_run(cfg_on, is_funded=True) is False)
-            demo_runs = (_rogue.should_run(cfg_on, is_funded=False) is True)
-            ok = off_raw and funded_gate and demo_runs
-            detail = f"raw_off_master_identical={off_raw} funded_force_off={funded_gate} demo_runs={demo_runs}"
+            on_default = (bool(getattr(self.cfg, 'rogue_enabled', False)) is True
+                          and _rogue.should_run(self.cfg, is_funded=False) is True)
+            cfg_off = dataclasses.replace(self.cfg, rogue_enabled=False)
+            off_kills = (_rogue.should_run(cfg_off, is_funded=False) is False)
+            funded_gate = (_rogue.should_run(self.cfg, is_funded=True) is False)
+            ok = on_default and off_kills and funded_gate
+            detail = (f"boot_default_on={on_default} explicit_off_kills={off_kills} "
+                      f"funded_force_off={funded_gate}")
         except Exception as e:
             self._record(132, FAIL, f"raised: {e!r}"); return
         self._record(132, PASS if ok else FAIL, detail)
@@ -8481,6 +9171,17 @@ class SelfTest:
             self._step_d6_a4_default_true()
             self._step_d6_poll_until_flat()
             self._step_d6_entries_blocked()
+            # v3.6.0: engine switches (/anchors /rogue /engines) + Rogue seed
+            # independence (rogue_seed_fallback + seed_source provenance).
+            self._step_engine_defaults_wired()
+            self._step_anchors_off_manage_only()
+            self._step_rogue_off_manage_only()
+            self._step_engine_persist_override()
+            self._step_seed_fallback_modes()
+            self._step_seed_a1_regression()
+            self._step_no_midday_reseed()
+            self._step_switch_friday_compose()
+            self._step_scoped_flatten_confirm()
         finally:
             self._cleanup()
         return self._report(ts)

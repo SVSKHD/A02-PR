@@ -179,6 +179,14 @@ def _anchor_missed(self, label, anchor_utc, utc_now):
 def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
     if self.paused:
         return
+    # v3.6.0 ENGINE SWITCH (anchors OFF = MANAGE-ONLY): no NEW straddle may place
+    # while the anchor engine is switched off (/anchors off). Same per-pass seam as
+    # the paused / testfire / Friday skip-day gates around it; defense-in-depth with
+    # the _tick call-site gate (live_trader._anchor_entries_blocked). GUARDED read:
+    # a trader without the runtime dict (stubs / old snapshots) reads ENABLED.
+    _eng = getattr(self, 'engines', None)
+    if isinstance(_eng, dict) and not bool(_eng.get('anchors', True)):
+        return
     # v3.2.9: during a manual TESTFIRE session, scheduled-anchor placement is
     # SUPPRESSED so the manual entry is isolated and can never collide with a real
     # anchor (rail #4). The deferred-anchor completion path (_complete_deferred_

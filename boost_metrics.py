@@ -39,8 +39,12 @@ def pullback_json(counts: dict, date_str) -> str:
 
 
 # ---- 9: boost ledger (PURE) -----------------------------------------------------
+# v3.6.0: seed_source appended LAST (ROGUE rows carry A1_ANCHOR | A1_TIME_SNAPSHOT |
+# MARKET_OPEN | MANUAL; anchor-engine boost rows leave it '') so the July evidence
+# stays segmentable per seed source (D-8). Appending keeps an existing ledger file's
+# positional columns valid -- an old header simply lacks the tail column.
 LEDGER_COLUMNS = ('ts', 'anchor', 'kind', 'event', 'arm_px', 'entry_px',
-                  'exit_px', 'pnl_usd')
+                  'exit_px', 'pnl_usd', 'seed_source')
 
 
 def ledger_row(event: dict) -> list:

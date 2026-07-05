@@ -166,13 +166,16 @@ class Config:
     # Rogue plants its OWN price-anchor where a strong move completes, then hunts the next
     # leg, reusing the rally/rescue/trail HELPERS from that anchor -- but ROGUE-tagged and
     # closed only against its own magic/label. rogue_enabled is the single master switch.
-    # FREEZE: the RAW default is False -> all-flags-off == master (byte-identical). DEMO
-    # default-ON is a RUNTIME promotion (rogue.funded_default: the boot sets it True on a
-    # demo / non-funded account); a FUNDED account FORCE-disables it (rogue.should_run --
-    # mandatory gate, un-proven Rogue never boots ON on real capital). With it OFF there
-    # is NO watching, anchoring, or entering. Rogue is the deliberate demo-only exception;
-    # all OTHER strategy flags stay default OFF.
-    rogue_enabled: bool = False        # MASTER SWITCH (raw default OFF; demo boot promotes ON)
+    # v3.6.0 ENGINE SWITCH: the boot default is now True (the Rogue engine has been the
+    # live demo engine since the trial started; the old raw-False default only existed to
+    # be promoted anyway). The account-type gates are UNCHANGED and still authoritative on
+    # every boot: rogue.promote_on_boot sets this True on a demo (non-funded) account and
+    # FORCE-disables it on a funded one, and rogue.should_run refuses a funded account
+    # regardless of the flag (mandatory gate, un-proven Rogue never runs on real capital).
+    # This config default is the BOOT DEFAULT of the LiveTrader's runtime engine switch
+    # (live_trader.engines['rogue'], /rogue on|off) which ANDs with -- never replaces --
+    # rogue_a1_anchor_mode and the demo/funded promotion gate above.
+    rogue_enabled: bool = True         # MASTER SWITCH (v3.6.0 boot default ON; funded still forced OFF)
     rogue_daywatch: bool = True        # continuous M5 vision (only meaningful when rogue_enabled)
     rogue_max_reentries_per_day: int = 10   # HARD ceiling on NEW entries/day (the cap)
     rogue_min_candles: int = 4         # strong-move trigger: >= this many same-dir M5 closes
@@ -225,10 +228,11 @@ class Config:
     # is Fix 3's live daily loss stop + rogue_rescue_cap_dollars ($13) per recovery leg.
     # Engine-gated keys: inert/no-op while rogue_a1_anchor_mode is OFF. Rogue-only
     # (magic 20260626); the A1 read is READ-ONLY and never closes an anchor 20260522 leg.
-    # DEFAULT ON (P1): the A1-anchored engine is the live Rogue engine. This is still
-    # freeze-safe -- the all-flags-off==master freeze is gated by rogue_enabled (raw default
-    # OFF), so with rogue OFF this key is never reached. (Closes the E-1 ghost: the stale
-    # "DEFAULT OFF / legacy monster is live" comment no longer matched the live config.)
+    # DEFAULT ON (P1): the A1-anchored engine is the live Rogue engine. Reached only
+    # when rogue runs at all (rogue_enabled + the funded force-off gate + the v3.6.0
+    # /rogue runtime switch); with rogue off this key is never reached. (Closes the
+    # E-1 ghost: the stale "DEFAULT OFF / legacy monster is live" comment no longer
+    # matched the live config.)
     rogue_a1_anchor_mode: bool = True           # Fix 4 master flag (DEFAULT ON, live engine)
     rogue_entry_confirm_redesign: float = 10.0  # $ off the anchor to ENTER in the move dir
     rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
@@ -529,6 +533,38 @@ class Config:
     # now defaults True (was False pre-D-6). Set False explicitly in cfg to
     # restore the old demo behavior of letting A4 fire on Fridays.
     a4_skip_friday: bool = True
+
+    # --- v3.6.0 ENGINE SWITCHES (runtime-toggleable, boot defaults here) ----------
+    # Two per-engine runtime switches, owned at runtime by the LiveTrader
+    # (live_trader.engines, Discord /anchors on|off · /rogue on|off · /engines status)
+    # and PERSISTED in run/state.json like the Rogue governors. These config values
+    # are the BOOT DEFAULTS only: a same-day restart restores the persisted runtime
+    # state (persisted wins), and any boot where restored != this default emits the
+    # "⚠️ ENGINE STATE OVERRIDE" log + Discord alert naming both values.
+    # non_oco_enabled = the ANCHOR (Non-OCO straddle) engine switch. OFF = MANAGE-ONLY:
+    # no new straddles (gated at the shared entries-blocked seam,
+    # live_trader._anchor_entries_blocked: effective_block = friday_window OR
+    # engine_disabled) and no boost family (RALLY / RESCUE / F-B) even on legs
+    # restored from state.json -- while trails, exits, SL management, EOD flatten,
+    # the Friday poll-flatten and the kill switch continue on ALL open positions.
+    # OFF never orphans a leg. Distinct from `no_oco` above (the trade STYLE knob);
+    # this is the engine on/off. The Rogue engine switch reuses rogue_enabled (above)
+    # as its boot default -- one master switch per engine, no duplicate key.
+    non_oco_enabled: bool = True
+    # ROGUE SEED INDEPENDENCE (anchors-off must NOT stop Rogue): when the anchor
+    # engine does not place A1 (non_oco_enabled False, or A1 gave up after its late
+    # window), the A1-anchored Rogue engine still needs a morning seed. Source is
+    # resolved AT SEED TIME from the current switch state (rogue.resolve_seed):
+    #   "a1_time_snapshot" (DEFAULT): at A1's scheduled clock time, capture the
+    #       current tick price as the Rogue seed anchor -- identical timing to the
+    #       real A1 seed, no orders placed.
+    #   "market_open": seed anchor = first live tick price of the broker trading day.
+    # With non_oco_enabled True and A1 placing normally, Rogue seeds off the REAL A1
+    # anchor exactly as before (byte-identical; regression-guarded in the selftest).
+    # Every seed logs "ROGUE SEED via A1_ANCHOR | A1_TIME_SNAPSHOT | MARKET_OPEN @
+    # price" and ledger/pattern-log rows carry a seed_source column (D-8 evidence
+    # stays segmentable per seed source).
+    rogue_seed_fallback: str = "a1_time_snapshot"   # or "market_open"
 
     # Risk
     starting_balance: float = 50000.0

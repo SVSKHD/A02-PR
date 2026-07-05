@@ -15,8 +15,8 @@ observe() is a behavior-NEUTRAL close watcher: it reads broker state to detect a
 Rogue ticket, then backfills the exit columns of the matching ENTER row -- WITHOUT mutating
 the Rogue mechanism. archive_day() freezes each broker day's files into logs/archive/{date}/.
 
-Everything is GUARDED: a logging/file error can never reach trading. With rogue_enabled OFF
-(raw default) nothing here runs -> byte-identical to master.
+Everything is GUARDED: a logging/file error can never reach trading. With rogue_enabled
+explicitly OFF nothing here runs.
 """
 from __future__ import annotations
 
@@ -33,13 +33,16 @@ PATTERNS_CSV = "rogue_patterns.csv"
 TRADES_CSV = "rogue_trades.csv"
 
 # entry (shape features + decision) ... then exit (filled on close).
+# v3.6.0: seed_source appended LAST (D-8: evidence stays segmentable per seed
+# source -- A1_ANCHOR | A1_TIME_SNAPSHOT | MARKET_OPEN | MANUAL). Appending keeps
+# an existing file's positional columns valid (old headers simply lack the tail).
 PATTERN_COLUMNS = ['ts', 'direction', 'range_dollars', 'body_ratio', 'candle_count',
                    'atr', 'spread', 'time_bucket', 'confirm_dollars', 'decision',
                    'model_score',
                    'entry_price', 'max_fav', 'trail_path_summary', 'exit_price',
-                   'held_minutes', 'outcome_dollars', 'magic']
+                   'held_minutes', 'outcome_dollars', 'magic', 'seed_source']
 TRADE_COLUMNS = ['ts', 'event', 'direction', 'entry', 'exit', 'sl',
-                 'outcome_dollars', 'ticket', 'magic']
+                 'outcome_dollars', 'ticket', 'magic', 'seed_source']
 
 EXIT_COLUMNS = ['max_fav', 'trail_path_summary', 'exit_price', 'held_minutes',
                 'outcome_dollars']
@@ -124,9 +127,10 @@ def _append_row(path, columns, row):
 
 
 def log_eval(run_dir, *, ts, direction, features, decision, model_score,
-             entry_price='', outcome_dollars='', magic=ROGUE_MAGIC):
+             entry_price='', outcome_dollars='', magic=ROGUE_MAGIC, seed_source=''):
     """Append ONE Rogue evaluation row (entry shape features + decision + model_score, with
-    the exit columns left blank to be backfilled on close). Returns the row dict. Guarded."""
+    the exit columns left blank to be backfilled on close). Returns the row dict. Guarded.
+    v3.6.0: seed_source tags the row with the day's seed provenance (D-8)."""
     try:
         f = features or {}
         row = {
@@ -138,7 +142,7 @@ def log_eval(run_dir, *, ts, direction, features, decision, model_score,
             'model_score': ('' if model_score is None else round(float(model_score), 4)),
             'entry_price': entry_price, 'max_fav': '', 'trail_path_summary': '',
             'exit_price': '', 'held_minutes': '', 'outcome_dollars': outcome_dollars,
-            'magic': int(magic),
+            'magic': int(magic), 'seed_source': seed_source or '',
         }
         _append_row(os.path.join(run_dir, PATTERNS_CSV), PATTERN_COLUMNS, row)
         return row
@@ -148,12 +152,13 @@ def log_eval(run_dir, *, ts, direction, features, decision, model_score,
 
 
 def log_trade(run_dir, *, ts, event, direction, entry, exit_px, sl,
-              outcome_dollars='', ticket='', magic=ROGUE_MAGIC):
-    """Append one ACTUAL Rogue fill/close row to rogue_trades.csv. Guarded."""
+              outcome_dollars='', ticket='', magic=ROGUE_MAGIC, seed_source=''):
+    """Append one ACTUAL Rogue fill/close row to rogue_trades.csv. Guarded.
+    v3.6.0: seed_source tags the row with the day's seed provenance (D-8)."""
     try:
         row = {'ts': ts, 'event': event, 'direction': direction, 'entry': entry,
                'exit': exit_px, 'sl': sl, 'outcome_dollars': outcome_dollars,
-               'ticket': ticket, 'magic': int(magic)}
+               'ticket': ticket, 'magic': int(magic), 'seed_source': seed_source or ''}
         _append_row(os.path.join(run_dir, TRADES_CSV), TRADE_COLUMNS, row)
         return row
     except Exception as e:
@@ -258,7 +263,8 @@ def observe(trader):
                       if '' not in (entry, peak, exit_px) else '')
         log_trade(run_dir, ts=ts, event='close', direction=side,
                   entry=entry, exit_px=exit_px, sl=exit_px,
-                  outcome_dollars=outcome, ticket=tk)
+                  outcome_dollars=outcome, ticket=tk,
+                  seed_source=str(st.get('seed_source') or ''))
         if enter_ts and outcome != '':
             backfill_exit(run_dir, enter_ts,
                           {'max_fav': max_fav, 'trail_path_summary': trail_path,

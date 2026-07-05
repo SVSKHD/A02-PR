@@ -41,9 +41,9 @@ def _persist_state(trader):
 # --- the demo-default-ON / funded-OFF run gate (freeze-safe) ----------------------
 def funded_default(is_demo, is_funded):
     """The value the boot promotes rogue_enabled to per account type: ON for a demo
-    (non-funded) account, OFF for funded. This is how 'demo default ON' is achieved
-    WITHOUT a True raw config default (which would break the all-flags-off==master
-    freeze). PURE."""
+    (non-funded) account, OFF for funded. v3.6.0: the config boot default is now
+    True, but this per-account promotion stays authoritative on every boot -- a
+    funded account is always forced OFF regardless of the config value. PURE."""
     if is_funded:
         return False
     return bool(is_demo)
@@ -52,9 +52,10 @@ def funded_default(is_demo, is_funded):
 def should_run(cfg, is_funded=False):
     """The single effective on/off for the ENTIRE Rogue mechanism. rogue_enabled is the
     master switch; a FUNDED account force-disables it (mandatory gate) regardless of the
-    flag -- un-proven Rogue never boots ON on real capital. With rogue_enabled False (the
-    raw config default) this is False -> no watch, no anchor, no entry -> master
-    byte-identical. PURE."""
+    flag -- un-proven Rogue never boots ON on real capital. With rogue_enabled explicitly
+    False this is False -> no watch, no anchor, no entry. (v3.6.0: the config boot
+    default is True; the runtime /rogue engine switch ANDs on top of this at the
+    drive() call site, it never replaces this gate.) PURE."""
     if is_funded:
         return False
     return bool(getattr(cfg, 'rogue_enabled', False))
@@ -209,9 +210,10 @@ def account_is_demo(trader):
 
 
 def promote_on_boot(trader):
-    """DEMO default-ON: on a demo (non-funded) account the boot promotes rogue_enabled ON
-    (the raw config default is OFF for funded-safety + the freeze). A funded account is
-    NEVER promoted. Returns the effective rogue_enabled. Guarded; never raises."""
+    """DEMO default-ON / FUNDED forced-OFF: on every boot the account type sets
+    rogue_enabled -- ON for a demo (non-funded) account, forced OFF for funded (v3.6.0:
+    the config boot default is True, but this per-account stamp stays authoritative).
+    Returns the effective rogue_enabled. Guarded; never raises."""
     try:
         is_demo = account_is_demo(trader)
         is_funded = not is_demo
@@ -358,6 +360,143 @@ def _a1_anchor_price(trader):
     return None
 
 
+# --- v3.6.0 ROGUE SEED INDEPENDENCE (anchors-off must NOT stop Rogue) --------------
+# Seed-source labels: every seed logs "ROGUE SEED via <SOURCE> @ price" and stamps
+# st['seed_source'] so ledger/pattern-log rows stay segmentable per source (D-8).
+SEED_A1_ANCHOR = 'A1_ANCHOR'               # the real A1 anchor read (master behavior)
+SEED_A1_TIME_SNAPSHOT = 'A1_TIME_SNAPSHOT' # tick price captured AT A1's scheduled time
+SEED_MARKET_OPEN = 'MARKET_OPEN'           # first live tick price of the broker day
+SEED_MANUAL = 'MANUAL'                     # the rogueseed command (manual_seed)
+
+
+def _anchors_engine_on(trader):
+    """Runtime state of the ANCHOR engine switch (live_trader.engines['anchors'],
+    /anchors on|off). GUARDED: a trader without the runtime dict (stubs, old
+    snapshots) reads ON -> the A1_ANCHOR read, i.e. master behavior."""
+    eng = getattr(trader, 'engines', None)
+    if not isinstance(eng, dict):
+        return True
+    return bool(eng.get('anchors', True))
+
+
+def _a1_gave_up(trader):
+    """True iff A1 is recorded MISSED for today (its late window elapsed with no
+    placement) -- the 'A1 otherwise doesn't place' branch of the seed fallback.
+    Guarded; False on any doubt (master behavior: keep waiting for A1)."""
+    try:
+        missed = (getattr(trader, 'state', {}) or {}).get('missed_anchors_today', []) or []
+        return any(str(lbl).startswith('A1') for lbl in missed)
+    except Exception:
+        return False
+
+
+def _a1_sched_reached(trader):
+    """True once broker wall-clock has reached A1's scheduled time today -- resolved
+    via the SAME resolver the anchor engine uses (_resolved_anchor_hm, Monday cushion
+    included), so the a1_time_snapshot capture has IDENTICAL timing to a real A1.
+    Guarded: any missing seam / error -> False (never snapshot early)."""
+    try:
+        import pandas as _pd
+        label, hour, minute = trader.cfg.anchors[0]
+        utc_now = _pd.Timestamp.now(tz='UTC')
+        bdate = (utc_now + _pd.Timedelta(hours=trader.cfg.broker_tz_offset_hours)).date()
+        rh, rm = trader._resolved_anchor_hm(label, bdate, hour, minute)
+        sched = trader._anchor_datetime_utc(bdate, rh,
+                                            trader.cfg.broker_tz_offset_hours, rm)
+        return bool(utc_now >= sched)
+    except Exception:
+        return False
+
+
+def _capture_seed_snapshots(trader, st, price):
+    """PASSIVE per-tick capture of the two fallback seed candidates (NO orders):
+    day_open_px = the first live tick price of the broker trading day this driver
+    saw; a1_snap_px = the tick price at A1's scheduled clock time. Both are captured
+    regardless of the current switch state (capturing a price is free), so a mid-day
+    /rogue on can still seed with A1 timing; resolve_seed picks AT SEED TIME which
+    one (if either) is used. Persisted with the governors (p1_state). Guarded."""
+    try:
+        if price is None:
+            return
+        changed = False
+        if st.get('day_open_px') is None:
+            st['day_open_px'] = round(float(price), 2)
+            changed = True
+        if st.get('a1_snap_px') is None and _a1_sched_reached(trader):
+            st['a1_snap_px'] = round(float(price), 2)
+            log.info(f"{ROGUE_ALERT_PREFIX} A1-time snapshot captured @ "
+                     f"{st['a1_snap_px']} (fallback seed candidate; no order placed)")
+            changed = True
+        if changed:
+            _persist_state(trader)
+    except Exception:
+        pass
+
+
+def resolve_seed(trader, st):
+    """(seed_px, seed_source) for the A1-mode engine when NO chain target exists.
+    Resolution happens AT SEED TIME from the CURRENT switch state:
+
+      1. a fallback seed already LATCHED today -> reuse it (a mid-day toggle must
+         never double-seed or orphan the day's chain);
+      2. anchor engine ON and A1 not given up -> the REAL A1 anchor read, per tick,
+         exactly as master (byte-identical when non_oco_enabled=True);
+      3. else cfg.rogue_seed_fallback: 'a1_time_snapshot' (DEFAULT -- the price
+         captured at A1's scheduled time) or 'market_open' (first tick of the
+         broker day).
+
+    Returns (None, source) while the chosen source has no price yet -- the engine
+    WAITS, exactly like master waits for A1 to place. Guarded reads only."""
+    if st.get('seed_px') is not None:
+        return float(st['seed_px']), st.get('seed_source')
+    if _anchors_engine_on(trader) and not _a1_gave_up(trader):
+        return _a1_anchor_price(trader), SEED_A1_ANCHOR
+    # already seeded TODAY via the real A1 read, and the switch was toggled off
+    # (or A1 later gave up) mid-day -> LATCH the recorded A1 seed instead of
+    # re-seeding via the fallback: one seed per day, never a double-seed.
+    if (st.get('seed_source') == SEED_A1_ANCHOR
+            and st.get('seed_recorded_px') is not None):
+        st['seed_px'] = float(st['seed_recorded_px'])
+        return st['seed_px'], SEED_A1_ANCHOR
+    mode = str(getattr(trader.cfg, 'rogue_seed_fallback', 'a1_time_snapshot')).lower()
+    if mode == 'market_open':
+        return st.get('day_open_px'), SEED_MARKET_OPEN
+    return st.get('a1_snap_px'), SEED_A1_TIME_SNAPSHOT
+
+
+def _record_seed(trader, st, seed_px, seed_source):
+    """Log 'ROGUE SEED via <SOURCE> @ price' ONCE per (source, price) episode and
+    stamp st['seed_source'] so every subsequent ledger/pattern row carries it.
+    A FALLBACK seed additionally LATCHES (st['seed_px']): once seeded today,
+    toggling the anchor engine does nothing to the seed/chain. The A1_ANCHOR read
+    is deliberately NOT latched -- it stays the live per-tick read master does.
+    Guarded; never raises onto the driver."""
+    try:
+        if seed_px is None:
+            return
+        key = f"{seed_source}:{round(float(seed_px), 2)}"
+        st['seed_source'] = seed_source
+        # remember the last recorded price: the A1_ANCHOR read stays live per tick
+        # (master), but if the switch is later toggled off mid-day, resolve_seed
+        # latches THIS price rather than re-seeding via the fallback.
+        st['seed_recorded_px'] = round(float(seed_px), 2)
+        if seed_source in (SEED_A1_TIME_SNAPSHOT, SEED_MARKET_OPEN):
+            st['seed_px'] = round(float(seed_px), 2)
+        if st.get('_seed_log_key') == key:
+            return
+        st['_seed_log_key'] = key
+        msg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ROGUE SEED via {seed_source} @ "
+               f"{round(float(seed_px), 2)}")
+        log.info(msg)
+        try:
+            trader.tele.info(msg)
+        except Exception:
+            pass
+        _persist_state(trader)
+    except Exception:
+        pass
+
+
 def _drive_a1(trader, st, allow_new_entries=True):
     """Fix 4 A1-ANCHORED driver (impure; runs ONLY when rogue_a1_anchor_mode is ON). Seeds
     from A1 (read-only) / chains to the last closed Rogue level, enters on a $10 move,
@@ -375,6 +514,10 @@ def _drive_a1(trader, st, allow_new_entries=True):
     price = _mid(trader)
     if price is None:
         return
+    # v3.6.0 SEED INDEPENDENCE: passively capture the fallback seed candidates
+    # (first-tick-of-day + A1-scheduled-time snapshot) every tick, whether or not
+    # they end up used -- resolve_seed decides AT SEED TIME. No orders placed.
+    _capture_seed_snapshots(trader, st, price)
     # book a broker-side close FIRST (frees the slot + records the level for chaining).
     o_before = st.get('open')
     if o_before is not None:
@@ -412,9 +555,17 @@ def _drive_a1(trader, st, allow_new_entries=True):
     detect_close(trader, st)
     if not allow_new_entries:
         return                              # Fix 3: no NEW entries post-EOD / kill-locked
-    anchor = a1_seed_anchor(st.get('a1_last_close'), _a1_anchor_price(trader))
+    # v3.6.0 SEED INDEPENDENCE: with no chain target, the seed source is resolved
+    # AT SEED TIME from the current switch state -- the real A1 anchor when the
+    # anchor engine placed (master, byte-identical), else the configured fallback
+    # (A1-time snapshot / market open). Every seed logs its source once and stamps
+    # st['seed_source'] for the ledger/pattern-log rows.
+    seed_px, seed_source = resolve_seed(trader, st)
+    anchor = a1_seed_anchor(st.get('a1_last_close'), seed_px)
     if anchor is None:
         return
+    if st.get('a1_last_close') is None:
+        _record_seed(trader, st, seed_px, seed_source)
     # P3 (E-17): this anchor is CHAINED iff it is the re-anchor detect_close planted
     # after a close (chain_anchor matches the active chain target). The A1 morning seed,
     # a manual rogueseed, and a reversal-recovery anchor all leave chain_anchor unset ->
@@ -668,7 +819,8 @@ def _model_gate(trader, st, price, epx, sl, ok):
         if st.get('rpl_eval_anchor') != st.get('anchor'):   # one eval per setup (no flood)
             _pl.log_eval(getattr(trader, 'run_dir', '.'), ts=ts, direction=st.get('leg_dir'),
                          features=feats, decision=decision, model_score=score,
-                         entry_price=(round(float(epx), 2) if decision == _pl.ENTER else ''))
+                         entry_price=(round(float(epx), 2) if decision == _pl.ENTER else ''),
+                         seed_source=str(st.get('seed_source') or ''))
             st['rpl_eval_anchor'] = st.get('anchor')
             if decision == _pl.ENTER:
                 rpl = getattr(trader, '_rpl', None)
@@ -721,7 +873,8 @@ def _mark_rogue_open(trader, st, entry_px, sl, tk, rc):
         _bm.append_ledger(trader, {'ts': _pd.Timestamp.now(tz='UTC').isoformat(),
                                    'anchor': ROGUE_LABEL, 'kind': 'ROGUE',
                                    'event': 'enter', 'arm_px': st.get('anchor'),
-                                   'entry_px': entry_px})
+                                   'entry_px': entry_px,
+                                   'seed_source': st.get('seed_source')})
     except Exception:
         pass
     try:
@@ -906,7 +1059,8 @@ def detect_close(trader, st):
                                    'anchor': ROGUE_LABEL, 'kind': 'ROGUE',
                                    'event': 'exit', 'entry_px': o.get('entry'),
                                    'exit_px': _rogue_close_price(trader, tk),
-                                   'pnl_usd': round(float(pnl), 2)})
+                                   'pnl_usd': round(float(pnl), 2),
+                                   'seed_source': st.get('seed_source')})
     except Exception:
         pass
     st['open'] = None
@@ -1025,6 +1179,31 @@ def force_close_open(trader, reason="flatten"):
         return False
 
 
+def cancel_pendings(trader, reason="flatten"):
+    """v3.6.0 /rogue flatten confirm: cancel any PENDING order carrying ROGUE_MAGIC
+    (20260626). Rogue currently places market entries only, so this is normally a
+    no-op -- it exists so a scoped Rogue flatten provably leaves nothing resting at
+    the broker. ROGUE-ONLY: an anchor (20260522) or warmup (9999998) pending is
+    never touched. Returns the number cancelled. Guarded; never raises."""
+    n = 0
+    try:
+        pendings = trader.adapter.mt5.orders_get(symbol=trader.cfg.symbol) or []
+        for o in pendings:
+            try:
+                if int(getattr(o, 'magic', -1)) != ROGUE_MAGIC:
+                    continue
+                trader.adapter.cancel_order(int(o.ticket), dry_run=trader.paper)
+                n += 1
+            except Exception as e:
+                log.warning(f"{ROGUE_ALERT_PREFIX} cancel pending "
+                            f"{getattr(o, 'ticket', '?')} non-fatal: {e!r}")
+        if n:
+            log.info(f"{ROGUE_ALERT_PREFIX} cancelled {n} Rogue pending(s) ({reason})")
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} cancel_pendings non-fatal: {e!r}")
+    return n
+
+
 # --- manual current-tick seed (mid-day restart: no A1 event to seed the A1-mode engine) --
 def manual_seed_ok(cfg, is_demo):
     """PURE gate for `rogueseed`. Returns (ok, reason). Valid ONLY when rogue_a1_anchor_mode
@@ -1075,6 +1254,8 @@ def manual_seed(trader, price):
         # plant the seed as the chain target the Fix 4 engine anchors from.
         st['a1_last_close'] = price
         st['a1_reverted'] = False
+        # v3.6.0: a manual seed is its own provenance -- ledger/pattern rows carry it.
+        st['seed_source'] = SEED_MANUAL
         # P3 (E-17): a manual seed is NOT a chained anchor -- no cooldown/displacement
         # gate on the first entry off it (same exemption as the A1 morning seed).
         st['chain_time'] = None

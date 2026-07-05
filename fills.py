@@ -587,6 +587,21 @@ def _check_boost_triggers(self):
     # (rally._override_entry_decision) can read it without a signature change. Harmless
     # when override_entry_enabled is OFF (the gate never reads it).
     self._last_boost_mid = mid
+    # v3.6.0 ENGINE SWITCH (anchors OFF = MANAGE-ONLY): the whole boost family
+    # (RALLY / RESCUE / F-B trapped late-rescue) opens NEW tickets off an anchor
+    # leg, so it is entry-side and switched off with the engine -- including on
+    # legs restored from state.json (every candidate leg lives in shadow_positions,
+    # exactly what the loop below iterates). The whipsaw-cap enforcement still
+    # runs: hard-closing a breaching boost protects an OPEN position, it is not a
+    # new entry. GUARDED read (a stub trader without the runtime dict reads
+    # ENABLED -- see live_trader._engine_enabled).
+    _eng = getattr(self, 'engines', None)
+    if isinstance(_eng, dict) and not bool(_eng.get('anchors', True)):
+        try:
+            self._enforce_boost_cap(mid)
+        except Exception as e:
+            log.warning(f"_enforce_boost_cap failed: {e!r}")
+        return
     import tick_hold as _th
     # v3.2.8 Phase 1: ASYMMETRIC arm. A WINNING leg arms RALLY at +rally_arm_fav ($5);
     # a LOSING leg arms RESCUE at -rescue_arm ($10, unchanged boost_trigger_dollars).
