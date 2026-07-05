@@ -224,9 +224,13 @@ def run_daily_report(trader, date_str=None):
 def load_rogue_closes(jdir, date_str):
     """Impure: closed Rogue events (kind=ROGUE, event=exit) for `date_str` out of
     boost_ledger.csv, as [{'pnl': float}, ...]. `ts` is an ISO-8601 UTC timestamp
-    (see append_ledger callers) so its date prefix is compared against `date_str`.
+    (see append_ledger callers), but `date_str` is an IST broker/calendar day (same
+    convention as journal.py's date_ist) -- so `ts` is converted to Asia/Kolkata
+    before its date is compared, not sliced as a raw UTC prefix. A close at, say,
+    18:45 UTC lands on the NEXT IST calendar day and must bucket there.
     Missing file / rows -> []. Never raises."""
     import csv as _csv
+    import pandas as _pd
     path = os.path.join(jdir, "boost_ledger.csv")
     out = []
     if not os.path.exists(path):
@@ -237,7 +241,16 @@ def load_rogue_closes(jdir, date_str):
                 if r.get('kind') != 'ROGUE' or r.get('event') != 'exit':
                     continue
                 ts = r.get('ts') or ''
-                if ts[:10] != date_str:
+                if not ts:
+                    continue
+                try:
+                    tsp = _pd.Timestamp(ts)
+                    if tsp.tzinfo is None:
+                        tsp = tsp.tz_localize('UTC')
+                    ts_date_ist = tsp.tz_convert('Asia/Kolkata').strftime('%Y-%m-%d')
+                except (ValueError, TypeError):
+                    continue
+                if ts_date_ist != date_str:
                     continue
                 try:
                     pnl = float(r.get('pnl_usd') or 0.0)

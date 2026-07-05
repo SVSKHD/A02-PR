@@ -1520,7 +1520,11 @@ class LiveTrader:
                 # v3.5.0 feature 10: per-anchor markdown report (read-only; guarded).
                 try:
                     import boost_metrics as _bm
-                    _bm.run_daily_report(self)
+                    # R-1: pass the same broker_date pnl_report gets below, so both
+                    # EOD reports key off one authoritative day instead of _bm
+                    # defaulting to IST wall-clock now() (which can already be
+                    # tomorrow relative to the broker day this EOD branch is for).
+                    _bm.run_daily_report(self, date_str=str(broker_date))
                 except Exception:
                     pass
                 # P4: full per-engine/per-anchor daily P&L report (markdown + CSV

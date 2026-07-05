@@ -293,6 +293,8 @@ STEP_NAMES = {
     215: "e19 boot survives",     # unconfirmed offset -> sleep-probe, never the clock-drift abort
     216: "friday flatten gate",   # Friday cutoff flattens anchor+boost, Rogue untouched, blocks entries
     217: "friday a4 a5 skip",     # a5_skip_friday/a4_skip_friday skip placement outright on Friday
+
+    218: "r1 date correctness",   # explicit date_str (no now()-default) + IST midnight bucketing
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4307,6 +4309,63 @@ class SelfTest:
             self._record(217, FAIL, f"raised: {e!r}"); return
         self._record(217, PASS if ok else FAIL, detail)
 
+    def _step_r1_date_correctness(self):
+        # 218 R-1: two date bugs, one acceptance test.
+        # (a) run_daily_report(trader, date_str=...) must use the EXACT date_str
+        #     passed (the live EOD hook now passes broker_date explicitly instead
+        #     of letting it default to IST wall-clock now(), which used to leak
+        #     whichever day now() landed on -- e.g. an early-morning-IST EOD firing
+        #     for YESTERDAY's broker day would otherwise misfile as today).
+        # (b) load_rogue_closes buckets a Rogue exit by its IST calendar day, not
+        #     a raw UTC ts[:10] slice -- a close at 18:45 UTC (= 00:15 IST the
+        #     NEXT day) must land in the next day's Rogue section, not today's.
+        import boost_metrics as _bm, tempfile, os as _os, csv as _csv
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_r1_date_')
+
+            # (a) explicit date_str is honored even though "now" would differ.
+            month_csv = _os.path.join(tmp, "trades_2026-07.csv")
+            with open(month_csv, 'w', newline='') as f:
+                w = _csv.writer(f)
+                w.writerow(['date_ist', 'anchor', 'realized_pnl_usd'])
+                w.writerow(['2026-07-02', 'A1', '100.00'])   # requested day
+                w.writerow(['2026-07-03', 'A1', '999.00'])   # a DIFFERENT day -- must be excluded
+
+            import types as _types
+            trader = _types.SimpleNamespace(
+                cfg=_types.SimpleNamespace(util_daily_report=True),
+                _journal_dir=lambda: tmp, shadow_positions={})
+            out_path = _bm.run_daily_report(trader, date_str='2026-07-02')
+            with open(out_path) as f:
+                md = f.read()
+            explicit_date_honored = ('$+100.00' in md and '999.00' not in md
+                                     and out_path.endswith('daily_report_2026-07-02.md'))
+
+            # (b) IST midnight bucketing on load_rogue_closes.
+            ledger_csv = _os.path.join(tmp, "boost_ledger.csv")
+            with open(ledger_csv, 'w', newline='') as f:
+                w = _csv.writer(f)
+                w.writerow(_bm.LEDGER_COLUMNS)
+                # 18:45 UTC on 07-03 = 00:15 IST on 07-04 -- belongs to the NEXT IST day.
+                w.writerow(['2026-07-03T18:45:00+00:00', 'A4', 'ROGUE', 'exit',
+                           '', '', '', '50.00'])
+                # 10:00 UTC on 07-03 = 15:30 IST on 07-03 -- same-day control case.
+                w.writerow(['2026-07-03T10:00:00+00:00', 'A4', 'ROGUE', 'exit',
+                           '', '', '', '25.00'])
+
+            day_03 = _bm.load_rogue_closes(tmp, '2026-07-03')
+            day_04 = _bm.load_rogue_closes(tmp, '2026-07-04')
+            midnight_boundary_ok = (len(day_03) == 1 and day_03[0]['pnl'] == 25.0
+                                    and len(day_04) == 1 and day_04[0]['pnl'] == 50.0)
+
+            ok = explicit_date_honored and midnight_boundary_ok
+            detail = (f"explicit_date_str_honored={explicit_date_honored} "
+                      f"ist_midnight_bucketing={midnight_boundary_ok} "
+                      f"(07-03={[r['pnl'] for r in day_03]} 07-04={[r['pnl'] for r in day_04]})")
+        except Exception as e:
+            self._record(218, FAIL, f"raised: {e!r}"); return
+        self._record(218, PASS if ok else FAIL, detail)
+
     def _step_rally_sl13_cap910(self):
         # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
         # cap -$700 -- per-kind, never one shared value. Asserts the plan SL, the live
@@ -8107,6 +8166,9 @@ class SelfTest:
             self._step_e19_boot_survives()
             self._step_friday_flatten_gate()
             self._step_friday_a4_a5_skip()
+            # R-1: EOD hook passes broker_date explicitly + Rogue closes bucket by
+            # IST calendar day, not a raw UTC ts[:10] slice.
+            self._step_r1_date_correctness()
         finally:
             self._cleanup()
         return self._report(ts)
