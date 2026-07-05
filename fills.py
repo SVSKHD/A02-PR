@@ -616,6 +616,24 @@ def _check_boost_triggers(self):
                 _lr = None
             if _lr is not None:
                 shadow['trapped_rescue_fired'] = True   # one late-rescue per trapped leg
+                # V-3/D-6 Branch 2: this path fires THROUGH the break-and-hold gate
+                # (by design, see the comment above) with no distinct log line -- the
+                # ONLY prior evidence was the generic "BOOST FIRED" alert inside
+                # place_fleet, indistinguishable from a normal RALLY/RESCUE fire.
+                # Logging only: emits before the fire, never gates it.
+                try:
+                    self.tele.info(
+                        f"🛟 F-B TRAPPED RESCUE FIRED | parent {ticket} | "
+                        f"{_lr.boost_side} x{_lr.n} | SL ${_lr.sl_dollars:.2f}")
+                except Exception:
+                    pass
+                if tr is not None:
+                    try:
+                        tr.break_eval(shadow.get('anchor_label'), side=_lr.boost_side,
+                                      kind=_lr.kind, result='BYPASS_TRAPPED_RESCUE',
+                                      reason='fb_trapped_late_rescue_fires_through_gate')
+                    except Exception:
+                        pass
                 self._fire_boost_event(ticket, shadow, _lr)
                 continue
         # winning side arms at the rally arm ($5); losing side at the rescue arm ($10).

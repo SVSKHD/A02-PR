@@ -295,6 +295,7 @@ STEP_NAMES = {
     217: "friday a4 a5 skip",     # a5_skip_friday/a4_skip_friday skip placement outright on Friday
 
     218: "r1 date correctness",   # explicit date_str (no now()-default) + IST midnight bucketing
+    219: "fb silent-fire logging",  # F-B log line + ledger kind=FB + swallowed-write now alerts
 
     220: "d6 a4 default true",     # a4_skip_friday now defaults True (was False pre-D-6)
     221: "d6 poll until flat",     # poll loop retries a failed pass; latches only on verified flat
@@ -3829,6 +3830,7 @@ class SelfTest:
                                       rally_boosts_enabled=False, rescue_boosts_enabled=False)
             fired = []
             gate_asked = {'n': 0}
+            logged = []
             tk = types.SimpleNamespace(bid=4055.00, ask=4055.20)  # mid 4055.10: -$10.54 adverse
             mt5 = types.SimpleNamespace(symbol_info_tick=lambda s: tk)
             adapter = types.SimpleNamespace(mt5=mt5)
@@ -3839,6 +3841,7 @@ class SelfTest:
                 cfg=cfg, adapter=adapter, paper=False, symbol=cfg.symbol,
                 shadow_positions={777: shadow},
                 _last_boost_mid=None,
+                tele=types.SimpleNamespace(info=lambda msg, **k: logged.append(msg)),
                 _break_and_hold_ok=lambda sh, pl: (gate_asked.__setitem__(
                     'n', gate_asked['n'] + 1), False)[1],   # would ALWAYS refuse
                 _rescue_entry_ok=lambda sh, pl: False,
@@ -3850,9 +3853,13 @@ class SelfTest:
             hedge_fired = (len(fired) == 1 and fired[0].event_type == 'TRAPPED_LATE_RESCUE'
                           and fired[0].boost_side == 'SELL')
             gate_never_asked = (gate_asked['n'] == 0)
-            ok = hedge_fired and gate_never_asked
+            # Branch 2 (2a): a distinct log line now fires BEFORE the hedge (no
+            # ptrace attr on this stub -> tr.break_eval is skipped, tele.info isn't).
+            logged_ok = (len(logged) == 1 and 'F-B TRAPPED RESCUE FIRED' in logged[0]
+                        and 'parent 777' in logged[0] and 'SELL' in logged[0])
+            ok = hedge_fired and gate_never_asked and logged_ok
             detail = (f"hedge_fired={hedge_fired} break_and_hold_never_asked={gate_never_asked} "
-                      f"(gate_would_have_refused=True)")
+                      f"(gate_would_have_refused=True) fb_log_line_emitted={logged_ok}")
         except Exception as e:
             self._record(205, FAIL, f"raised: {e!r}"); return
         self._record(205, PASS if ok else FAIL, detail)
@@ -4372,6 +4379,97 @@ class SelfTest:
         except Exception as e:
             self._record(218, FAIL, f"raised: {e!r}"); return
         self._record(218, PASS if ok else FAIL, detail)
+
+    def _mk_fb_trader(self, tmp, extra_shadow=None):
+        """Shared stub for step 219: a trapped BUY leg $10.54 adverse, wired through
+        the REAL fills._fire_boost_event -> boosts_dispatch -> rescue.fire ->
+        boosts_common.place_fleet chain (only the break-and-hold/rescue-entry/FP-guard
+        seams are stubbed -- the trapped path never reaches them) so the ledger write
+        and the new log line are exercised end-to-end, not just the gate bypass."""
+        import types, dataclasses
+        import fills as _fills
+        cfg = dataclasses.replace(self.cfg, trapped_late_rescue_enabled=True,
+                                  trapped_rescue_arm_dollars=10.0,
+                                  rescue_boost_count=1, lot_size=0.10,
+                                  contract_size=100.0)
+        tk = types.SimpleNamespace(bid=4055.00, ask=4055.20)  # mid 4055.10: -$10.54 adverse
+        mt5 = types.SimpleNamespace(symbol_info_tick=lambda s: tk)
+        adapter = types.SimpleNamespace(
+            mt5=mt5, place_market_order=lambda sym, side, lot, sl=None, tp=None,
+            magic=None, comment=None, dry_run=False: types.SimpleNamespace(
+                retcode=10009, order=90001, deal=90001, price=4054.85))
+        shadow = dict(extra_shadow or {
+            'side': 'BUY', 'leg_fill_price': 4065.64, 'entry_price': 4065.64,
+            'anchor_label': 'A1', 'boost': False, 'boost_fired': False,
+            'boost_eligible': True, 'boost_rally_only': True})
+        logged = []
+        tr = types.SimpleNamespace(
+            cfg=cfg, adapter=adapter, paper=False, symbol=cfg.symbol,
+            shadow_positions={777: shadow}, _last_boost_mid=None,
+            state={'last_broker_date': '2026-07-03'},
+            tele=types.SimpleNamespace(
+                info=lambda msg, **k: logged.append(('info', msg)),
+                send=lambda msg, *a, **k: logged.append(('send', msg)),
+                error=lambda msg, **k: logged.append(('error', msg))),
+            _journal_dir=lambda: tmp,
+            _break_and_hold_ok=lambda sh, pl: False,
+            _rescue_entry_ok=lambda sh, pl: False,
+            _fp_guard_ok=lambda sh, n: True,
+            _enforce_boost_cap=lambda mid: None)
+        tr._fire_boost_event = lambda tkt, sh, pl: _fills._fire_boost_event(tr, tkt, sh, pl)
+        return tr, logged
+
+    def _step_fb_silent_fire_logging(self):
+        # 219 Branch 2 (2a-2d): the F-B trapped late-rescue path fires through the
+        # SAME dispatch -> boosts_common.place_fleet as a normal RALLY/RESCUE boost.
+        # Exercise the REAL chain end-to-end and assert: (a) the distinct F-B log
+        # line fires before the hedge; (b) the ledger row lands kind=FB (not
+        # RESCUE, which is all plan.kind ever says for F-B) with ts populated;
+        # (c) a ledger-write failure is now logged + alerted, never silently
+        # swallowed -- R-3(d)'s real fills went missing for weeks with zero trace
+        # via exactly this kind of bare except:pass.
+        import tempfile, os as _os, csv as _csv
+        import fills as _fills
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_fb_ledger_')
+            tr, logged = self._mk_fb_trader(tmp)
+            _fills._check_boost_triggers(tr)
+
+            fb_log = any(k == 'info' and 'F-B TRAPPED RESCUE FIRED' in m
+                        and 'parent 777' in m and 'SELL' in m for k, m in logged)
+            ledger_path = _os.path.join(tmp, 'boost_ledger.csv')
+            with open(ledger_path) as f:
+                rows = list(_csv.DictReader(f))
+            ledger_ok = (len(rows) == 1 and rows[0]['kind'] == 'FB'
+                        and rows[0]['event'] == 'enter' and bool(rows[0]['ts']))
+
+            # (2d) force the ledger write to fail and confirm it now surfaces loud
+            # instead of vanishing into a bare except:pass.
+            import boost_metrics as _bm
+            orig_append = _bm.append_ledger
+
+            def _boom(*a, **k):
+                raise OSError('disk full (simulated)')
+            _bm.append_ledger = _boom
+            try:
+                tmp2 = tempfile.mkdtemp(prefix='aureon_fb_ledger2_')
+                tr2, logged2 = self._mk_fb_trader(tmp2, extra_shadow={
+                    'side': 'BUY', 'leg_fill_price': 4065.64, 'entry_price': 4065.64,
+                    'anchor_label': 'A1', 'boost': False, 'boost_fired': False,
+                    'boost_eligible': True, 'boost_rally_only': True})
+                _fills._check_boost_triggers(tr2)
+                swallow_hardened = any(k == 'error' for k, m in logged2)
+            finally:
+                _bm.append_ledger = orig_append
+
+            ok = fb_log and ledger_ok and swallow_hardened
+            detail = (f"fb_log_line={fb_log} ledger_kind_fb={ledger_ok} "
+                      f"(row={rows[0] if rows else None}) "
+                      f"write_failure_now_alerted={swallow_hardened}")
+        except Exception as e:
+            self._record(219, FAIL, f"raised: {e!r}"); return
+        self._record(219, PASS if ok else FAIL, detail)
+
     def _step_d6_a4_default_true(self):
         # 220 D-6 (3a): a4_skip_friday's ACTUAL default is now True (was False)
         # -- the weekend-hold ban makes any Friday anchor that might still be
@@ -8375,6 +8473,9 @@ class SelfTest:
             # R-1: EOD hook passes broker_date explicitly + Rogue closes bucket by
             # IST calendar day, not a raw UTC ts[:10] slice.
             self._step_r1_date_correctness()
+            # Branch 2 (V-3): F-B trapped late-rescue log line + ledger kind=FB
+            # + hardened ledger-write-failure alerting.
+            self._step_fb_silent_fire_logging()
             # D-6: Friday poll-flatten (never single-shot) + a4 default flip +
             # both-engine entry blocking.
             self._step_d6_a4_default_true()

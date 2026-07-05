@@ -133,12 +133,31 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
             # immediate/non-pullback boost fill was silently absent from the ledger.
             try:
                 import boost_metrics as _bm
+                # R-3/D-6 Branch 2 (2c): a trapped late-rescue hedge (F-B) routes
+                # through this SAME shared placement loop as a normal RESCUE
+                # (plan.kind is always "RESCUE" for F-B -- see boosts.py's
+                # plan_trapped_late_rescue). Tag it distinctly as kind=FB so the
+                # ledger (and the daily Rogue/report readers of it) can tell an
+                # F-B hedge apart from an ordinary RESCUE boost instead of both
+                # silently landing as "RESCUE".
+                _ledger_kind = 'FB' if plan.event_type == 'TRAPPED_LATE_RESCUE' else plan.kind
                 _bm.append_ledger(self, {
                     'ts': pd.Timestamp.now(tz='UTC').isoformat(), 'anchor': anchor,
-                    'kind': plan.kind, 'event': 'enter', 'arm_px': round(ref, 2),
+                    'kind': _ledger_kind, 'event': 'enter', 'arm_px': round(ref, 2),
                     'entry_px': round(b_fp, 2)})
-            except Exception:
-                pass
+            except Exception as e:
+                # 2d: a swallowed ledger-write failure here is exactly how R-3(d)'s
+                # real fills went missing for weeks with zero trace. Never let it
+                # vanish silently again -- log loud and alert, even though the
+                # write itself still fails soft (never blocks placement/order flow).
+                log.error(f"boost_ledger.csv write FAILED for {plan.kind} "
+                         f"(ticket {b_tk}): {e!r}")
+                try:
+                    self.tele.error(
+                        f"⚠️ boost_ledger.csv write failed for {plan.kind} @ {anchor} "
+                        f"(ticket {b_tk}): {md_escape(repr(e))}")
+                except Exception:
+                    pass
         else:
             self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} rejected rc={rc} ({md_escape(rcn)})")
             fleet.append({'ticket': None, 'fill': None, 'rc': rc, 'comment': cmt})
