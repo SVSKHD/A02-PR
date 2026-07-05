@@ -106,12 +106,21 @@ def _ensure_day_start_equity(self):
     log.info(f"Daily kill baseline backfilled to opening equity ${base:,.2f}")
 
 
-def _flatten_all(self, reason: str = "Manual"):
+def _flatten_all(self, reason: str = "Manual", scope: str = "ALL"):
     """v2.5: hardened EOD flatten — retries up to 3x on rc=-1, verifies via broker query.
     Critical: if a position fails to close at EOD, it stays open OVERNIGHT
-    with bracket SL, and the bot loses tracking. Worth fighting for the close."""
+    with bracket SL, and the bot loses tracking. Worth fighting for the close.
+
+    v3.6.0 scope: "ALL" (default -- every existing caller, byte-identical) also
+    force-closes the open Rogue ticket on a non-EOD reason (the E-15 block below);
+    "ANCHORS" (the /anchors flatten confirm command) touches ONLY the anchor
+    engine's book -- shadow_positions/shadow_pendings hold exclusively magic-
+    20260522 legs (Rogue's ticket lives in self._rogue['open'], never here) and
+    the Rogue force-close is skipped, so a scoped flatten can never close a
+    Rogue 20260626 ticket."""
     self.tele.warn(f"FLATTEN ({reason}) — closing {len(self.shadow_positions)} positions, "
-                   f"cancelling {len(self.shadow_pendings)} pendings")
+                   f"cancelling {len(self.shadow_pendings)} pendings"
+                   + (" [ANCHORS-scoped: Rogue untouched]" if scope == "ANCHORS" else ""))
 
     import time as _time
 
@@ -182,7 +191,9 @@ def _flatten_all(self, reason: str = "Manual"):
     # touches it. EOD is EXCLUDED here: rogue.eod_flatten (gated on rogue_flatten_at_eod,
     # default OFF) owns the EOD decision so a deliberate post-EOD ride is preserved.
     # Rogue-scoped + guarded so it can never block the anchor flatten.
-    if str(reason) != "EOD":
+    # v3.6.0: an ANCHORS-scoped flatten (/anchors flatten confirm) also skips this --
+    # it must only ever touch magic 20260522.
+    if str(reason) != "EOD" and str(scope) != "ANCHORS":
         try:
             import rogue as _rogue
             _rogue.force_close_open(self, reason=reason)

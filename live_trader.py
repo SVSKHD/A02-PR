@@ -251,6 +251,21 @@ class LiveTrader:
         # Pause flag (set via /pause command)
         self.paused = False
 
+        # v3.6.0 ENGINE SWITCHES — runtime per-engine flags, owned HERE (the config
+        # keys are boot defaults only). Toggled live via Discord (/anchors on|off,
+        # /rogue on|off; effective next tick, no restart) and PERSISTED in
+        # run/state.json like the Rogue governors (p1_state snapshot/recover): on a
+        # SAME-day restart the persisted state WINS, and a restored value that
+        # differs from the boot default emits the ENGINE STATE OVERRIDE alert.
+        # OFF = MANAGE-ONLY (no NEW entries for that engine; trails/exits/SL/EOD/
+        # Friday-flatten/kill-switch continue on all open positions of both magics
+        # -- OFF never orphans a leg).
+        self.engines = {'anchors': bool(getattr(cfg, 'non_oco_enabled', True)),
+                        'rogue': bool(getattr(cfg, 'rogue_enabled', True))}
+        # the boot defaults, frozen at init, for the restore-override comparison
+        # (cfg.rogue_enabled itself is mutated later by rogue.promote_on_boot).
+        self._engine_boot_defaults = dict(self.engines)
+
         # Monday-wake hardening: no anchor places until the broker time offset is
         # measured fresh on wake and matches cfg.EXPECTED_BROKER_OFFSET_HOURS.
         # Stays False until _validate_offset_on_wake() confirms it (live mode).
@@ -581,6 +596,9 @@ class LiveTrader:
             "anchors_processed_today": self.state.get("processed_anchors_today", []),
             "kill_switch_locked": self.state.get("kill_switch_locked", False),
             "paused": self.paused,
+            # v3.6.0 engine switches (runtime state; config keys are boot defaults)
+            "engines": {"anchors": self._engine_enabled('anchors'),
+                        "rogue": self._engine_enabled('rogue')},
             "mode": "paper" if self.paper else "live",
             "lot_size": self.cfg.lot_size,
             "starting_balance": self.cfg.starting_balance,
@@ -660,7 +678,30 @@ class LiveTrader:
         cmds = self._consume_commands()
         for c in cmds:
             cmd = c.get("cmd", "").lower()
-            if cmd == "flatten":
+            args = c.get("args") or {}
+            if cmd == "engine":
+                # v3.6.0 /anchors on|off · /rogue on|off (queued by the watchdog).
+                # Effective NEXT TICK (this consume runs at tick step 0); the bot
+                # posts the confirm embed itself (engines state + counts per magic).
+                try:
+                    self._set_engine(str(args.get("engine", "")).lower(),
+                                     str(args.get("action", "")).lower() == "on")
+                except Exception as e:
+                    log.warning(f"engine toggle command failed (non-fatal): {e!r}")
+            elif cmd == "engines_status":
+                # v3.6.0 /engines status · /anchors status · /rogue status
+                try:
+                    self._post_engines_status()
+                except Exception as e:
+                    log.warning(f"engines status command failed (non-fatal): {e!r}")
+            elif cmd in ("anchors_flatten", "rogue_flatten"):
+                # v3.6.0 confirm-gated per-magic flatten (see _handle_engine_flatten).
+                try:
+                    self._handle_engine_flatten(cmd.split("_", 1)[0],
+                                                bool(args.get("confirm", False)))
+                except Exception as e:
+                    log.warning(f"{cmd} command failed (non-fatal): {e!r}")
+            elif cmd == "flatten":
                 self.tele.warn("🚨 /flatten received — closing all positions")
                 self._flatten_all(reason="ManualFlatten")
             elif cmd == "pause":
@@ -851,6 +892,144 @@ class LiveTrader:
         thin, separately-testable wrapper around _friday_flatten_reached so the
         two _tick() call sites (anchor-due, Rogue drive()) can't drift apart."""
         return self._friday_flatten_reached(broker_date, utc_now)
+
+    # ------------------------------------------------------------------------
+    # v3.6.0 ENGINE SWITCHES — runtime read/toggle + the shared entries-blocked
+    # seams (effective_block = friday_window OR engine_disabled, per engine).
+    # ------------------------------------------------------------------------
+
+    def _engine_enabled(self, engine: str) -> bool:
+        """Runtime engine-switch read ('anchors' | 'rogue'). GUARDED: a trader
+        without the engines dict (selftest stubs, old snapshots) reads ENABLED --
+        the switches can only ever REMOVE behavior, never invent it."""
+        eng = getattr(self, 'engines', None)
+        if not isinstance(eng, dict):
+            return True
+        return bool(eng.get(engine, True))
+
+    def _set_engine(self, engine: str, on: bool, source: str = "Discord"):
+        """Flip a runtime engine switch (effective next tick, no restart), persist it
+        to run/state.json (p1_state, like the governors), and post the confirm embed
+        (both engines' state + open-position count per magic). Guarded."""
+        if engine not in ('anchors', 'rogue'):
+            return
+        prev = self._engine_enabled(engine)
+        self.engines[engine] = bool(on)
+        mode = ('entries live' if on else
+                'MANAGE-ONLY: no new entries; trails/exits/SL/EOD/kill-switch '
+                'continue on open positions')
+        log.warning(f"ENGINE SWITCH: {engine} {'ON' if on else 'OFF'} "
+                    f"(was {'ON' if prev else 'OFF'}, via {source}) — {mode}")
+        try:
+            import p1_state as _p1
+            _p1.save(self, force=True)   # a toggle must survive a restart (paper too)
+        except Exception:
+            pass
+        self._post_engines_status(
+            note=f"{'⚓' if engine == 'anchors' else '🦏'} "
+                 f"`/{engine} {'on' if on else 'off'}` applied — effective next tick"
+                 + ("" if on else " (manage-only: existing positions keep trailing)"))
+
+    def _anchor_entries_blocked(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
+        """v3.6.0 shared entries-blocked seam for the ANCHOR engine (the PR-89 D-6
+        seam, extended): effective_block = friday_window OR engine_disabled. Gates
+        NEW straddle placement only -- management of open positions never routes
+        through here (OFF never orphans a leg)."""
+        return (self._friday_entries_blocked(broker_date, utc_now)
+                or not self._engine_enabled('anchors'))
+
+    def _rogue_entries_blocked(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
+        """v3.6.0 shared entries-blocked seam for the ROGUE engine: effective_block =
+        friday_window OR engine_disabled. Feeds drive(allow_new_entries=...) -- with
+        it blocked, drive() still trail-manages and books closes on an existing open
+        Rogue position (manage-only), it just takes no seed/chain/reversal entry."""
+        return (self._friday_entries_blocked(broker_date, utc_now)
+                or not self._engine_enabled('rogue'))
+
+    def _open_counts_per_magic(self):
+        """Broker-truth open-position/pending counts per magic (anchor 20260522 /
+        Rogue 20260626 / other) for the engines confirm embed. Reuses the D-6
+        broker query. Paper mode / query failure degrade to shadow-book counts."""
+        try:
+            flat, counts = self._friday_query_flat()
+            if 'query_error' not in counts:
+                return counts
+        except Exception:
+            pass
+        return {'anchor_positions': len(getattr(self, 'shadow_positions', {}) or {}),
+                'rogue_positions': (1 if (getattr(self, '_rogue', None) or {}).get('open')
+                                    else 0),
+                'anchor_pendings': len(getattr(self, 'shadow_pendings', {}) or {})}
+
+    def _post_engines_status(self, note: str = ""):
+        """The /engines status (and toggle-confirm) embed: BOTH engines' runtime
+        state + open-position count per magic. Guarded; never raises onto the tick."""
+        try:
+            import rogue as _rogue
+            counts = self._open_counts_per_magic()
+            snap = {
+                "Anchors engine": ("🟢 ON" if self._engine_enabled('anchors')
+                                   else "🔴 OFF (manage-only)"),
+                "Rogue engine": ("🟢 ON" if self._engine_enabled('rogue')
+                                 else "🔴 OFF (manage-only)"),
+                f"Open {self._FRIDAY_ANCHOR_MAGIC} (anchor)":
+                    f"{counts.get('anchor_positions', 0)} pos / "
+                    f"{counts.get('anchor_pendings', 0)} pend",
+                f"Open {_rogue.ROGUE_MAGIC} (Rogue)":
+                    f"{counts.get('rogue_positions', 0)} pos / "
+                    f"{counts.get('rogue_pendings', 0)} pend",
+                "Seed fallback": str(getattr(self.cfg, 'rogue_seed_fallback',
+                                             'a1_time_snapshot')),
+            }
+            lines = ([note] if note else []) + [
+                f"{k}: {v}" for k, v in snap.items()]
+            self.tele.send("⚙️ *ENGINES*\n" + "\n".join(lines), Severity.INFO,
+                           card=dc.card_status(snap))
+        except Exception as e:
+            log.warning(f"engines status post failed (non-fatal): {e!r}")
+
+    def _handle_engine_flatten(self, engine: str, confirm: bool):
+        """Confirm-gated per-magic flatten. Bare `/anchors|/rogue flatten` replies
+        with the live position count and asks for the confirm; `... flatten confirm`
+        executes -- ANCHORS: risk._flatten_all scoped to the anchor engine (magic
+        20260522 book; the Rogue force-close inside _flatten_all is skipped);
+        ROGUE: rogue.force_close_open + rogue.cancel_pendings (magic 20260626 only).
+        Neither touches the other engine's tickets."""
+        import rogue as _rogue
+        counts = self._open_counts_per_magic()
+        if engine == 'anchors':
+            n = counts.get('anchor_positions', 0)
+            n_pend = counts.get('anchor_pendings', 0)
+            if not confirm:
+                self.tele.warn(
+                    f"⚓ */anchors flatten* — {n} open position(s), {n_pend} pending(s) "
+                    f"on magic {self._FRIDAY_ANCHOR_MAGIC}. NOT closed. "
+                    f"Send `/anchors flatten confirm` to execute.")
+                return
+            self.tele.warn(f"⚓🚨 /anchors flatten CONFIRMED — closing {n} position(s) "
+                           f"+ {n_pend} pending(s) on magic {self._FRIDAY_ANCHOR_MAGIC} "
+                           f"(Rogue untouched)")
+            self._flatten_all(reason="AnchorsFlatten", scope="ANCHORS")
+        elif engine == 'rogue':
+            n = counts.get('rogue_positions', 0)
+            n_pend = counts.get('rogue_pendings', 0)
+            if not confirm:
+                self.tele.warn(
+                    f"🦏 */rogue flatten* — {n} open position(s), {n_pend} pending(s) "
+                    f"on magic {_rogue.ROGUE_MAGIC}. NOT closed. "
+                    f"Send `/rogue flatten confirm` to execute.")
+                return
+            self.tele.warn(f"🦏🚨 /rogue flatten CONFIRMED — closing {n} position(s) "
+                           f"+ cancelling {n_pend} pending(s) on magic "
+                           f"{_rogue.ROGUE_MAGIC} (anchors untouched)")
+            try:
+                _rogue.force_close_open(self, reason="ManualFlatten")
+            except Exception as e:
+                log.warning(f"rogue flatten close failed (non-fatal): {e!r}")
+            try:
+                _rogue.cancel_pendings(self)
+            except Exception as e:
+                log.warning(f"rogue flatten pending-cancel failed (non-fatal): {e!r}")
 
     # ------------------------------------------------------------------------
     # v3.0.0 commit 4: weekend self-sleep + Monday auto-resume
@@ -1705,17 +1884,23 @@ class LiveTrader:
         # D-6: new Rogue entries are ALSO blocked once the Friday flatten window opens
         # (gated directly on _friday_flatten_reached, not the done-latch, so this takes
         # effect the instant the cutoff hits -- independent of poll/verify progress).
+        # v3.6.0: the gate is now the shared per-engine seam _rogue_entries_blocked
+        # (= friday_window OR rogue engine switch OFF). With entries blocked, drive()
+        # still trail-manages / books closes on an existing open Rogue position
+        # (manage-only) -- the switch never orphans a leg.
         try:
             import rogue as _rogue
-            _rogue.drive(self, allow_new_entries=not self._friday_entries_blocked(broker_date, utc_now))
+            _rogue.drive(self, allow_new_entries=not self._rogue_entries_blocked(broker_date, utc_now))
         except Exception:
             pass
 
         # 7. Anchor due? Blocked from the instant the Friday flatten window opens
         # (5.5 above) -- no NEW anchor entry may open between the Friday cutoff and
-        # Monday. Gated directly on _friday_entries_blocked (not the done-latch,
-        # which now means "broker-verified flat", not "entries blocked").
-        if not self._friday_entries_blocked(broker_date, utc_now):
+        # Monday. v3.6.0: gated on the shared per-engine seam _anchor_entries_blocked
+        # (= _friday_entries_blocked OR anchors engine switch OFF), so /anchors off
+        # blocks new straddles at the SAME seam the Friday window uses. Trails (step
+        # 8), exits, EOD (step 6) and the kill switch (step 5) run regardless.
+        if not self._anchor_entries_blocked(broker_date, utc_now):
             self._process_anchor_if_due(broker_date, utc_now)
 
         # 7b. v2.5: Complete any deferred anchor placement (settle window or retry)
@@ -1758,10 +1943,10 @@ def run_live(cfg, paper: bool = True):
         # rogue dormant. Promote here too: this runs on every live start
         # regardless of weekday/weekend/wake, AFTER the adapter is connected (so
         # account_is_demo reads the real account) and BEFORE trading starts.
-        # LIVE only -- paper must never promote. Idempotent (just sets the flag
-        # True on a demo account); fully guarded so it can never abort the boot.
-        # rogue_enabled stays raw-False in config (the freeze); promotion is
-        # runtime-only.
+        # LIVE only -- paper must never promote. Idempotent (just stamps the flag
+        # per account type); fully guarded so it can never abort the boot.
+        # v3.6.0: the config boot default is True, but this per-account stamp
+        # (demo ON / funded forced OFF) stays authoritative on every live boot.
         if not paper:
             try:
                 import rogue as _rogue

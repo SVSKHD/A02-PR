@@ -68,7 +68,18 @@ def snapshot(trader):
             'processed_anchors_today': [],
             'anchor_placed_markers': {},
             'rogue': None,
-            'boost_trails': {}}
+            'boost_trails': {},
+            'engines': None}
+    try:
+        # v3.6.0 ENGINE SWITCHES: persist the runtime flags so a same-day restart
+        # restores them (persisted state WINS over the config boot defaults; the
+        # override-vs-default alert fires in recover_on_boot).
+        eng = getattr(trader, 'engines', None)
+        if isinstance(eng, dict):
+            snap['engines'] = {'anchors': bool(eng.get('anchors', True)),
+                               'rogue': bool(eng.get('rogue', True))}
+    except Exception:
+        pass
     try:
         st = getattr(trader, 'state', {}) or {}
         snap['processed_anchors_today'] = list(st.get('processed_anchors_today', []) or [])
@@ -95,6 +106,14 @@ def snapshot(trader):
                 'chain_anchor': r.get('chain_anchor'),
                 'chain_disp_up': float(r.get('chain_disp_up', 0.0) or 0.0),
                 'chain_disp_dn': float(r.get('chain_disp_dn', 0.0) or 0.0),
+                # v3.6.0 seed independence: the latched seed + the passive fallback
+                # captures survive a same-day restart, so a restart never re-seeds
+                # at a different price/source.
+                'seed_px': r.get('seed_px'),
+                'seed_source': r.get('seed_source'),
+                'seed_recorded_px': r.get('seed_recorded_px'),
+                'a1_snap_px': r.get('a1_snap_px'),
+                'day_open_px': r.get('day_open_px'),
                 'open': ({'ticket': o.get('ticket'), 'side': o.get('side'),
                           'entry': o.get('entry'), 'sl': o.get('sl'), 'peak': o.get('peak'),
                           'magic': o.get('magic'), 'leg_type': o.get('leg_type')}
@@ -191,6 +210,34 @@ def recover_on_boot(trader):
             summary['reason'] = f'new-day(saved={saved_day},today={today})'
             log.info(f"RESTART-RECOVERY: stale/new-day file ignored ({summary['reason']}).")
             return summary
+        # --- v3.6.0 restore the ENGINE SWITCHES (persisted runtime state WINS over
+        # the config boot defaults). Any restored value that differs from the boot
+        # default is LOUD: "⚠️ ENGINE STATE OVERRIDE" log + Discord alert naming
+        # BOTH values, so a forgotten mid-day /anchors off can never silently
+        # carry into a restart unnoticed. ---
+        eng_saved = data.get('engines')
+        if isinstance(eng_saved, dict) and isinstance(getattr(trader, 'engines', None), dict):
+            defaults = getattr(trader, '_engine_boot_defaults', None) or {
+                'anchors': bool(getattr(trader.cfg, 'non_oco_enabled', True)),
+                'rogue': bool(getattr(trader.cfg, 'rogue_enabled', True))}
+            for name in ('anchors', 'rogue'):
+                if name not in eng_saved:
+                    continue
+                restored = bool(eng_saved[name])
+                trader.engines[name] = restored          # persisted state WINS
+                boot_default = bool(defaults.get(name, True))
+                if restored != boot_default:
+                    msg = (f"⚠️ ENGINE STATE OVERRIDE — {name} engine restored "
+                           f"{'ON' if restored else 'OFF'} from run/state.json, but the "
+                           f"config boot default is {'ON' if boot_default else 'OFF'}. "
+                           f"Persisted state wins; use /{name} "
+                           f"{'off' if restored else 'on'} to revert.")
+                    log.warning(msg)
+                    try:
+                        trader.tele.warn(msg)
+                    except Exception:
+                        pass
+            summary['engines'] = dict(trader.engines)
         # --- restore ROGUE governors + chain anchor + open ticket ---
         r = data.get('rogue')
         if isinstance(r, dict):
@@ -211,7 +258,14 @@ def recover_on_boot(trader):
                   'chain_time': r.get('chain_time'),
                   'chain_anchor': r.get('chain_anchor'),
                   'chain_disp_up': float(r.get('chain_disp_up', 0.0) or 0.0),
-                  'chain_disp_dn': float(r.get('chain_disp_dn', 0.0) or 0.0)}
+                  'chain_disp_dn': float(r.get('chain_disp_dn', 0.0) or 0.0),
+                  # v3.6.0 seed independence: restore the latched seed + fallback
+                  # captures (a same-day restart must never re-seed differently).
+                  'seed_px': r.get('seed_px'),
+                  'seed_source': r.get('seed_source'),
+                  'seed_recorded_px': r.get('seed_recorded_px'),
+                  'a1_snap_px': r.get('a1_snap_px'),
+                  'day_open_px': r.get('day_open_px')}
             o = r.get('open')
             if o and o.get('ticket') is not None and _position_open_at_broker(trader, o.get('ticket')):
                 # ADOPT the already-open Rogue position instead of ignoring it.

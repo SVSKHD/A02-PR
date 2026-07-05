@@ -26,13 +26,17 @@ _EXPECTED_FLAGS = (
     'rescue_entry_smooth_confirm', 'override_entry_dynamic_sl',
     'parent_profit_override_enabled', 'rally_pullback_enabled',
     'rogue_enabled', 'rogue_daywatch',
+    # v3.6.0 engine switches + rogue seed independence
+    'non_oco_enabled', 'rogue_seed_fallback',
 )
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
                     'boosts_common', 'strategy', 'break_hold')
 # the LiveTrader seams that MUST be bound for the per-tick flow to dispatch.
 _SEAMS = ('_break_and_hold_ok', '_rescue_entry_ok', '_check_boost_triggers',
-          '_resolved_anchor_hm', '_process_anchor_if_due')
+          '_resolved_anchor_hm', '_process_anchor_if_due',
+          # v3.6.0 engine switches: the shared entries-blocked seams + the runtime read
+          '_engine_enabled', '_anchor_entries_blocked', '_rogue_entries_blocked')
 
 
 def _probe(cfg):
@@ -83,6 +87,12 @@ def _probe(cfg):
           'funded => forced OFF (mandatory gate)')
     except Exception as e:
         w('rogue:import', False, f'rogue import FAILED: {e!r}')
+
+    # 4b. v3.6.0 rogue seed fallback: the knob must hold a KNOWN mode -- a typo'd
+    #     value would silently leave Rogue seedless on an anchors-off morning.
+    _seed_mode = str(getattr(cfg, 'rogue_seed_fallback', 'a1_time_snapshot')).lower()
+    w('rogue:seed_fallback_valid', _seed_mode in ('a1_time_snapshot', 'market_open'),
+      f'rogue_seed_fallback={_seed_mode!r}')
 
     # 5. derived-cap discipline present (rescue/rally caps resolvable).
     try:

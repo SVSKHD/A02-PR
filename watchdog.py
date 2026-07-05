@@ -92,7 +92,9 @@ def relaunch_policy(exit_code, consecutive_selfrestarts,
         return 'relaunch'
     return 'stop'
 ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
-                    "resume","today","help","start"}
+                    "resume","today","help","start",
+                    # v3.6.0 engine switches (runtime, no restart)
+                    "anchors","rogue","engines"}
 
 
 HELP_TEXT = """*AUREON v2 commands*
@@ -104,6 +106,11 @@ HELP_TEXT = """*AUREON v2 commands*
 ⏸ `/pause` — stop placing new anchor orders
 ▶️ `/resume` — resume anchor processing
 📈 `/today` — today's trade summary
+⚓ `/anchors on|off|status` — anchor engine switch (off = manage-only)
+⚓ `/anchors flatten confirm` — close ONLY anchor-magic (20260522) positions
+🦏 `/rogue on|off|status` — Rogue engine switch (off = manage-only)
+🦏 `/rogue flatten confirm` — close ONLY Rogue-magic (20260626) positions
+⚙️ `/engines status` — both engines' state + open count per magic
 ❓ `/help` — this message
 """
 
@@ -519,6 +526,36 @@ class Watchdog:
             self.tele.info("▶️ Resume queued — anchor processing back on")
         elif cmd == "today":
             self.tele.info(self._format_today_summary())
+        elif cmd in ("anchors", "rogue"):
+            # v3.6.0 engine switches: /anchors on|off|status|flatten [confirm] ·
+            # /rogue on|off|status|flatten [confirm]. The watchdog only PARSES and
+            # queues; the bot applies the toggle next tick and posts the confirm
+            # embed itself (engines state + open-position count per magic).
+            toks = (raw_text or "").split()[1:]
+            sub = toks[0].lower() if toks else "status"
+            if sub in ("on", "off"):
+                self._write_command("engine", {"engine": cmd, "action": sub})
+                self.tele.info(f"⚙️ `/{cmd} {sub}` queued — effective next tick "
+                               f"(no restart); bot will confirm with both engines' "
+                               f"state + open counts per magic.")
+            elif sub == "flatten":
+                confirm = any(t.lower() == "confirm" for t in toks[1:])
+                self._write_command(f"{cmd}_flatten", {"confirm": confirm})
+                if confirm:
+                    self.tele.warn(f"🚨 `/{cmd} flatten confirm` queued — bot will "
+                                   f"close ONLY that engine's magic.")
+                else:
+                    self.tele.info(f"`/{cmd} flatten` queued — bot will reply with "
+                                   f"the open-position count and ask for "
+                                   f"`/{cmd} flatten confirm`.")
+            elif sub == "status":
+                self._write_command("engines_status", {"engine": cmd})
+            else:
+                self.tele.info(f"Usage: `/{cmd} on|off|status` or "
+                               f"`/{cmd} flatten confirm`")
+        elif cmd == "engines":
+            # v3.6.0: /engines status — both engines' state + open count per magic.
+            self._write_command("engines_status", {})
 
     # ------------------------------------------------------------------------
     # Main supervisor loop
