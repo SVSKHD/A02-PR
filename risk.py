@@ -139,7 +139,13 @@ def _flatten_all(self, reason: str = "Manual"):
             _time.sleep(0.5)
         if not closed:
             failed_closes.append(ticket)
-        self.shadow_positions.pop(ticket, None)
+            # D-6: keep it tracked on a genuine failure -- a caller polling until
+            # broker-verified flat (the Friday weekend-hold-ban loop) needs this
+            # ticket to still be in shadow_positions on its NEXT _flatten_all()
+            # call, or the retry has nothing left to retry. Previously popped
+            # unconditionally, silently dropping tracking of a still-open position.
+        else:
+            self.shadow_positions.pop(ticket, None)
 
     # Cancel pendings with retry+verify
     failed_cancels = []
@@ -161,7 +167,10 @@ def _flatten_all(self, reason: str = "Manual"):
             _time.sleep(0.3)
         if not cancelled:
             failed_cancels.append(ticket)
-        self.shadow_pendings.pop(ticket, None)
+            # D-6: same reasoning as the position loop above -- stay tracked so a
+            # polling caller's next pass retries it.
+        else:
+            self.shadow_pendings.pop(ticket, None)
 
     # v2.5.2: if a deferred anchor was queued, drop it on flatten (consistent state)
     if self._deferred_anchor is not None:

@@ -514,16 +514,21 @@ class Config:
     # at eod_broker_hour (23:00) every day, weekends included; this flag only
     # covers the anchor engine (magic 20260522) + its boost/rescue/rally legs.
     friday_flatten_broker_hour: float = 22.5
+    # D-6: the Friday flatten is a POLL LOOP, not a single-shot -- from the cutoff
+    # above onward, re-invoke the flatten + broker-verify-flat check at most once
+    # per this many seconds of broker wall-clock (never faster; a dead/frozen feed
+    # can't accelerate it since it's driven off utc_now, not tick freshness).
+    friday_flatten_poll_seconds: float = 30.0
     # A5 (19:30 broker, the latest-firing normal anchor) never fires on Friday --
     # its fill would sit for barely ~3h before the friday_flatten cutoff closes it
     # again, all fee/spread cost and no time to develop. Demo default ON.
     a5_skip_friday: bool = True
-    # A4 (16:40 broker) has more runway before the Friday cutoff than A5, so it
-    # stays ON by default (demo). A funded (FundingPips Zero) deploy should flip
-    # this True explicitly in cfg -- the weekend-hold ban makes ANY Friday anchor
-    # that might still be open going into a slow-closing week not worth the risk
-    # of a hard account breach, even with friday_flatten_enabled as a backstop.
-    a4_skip_friday: bool = False
+    # A4 (16:40 broker): the weekend-hold ban makes ANY Friday anchor that might
+    # still be open going into a slow-closing week not worth the risk of a hard
+    # account breach, even with friday_flatten_enabled as a backstop -- so this
+    # now defaults True (was False pre-D-6). Set False explicitly in cfg to
+    # restore the old demo behavior of letting A4 fire on Fridays.
+    a4_skip_friday: bool = True
 
     # Risk
     starting_balance: float = 50000.0

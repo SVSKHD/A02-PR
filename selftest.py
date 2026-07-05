@@ -295,6 +295,10 @@ STEP_NAMES = {
     217: "friday a4 a5 skip",     # a5_skip_friday/a4_skip_friday skip placement outright on Friday
 
     218: "r1 date correctness",   # explicit date_str (no now()-default) + IST midnight bucketing
+
+    220: "d6 a4 default true",     # a4_skip_friday now defaults True (was False pre-D-6)
+    221: "d6 poll until flat",     # poll loop retries a failed pass; latches only on verified flat
+    222: "d6 entries blocked",     # anchor + Rogue entries both gated on _friday_entries_blocked
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4269,11 +4273,14 @@ class SelfTest:
         self._record(216, PASS if ok else FAIL, detail)
 
     def _step_friday_a4_a5_skip(self):
-        # 217 a5_skip_friday (default True) / a4_skip_friday (default False, a
-        # funded deploy flips it True) skip an anchor's placement OUTRIGHT for
-        # the whole Friday -- distinct from friday_flatten_broker_hour, which
-        # only closes whatever IS open later in the day. Other anchors (A1/A2)
-        # are never Friday-skipped by this check, on Friday or any other day.
+        # 217 a5_skip_friday (default True) / a4_skip_friday (D-6: now ALSO
+        # defaults True, was False pre-D-6 -- see step 220) skip an anchor's
+        # placement OUTRIGHT for the whole Friday -- distinct from
+        # friday_flatten_broker_hour, which only closes whatever IS open later
+        # in the day. Other anchors (A1/A2) are never Friday-skipped by this
+        # check, on Friday or any other day. This step exercises the FLAG
+        # MECHANICS with explicit cfg overrides (both True and False), not the
+        # actual default -- step 220 covers the real default value.
         import anchors as _an, dataclasses
         from datetime import date as _date
         try:
@@ -4365,6 +4372,205 @@ class SelfTest:
         except Exception as e:
             self._record(218, FAIL, f"raised: {e!r}"); return
         self._record(218, PASS if ok else FAIL, detail)
+    def _step_d6_a4_default_true(self):
+        # 220 D-6 (3a): a4_skip_friday's ACTUAL default is now True (was False)
+        # -- the weekend-hold ban makes any Friday anchor that might still be
+        # open into the weekend too risky, even with the D-6 poll-flatten as a
+        # backstop. Reads self.cfg directly (no override), unlike step 217
+        # which only exercises the flag mechanics with explicit values.
+        try:
+            default_true = (self.cfg.a4_skip_friday is True)
+            a5_still_true = (self.cfg.a5_skip_friday is True)
+            import dataclasses
+            still_toggleable = True
+            try:
+                dataclasses.replace(self.cfg, a4_skip_friday=False)
+            except Exception:
+                still_toggleable = False
+            ok = default_true and a5_still_true and still_toggleable
+            detail = (f"a4_skip_friday_default={self.cfg.a4_skip_friday} "
+                      f"a5_skip_friday_default={self.cfg.a5_skip_friday} "
+                      f"still_toggleable_off={still_toggleable}")
+        except Exception as e:
+            self._record(220, FAIL, f"raised: {e!r}"); return
+        self._record(220, PASS if ok else FAIL, detail)
+
+    def _step_d6_poll_until_flat(self):
+        # 221 D-6 (3b/3c): the Friday flatten is a POLL LOOP, never single-shot.
+        # (i) a pass that fails to close a stuck anchor leg (3x rc=-1, matching
+        # _flatten_all's own bounded retry) is alerted and does NOT latch --
+        # the NEXT poll (>= friday_flatten_poll_seconds later) retries it and
+        # only latches once a broker query confirms flat; (iii) pendings AND
+        # positions of BOTH magics (anchor 20260522, Rogue 20260626) are
+        # cancelled/closed and broker-verified before the Discord confirm.
+        # An immediate re-poll at the SAME instant is rate-limited (no new
+        # attempt) -- proving this is wall-clock-paced, not per-tick, so a
+        # fast tick loop (or a stalled feed -- see wait_until_market_open's
+        # analogous wall-clock probe) can't hammer the broker or stall it.
+        import types, dataclasses
+        import live_trader as _lt
+        import risk as _risk
+        import rogue as _rogue
+        from datetime import date as _date
+        try:
+            cfg = dataclasses.replace(self.cfg, friday_flatten_enabled=True,
+                                      friday_flatten_broker_hour=22.5,
+                                      broker_tz_offset_hours=3,
+                                      friday_flatten_poll_seconds=30.0)
+            friday = _date(2026, 7, 3)
+            t0 = pd.Timestamp('2026-07-03 19:31:00', tz='UTC')  # 22:31 broker -- past cutoff
+
+            # env: a STUCK anchor position (501, magic 20260522) that fails to
+            # close for 3 attempts on poll 1 and succeeds on poll 2; one anchor
+            # PENDING (502) that cancels cleanly first try; a Rogue position
+            # (900, magic 20260626) that closes cleanly first try.
+            env = {'positions': {501: {'magic': 20260522}, 900: {'magic': 20260626}},
+                  'pendings': {502: {'magic': 20260522}},
+                  'close_attempts': {}, 'logged': []}
+
+            def positions_get(ticket=None, symbol=None):
+                if ticket is not None:
+                    return ([types.SimpleNamespace(ticket=ticket)]
+                            if int(ticket) in env['positions'] else [])
+                return [types.SimpleNamespace(ticket=tk, magic=v['magic'], type=0,
+                                              price_open=4000.0, sl=3982.0, tp=4030.0)
+                        for tk, v in env['positions'].items()]
+
+            def orders_get(ticket=None, symbol=None):
+                if ticket is not None:
+                    return ([types.SimpleNamespace(ticket=ticket)]
+                            if int(ticket) in env['pendings'] else [])
+                return [types.SimpleNamespace(ticket=tk, magic=v['magic'], type=2,
+                                              price_open=4010.0)
+                        for tk, v in env['pendings'].items()]
+
+            def close_position(ticket, dry_run=False):
+                n = env['close_attempts'].get(ticket, 0)
+                env['close_attempts'][ticket] = n + 1
+                if ticket == 501 and n < 3:   # poll 1's 3 attempts all fail
+                    return
+                env['positions'].pop(ticket, None)   # poll 2 (or ticket 900): succeeds
+
+            def cancel_order(ticket, dry_run=False):
+                env['pendings'].pop(ticket, None)
+
+            mt5 = types.SimpleNamespace(positions_get=positions_get, orders_get=orders_get)
+            adapter = types.SimpleNamespace(mt5=mt5, close_position=close_position,
+                                            cancel_order=cancel_order)
+            tr = types.SimpleNamespace(
+                cfg=cfg, adapter=adapter, paper=False,
+                shadow_positions={501: {'anchor_label': 'A1', 'side': 'BUY'}},
+                shadow_pendings={502: {'anchor_label': 'A1', 'side': 'BUY',
+                                      'sibling_ticket': None}},
+                _deferred_anchor=None, state={},
+                _rogue={'open': {'ticket': 900}, 'gov': {}},
+                tele=types.SimpleNamespace(
+                    warn=lambda m, **k: env['logged'].append(('warn', m)),
+                    error=lambda m, **k: env['logged'].append(('error', m)),
+                    critical=lambda m, **k: env['logged'].append(('critical', m))),
+                _save_state=lambda: None,
+                _FRIDAY_ANCHOR_MAGIC=_lt.LiveTrader._FRIDAY_ANCHOR_MAGIC)
+            tr._friday_query_flat = lambda: _lt.LiveTrader._friday_query_flat(tr)
+            tr._friday_resync_shadow_from_broker = (
+                lambda: _lt.LiveTrader._friday_resync_shadow_from_broker(tr))
+            tr._flatten_all = lambda reason="Manual": _risk._flatten_all(tr, reason=reason)
+
+            orig_record_close, orig_persist, orig_close_pnl = (
+                _rogue.record_close, _rogue._persist_state, _rogue._rogue_close_pnl)
+            _rogue.record_close = lambda *a, **k: None
+            _rogue._persist_state = lambda *a, **k: None
+            _rogue._rogue_close_pnl = lambda *a, **k: 0.0
+            try:
+                # --- poll 1: cutoff just reached -- anchor leg fails 3x; pending
+                # cancels clean; Rogue closes clean. Overall: NOT flat (501 stuck). ---
+                _lt.LiveTrader._friday_poll_flatten(tr, friday, t0)
+                pass1_not_flat = (not tr.state.get('friday_flatten_done')
+                                  and 501 in env['positions']
+                                  and env['close_attempts'].get(501) == 3)
+                pass1_alerted = any(k == 'error' for k, m in env['logged'])
+                pending_cancelled_pass1 = (502 not in env['pendings'])
+                rogue_closed_pass1 = (tr._rogue['open'] is None
+                                      and 900 not in env['positions'])
+
+                # --- immediate re-poll, SAME instant: rate-limited, no new attempt ---
+                _lt.LiveTrader._friday_poll_flatten(tr, friday, t0)
+                rate_limited = (env['close_attempts'].get(501) == 3)
+
+                # --- poll 2: >= poll_seconds later -- this pass succeeds -> latch ---
+                t1 = t0 + pd.Timedelta(seconds=31)
+                _lt.LiveTrader._friday_poll_flatten(tr, friday, t1)
+                pass2_flat_and_latched = (tr.state.get('friday_flatten_done') is True
+                                          and 501 not in env['positions'])
+                confirm_sent = any(k == 'warn' and 'CONFIRMED flat' in m
+                                   for k, m in env['logged'])
+            finally:
+                _rogue.record_close, _rogue._persist_state, _rogue._rogue_close_pnl = (
+                    orig_record_close, orig_persist, orig_close_pnl)
+
+            ok = (pass1_not_flat and pass1_alerted and pending_cancelled_pass1
+                 and rogue_closed_pass1 and rate_limited and pass2_flat_and_latched
+                 and confirm_sent)
+            detail = (f"pass1_not_flat_retries={pass1_not_flat} "
+                      f"pass1_alerted={pass1_alerted} "
+                      f"pending_cancelled_pass1={pending_cancelled_pass1} "
+                      f"rogue_closed_pass1={rogue_closed_pass1} "
+                      f"rate_limited={rate_limited} "
+                      f"pass2_flat_and_latched={pass2_flat_and_latched} "
+                      f"confirm_sent={confirm_sent}")
+        except Exception as e:
+            self._record(221, FAIL, f"raised: {e!r}"); return
+        self._record(221, PASS if ok else FAIL, detail)
+
+    def _step_d6_entries_blocked(self):
+        # 222 D-6 (3b): new entries for BOTH engines (anchor + Rogue) are
+        # blocked from the instant the Friday flatten window opens --
+        # independent of the poll/verify progress in step 221. Verifies (a)
+        # _friday_entries_blocked is a live wrapper around _friday_flatten_reached
+        # (True post-cutoff Friday, False pre-cutoff Friday, False any other
+        # day) and (b) BOTH _tick() call sites (Rogue drive(), anchor-due) are
+        # wired through that SAME shared seam by inspecting the real method's
+        # source -- so the two call sites can never silently drift apart.
+        import inspect
+        import live_trader as _lt
+        import dataclasses
+        from datetime import date as _date
+        try:
+            cfg = dataclasses.replace(self.cfg, friday_flatten_enabled=True,
+                                      friday_flatten_broker_hour=22.5,
+                                      broker_tz_offset_hours=3)
+
+            class _Stub:
+                pass
+            t = _Stub()
+            t.cfg = cfg
+            from utils import anchor_datetime_utc as _adu
+            t._anchor_datetime_utc = _adu
+            t._friday_flatten_reached = (
+                lambda broker_date, utc_now: _lt.LiveTrader._friday_flatten_reached(
+                    t, broker_date, utc_now))
+
+            friday = _date(2026, 7, 3)
+            saturday = _date(2026, 7, 4)
+            before = pd.Timestamp('2026-07-03 18:59:00', tz='UTC')   # 21:59 broker
+            after = pd.Timestamp('2026-07-03 19:31:00', tz='UTC')    # 22:31 broker
+
+            blocked_after_cutoff = _lt.LiveTrader._friday_entries_blocked(t, friday, after) is True
+            not_blocked_before_cutoff = _lt.LiveTrader._friday_entries_blocked(t, friday, before) is False
+            not_blocked_other_day = _lt.LiveTrader._friday_entries_blocked(t, saturday, after) is False
+
+            src = inspect.getsource(_lt.LiveTrader._tick)
+            rogue_gated = ('allow_new_entries=not self._friday_entries_blocked(' in src)
+            anchor_gated = ('if not self._friday_entries_blocked(broker_date, utc_now):' in src)
+
+            ok = (blocked_after_cutoff and not_blocked_before_cutoff
+                 and not_blocked_other_day and rogue_gated and anchor_gated)
+            detail = (f"blocked_after_cutoff={blocked_after_cutoff} "
+                      f"not_blocked_before_cutoff={not_blocked_before_cutoff} "
+                      f"not_blocked_other_day={not_blocked_other_day} "
+                      f"rogue_drive_gated={rogue_gated} anchor_due_gated={anchor_gated}")
+        except Exception as e:
+            self._record(222, FAIL, f"raised: {e!r}"); return
+        self._record(222, PASS if ok else FAIL, detail)
 
     def _step_rally_sl13_cap910(self):
         # 93 (FIX 2): RALLY boost SL/backstop $13, whipsaw cap -$910; RESCUE SL $10,
@@ -8169,6 +8375,11 @@ class SelfTest:
             # R-1: EOD hook passes broker_date explicitly + Rogue closes bucket by
             # IST calendar day, not a raw UTC ts[:10] slice.
             self._step_r1_date_correctness()
+            # D-6: Friday poll-flatten (never single-shot) + a4 default flip +
+            # both-engine entry blocking.
+            self._step_d6_a4_default_true()
+            self._step_d6_poll_until_flat()
+            self._step_d6_entries_blocked()
         finally:
             self._cleanup()
         return self._report(ts)
