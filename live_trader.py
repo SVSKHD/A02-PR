@@ -706,6 +706,152 @@ class LiveTrader:
             broker_date, hour, self.cfg.broker_tz_offset_hours, minute)
         return utc_now >= threshold
 
+    # anchor engine's magic (mt5_adapter.py place_market_order/place_stop_order
+    # default `magic=20260522`); Rogue's is rogue.ROGUE_MAGIC (20260626).
+    _FRIDAY_ANCHOR_MAGIC = 20260522
+
+    def _friday_query_flat(self):
+        """D-6: broker-verified flat check for the Friday weekend-hold-ban poll --
+        queries MT5 DIRECTLY for this symbol's open positions + pending orders
+        (never trusts shadow_positions/shadow_pendings, which is exactly the
+        state a dead/reconnecting feed can desync from the broker). Returns
+        (flat: bool, counts: dict) so a failed pass's alert can name what's
+        still open. A query failure is NEVER treated as flat."""
+        import rogue as _rogue
+        try:
+            positions = self.adapter.mt5.positions_get(symbol=self.cfg.symbol) or []
+            pendings = self.adapter.mt5.orders_get(symbol=self.cfg.symbol) or []
+        except Exception as e:
+            return False, {'query_error': repr(e)}
+
+        def _magic(o):
+            try:
+                return int(getattr(o, 'magic', -1))
+            except (TypeError, ValueError):
+                return -1
+        anchor_m, rogue_m = self._FRIDAY_ANCHOR_MAGIC, _rogue.ROGUE_MAGIC
+        counts = {
+            'anchor_positions': sum(1 for p in positions if _magic(p) == anchor_m),
+            'rogue_positions': sum(1 for p in positions if _magic(p) == rogue_m),
+            'other_positions': sum(1 for p in positions
+                                   if _magic(p) not in (anchor_m, rogue_m)),
+            'anchor_pendings': sum(1 for o in pendings if _magic(o) == anchor_m),
+            'rogue_pendings': sum(1 for o in pendings if _magic(o) == rogue_m),
+            'other_pendings': sum(1 for o in pendings
+                                  if _magic(o) not in (anchor_m, rogue_m)),
+        }
+        return (len(positions) == 0 and len(pendings) == 0), counts
+
+    def _friday_resync_shadow_from_broker(self):
+        """D-6: before each poll-flatten pass, make sure risk._flatten_all's
+        per-ticket retry loop has something to iterate for EVERY broker-open
+        anchor position/pending on this symbol -- not just whatever is still in
+        shadow_positions/shadow_pendings. A minimal synthesized entry is enough
+        (only the ticket + side/prices _flatten_all's close/cancel calls need).
+        Never overwrites an already-tracked ticket. Rogue positions are
+        explicitly EXCLUDED here -- Rogue's own open ticket is tracked
+        separately (self._rogue['open']) and closed via
+        rogue.force_close_open(), never via shadow_positions/_flatten_all;
+        adopting a Rogue-magic ticket here would race a double-close attempt
+        against force_close_open on the SAME ticket."""
+        import rogue as _rogue
+        try:
+            positions = self.adapter.mt5.positions_get(symbol=self.cfg.symbol) or []
+            pendings = self.adapter.mt5.orders_get(symbol=self.cfg.symbol) or []
+        except Exception as e:
+            log.warning(f"friday flatten resync: broker query failed: {e!r}")
+            return
+        for p in positions:
+            tk = int(p.ticket)
+            if tk in self.shadow_positions:
+                continue
+            if int(getattr(p, 'magic', -1)) == _rogue.ROGUE_MAGIC:
+                continue
+            side = 'BUY' if getattr(p, 'type', 0) == 0 else 'SELL'
+            price_open = float(getattr(p, 'price_open', 0.0))
+            self.shadow_positions[tk] = {
+                'anchor_label': 'FRIDAY_FLATTEN_RESYNC', 'side': side,
+                'entry_price': price_open, 'current_sl': float(getattr(p, 'sl', 0.0)),
+                'tp_level': float(getattr(p, 'tp', 0.0)), 'max_fav': price_open,
+                'fill_time': pd.Timestamp.now(tz='UTC').isoformat(), 'role': 'normal',
+            }
+        for o in pendings:
+            tk = int(o.ticket)
+            if tk in self.shadow_pendings:
+                continue
+            self.shadow_pendings[tk] = {
+                'anchor_label': 'FRIDAY_FLATTEN_RESYNC',
+                'side': 'BUY' if getattr(o, 'type', 0) in (2, 4) else 'SELL',
+                'sibling_ticket': None,
+                'entry_price': float(getattr(o, 'price_open', 0.0)),
+                'rescue_on_fill': False,
+            }
+
+    def _friday_poll_flatten(self, broker_date: DateType, utc_now: pd.Timestamp):
+        """D-6: poll-until-flat Friday weekend-hold-ban flatten. Called every
+        tick once the Friday cutoff is reached and not yet broker-verified flat;
+        internally rate-limited to at most one actual flatten+verify pass per
+        cfg.friday_flatten_poll_seconds (default 30s) of BROKER WALL-CLOCK
+        (utc_now), not tick/price freshness -- so a frozen/dead feed can never
+        stall the poll (mirrors wait_until_market_open's same wall-clock-driven
+        probe). NEVER single-shot: every pass re-syncs shadow bookkeeping from
+        the broker, re-invokes _flatten_all (keeping its own bounded per-ticket
+        retry) for the anchor engine + force-closes any open Rogue ticket, then
+        VERIFIES flat by broker query across BOTH magics. friday_flatten_done
+        (and the Discord confirm) only ever set on a broker-verified flat pass;
+        a failed pass alerts and leaves state untouched so the next poll retries."""
+        import rogue as _rogue
+        poll_s = float(getattr(self.cfg, 'friday_flatten_poll_seconds', 30.0))
+        last = self.state.get('friday_flatten_last_poll_utc')
+        if last:
+            try:
+                elapsed = (utc_now - pd.Timestamp(last)).total_seconds()
+            except Exception:
+                elapsed = poll_s  # malformed timestamp -> don't get stuck; poll now
+            if elapsed < poll_s:
+                return
+        self.state['friday_flatten_last_poll_utc'] = utc_now.isoformat()
+        self._save_state()
+
+        self._friday_resync_shadow_from_broker()
+        if self.shadow_positions or self.shadow_pendings:
+            # != "EOD" -> risk._flatten_all ALSO force-closes any open Rogue
+            # ticket (see risk.py:176); the daily EOD flatten still passes
+            # reason="EOD" deliberately, unchanged, to let Rogue ride per
+            # rogue_flatten_at_eod.
+            self._flatten_all(reason="FRIDAY_FLATTEN")
+        try:
+            _rogue.force_close_open(self, reason="FRIDAY_FLATTEN")
+        except Exception:
+            pass
+
+        flat, counts = self._friday_query_flat()
+        if flat:
+            self.state['friday_flatten_done'] = True
+            self._save_state()
+            log.warning(
+                f"FRIDAY FLATTEN — broker-verified FLAT (both magics) at "
+                f"{self.cfg.friday_flatten_broker_hour} broker hour; no new "
+                f"entries (anchor or Rogue) until Monday.")
+            self.tele.warn(
+                f"🗓️✅ *Friday flatten CONFIRMED flat* — 0 positions, 0 pendings "
+                f"(anchor {self._FRIDAY_ANCHOR_MAGIC} + Rogue {_rogue.ROGUE_MAGIC}), "
+                f"broker-verified. No new entries either engine until Monday.")
+        else:
+            log.error(f"FRIDAY FLATTEN pass FAILED — still not flat: {counts}; "
+                     f"retrying in <= {poll_s:.0f}s.")
+            self.tele.error(
+                f"⚠️ *Friday flatten pass FAILED* — still open: {counts}. "
+                f"Retrying every {poll_s:.0f}s until broker-verified flat.")
+
+    def _friday_entries_blocked(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
+        """D-6: True from the instant the Friday flatten window opens until the
+        next broker day (Monday) -- gates NEW entries for BOTH engines (anchor +
+        Rogue), independent of _friday_poll_flatten's verify/latch progress. A
+        thin, separately-testable wrapper around _friday_flatten_reached so the
+        two _tick() call sites (anchor-due, Rogue drive()) can't drift apart."""
+        return self._friday_flatten_reached(broker_date, utc_now)
+
     # ------------------------------------------------------------------------
     # v3.0.0 commit 4: weekend self-sleep + Monday auto-resume
     # ------------------------------------------------------------------------
@@ -1469,30 +1615,18 @@ class LiveTrader:
                 self._write_status(broker_date)
             return
 
-        # 5.5 Friday weekend-hold ban: flatten anchor + boost legs ONCE at
-        # cfg.friday_flatten_broker_hour (default 22:30 broker, 30min ahead of the
-        # normal 23:00 EOD), then block NEW anchor entries for the rest of the day
-        # (step 7 below checks the same 'friday_flatten_done' flag). FundingPips
-        # Zero (and prop-firm rules generally) treat ANY position held over the
-        # weekend as a hard breach / account termination -- this is deliberately
-        # earlier and separate from the daily EOD flatten. Rogue is UNTOUCHED here
-        # (reason="EOD" so risk._flatten_all does not also force-close it) --
-        # rogue_flatten_at_eod already flattens Rogue at eod_broker_hour every day,
-        # weekends included, and still will ~30min later via the EOD branch below.
+        # 5.5 D-6 Friday weekend-hold ban: from cfg.friday_flatten_broker_hour
+        # (default 22:30 broker, 30min ahead of the normal 23:00 EOD) onward,
+        # POLL until a broker query confirms BOTH magics (anchor 20260522, Rogue
+        # 20260626) are flat -- single-shot is forbidden (07-03: the feed froze
+        # ~20:00 broker before the one timed attempt fired, and it was never
+        # retried). New entries for BOTH engines are blocked from the INSTANT
+        # this window opens, independent of flatten/verify progress (see the
+        # anchor-due gate + the Rogue drive() call below, both now gated
+        # directly on _friday_flatten_reached rather than on the done-latch).
+        # friday_flatten_done only latches once broker-verified flat.
         if self._friday_flatten_reached(broker_date, utc_now) and not self.state.get('friday_flatten_done'):
-            if self.shadow_positions or self.shadow_pendings:
-                self._flatten_all(reason="EOD")
-            self.state['friday_flatten_done'] = True
-            self._save_state()
-            log.warning(
-                f"FRIDAY FLATTEN — anchor+boost legs closed at "
-                f"{self.cfg.friday_flatten_broker_hour} broker hour "
-                f"(weekend-hold ban); no new anchor entries until Monday.")
-            self.tele.warn(
-                f"🗓️ *Friday flatten* — anchor + boost legs closed at "
-                f"`{self.cfg.friday_flatten_broker_hour}` broker hour. "
-                f"No new anchor entries until Monday (Rogue unaffected; its own "
-                f"EOD flatten still applies at `{self.cfg.eod_broker_hour}:00`).")
+            self._friday_poll_flatten(broker_date, utc_now)
 
         # 6. EOD?
         if self._eod_reached(broker_date, utc_now):
@@ -1568,15 +1702,20 @@ class LiveTrader:
         # gate AND the EOD check, both of which `return` above — so a NEW Rogue entry can
         # only open on a live, non-killed, pre-EOD tick. No-op unless rogue is ON (demo-
         # promoted, never funded). Fully guarded (the _tick except below also catches it).
+        # D-6: new Rogue entries are ALSO blocked once the Friday flatten window opens
+        # (gated directly on _friday_flatten_reached, not the done-latch, so this takes
+        # effect the instant the cutoff hits -- independent of poll/verify progress).
         try:
             import rogue as _rogue
-            _rogue.drive(self)
+            _rogue.drive(self, allow_new_entries=not self._friday_entries_blocked(broker_date, utc_now))
         except Exception:
             pass
 
-        # 7. Anchor due? Skipped once the Friday flatten has fired today (5.5 above)
-        # -- no NEW anchor entry may open between the Friday cutoff and Monday.
-        if not self.state.get('friday_flatten_done'):
+        # 7. Anchor due? Blocked from the instant the Friday flatten window opens
+        # (5.5 above) -- no NEW anchor entry may open between the Friday cutoff and
+        # Monday. Gated directly on _friday_entries_blocked (not the done-latch,
+        # which now means "broker-verified flat", not "entries blocked").
+        if not self._friday_entries_blocked(broker_date, utc_now):
             self._process_anchor_if_due(broker_date, utc_now)
 
         # 7b. v2.5: Complete any deferred anchor placement (settle window or retry)
