@@ -18,12 +18,26 @@ import logging
 
 log = logging.getLogger("AUREON")
 
+def _pdig(cfg):
+    """feat/symbol-profiles: price decimal places (cfg.price_digits; gold 2, silver 3)."""
+    return int(getattr(cfg, 'price_digits', 2))
+
+
 # --- tagging (distinct from the anchors) -----------------------------------------
 ROGUE_MAGIC = 20260626          # distinct from the anchor magic (20260522) + warmup (9999998)
 ROGUE_LABEL = "ROGUE"
 ROGUE_LEG_TYPE = "rogue"
 ROGUE_ALERT_PREFIX = "[ROGUE]"
 ROGUE_GLYPH = "🦏"               # chart glyph distinct from the anchor glyphs
+
+
+def rogue_magic(cfg=None):
+    """feat/symbol-profiles: the instance's Rogue magic. Every RUNTIME read
+    (order stamping, closes(), cancel_pendings, force_close_open, pnl filters)
+    goes through here so a silver profile (rogue_magic=20260711) stamps and
+    scopes its own book; the module constant stays as the gold fallback for
+    cfg-less pure callers, so a bare call is byte-identical to pre-profile."""
+    return int(getattr(cfg, 'rogue_magic', ROGUE_MAGIC) or ROGUE_MAGIC)
 
 
 def _persist_state(trader):
@@ -94,7 +108,7 @@ def detect_monster(candles, cfg):
     if avg_range <= 0 or bodies < body_mult * avg_range:
         return False, None, None
     completion = hi if direction == 'BUY' else lo
-    return True, direction, round(completion, 2)
+    return True, direction, round(completion, _pdig(cfg))
 
 
 # --- early entry off the rogue anchor (NOT chasing the obvious top) ---------------
@@ -110,10 +124,10 @@ def entry_decision(anchor_price, leg_direction, current_price, cfg):
     a = float(anchor_price)
     if leg_direction == 'BUY':
         if (p - a) >= confirm:
-            return True, round(p, 2), round(p - init_sl, 2)
+            return True, round(p, _pdig(cfg)), round(p - init_sl, _pdig(cfg))
     elif leg_direction == 'SELL':
         if (a - p) >= confirm:
-            return True, round(p, 2), round(p + init_sl, 2)
+            return True, round(p, _pdig(cfg)), round(p + init_sl, _pdig(cfg))
     return False, None, None
 
 
@@ -185,14 +199,15 @@ def record_close(state, pnl_dollars, was_fail, cfg):
 
 
 # --- closure isolation: a rogue close only ever closes rogue legs -----------------
-def closes(position, scope):
+def closes(position, scope, cfg=None):
     """PURE label-scoped closure check. A close issued for `scope` ('ROGUE' or 'ANCHOR')
     closes a position ONLY if the position belongs to that scope (by magic/leg_type).
     A ROGUE close never closes an anchor leg and vice versa -- there is NO generic
-    close-all. `position` is a dict/obj with 'magic' (and/or 'leg_type')."""
+    close-all. `position` is a dict/obj with 'magic' (and/or 'leg_type'). `cfg`
+    (optional) supplies the instance's rogue_magic; omitted -> gold constant."""
     pos_magic = position.get('magic') if hasattr(position, 'get') else getattr(position, 'magic', None)
     pos_type = position.get('leg_type') if hasattr(position, 'get') else getattr(position, 'leg_type', None)
-    is_rogue = (pos_magic == ROGUE_MAGIC) or (pos_type == ROGUE_LEG_TYPE)
+    is_rogue = (pos_magic == rogue_magic(cfg)) or (pos_type == ROGUE_LEG_TYPE)
     if str(scope).upper() == 'ROGUE':
         return bool(is_rogue)
     return not bool(is_rogue)   # ANCHOR scope closes only NON-rogue legs
@@ -267,9 +282,9 @@ def a1_entry_decision(anchor_price, current_price, cfg):
     if cap > 0 and abs(move) > cap:
         return False, None, None, None       # GATE 1: exhausted move -> no chase
     if move >= confirm:
-        return True, 'BUY', round(p, 2), round(p - init_sl, 2)
+        return True, 'BUY', round(p, _pdig(cfg)), round(p - init_sl, _pdig(cfg))
     if move <= -confirm:
-        return True, 'SELL', round(p, 2), round(p + init_sl, 2)
+        return True, 'SELL', round(p, _pdig(cfg)), round(p + init_sl, _pdig(cfg))
     return False, None, None, None
 
 
@@ -420,10 +435,10 @@ def _capture_seed_snapshots(trader, st, price):
             return
         changed = False
         if st.get('day_open_px') is None:
-            st['day_open_px'] = round(float(price), 2)
+            st['day_open_px'] = round(float(price), _pdig(trader.cfg))
             changed = True
         if st.get('a1_snap_px') is None and _a1_sched_reached(trader):
-            st['a1_snap_px'] = round(float(price), 2)
+            st['a1_snap_px'] = round(float(price), _pdig(trader.cfg))
             log.info(f"{ROGUE_ALERT_PREFIX} A1-time snapshot captured @ "
                      f"{st['a1_snap_px']} (fallback seed candidate; no order placed)")
             changed = True
@@ -474,19 +489,19 @@ def _record_seed(trader, st, seed_px, seed_source):
     try:
         if seed_px is None:
             return
-        key = f"{seed_source}:{round(float(seed_px), 2)}"
+        key = f"{seed_source}:{round(float(seed_px), _pdig(trader.cfg))}"
         st['seed_source'] = seed_source
         # remember the last recorded price: the A1_ANCHOR read stays live per tick
         # (master), but if the switch is later toggled off mid-day, resolve_seed
         # latches THIS price rather than re-seeding via the fallback.
-        st['seed_recorded_px'] = round(float(seed_px), 2)
+        st['seed_recorded_px'] = round(float(seed_px), _pdig(trader.cfg))
         if seed_source in (SEED_A1_TIME_SNAPSHOT, SEED_MARKET_OPEN):
-            st['seed_px'] = round(float(seed_px), 2)
+            st['seed_px'] = round(float(seed_px), _pdig(trader.cfg))
         if st.get('_seed_log_key') == key:
             return
         st['_seed_log_key'] = key
         msg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ROGUE SEED via {seed_source} @ "
-               f"{round(float(seed_px), 2)}")
+               f"{round(float(seed_px), _pdig(trader.cfg))}")
         log.info(msg)
         try:
             trader.tele.info(msg)
@@ -605,7 +620,8 @@ def _drive_a1(trader, st, allow_new_entries=True):
     # a reversal-recovery leg uses the wider per-rescue cap as its SL (still bounded).
     if st.get('a1_reverted'):
         cap = float(getattr(trader.cfg, 'rogue_rescue_cap_dollars', 13.0))
-        sl = round(epx - cap, 2) if side == 'BUY' else round(epx + cap, 2)
+        sl = (round(epx - cap, _pdig(trader.cfg)) if side == 'BUY'
+              else round(epx + cap, _pdig(trader.cfg)))
         st['a1_reverted'] = False
     st['leg_dir'] = side
     st['anchor'] = anchor
@@ -754,7 +770,7 @@ def _log_chase_reject(trader, st, anchor, price):
             if st.get('_chase_log_key') is not None:
                 st['_chase_log_key'] = None      # back inside the band -> re-arm the log
             return
-        key = f"{round(float(anchor), 2)}:{'UP' if move > 0 else 'DN'}"
+        key = f"{round(float(anchor), _pdig(trader.cfg))}:{'UP' if move > 0 else 'DN'}"
         if st.get('_chase_log_key') == key:
             return                               # same episode -> already logged
         st['_chase_log_key'] = key
@@ -792,7 +808,7 @@ def _log_chain_block(trader, st, reason, remaining):
 def _spread(trader):
     try:
         tk = trader.adapter.mt5.symbol_info_tick(trader.cfg.symbol)
-        return round(float(tk.ask) - float(tk.bid), 2)
+        return round(float(tk.ask) - float(tk.bid), _pdig(trader.cfg))
     except Exception:
         return 0.0
 
@@ -819,7 +835,7 @@ def _model_gate(trader, st, price, epx, sl, ok):
         if st.get('rpl_eval_anchor') != st.get('anchor'):   # one eval per setup (no flood)
             _pl.log_eval(getattr(trader, 'run_dir', '.'), ts=ts, direction=st.get('leg_dir'),
                          features=feats, decision=decision, model_score=score,
-                         entry_price=(round(float(epx), 2) if decision == _pl.ENTER else ''),
+                         entry_price=(round(float(epx), _pdig(trader.cfg)) if decision == _pl.ENTER else ''),
                          seed_source=str(st.get('seed_source') or ''))
             st['rpl_eval_anchor'] = st.get('anchor')
             if decision == _pl.ENTER:
@@ -828,7 +844,7 @@ def _model_gate(trader, st, price, epx, sl, ok):
                     rpl = {}
                     trader._rpl = rpl
                 rpl['enter_ts'] = ts
-                rpl['enter_price'] = round(float(epx), 2)
+                rpl['enter_price'] = round(float(epx), _pdig(trader.cfg))
         if blocked:
             trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} SKIP_BY_MODEL "
                              f"score={round(float(score), 3)} < thr {thr}")
@@ -854,7 +870,8 @@ def _rogue_recompute_sl(trader, side, sl):
             return sl
         px = float(tk.ask) if side == 'BUY' else float(tk.bid)
         pad = min_dist + 2.0 * point
-        return round(px - pad, 2) if side == 'BUY' else round(px + pad, 2)
+        return (round(px - pad, _pdig(trader.cfg)) if side == 'BUY'
+                else round(px + pad, _pdig(trader.cfg)))
     except Exception:
         return sl
 
@@ -865,7 +882,8 @@ def _mark_rogue_open(trader, st, entry_px, sl, tk, rc):
     paper shadow path). Never called on a failed live placement (the brick fix)."""
     side = st['leg_dir']
     st['open'] = {'ticket': tk, 'side': side, 'entry': entry_px, 'sl': sl,
-                  'peak': entry_px, 'magic': ROGUE_MAGIC, 'leg_type': ROGUE_LEG_TYPE}
+                  'peak': entry_px, 'magic': rogue_magic(trader.cfg),
+                  'leg_type': ROGUE_LEG_TYPE}
     record_entry(st['gov'])
     try:
         import boost_metrics as _bm
@@ -896,14 +914,15 @@ def _place_rogue_entry(trader, st, entry_px, sl):
     open), NO slot is consumed, an abort alert has already fired, and the engine stays
     alive for the next signal -- it does not brick."""
     side = st['leg_dir']
-    tp = round(entry_px + (200.0 if side == 'BUY' else -200.0), 2)  # far TP; the trail governs
+    tp = round(entry_px + (200.0 if side == 'BUY' else -200.0), _pdig(trader.cfg))  # far TP; the trail governs
     if trader.paper:
         # PAPER / dry-run: no real broker + no brick risk -- keep the prior shadow-entry
         # behavior (single send; selftest stub adapters return a success object + ticket).
         try:
             res = trader.adapter.place_market_order(
                 trader.cfg.symbol, side, trader.cfg.lot_size, sl=sl, tp=tp,
-                magic=ROGUE_MAGIC, comment=f"AUR_ROGUE_{side[0]}", dry_run=True)
+                magic=rogue_magic(trader.cfg), comment=f"AUR_ROGUE_{side[0]}",
+                dry_run=True)
             rc = getattr(res, 'retcode', None) if res is not None else None
             tk = getattr(res, 'order', None) or getattr(res, 'deal', None)
             _mark_rogue_open(trader, st, entry_px, sl, tk, rc)
@@ -916,10 +935,11 @@ def _place_rogue_entry(trader, st, entry_px, sl):
         _sl = _rogue_recompute_sl(trader, side, sl) if recompute_stops else sl
         return trader.adapter.place_market_order(
             trader.cfg.symbol, side, trader.cfg.lot_size, sl=_sl, tp=tp,
-            magic=ROGUE_MAGIC, comment=f"AUR_ROGUE_{side[0]}", dry_run=False)
+            magic=rogue_magic(trader.cfg), comment=f"AUR_ROGUE_{side[0]}",
+            dry_run=False)
     describe = {'label': f'ROGUE {side}', 'side': side, 'symbol': trader.cfg.symbol,
                 'lot': trader.cfg.lot_size, 'price': 'mkt', 'sl': sl, 'tp': tp,
-                'magic': ROGUE_MAGIC}
+                'magic': rogue_magic(trader.cfg)}
     try:
         res = trader.adapter.place_with_retry(
             _send, describe=describe, tele=getattr(trader, 'tele', None))
@@ -955,7 +975,7 @@ def _manage_rogue_open(trader, st, price):
     if profit < float(getattr(trader.cfg, 'rogue_trail_arm', 5.0)):
         return                      # trail not armed yet (still on the init SL)
     gap = trail_gap(profit, trader.cfg)
-    new_sl = round(o['peak'] - sgn * gap, 2)
+    new_sl = round(o['peak'] - sgn * gap, _pdig(trader.cfg))
     # one-way ratchet
     if (side == 'BUY' and new_sl > o['sl']) or (side == 'SELL' and new_sl < o['sl']):
         o['sl'] = new_sl
@@ -1190,7 +1210,7 @@ def cancel_pendings(trader, reason="flatten"):
         pendings = trader.adapter.mt5.orders_get(symbol=trader.cfg.symbol) or []
         for o in pendings:
             try:
-                if int(getattr(o, 'magic', -1)) != ROGUE_MAGIC:
+                if int(getattr(o, 'magic', -1)) != rogue_magic(trader.cfg):
                     continue
                 trader.adapter.cancel_order(int(o.ticket), dry_run=trader.paper)
                 n += 1
@@ -1239,7 +1259,7 @@ def manual_seed(trader, price):
         if price is None:
             log.warning(f"{ROGUE_ALERT_PREFIX} MANUAL SEED refused (no_tick): no sane tick")
             return False, 'no_tick', None
-        price = round(float(price), 2)
+        price = round(float(price), _pdig(trader.cfg))
         # ensure the per-day Rogue state exists (mirrors drive()'s init on a fresh restart).
         today = ''
         try:
@@ -1292,7 +1312,7 @@ def seed_tick_price(trader):
             try:
                 ok, price, _held, _reason = _th.settle_anchor_tick(prices, trader.cfg)
                 if ok and price is not None:
-                    return round(float(price), 2)
+                    return round(float(price), _pdig(trader.cfg))
             except Exception:
                 pass
     except Exception:

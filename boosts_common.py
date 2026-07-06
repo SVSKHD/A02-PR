@@ -87,7 +87,8 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
         try:
             res = self.adapter.place_market_order(
                 self.cfg.symbol, side, self.cfg.lot_size,
-                sl=b_sl, tp=b_tp, comment=cmt, dry_run=self.paper)
+                sl=b_sl, tp=b_tp, comment=cmt, dry_run=self.paper,
+                magic=int(getattr(self.cfg, 'anchor_magic', 20260522)))
         except Exception as e:
             self.tele.error(f"❌ {plan.kind} BOOST{bi + 1} EXCEPTION: {md_escape(repr(e))}")
             fleet.append({'ticket': None, 'fill': None, 'rc': None, 'comment': cmt})

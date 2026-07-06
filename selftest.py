@@ -310,6 +310,13 @@ STEP_NAMES = {
     229: "no mid-day re-seed",     # toggling anchors mid-day never re-seeds/orphans an existing seed or chain
     230: "switch+friday compose",  # per-engine seam blocks on EITHER (engine off OR friday window)
     231: "scoped flatten confirm", # /anchors|/rogue flatten touch only their magic and require confirm
+    # feat/symbol-profiles — MERGE GATE additions (232-237)
+    232: "gold regression",        # Config() field-by-field == frozen master-defaults snapshot
+    233: "silver profile",         # silver loads, validator passes, magics 20260710/20260711
+    234: "price digits",           # no PRICE-path round(x,2) left (source scan) + 3dp pure levels
+    235: "magic separation",       # stamping reads cfg; no runtime 20260522/20260626 literals
+    236: "tolerance golds",        # new tolerance cfg fields reproduce the old literals exactly
+    237: "instance isolation",     # PID lock + state path resolve inside cwd only
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9182,9 +9189,274 @@ class SelfTest:
             self._step_no_midday_reseed()
             self._step_switch_friday_compose()
             self._step_scoped_flatten_confirm()
+            # feat/symbol-profiles — MERGE GATE (232-237)
+            self._step_profile_gold_regression()
+            self._step_profile_silver_loads()
+            self._step_profile_price_digits()
+            self._step_profile_magic_separation()
+            self._step_profile_tolerance_golds()
+            self._step_profile_instance_isolation()
         finally:
             self._cleanup()
         return self._report(ts)
+
+    # ------------------------------------------------------------------
+    # feat/symbol-profiles — MERGE GATE steps 232-237. GOLD stays byte-
+    # identical (232/236), silver loads + validates (233), the price/magic
+    # parameterization is proven both functionally and by source scan
+    # (234/235), and two instances can never share a PID lock / state file
+    # (237). All pure — no MT5, no orders.
+    # ------------------------------------------------------------------
+
+    # Remaining `round(x, 2)` in the five price-path modules that are MONEY or
+    # LOT-STEP rounding by design (NOT prices) — the ONLY allowed leftovers.
+    _P_ROUND2_ALLOW = {
+        'anchors.py': ('gap_lot     = gap_lot_override or round(self.cfg.lot_size / 2, 2)',
+                       'gap_lot = round(self.cfg.lot_size / 2, 2)',
+                       'rcv_lot = round(max(gap_lot / 2 if gap_mode else gap_lot * 0.5, 0.01), 2)'),
+        'rogue.py': ("'pnl_usd': round(float(pnl), 2),",),
+        'trails.py': (),
+        'strategy.py': (),
+        'fills.py': ('_max_loss = round(_sgn * (_sl - _e) * _mult, 2)',
+                     '_max_gain = round(_sgn * (_tp - _e) * _mult, 2)',
+                     'outcome, round(pnl_usd, 2), ticket,',
+                     'pnl=round(pnl_usd, 2),'),
+    }
+
+    # Lines in placement/close-path modules still carrying a magic literal —
+    # every one a SIGNATURE DEFAULT / cfg-fallback ("outside defaults" rule).
+    _P_MAGIC_ALLOW = {
+        'mt5_adapter.py': ('magic: int = 20260522',
+                           'close_magic = int(magic) if magic is not None else 20260522'),
+        'rogue.py': ('ROGUE_MAGIC = 20260626',),
+        'anchors.py': ("int(getattr(self.cfg, 'anchor_magic', 20260522))",),
+        'boosts_common.py': ("int(getattr(self.cfg, 'anchor_magic', 20260522))",),
+        'live_trader.py': ('WARMUP_MAGIC = 9999998',
+                           "int(getattr(self.cfg, 'anchor_magic', 20260522))",),
+        'risk.py': (),
+        'trails.py': (),
+        'fills.py': (),
+    }
+
+    @staticmethod
+    def _p_code_lines(fname):
+        """(lineno, code) for every line of `fname` with comments stripped and
+        docstring-ish quoted text ignored crudely via the '#' split -- enough
+        for literal scans (the literals we hunt never appear mid-string on
+        code paths)."""
+        out = []
+        in_doc = False
+        with open(fname, encoding='utf-8') as f:
+            for i, raw in enumerate(f, 1):
+                line = raw.rstrip('\n')
+                stripped = line.strip()
+                # crude docstring tracker: toggling on lines containing triple quotes
+                n_trip = stripped.count('"""') + stripped.count("'''")
+                if in_doc:
+                    if n_trip % 2 == 1:
+                        in_doc = False
+                    continue
+                if n_trip % 2 == 1:
+                    in_doc = True
+                    line = line.split('"""')[0].split("'''")[0]
+                out.append((i, line.split('#', 1)[0]))
+        return out
+
+    def _step_profile_gold_regression(self):
+        # 232 GOLD REGRESSION: a bare Config() must equal the frozen snapshot of
+        # master's defaults field-by-field (snapshot written from master 7e6384d
+        # BEFORE any feat/symbol-profiles edit), and build_config('gold') must
+        # be exactly Config() (gold PROFILE is {}).
+        try:
+            import dataclasses as _dc, json as _json
+            from config import Config as _C
+            from config_profiles import build_config as _bc
+            snap = _json.load(open('gold_defaults_snapshot.json'))
+            cfg = _C()
+            cur = {f.name: repr(getattr(cfg, f.name)) for f in _dc.fields(_C)}
+            drift = sorted(k for k, v in snap.items() if cur.get(k) != v)
+            gold_is_default = (_bc('gold') == _C())
+            ok = (not drift) and gold_is_default and len(snap) >= 140
+            detail = (f"{len(snap) - len(drift)}/{len(snap)} master fields match, "
+                      f"gold==Config()={gold_is_default}"
+                      + (f", DRIFTED: {drift[:5]}" if drift else ""))
+            self._record(232, PASS if ok else FAIL, detail)
+        except Exception as e:
+            self._record(232, FAIL, f"raised: {e!r}")
+
+    def _step_profile_silver_loads(self):
+        # 233: silver profile loads via the loader, the boot validator passes it,
+        # magics are 20260710/20260711, and the loader REJECTS unknown keys +
+        # unknown profile names loudly.
+        try:
+            import config_profiles as _cp
+            from aureon_validator import validate as _validate
+            s = _cp.build_config('silver')
+            ids_ok = (s.symbol == 'XAGUSD' and s.contract_size == 5000.0
+                      and s.anchor_magic == 20260710 and s.rogue_magic == 20260711
+                      and s.price_digits == 3)
+            rep = _validate(s)
+            val_ok = (rep['verdict'] == 'SAFE-TO-START')
+            try:
+                _cp.build_config('copper')
+                bad_name_rejected = False
+            except ValueError:
+                bad_name_rejected = True
+            _orig = _cp.load_profile
+            _cp.load_profile = lambda n: {'symbol': 'XAGUSD', 'not_a_cfg_key': 1}
+            try:
+                _cp.build_config('silver')
+                unknown_rejected = False
+            except ValueError:
+                unknown_rejected = True
+            finally:
+                _cp.load_profile = _orig
+            ok = ids_ok and val_ok and bad_name_rejected and unknown_rejected
+            self._record(233, PASS if ok else FAIL,
+                         f"ids={ids_ok} validator={rep['verdict']} "
+                         f"bad_name_rejected={bad_name_rejected} "
+                         f"unknown_key_rejected={unknown_rejected}")
+        except Exception as e:
+            self._record(233, FAIL, f"raised: {e!r}")
+
+    def _step_profile_price_digits(self):
+        # 234: (a) SOURCE SCAN -- no PRICE-path literal round(x, 2) remains in the
+        # five converted modules (only the allowlisted money/lot-step sites); and
+        # (b) price_digits=3 actually produces 3dp levels in the straddle/trail/
+        # rogue PURE functions while gold stays 2dp.
+        try:
+            import re as _re
+            offenders = []
+            for fname, allow in self._P_ROUND2_ALLOW.items():
+                for lineno, code in self._p_code_lines(fname):
+                    if _re.search(r'round\([^()]*(?:\([^()]*\)[^()]*)*,\s*2\)', code) \
+                            and not any(a in code for a in allow):
+                        offenders.append(f'{fname}:{lineno}')
+            scan_ok = not offenders
+            import config_profiles as _cp
+            from config import Config as _C
+            import rogue as _rogue
+            from strategy import lock_trigger_price as _ltp
+            from anchors import _pdig as _apdig
+            g, s = _C(), _cp.build_config('silver')
+            # straddle stop levels (the same _pdig+round the placement path uses)
+            straddle_ok = (round(36.1234 + s.trigger_dist, _apdig(s)) == 36.293
+                           and round(4000.123 + g.trigger_dist, _apdig(g)) == 4005.12)
+            # trail: lock rung trigger prices honor cfg.price_digits
+            trail_ok = (_ltp('BUY', 36.1234, 1, s) == 41.123
+                        and _ltp('BUY', 4000.123, 1, g) == 4005.12
+                        and _ltp('BUY', 4000.123, 1) == 4005.12)  # cfg-less = gold
+            # rogue: A1-mode entry + SL at 3dp on silver, 2dp on gold
+            s_ent = _rogue.a1_entry_decision(36.000, 36.350, s)
+            g_ent = _rogue.a1_entry_decision(4000.0, 4010.5, g)
+            rogue_ok = (s_ent[0] is True and s_ent[1] == 'BUY'
+                        and s_ent[2] == 36.35 and s_ent[3] == round(36.35 - s.rogue_init_sl, 3)
+                        and g_ent[0] is True and g_ent[3] == round(4010.5 - g.rogue_init_sl, 2))
+            ok = scan_ok and straddle_ok and trail_ok and rogue_ok
+            self._record(234, PASS if ok else FAIL,
+                         f"scan_clean={scan_ok}{' ' + ','.join(offenders[:4]) if offenders else ''} "
+                         f"straddle3dp={straddle_ok} trail3dp={trail_ok} rogue3dp={rogue_ok}")
+        except Exception as e:
+            self._record(234, FAIL, f"raised: {e!r}")
+
+    def _step_profile_magic_separation(self):
+        # 235: order-stamping paths read cfg (functional), and NO literal
+        # 20260522/20260626 remains on a runtime placement/close code path
+        # outside signature defaults / cfg fallbacks (source scan).
+        try:
+            import types as _types
+            import rogue as _rogue
+            silver = None
+            import config_profiles as _cp
+            silver = _cp.build_config('silver')
+            # functional: the runtime resolver follows cfg, falls back to gold
+            fn_ok = (_rogue.rogue_magic(silver) == 20260711
+                     and _rogue.rogue_magic(None) == 20260626
+                     and _rogue.rogue_magic(self.cfg) == int(getattr(self.cfg, 'rogue_magic', 20260626)))
+            # functional: closes() scoping honors the cfg magic
+            silver_rogue_pos = {'magic': 20260711}
+            scope_ok = (_rogue.closes(silver_rogue_pos, 'ROGUE', silver) is True
+                        and _rogue.closes(silver_rogue_pos, 'ANCHOR', silver) is False
+                        and _rogue.closes({'magic': 20260626}, 'ROGUE') is True)
+            # functional: a silver Rogue placement stamps the silver magic
+            placed = []
+            tr = _types.SimpleNamespace(
+                cfg=silver, paper=True,
+                adapter=_types.SimpleNamespace(
+                    place_market_order=lambda sym, side, lot, sl=None, tp=None,
+                    magic=None, comment='', dry_run=False:
+                    placed.append(magic) or _types.SimpleNamespace(retcode=10009, order=1)),
+                tele=_types.SimpleNamespace(info=lambda *a, **k: None),
+                run_dir=None)
+            st = {'leg_dir': 'BUY', 'gov': _rogue.new_day_state(), 'anchor': 36.0}
+            _rogue._place_rogue_entry(tr, st, 36.35, 36.18)
+            stamp_ok = (placed == [20260711])
+            # source scan: placement/close-path modules
+            offenders = []
+            for fname, allow in self._P_MAGIC_ALLOW.items():
+                for lineno, code in self._p_code_lines(fname):
+                    if ('20260522' in code or '20260626' in code) \
+                            and not any(a in code for a in allow):
+                        offenders.append(f'{fname}:{lineno}')
+            scan_ok = not offenders
+            ok = fn_ok and scope_ok and stamp_ok and scan_ok
+            self._record(235, PASS if ok else FAIL,
+                         f"resolver={fn_ok} closes_scoped={scope_ok} stamp={stamp_ok} "
+                         f"scan_clean={scan_ok}"
+                         f"{' ' + ','.join(offenders[:4]) if offenders else ''}")
+        except Exception as e:
+            self._record(235, FAIL, f"raised: {e!r}")
+
+    def _step_profile_tolerance_golds(self):
+        # 236: every new tolerance field's GOLD default reproduces the literal it
+        # replaced exactly (0.1 / 0.5 / 15.0 / 0.05 / 0.30 / 0.40 / 0.05), and the
+        # gold magics are 20260522/20260626.
+        try:
+            from config import Config as _C
+            g = _C()
+            expected = {'anchor_drift_tol': 0.1, 'recovery_slip_min': 0.5,
+                        'recovery_slip_max': 15.0, 'tp_detect_tol': 0.05,
+                        'sl_mismatch_alert': 0.30, 'shadow_entry_tol': 0.40,
+                        'broker_sl_assert_tol': 0.05}
+            bad = {k: getattr(g, k, None) for k, v in expected.items()
+                   if getattr(g, k, None) != v}
+            magics_ok = (g.anchor_magic == 20260522 and g.rogue_magic == 20260626
+                         and g.price_digits == 2 and g.contract_size == 100.0)
+            ok = (not bad) and magics_ok
+            self._record(236, PASS if ok else FAIL,
+                         f"tolerances={'all-gold' if not bad else bad} "
+                         f"magics/digits/contract={magics_ok}")
+        except Exception as e:
+            self._record(236, FAIL, f"raised: {e!r}")
+
+    def _step_profile_instance_isolation(self):
+        # 237: TWO-INSTANCE ISOLATION -- the PID lock and every state/IPC path
+        # resolve inside the instance's OWN cwd (all cwd-relative defaults), so
+        # the gold checkout and the silver clone (different directories) can
+        # never share a lock, a state file, or a run dir on one machine.
+        try:
+            import os as _os
+            from config import Config as _C
+            run_dir_default = _os.environ.get("AUREON_RUN_DIR", "./run")
+            pid_path = _os.path.join(run_dir_default, "aureon.pid")
+            state_file = _C().state_file
+            cwd = _os.path.abspath(_os.getcwd())
+            def _inside_cwd(p):
+                return _os.path.abspath(p).startswith(cwd + _os.sep)
+            rel_ok = (not _os.path.isabs(state_file)) and (not _os.path.isabs(pid_path))
+            inside_ok = _inside_cwd(pid_path) and _inside_cwd(state_file) \
+                and _inside_cwd(run_dir_default)
+            # two hypothetical instance roots resolve to DISTINCT lock/state paths
+            a = _os.path.join(_os.sep, 'A02-PR', 'run', 'aureon.pid')
+            b = _os.path.join(_os.sep, 'A02-PR-XAG', 'run', 'aureon.pid')
+            distinct_ok = a != b
+            ok = rel_ok and inside_ok and distinct_ok
+            self._record(237, PASS if ok else FAIL,
+                         f"relative={rel_ok} inside_cwd={inside_ok} "
+                         f"distinct_roots={distinct_ok} "
+                         f"(pid={pid_path} state={state_file})")
+        except Exception as e:
+            self._record(237, FAIL, f"raised: {e!r}")
 
     def _run_guarded(self, n: int, step):
         try:

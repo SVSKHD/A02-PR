@@ -21,6 +21,11 @@ from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
 
+def _pdig(cfg):
+    """feat/symbol-profiles: price decimal places (cfg.price_digits; gold 2, silver 3)."""
+    return int(getattr(cfg, 'price_digits', 2))
+
+
 
 def _resolve_parent_sl(self, shadow):
     """E-6: READ-ONLY resolve a boost's PARENT anchor-leg current trailing stop, from
@@ -162,11 +167,11 @@ def _manage_trails_on_bar_close(self):
                 if _s > 0:
                     _stop = max(_e, _pk - self.cfg.trail_gap)
                     if _lo <= _stop:
-                        shadow['nh_exit'] = round(_stop, 2)
+                        shadow['nh_exit'] = round(_stop, _pdig(self.cfg))
                 else:
                     _stop = min(_e, _pk + self.cfg.trail_gap)
                     if _hi >= _stop:
-                        shadow['nh_exit'] = round(_stop, 2)
+                        shadow['nh_exit'] = round(_stop, _pdig(self.cfg))
 
         # v2.7.1 TSTOP -- loser time-stop (grid-validated). At hold expiry, a leg
         # whose best favorable excursion never reached +$tstop_fav is a trapped
@@ -202,7 +207,7 @@ def _manage_trails_on_bar_close(self):
             # the bot's intended sl — EVERY bar, not only on advance. A silently
             # dropped/rejected modify (the A2 -990 bug) self-heals next bar
             # instead of leaving the original stop live for hours.
-            intended = round(pos.current_sl, 2)
+            intended = round(pos.current_sl, _pdig(self.cfg))
 
             # v2.5.8: clamp SL to the broker's minimum LEGAL distance from market.
             # This broker reports stops_level=0 but rejects stops within ~$0.20 of
@@ -229,10 +234,10 @@ def _manage_trails_on_bar_close(self):
                     # re-arm it. Market-close is reserved for genuine SL/TP/kill/EOD.
                     _through = False
                     if shadow['side'] == 'BUY':
-                        max_legal = round(ctk.bid - floor, 2)
+                        max_legal = round(ctk.bid - floor, _pdig(self.cfg))
                         _through = intended > max_legal
                     else:
-                        min_legal = round(ctk.ask + floor, 2)
+                        min_legal = round(ctk.ask + floor, _pdig(self.cfg))
                         _through = intended < min_legal
                     if not _through:
                         # episode over -- the next through-event gets a fresh warning.
@@ -267,8 +272,8 @@ def _manage_trails_on_bar_close(self):
                                             ask=ctk.ask,
                                             position_price=shadow.get('entry_price'),
                                             max_fav=shadow.get('max_fav'),
-                                            rejected_stop=round(intended, 2),
-                                            stop_price=round(old_sl, 2),
+                                            rejected_stop=round(intended, _pdig(self.cfg)),
+                                            stop_price=round(old_sl, _pdig(self.cfg)),
                                             reason="stop_through_no_armed_lock_no_advance")
                                 except Exception:
                                     pass
@@ -279,7 +284,7 @@ def _manage_trails_on_bar_close(self):
                                     f"${intended:.2f} was through bid/ask) | further "
                                     f"repeats this episode are suppressed")
                             # NO advance: current_sl/shadow stay exactly as they were.
-                            intended = round(old_sl, 2)
+                            intended = round(old_sl, _pdig(self.cfg))
                             pos.current_sl = old_sl
                         else:
                             # A genuinely armed lock (tier 2/3) IS worth protecting --
@@ -287,9 +292,9 @@ def _manage_trails_on_bar_close(self):
                             # (long) / above market (short); else clamp to the closest
                             # legal level. Either way we re-arm a VALID stop -- never dump.
                             if shadow['side'] == 'BUY':
-                                corrected = round(min(old_sl, max_legal), 2)
+                                corrected = round(min(old_sl, max_legal), _pdig(self.cfg))
                             else:
-                                corrected = round(max(old_sl, min_legal), 2)
+                                corrected = round(max(old_sl, min_legal), _pdig(self.cfg))
                             if not shadow.get('_stopthru_episode_warned'):
                                 shadow['_stopthru_episode_warned'] = True
                                 try:
@@ -300,7 +305,7 @@ def _manage_trails_on_bar_close(self):
                                             ask=ctk.ask,
                                             position_price=shadow.get('entry_price'),
                                             max_fav=shadow.get('max_fav'),
-                                            rejected_stop=round(intended, 2),
+                                            rejected_stop=round(intended, _pdig(self.cfg)),
                                             stop_price=corrected,
                                             reason="stop_through_replaced_not_closed")
                                 except Exception:
@@ -329,7 +334,7 @@ def _manage_trails_on_bar_close(self):
                 broker_sl = None
                 log.warning(f"Could not read broker SL for {ticket}: {e}")
 
-            needs_assert = (broker_sl is None) or (abs(broker_sl - intended) > 0.05)
+            needs_assert = (broker_sl is None) or (abs(broker_sl - intended) > self.cfg.broker_sl_assert_tol)
             if needs_assert:
                 if pos.current_sl != old_sl:
                     log.info(

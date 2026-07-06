@@ -88,6 +88,7 @@ _EVENT_TYPE_TO_LEG_CLASS = {
 }
 
 ROGUE_MAGIC_DEFAULT = 20260626
+ANCHOR_MAGIC_DEFAULT = 20260522
 
 _ANCHOR_ORIG_RE = re.compile(r'^AUR_([A-Z0-9]{2})_(BUY|SELL)(?:_(G|RCV|CFM))?(?:_R\d+)?$')
 _ANCHOR_BOOST_RE = re.compile(r'^AUR_([A-Z0-9]{2})_([BS])_B(\d+)$')
@@ -698,18 +699,27 @@ def run_dir_default():
 # Orchestration for one day
 # ---------------------------------------------------------------------------
 def build_day_report(adapter, date_str, run_dir=None, logs_dir=None,
-                     rogue_magic=ROGUE_MAGIC_DEFAULT):
+                     rogue_magic=ROGUE_MAGIC_DEFAULT, cfg=None):
     """Impure orchestrator: pull MT5 history for `date_str` (IST calendar
     day), join rescue_events.csv + the journal CSV + the day's log file, and
     return {'trades', 'per_anchor', 'whipsaw_counts', 'rogue', 'w2',
     'unclassified'} -- everything render_markdown/ledger_rows need. Never
-    raises (every reader below degrades independently)."""
+    raises (every reader below degrades independently).
+
+    feat/symbol-profiles: `cfg` (optional) supplies THIS instance's
+    anchor_magic/rogue_magic; the ground-truth trade list is filtered to
+    those two magics so a silver instance's report never reads gold trades
+    (and vice versa) on a shared account. cfg omitted -> gold defaults."""
     run_dir = run_dir or run_dir_default()
     logs_dir = logs_dir or _logs_dir()
+    anchor_magic = int(getattr(cfg, 'anchor_magic', ANCHOR_MAGIC_DEFAULT))
+    if cfg is not None:
+        rogue_magic = int(getattr(cfg, 'rogue_magic', rogue_magic))
     dt_from, dt_to = ist_day_window_utc(date_str)
     deals = fetch_deals_for_range(adapter, dt_from, dt_to)
     rescue_idx = load_rescue_event_index(run_dir)
     trades = build_trades(deals, rescue_idx, rogue_magic=rogue_magic)
+    trades = [t for t in trades if t['magic'] in (anchor_magic, rogue_magic)]
     whipsaw_counts = detect_whipsaws(trades)
     per_anchor = per_anchor_stats(trades, whipsaw_counts)
     journal_idx = load_journal_index(run_dir, date_str)
@@ -828,10 +838,12 @@ def run_eod_report(self, broker_date):
         if not bool(getattr(self.cfg, 'util_daily_pnl_report', True)):
             return None
         date_str = str(broker_date)
-        rep = build_day_report(self.adapter, date_str, run_dir=self.run_dir)
+        rep = build_day_report(self.adapter, date_str, run_dir=self.run_dir,
+                               cfg=self.cfg)
         month_stats = None
         try:
-            month_stats = month_to_date_rollup(self.adapter, date_str, run_dir=self.run_dir)
+            month_stats = month_to_date_rollup(self.adapter, date_str,
+                                               run_dir=self.run_dir, cfg=self.cfg)
         except Exception as e:
             log.warning(f"pnl_report: month rollup failed (day report unaffected): {e!r}")
         md_path, csv_path = write_report_files(rep, run_dir=self.run_dir,
@@ -851,7 +863,7 @@ def run_eod_report(self, broker_date):
         return None
 
 
-def month_to_date_rollup(adapter, date_str, run_dir=None):
+def month_to_date_rollup(adapter, date_str, run_dir=None, cfg=None):
     """Build the month-to-date per-anchor roll-up (1st of the month through
     date_str inclusive) by running build_day_report for each day and summing
     via rollup_period. Bounded to <=31 iterations; a day with no deals just
@@ -863,7 +875,7 @@ def month_to_date_rollup(adapter, date_str, run_dir=None):
     cur = first
     while cur <= d:
         cur_str = cur.strftime('%Y-%m-%d')
-        rep = build_day_report(adapter, cur_str, run_dir=run_dir)
+        rep = build_day_report(adapter, cur_str, run_dir=run_dir, cfg=cfg)
         day_stats.append(rep['per_anchor'])
         cur += timedelta(days=1)
     return rollup_period(day_stats)
@@ -872,7 +884,7 @@ def month_to_date_rollup(adapter, date_str, run_dir=None):
 # ---------------------------------------------------------------------------
 # CLI entrypoint: python bot.py dailyreport [YYYY-MM-DD|YYYY-MM]
 # ---------------------------------------------------------------------------
-def run_dailyreport(date_arg=None):
+def run_dailyreport(date_arg=None, cfg=None):
     """CLI (python bot.py dailyreport [YYYY-MM-DD|YYYY-MM]). Read-only: opens
     its own MT5Adapter for history reads only, never touches the broker's
     order book. A bare YYYY-MM-DD runs ONE day; YYYY-MM runs the whole month
@@ -892,14 +904,17 @@ def run_dailyreport(date_arg=None):
     try:
         from mt5_adapter import MT5Adapter
         from config import Config
-        adapter = MT5Adapter(Config().symbol)
+        if cfg is None:
+            cfg = Config()
+        adapter = MT5Adapter(cfg.symbol)
     except Exception as e:
         print(f"dailyreport: could not connect to MT5: {e!r}")
         return 1
     try:
         if is_day:
-            rep = build_day_report(adapter, date_arg, run_dir=run_dir)
-            month_stats = month_to_date_rollup(adapter, date_arg, run_dir=run_dir)
+            rep = build_day_report(adapter, date_arg, run_dir=run_dir, cfg=cfg)
+            month_stats = month_to_date_rollup(adapter, date_arg, run_dir=run_dir,
+                                               cfg=cfg)
             md_path, csv_path = write_report_files(
                 rep, run_dir=run_dir, month_rollup_stats=month_stats,
                 month_str=date_arg[:7])
@@ -917,7 +932,7 @@ def run_dailyreport(date_arg=None):
             last_rep = None
             while cur <= end:
                 cur_str = cur.strftime('%Y-%m-%d')
-                rep = build_day_report(adapter, cur_str, run_dir=run_dir)
+                rep = build_day_report(adapter, cur_str, run_dir=run_dir, cfg=cfg)
                 per_day_anchor_stats.append(rep['per_anchor'])
                 write_report_files(rep, run_dir=run_dir)
                 _print_day_summary(rep)

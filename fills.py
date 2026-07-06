@@ -28,6 +28,11 @@ import soft_restart as _soft  # v3.2.3: restart-reconcile classifier (pure, shar
 
 log = logging.getLogger("AUREON")
 
+def _pdig(cfg):
+    """feat/symbol-profiles: price decimal places (cfg.price_digits; gold 2, silver 3)."""
+    return int(getattr(cfg, 'price_digits', 2))
+
+
 
 # ============================================================================
 # Alert formatters (v3.0.7) — pure, NEVER raise
@@ -416,7 +421,7 @@ def _reconcile_with_broker(self):
                 _entry = float(shadow['entry_price'])
                 _cur_sl = shadow.get('current_sl')
                 slip_txt = ''
-                if abs(close_price - (_entry + _sgn * self.cfg.tp_dist)) < 0.05:
+                if abs(close_price - (_entry + _sgn * self.cfg.tp_dist)) < self.cfg.tp_detect_tol:
                     outcome = 'TP'
                 elif _sgn * (close_price - (_entry - _sgn * self.cfg.sl_dist)) <= 0.05:
                     outcome = 'SL'
@@ -432,7 +437,7 @@ def _reconcile_with_broker(self):
                         outcome = 'TIER'      # ladder tier 3 (+10 -> peak-2, floor +8)
                     else:
                         outcome = 'Trail'     # genuine post-hold trail level
-                    if _cur_sl is not None and abs(close_price - float(_cur_sl)) > 0.30:
+                    if _cur_sl is not None and abs(close_price - float(_cur_sl)) > self.cfg.sl_mismatch_alert:
                         slip_txt = (f" (slip {_sgn * (close_price - float(_cur_sl)):+.2f}"
                                     f" vs stop ${float(_cur_sl):.2f})")
                 if shadow.get('tstop'):
@@ -457,7 +462,7 @@ def _reconcile_with_broker(self):
                 if (hold_min is not None and outcome == 'Trail'
                         and self.cfg.freeze_minutes > 0
                         and hold_min < self.cfg.freeze_minutes - 0.5
-                        and abs(close_price - float(shadow['entry_price'])) > 0.40):
+                        and abs(close_price - float(shadow['entry_price'])) > self.cfg.shadow_entry_tol):
                     self.tele.warn(
                         f"🚨 *FREEZE BREACH* {shadow['anchor_label']} "
                         f"{shadow['side']}: Trail exit after only {hold_min:.1f}m "
@@ -470,7 +475,7 @@ def _reconcile_with_broker(self):
                 nh_txt = ''
                 _nh = shadow.get('nh_exit')
                 if _nh is not None:
-                    _nh_pnl = _sgn * (float(_nh) - _entry) * self.cfg.lot_size * 100
+                    _nh_pnl = _sgn * (float(_nh) - _entry) * self.cfg.lot_size * self.cfg.contract_size
                     nh_txt = f"\nno-hold trail would have exited @ ${float(_nh):.2f} (`${_nh_pnl:+.2f}`)"
                 # v3.0.7: never-raising formatter + important=True so a close
                 # alert can never be lost to a formatter throw or rate limiting.
@@ -507,7 +512,7 @@ def _reconcile_with_broker(self):
                         _trail_class = outcome in ('Trail', 'BE', 'LOCK4', 'TIER')
                         _etype = 'TRAIL' if _trail_class else outcome
                         _isl = shadow.get('current_sl')
-                        _slip = (round(close_price - float(_isl), 2)
+                        _slip = (round(close_price - float(_isl), _pdig(self.cfg))
                                  if _isl is not None else None)
                         tr.exit(ticket, shadow.get('anchor_label'),
                                 side=shadow.get('side'),
@@ -515,7 +520,7 @@ def _reconcile_with_broker(self):
                                 max_fav=shadow.get('max_fav'),
                                 stop_price=_isl, exit_type=_etype,
                                 exit_reason=outcome, intended_price=_isl,
-                                actual_fill=round(close_price, 2), slip=_slip,
+                                actual_fill=round(close_price, _pdig(self.cfg)), slip=_slip,
                                 pnl=round(pnl_usd, 2),
                                 held_minutes=(round(hold_min, 1)
                                               if hold_min is not None else None),
@@ -665,7 +670,7 @@ def _check_boost_triggers(self):
                 if tr is not None:
                     tr.tick_blip_rejected(ticket, shadow.get('anchor_label'),
                                           side=side, reverted_from=shadow['boost_cross_streak'],
-                                          move_dollars=round(leg_fav, 2))
+                                          move_dollars=round(leg_fav, _pdig(self.cfg)))
                 shadow['boost_cross_streak'] = 0
             # v3.2.3 MISSED_BOOST watchdog: a fire was EXPECTED (the threshold was
             # crossed AND that kind is enabled here) but none was planned -- the
@@ -678,7 +683,7 @@ def _check_boost_triggers(self):
             if (rally_exp or rescue_exp) and tr is not None:
                 _missed_trig = rally_arm if rally_exp else rescue_arm
                 tr.missed_boost(ticket, shadow.get('anchor_label'), side=side,
-                                position_price=fill_px, move_dollars=round(leg_fav, 2),
+                                position_price=fill_px, move_dollars=round(leg_fav, _pdig(self.cfg)),
                                 trigger=_missed_trig, rally_only=rally_only)
             continue
         # v3.2.5 tick-hold confirm: the cross must HOLD >= hold_ticks consecutive

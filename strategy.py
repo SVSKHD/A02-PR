@@ -10,6 +10,11 @@ import pandas as pd
 
 from config import Config
 
+def _pdig(cfg):
+    """feat/symbol-profiles: price decimal places (cfg.price_digits; gold 2, silver 3)."""
+    return int(getattr(cfg, 'price_digits', 2))
+
+
 
 @dataclass
 class Position:
@@ -260,8 +265,8 @@ def _update_boost_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     if (tracer is not None and bool(getattr(cfg, 'fix_boost_telemetry', True))
             and fav >= arm and sgn * (pos.current_sl - _prev_sl) > 1e-9):  # v3.5.0 feature 15
         _was_backstop = sgn * (_prev_sl - backstop) <= 1e-9
-        _kw = dict(side=pos.side, position_price=round(pos.entry_price, 2),
-                   max_fav=round(pos.max_fav, 2), stop_price=round(pos.current_sl, 2),
+        _kw = dict(side=pos.side, position_price=round(pos.entry_price, _pdig(cfg)),
+                   max_fav=round(pos.max_fav, _pdig(cfg)), stop_price=round(pos.current_sl, _pdig(cfg)),
                    boost_kind=getattr(pos, 'boost_kind', 'RESCUE'))
         try:
             anchor = getattr(pos, 'anchor_label', None)
@@ -369,8 +374,8 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
         # formulas, step size, and rung thresholds are UNCHANGED -- this only adds
         # the "max_fav reached?" guard + makes every evaluation visible. A blocked
         # phantom leaves a LOCK_REJECTED_PHANTOM line (countable, never silent).
-        trigger = lock_trigger_price(pos.side, pos.entry_price, level)
-        reached = lock_trigger_reached(pos.side, pos.entry_price, pos.max_fav, level)
+        trigger = lock_trigger_price(pos.side, pos.entry_price, level, cfg)
+        reached = lock_trigger_reached(pos.side, pos.entry_price, pos.max_fav, level, cfg)
         if tracer is not None:
             try:
                 tracer.lock_check(
@@ -386,7 +391,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
                     tracer.lock_rejected_phantom(
                         ticket, pos.anchor_label, now_utc=ts, side=pos.side,
                         position_price=pos.entry_price, max_fav=pos.max_fav,
-                        lock_level=level, attempted_lock_price=round(lock_price, 2),
+                        lock_level=level, attempted_lock_price=round(lock_price, _pdig(cfg)),
                         reason="max_fav_not_reached")
                 except Exception:
                     pass
@@ -397,7 +402,7 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
             if tracer is not None:
                 try:
                     tracer.violation(ticket, pos.anchor_label, "phantom_lock_applied",
-                                     attempted_lock_price=round(lock_price, 2),
+                                     attempted_lock_price=round(lock_price, _pdig(cfg)),
                                      max_fav=pos.max_fav)
                 except Exception:
                     pass
@@ -454,13 +459,13 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
                 tracer.lock_arm(
                     ticket, pos.anchor_label, now_utc=ts, side=pos.side,
                     position_price=pos.entry_price, max_fav=pos.max_fav,
-                    lock_level=_level_now, stop_price=round(pos.current_sl, 2),
+                    lock_level=_level_now, stop_price=round(pos.current_sl, _pdig(cfg)),
                     required=lock_ladder_prices(pos, cfg)[min(_level_now, 3) - 1][1])
             tracer.trail_advance(
                 ticket, pos.anchor_label, now_utc=ts, side=pos.side,
                 position_price=pos.entry_price, max_fav=pos.max_fav,
-                lock_level=_level_now, stop_price=round(pos.current_sl, 2),
-                old_stop=round(_sl_before, 2), new_stop=round(pos.current_sl, 2))
+                lock_level=_level_now, stop_price=round(pos.current_sl, _pdig(cfg)),
+                old_stop=round(_sl_before, _pdig(cfg)), new_stop=round(pos.current_sl, _pdig(cfg)))
         except Exception:
             pass
 
@@ -535,7 +540,7 @@ def update_max_fav(pos: Position, bar: pd.Series, cfg: Config,
                 tracer.maxfav_update(
                     ticket, pos.anchor_label, now_utc=ts,
                     position_price=pos.entry_price, max_fav=pos.max_fav,
-                    rejected_extreme=round(cand, 2), jump=round(jump, 2),
+                    rejected_extreme=round(cand, _pdig(cfg)), jump=round(jump, _pdig(cfg)),
                     reason="tick_jump_exceeds_max", accepted=False)
             except Exception:
                 pass
@@ -547,7 +552,7 @@ def update_max_fav(pos: Position, bar: pd.Series, cfg: Config,
             tracer.maxfav_update(
                 ticket, pos.anchor_label, now_utc=ts,
                 position_price=pos.entry_price, max_fav=pos.max_fav,
-                old_max_fav=round(old, 2), tick_price=round(cand, 2),
+                old_max_fav=round(old, _pdig(cfg)), tick_price=round(cand, _pdig(cfg)),
                 accepted=True)
         except Exception:
             pass
@@ -581,7 +586,7 @@ def lock_ladder_prices(pos: Position, cfg: Config):
     the fill-time prediction ladder (spec 1.4) and the confirmed-price gate
     (spec Part 2.1). A rung fires ONLY if max_fav actually reaches its level."""
     e = pos.entry_price
-    return [(L, lock_trigger_price(pos.side, e, L)) for L in (1, 2, 3)]
+    return [(L, lock_trigger_price(pos.side, e, L, cfg)) for L in (1, 2, 3)]
 
 
 # v3.2.3 PHANTOM-LOCK GUARD -- the SINGLE source of the "max_fav reached?" check,
@@ -590,15 +595,17 @@ def lock_ladder_prices(pos: Position, cfg: Config):
 _LOCK_RUNG_FAV = {1: 5.00, 2: 6.00, 3: 10.00}
 
 
-def lock_trigger_price(side: str, entry: float, level: int) -> float:
+def lock_trigger_price(side: str, entry: float, level: int, cfg=None) -> float:
     """The price max_fav must reach for lock `level` to be allowed to arm
-    (long: entry + fav; short: entry - fav)."""
-    return round(entry + _sgn_of(side) * _LOCK_RUNG_FAV[int(level)], 2)
+    (long: entry + fav; short: entry - fav). `cfg` (optional) supplies
+    price_digits; omitted -> gold 2dp, byte-identical."""
+    return round(entry + _sgn_of(side) * _LOCK_RUNG_FAV[int(level)], _pdig(cfg))
 
 
-def lock_trigger_reached(side: str, entry: float, max_fav: float, level: int) -> bool:
+def lock_trigger_reached(side: str, entry: float, max_fav: float, level: int,
+                         cfg=None) -> bool:
     """THE GUARD: True iff max_fav has GENUINELY reached lock `level`'s trigger
     price (long: max_fav >= trigger; short: max_fav <= trigger). A lock may apply
     ONLY when this is True -- a phantom (lock priced off a high/low that never
     happened) is blocked here. Pure; shared everywhere."""
-    return _sgn_of(side) * (max_fav - lock_trigger_price(side, entry, level)) >= -1e-9
+    return _sgn_of(side) * (max_fav - lock_trigger_price(side, entry, level, cfg)) >= -1e-9

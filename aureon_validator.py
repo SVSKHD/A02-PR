@@ -78,8 +78,10 @@ def _probe(cfg):
     #    matches rogue_enabled; a funded account is force-disabled).
     try:
         import rogue as _r
-        w('rogue:magic_distinct', _r.ROGUE_MAGIC not in (20260522, 9999998),
-          f'ROGUE_MAGIC={_r.ROGUE_MAGIC}')
+        _rm_eff = _r.rogue_magic(cfg)  # cfg-level (profile) value, gold fallback
+        _am_eff = int(getattr(cfg, 'anchor_magic', 20260522))
+        w('rogue:magic_distinct', _rm_eff not in (_am_eff, 9999998),
+          f'rogue_magic={_rm_eff} anchor_magic={_am_eff}')
         raw_run = _r.should_run(cfg, is_funded=False)
         w('rogue:run_matches_flag', raw_run == bool(getattr(cfg, 'rogue_enabled', False)),
           f'should_run={raw_run} rogue_enabled={getattr(cfg, "rogue_enabled", None)}')
@@ -93,6 +95,57 @@ def _probe(cfg):
     _seed_mode = str(getattr(cfg, 'rogue_seed_fallback', 'a1_time_snapshot')).lower()
     w('rogue:seed_fallback_valid', _seed_mode in ('a1_time_snapshot', 'market_open'),
       f'rogue_seed_fallback={_seed_mode!r}')
+
+    # 4c. feat/symbol-profiles: SCALE-FREE geometry rules. RATIO rules (not gold-
+    #     magnitude literals) so BOTH profiles validate: gold ($5/$18/$30) and
+    #     silver ($0.17/$0.61/$1.017) pass the same checks; a profile whose
+    #     geometry is inverted (SL beyond TP, trigger beyond SL) fails loudly.
+    try:
+        _trig = float(getattr(cfg, 'trigger_dist', 0.0))
+        _sl = float(getattr(cfg, 'sl_dist', 0.0))
+        _tp = float(getattr(cfg, 'tp_dist', 0.0))
+        w('ratio:trigger<sl<tp', 0.0 < _trig < _sl < _tp,
+          f'trigger_dist={_trig} sl_dist={_sl} tp_dist={_tp}')
+        _be = float(getattr(cfg, 'be_trigger', 0.0))
+        _arms = {'trail_arm_profit': float(getattr(cfg, 'trail_arm_profit', 0.0)),
+                 'boost_trail_arm_fav': float(getattr(cfg, 'boost_trail_arm_fav', 0.0)),
+                 'rally_arm_fav': float(getattr(cfg, 'rally_arm_fav', 0.0))}
+        w('ratio:be_trigger<trail_arms',
+          _be > 0.0 and all(_be < v for v in _arms.values()),
+          f'be_trigger={_be} vs {_arms}')
+        _bsls = {'boost_sl_dollars': float(getattr(cfg, 'boost_sl_dollars', 0.0)),
+                 'rally_boost_sl': float(getattr(cfg, 'rally_boost_sl', 0.0)),
+                 'trapped_rescue_sl_dollars': float(getattr(cfg, 'trapped_rescue_sl_dollars', 0.0))}
+        w('ratio:boost_sls<anchor_sl',
+          all(0.0 < v < _sl for v in _bsls.values()),
+          f'{_bsls} vs sl_dist={_sl}')
+        _floors = {'boost_lock_floor': float(getattr(cfg, 'boost_lock_floor', 0.0)),
+                   'rally_lock_floor': float(getattr(cfg, 'rally_lock_floor', 0.0))}
+        w('ratio:lock_floors>0', all(v > 0.0 for v in _floors.values()),
+          f'{_floors}')
+    except Exception as e:
+        w('ratio:geometry', False, f'ratio-rule probe FAILED: {e!r}')
+
+    # 4d. feat/symbol-profiles: instance identity + scale sanity.
+    _am = int(getattr(cfg, 'anchor_magic', 20260522))
+    _rm = int(getattr(cfg, 'rogue_magic', 20260626))
+    w('profile:magics_distinct', _am != _rm, f'anchor_magic={_am} rogue_magic={_rm}')
+    _pd = int(getattr(cfg, 'price_digits', 2))
+    w('profile:price_digits_valid', _pd in (2, 3), f'price_digits={_pd}')
+    # lot parity: the configured lot must be within 20% of the $630-risk lot
+    # (630 / (sl_dist × contract_size)) -- gold 630/(18×100)=0.35 exact; silver
+    # 630/(0.61×5000)≈0.2066 vs 0.21 ≈ 1.7% off. Catches a profile whose lot
+    # was not rescaled with its SL distance / contract size.
+    try:
+        _lot = float(getattr(cfg, 'lot_size', 0.0))
+        _cs = float(getattr(cfg, 'contract_size', 0.0))
+        _parity_lot = 630.0 / (float(getattr(cfg, 'sl_dist', 0.0)) * _cs)
+        _parity_err = abs(_lot - _parity_lot) / _lot if _lot > 0 else float('inf')
+        w('profile:lot_parity', _parity_err <= 0.20,
+          f'lot={_lot} vs 630/(sl_dist*contract_size)={_parity_lot:.4f} '
+          f'({_parity_err:.1%} off, tol 20%)')
+    except Exception as e:
+        w('profile:lot_parity', False, f'lot parity probe FAILED: {e!r}')
 
     # 5. derived-cap discipline present (rescue/rally caps resolvable).
     try:

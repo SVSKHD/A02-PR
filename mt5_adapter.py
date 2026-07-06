@@ -387,7 +387,8 @@ class MT5Adapter:
 
     def place_stop_order(self, symbol: str, side: str, price: float,
                          lot: float, sl: float, tp: float,
-                         comment: str = "AUREON_v2", dry_run: bool = False):
+                         comment: str = "AUREON_v2", dry_run: bool = False,
+                         magic: int = 20260522):
         comment = mt5_comment(comment)  # MT5 rejects comments > 31 chars (boost root cause)
         mt5 = self.mt5
         if side == 'BUY':
@@ -403,7 +404,7 @@ class MT5Adapter:
             "sl": sl,
             "tp": tp,
             "deviation": 20,
-            "magic": 20260522,
+            "magic": int(magic),   # anchor engine passes cfg.anchor_magic
             "comment": comment,
             "type_time": mt5.ORDER_TIME_DAY,
             "type_filling": mt5.ORDER_FILLING_IOC,
@@ -423,7 +424,8 @@ class MT5Adapter:
         if rc == -1:
             import time as _time
             _time.sleep(0.5)  # let broker settle
-            existing = self.find_pending_by_price(symbol, side, price, lot)
+            existing = self.find_pending_by_price(symbol, side, price, lot,
+                                                  magic=magic)
             if existing is not None:
                 log.info(
                     f"✅ Placed {side} stop @ {price} lot={lot}: rc=-1 but RECONCILED — "
@@ -534,7 +536,7 @@ class MT5Adapter:
             result = mt5.order_send(req)
         return result
 
-    def close_position(self, ticket, dry_run: bool = False):
+    def close_position(self, ticket, dry_run: bool = False, magic=None):
         mt5 = self.mt5
         if dry_run:
             log.info(f"[PAPER] Would close ticket {ticket}")
@@ -543,6 +545,15 @@ class MT5Adapter:
         if not pos: return None
         p = pos[0]
         tick = mt5.symbol_info_tick(p.symbol)
+        # Stamp the close deal with the POSITION's own magic (anchor/rogue/
+        # profile) so a multi-instance account's ledgers stay scoped; explicit
+        # `magic` overrides; the gold anchor literal is only the last fallback.
+        try:
+            close_magic = int(getattr(p, 'magic', 0) or 0)
+        except (TypeError, ValueError):
+            close_magic = 0
+        if not close_magic:
+            close_magic = int(magic) if magic is not None else 20260522
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
             "position": ticket,
@@ -551,7 +562,7 @@ class MT5Adapter:
             "type": mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY,
             "price": tick.bid if p.type == 0 else tick.ask,
             "deviation": 20,
-            "magic": 20260522,
+            "magic": close_magic,
             "comment": "AUREON_v2_close",
         }
         return mt5.order_send(req)

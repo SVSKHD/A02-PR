@@ -176,9 +176,11 @@ class LiveTrader:
         self._anchor_datetime_utc = anchor_datetime_utc
         self._eod_datetime_utc = eod_datetime_utc
 
-        # Telemetry
+        # Telemetry (feat/symbol-profiles: symbol drives the [XAG]-style alert
+        # prefix; XAU -> no prefix, gold output unchanged)
         component = f"AUREON-{'paper' if paper else 'live'}"
-        self.tele = telemetry_from_env(component=component)
+        self.tele = telemetry_from_env(component=component,
+                                       symbol=getattr(cfg, 'symbol', None))
 
         # v3.3.0 per-position structured trace (the trail-lock-fix overhaul). One
         # greppable line per state change so a ticket's whole life is gapless and
@@ -359,8 +361,8 @@ class LiveTrader:
                     f"Account #{info['login']}  on `{info['server']}`\n"
                     f"Balance: `${new_balance:,.2f}`  Equity: `${info['equity']:,.2f}`\n"
                     f"Lot: `{old_lot}` → `{new_lot}`\n"
-                    f"Max risk/trade: `${new_lot * self.cfg.sl_dist * 100:,.0f}` "
-                    f"(`{100 * new_lot * self.cfg.sl_dist * 100 / new_balance:.2f}%` of balance)\n"
+                    f"Max risk/trade: `${new_lot * self.cfg.sl_dist * self.cfg.contract_size:,.0f}` "
+                    f"(`{100 * new_lot * self.cfg.sl_dist * self.cfg.contract_size / new_balance:.2f}%` of balance)\n"
                     f"Daily kill switch: `-${new_balance * self.cfg.daily_loss_pct:,.0f}` "
                     f"(`{self.cfg.daily_loss_pct*100:.1f}%`)"
                 )
@@ -747,9 +749,11 @@ class LiveTrader:
             broker_date, hour, self.cfg.broker_tz_offset_hours, minute)
         return utc_now >= threshold
 
-    # anchor engine's magic (mt5_adapter.py place_market_order/place_stop_order
-    # default `magic=20260522`); Rogue's is rogue.ROGUE_MAGIC (20260626).
-    _FRIDAY_ANCHOR_MAGIC = 20260522
+    # anchor engine's magic (cfg.anchor_magic; mt5_adapter signature defaults
+    # keep the gold literal); Rogue's is cfg.rogue_magic (rogue.rogue_magic(cfg)).
+    @property
+    def _FRIDAY_ANCHOR_MAGIC(self):
+        return int(getattr(self.cfg, 'anchor_magic', 20260522))
 
     def _friday_query_flat(self):
         """D-6: broker-verified flat check for the Friday weekend-hold-ban poll --
@@ -770,7 +774,7 @@ class LiveTrader:
                 return int(getattr(o, 'magic', -1))
             except (TypeError, ValueError):
                 return -1
-        anchor_m, rogue_m = self._FRIDAY_ANCHOR_MAGIC, _rogue.ROGUE_MAGIC
+        anchor_m, rogue_m = self._FRIDAY_ANCHOR_MAGIC, _rogue.rogue_magic(self.cfg)
         counts = {
             'anchor_positions': sum(1 for p in positions if _magic(p) == anchor_m),
             'rogue_positions': sum(1 for p in positions if _magic(p) == rogue_m),
@@ -806,7 +810,7 @@ class LiveTrader:
             tk = int(p.ticket)
             if tk in self.shadow_positions:
                 continue
-            if int(getattr(p, 'magic', -1)) == _rogue.ROGUE_MAGIC:
+            if int(getattr(p, 'magic', -1)) == _rogue.rogue_magic(self.cfg):
                 continue
             side = 'BUY' if getattr(p, 'type', 0) == 0 else 'SELL'
             price_open = float(getattr(p, 'price_open', 0.0))
@@ -876,7 +880,7 @@ class LiveTrader:
                 f"entries (anchor or Rogue) until Monday.")
             self.tele.warn(
                 f"🗓️✅ *Friday flatten CONFIRMED flat* — 0 positions, 0 pendings "
-                f"(anchor {self._FRIDAY_ANCHOR_MAGIC} + Rogue {_rogue.ROGUE_MAGIC}), "
+                f"(anchor {self._FRIDAY_ANCHOR_MAGIC} + Rogue {_rogue.rogue_magic(self.cfg)}), "
                 f"broker-verified. No new entries either engine until Monday.")
         else:
             log.error(f"FRIDAY FLATTEN pass FAILED — still not flat: {counts}; "
@@ -975,7 +979,7 @@ class LiveTrader:
                 f"Open {self._FRIDAY_ANCHOR_MAGIC} (anchor)":
                     f"{counts.get('anchor_positions', 0)} pos / "
                     f"{counts.get('anchor_pendings', 0)} pend",
-                f"Open {_rogue.ROGUE_MAGIC} (Rogue)":
+                f"Open {_rogue.rogue_magic(self.cfg)} (Rogue)":
                     f"{counts.get('rogue_positions', 0)} pos / "
                     f"{counts.get('rogue_pendings', 0)} pend",
                 "Seed fallback": str(getattr(self.cfg, 'rogue_seed_fallback',
@@ -1016,12 +1020,12 @@ class LiveTrader:
             if not confirm:
                 self.tele.warn(
                     f"🦏 */rogue flatten* — {n} open position(s), {n_pend} pending(s) "
-                    f"on magic {_rogue.ROGUE_MAGIC}. NOT closed. "
+                    f"on magic {_rogue.rogue_magic(self.cfg)}. NOT closed. "
                     f"Send `/rogue flatten confirm` to execute.")
                 return
             self.tele.warn(f"🦏🚨 /rogue flatten CONFIRMED — closing {n} position(s) "
                            f"+ cancelling {n_pend} pending(s) on magic "
-                           f"{_rogue.ROGUE_MAGIC} (anchors untouched)")
+                           f"{_rogue.rogue_magic(self.cfg)} (anchors untouched)")
             try:
                 _rogue.force_close_open(self, reason="ManualFlatten")
             except Exception as e:
@@ -1568,13 +1572,13 @@ class LiveTrader:
     def run(self):
         _boost_sl = float(getattr(self.cfg, 'boost_sl_dollars', 10.0))
         _boost_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
-        _whip_cap = _boost_n * _boost_sl * self.cfg.lot_size * 100
+        _whip_cap = _boost_n * _boost_sl * self.cfg.lot_size * self.cfg.contract_size
         _boost_gap = float(getattr(self.cfg, 'boost_trail_gap_dollars', 3.50))
         # v3.3.6 banner-truth: RALLY boosts run their OWN $13 SL / -$910 cap / $2 trail
         # (rally_* keys), NOT the rescue $10/$3.50 the banner used to print. Show both.
         _rally_sl = float(getattr(self.cfg, 'rally_boost_sl', 13.0))
         _rally_gap = float(getattr(self.cfg, 'rally_trail_gap', 2.00))
-        _rally_cap = _boost_n * _rally_sl * self.cfg.lot_size * 100
+        _rally_cap = _boost_n * _rally_sl * self.cfg.lot_size * self.cfg.contract_size
         # v3.1.0: alert-channel banner line (Discord, embed cards).
         _hb = int(getattr(self.cfg, 'discord_heartbeat_min', 60))
         _alert_line = (f"Alerts: Discord (embed cards) — commands ON, "

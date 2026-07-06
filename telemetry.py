@@ -178,6 +178,16 @@ def anchor_time_block(scheduled_utc, actual_utc=None, ontime_grace_s=120):
 # Telemetry
 # ============================================================================
 
+def symbol_prefix(symbol) -> str:
+    """feat/symbol-profiles: the alert/embed prefix for a non-gold instance.
+    XAU* (and empty/None) -> '' so GOLD output is byte-identical; any other
+    symbol gets its 3-letter tag, e.g. XAGUSD -> '[XAG] '. PURE."""
+    s = str(symbol or '').strip().upper()
+    if not s or s.startswith('XAU'):
+        return ''
+    return f"[{s[:3]}] "
+
+
 class Telemetry:
     """
     Singleton-ish telemetry hub. Instantiate once at program start, share
@@ -189,7 +199,11 @@ class Telemetry:
                  component: str = "AUREON",
                  discord=None,
                  alert_channels=None,
-                 min_severity: "Severity" = None):
+                 min_severity: "Severity" = None,
+                 symbol: Optional[str] = None):
+        # feat/symbol-profiles: every alert msg + embed title gets the symbol
+        # prefix ('' for XAU -> gold output unchanged).
+        self._prefix = symbol_prefix(symbol)
         # v3.1.0: Discord is the sole alert channel.
         # alert_channels (default ["discord"]) gates which sinks are live.
         self.alert_channels = [c.strip().lower() for c in
@@ -270,6 +284,16 @@ class Telemetry:
         (Discord unreachable) the card is QUEUED (in discord_client) and re-sent
         the instant any connection succeeds, so the operator never has to open MT5
         to learn a fill/close happened."""
+        if self._prefix:
+            if msg and not str(msg).startswith(self._prefix):
+                msg = self._prefix + str(msg)
+            try:
+                if card and isinstance(card, dict) and card.get('title') \
+                        and not str(card['title']).startswith(self._prefix):
+                    card = dict(card)
+                    card['title'] = self._prefix + str(card['title'])
+            except Exception:
+                pass  # a malformed card must never block the alert
         try:
             self._queue.put_nowait({
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -404,11 +428,12 @@ def md_escape(s):
     return str(s)
 
 
-def telemetry_from_env(component: str = "AUREON") -> Telemetry:
+def telemetry_from_env(component: str = "AUREON", symbol: Optional[str] = None) -> Telemetry:
     """
     Build a Telemetry instance from environment variables.
     v3.1.0: Discord is the sole alert channel (enabled with DISCORD_BOT_TOKEN +
     DISCORD_CHANNEL_ID). Always returns a working Telemetry.
+    feat/symbol-profiles: `symbol` drives the alert prefix (see symbol_prefix).
     """
     sev_name = os.environ.get("AUREON_ALERT_MIN_SEVERITY", "INFO").upper()
     min_sev = SEVERITY_FROM_STRING.get(sev_name, Severity.INFO)
@@ -421,7 +446,8 @@ def telemetry_from_env(component: str = "AUREON") -> Telemetry:
 
     dc = discord_client.config_from_env() if _DISCORD_OK else None
     return Telemetry(log_file=log_file, component=component,
-                     discord=dc, alert_channels=channels, min_severity=min_sev)
+                     discord=dc, alert_channels=channels, min_severity=min_sev,
+                     symbol=symbol)
 
 
 # ============================================================================

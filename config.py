@@ -5,6 +5,19 @@ from typing import List, Optional, Tuple
 
 @dataclass
 class Config:
+    # --- symbol-profile support (feat/symbol-profiles) -------------------------
+    # Every default below equals the literal it replaced, so a bare Config() (gold)
+    # is byte-identical to pre-profile behavior (regression-guarded in selftest).
+    anchor_magic: int = 20260522        # was hardcoded across modules
+    rogue_magic: int = 20260626         # was module constant rogue.ROGUE_MAGIC
+    price_digits: int = 2               # gold has 2 digits; silver 3
+    anchor_drift_tol: float = 0.1       # anchors.py drift guard literal
+    recovery_slip_min: float = 0.5      # anchors.py in-flight recovery band
+    recovery_slip_max: float = 15.0
+    tp_detect_tol: float = 0.05         # fills.py TP-close attribution
+    sl_mismatch_alert: float = 0.30     # fills.py alert threshold
+    shadow_entry_tol: float = 0.40      # fills.py shadow-entry distance
+    broker_sl_assert_tol: float = 0.05  # trails.py broker-SL re-assert
     # Strategy
     symbol: str = "XAUUSD"
     contract_size: float = 100.0  # oz per 1.0 lot

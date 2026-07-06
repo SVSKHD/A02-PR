@@ -31,8 +31,8 @@ def _compute_safe_lot(self, balance: float) -> float:
     risk_pct = (self.cfg.risk_pct_over_50k if balance >= 50_000
                 else self.cfg.risk_pct_under_50k)
     max_loss = balance * risk_pct * self.cfg.slippage_buffer
-    # SL distance × oz per lot (contract_size assumed 100 for XAUUSD)
-    max_lot = max_loss / (self.cfg.sl_dist * 100)
+    # SL distance × units per lot (cfg.contract_size: 100 oz gold / 5000 oz silver)
+    max_lot = max_loss / (self.cfg.sl_dist * self.cfg.contract_size)
     # Apply user conservatism multiplier
     effective_lot = max_lot * self.cfg.lot_conservatism
 

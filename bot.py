@@ -95,13 +95,29 @@ def main():
     parser.add_argument('--date', default=None, metavar='YYYY-MM-DD|YYYY-MM',
                         help="dailyreport: the day (or whole month) to report on. "
                              "Default: today (UTC).")
+    parser.add_argument('--profile', choices=['gold', 'silver'], default='gold',
+                        help="Symbol profile (config_profiles/): 'gold' (XAUUSD, "
+                             "the Config defaults — byte-identical) or 'silver' "
+                             "(XAGUSD, measured scale). Applies to EVERY mode "
+                             "that builds a Config.")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
 
     global log
     log = setup_logging(args.log_level)
 
-    cfg = Config()
+    # feat/symbol-profiles: cfg = Config(**PROFILE); gold's PROFILE is {} so the
+    # default is exactly Config(). Unknown profile keys abort loudly (loader rule).
+    from config_profiles import build_config
+    try:
+        cfg = build_config(args.profile)
+    except ValueError as e:
+        log.error(f"🛑 profile load failed: {e}")
+        sys.exit(1)
+    if args.profile != 'gold':
+        log.info(f"Symbol profile: {args.profile} → {cfg.symbol} "
+                 f"(magics {cfg.anchor_magic}/{cfg.rogue_magic}, "
+                 f"{cfg.price_digits}dp, contract {cfg.contract_size})")
     if args.no_oco: cfg.no_oco = True
 
     if args.lot is not None: cfg.lot_size = args.lot
@@ -194,7 +210,7 @@ def main():
         # order book (opens MT5 for HISTORY reads only). A YYYY-MM-DD date runs one
         # day; YYYY-MM runs the whole month (each day + a month roll-up).
         from pnl_report import run_dailyreport
-        sys.exit(run_dailyreport(date_arg=args.date))
+        sys.exit(run_dailyreport(date_arg=args.date, cfg=cfg))
 
     elif args.mode == 'rogueseed':
         # Manual Rogue A1-mode seed: enqueue a 'rogueseed' command onto the RUNNING bot's

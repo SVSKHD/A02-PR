@@ -21,6 +21,11 @@ from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
 
 log = logging.getLogger("AUREON")
 
+def _pdig(cfg):
+    """feat/symbol-profiles: price decimal places (cfg.price_digits; gold 2, silver 3)."""
+    return int(getattr(cfg, 'price_digits', 2))
+
+
 
 def resolved_anchor_hm(label, broker_date, hour, minute, cfg):
     """Pure (config-only) Monday-A1 cushion resolver — the SINGLE source of truth
@@ -371,8 +376,8 @@ def _capture_a1_anchor_from_tick(self, label, anchor_utc):
         log.warning(f"{label}: tick-fallback could not settle a sane tick "
                     f"({reason}, {len(prices)} samples) — not placing from tick")
         return None
-    buy_stop = round(price + self.cfg.trigger_dist, 2)
-    sell_stop = round(price - self.cfg.trigger_dist, 2)
+    buy_stop = round(price + self.cfg.trigger_dist, _pdig(self.cfg))
+    sell_stop = round(price - self.cfg.trigger_dist, _pdig(self.cfg))
     if tr is not None:
         tr.a1_placed_from_tick(label, anchor_price=price, buy_stop=buy_stop,
                                sell_stop=sell_stop, held_ticks=held, source='tick')
@@ -574,7 +579,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         gap_tp_dist = self.cfg.tp_dist
         if current_price is not None:
             gap = abs(current_price - anchor_price)
-            if gap > self.cfg.trigger_dist + 0.1:  # v2.3: was 0.5, now 0.1 — catches edge cases where market crept 10¢+ past trigger
+            if gap > self.cfg.trigger_dist + self.cfg.anchor_drift_tol:  # v2.3: was 0.5, now 0.1 (cfg.anchor_drift_tol) — catches edge cases where market crept 10¢+ past trigger
                 # Try to use the most recent M5 close as the new anchor.
                 # We fetch the M5 bar just before NOW (not the scheduled anchor time).
                 try:
@@ -586,10 +591,10 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                     if new_anchor is None or abs(new_anchor - current_price) > self.cfg.trigger_dist:
                         # Couldn't get fresh M5 OR fresh M5 also far from market
                         # → use current price as anchor directly
-                        new_anchor = round(current_price, 2)
+                        new_anchor = round(current_price, _pdig(self.cfg))
                 except Exception as e:
                     log.warning(f"Re-anchor M5 fetch failed: {e}")
-                    new_anchor = round(current_price, 2)
+                    new_anchor = round(current_price, _pdig(self.cfg))
 
                 gap_mode = True
                 gap_lot = round(self.cfg.lot_size / 2, 2)  # half-size
@@ -600,19 +605,19 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                     f"⚠️ *{label} GAP DETECTED{retry_tag}*\n"
                     f"Original anchor: `${anchor_price:.2f}`\n"
                     f"Current market:  `${current_price:.2f}`\n"
-                    f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + 0.1:.2f} threshold)\n"
+                    f"Gap: `${gap:.2f}` (> ${self.cfg.trigger_dist + self.cfg.anchor_drift_tol:.2f} threshold)\n"
                     f"→ Re-anchoring to current M5 close `${new_anchor:.2f}`\n"
                     f"→ Half-lot `{gap_lot}` with tight SL `${gap_sl_dist:.0f}` "
                     f"(reduced risk for gap-day breakout)"
                 )
                 anchor_price = new_anchor
 
-    buy_stop  = round(anchor_price + self.cfg.trigger_dist, 2)
-    sell_stop = round(anchor_price - self.cfg.trigger_dist, 2)
-    sl_buy    = round(buy_stop  - gap_sl_dist, 2)
-    sl_sell   = round(sell_stop + gap_sl_dist, 2)
-    tp_buy    = round(buy_stop  + gap_tp_dist, 2)
-    tp_sell   = round(sell_stop - gap_tp_dist, 2)
+    buy_stop  = round(anchor_price + self.cfg.trigger_dist, _pdig(self.cfg))
+    sell_stop = round(anchor_price - self.cfg.trigger_dist, _pdig(self.cfg))
+    sl_buy    = round(buy_stop  - gap_sl_dist, _pdig(self.cfg))
+    sl_sell   = round(sell_stop + gap_sl_dist, _pdig(self.cfg))
+    tp_buy    = round(buy_stop  + gap_tp_dist, _pdig(self.cfg))
+    tp_sell   = round(sell_stop - gap_tp_dist, _pdig(self.cfg))
 
     # FINAL SAFETY CHECK — after re-anchor, both stops should be on opposite
     # sides of current price. If only ONE is invalid, place the valid side
@@ -705,16 +710,17 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     # SL/TP geometry are held fixed (no recompute) so anchor straddle math is untouched --
     # only transient rejects are retried and never-retry rejects raise ONE alert.
     def _send_stop(side, price, sl, tp, comment):
+        _magic = int(getattr(self.cfg, 'anchor_magic', 20260522))
         if self.paper or not bool(getattr(self.cfg, 'order_retry_enabled', True)):
             return self.adapter.place_stop_order(
                 self.cfg.symbol, side, price, gap_lot, sl=sl, tp=tp,
-                comment=comment, dry_run=self.paper)
+                comment=comment, dry_run=self.paper, magic=_magic)
         def _sender(attempt, recompute_stops):
             return self.adapter.place_stop_order(
                 self.cfg.symbol, side, price, gap_lot, sl=sl, tp=tp,
-                comment=comment, dry_run=False)
+                comment=comment, dry_run=False, magic=_magic)
         describe = {'label': f'{label} {side}', 'side': side, 'symbol': self.cfg.symbol,
-                    'lot': gap_lot, 'price': price, 'sl': sl, 'tp': tp, 'magic': 20260522}
+                    'lot': gap_lot, 'price': price, 'sl': sl, 'tp': tp, 'magic': _magic}
         return self.adapter.place_with_retry(_sender, describe=describe,
                                              tele=getattr(self, 'tele', None))
 
@@ -854,17 +860,18 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
             slip = sell_stop - recovery_price
 
     # Catchable zone check
-    if breakout_side is not None and 0.5 <= slip <= 15.0 and recovery_price is not None:
+    if (breakout_side is not None and recovery_price is not None
+            and self.cfg.recovery_slip_min <= slip <= self.cfg.recovery_slip_max):
         # Half the gap_lot (already half if in gap mode), tight $10 SL,
         # normal $30 TP. Recovery trades tagged "_RCV" in MT5 comment.
         rcv_lot = round(max(gap_lot / 2 if gap_mode else gap_lot * 0.5, 0.01), 2)
         rcv_sl_dist = 10.0
         if breakout_side == 'BUY':
-            rcv_sl = round(recovery_price - rcv_sl_dist, 2)
-            rcv_tp = round(recovery_price + gap_tp_dist, 2)
+            rcv_sl = round(recovery_price - rcv_sl_dist, _pdig(self.cfg))
+            rcv_tp = round(recovery_price + gap_tp_dist, _pdig(self.cfg))
         else:
-            rcv_sl = round(recovery_price + rcv_sl_dist, 2)
-            rcv_tp = round(recovery_price - gap_tp_dist, 2)
+            rcv_sl = round(recovery_price + rcv_sl_dist, _pdig(self.cfg))
+            rcv_tp = round(recovery_price - gap_tp_dist, _pdig(self.cfg))
 
         self.tele.warn(
             f"🎯 *{label} IN-FLIGHT BREAKOUT — recovering {breakout_side}*\n"
@@ -876,7 +883,8 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
             self.cfg.symbol, breakout_side, rcv_lot,
             sl=rcv_sl, tp=rcv_tp,
             comment=f"AUR_{label[:2]}_{breakout_side[0]}_RCV",
-            dry_run=self.paper)
+            dry_run=self.paper,
+            magic=int(getattr(self.cfg, 'anchor_magic', 20260522)))
         mkt_rc = getattr(mkt_res, 'retcode', None) if mkt_res is not None else None
         if mkt_rc == 10009:
             actual_ticket = getattr(mkt_res, 'order', None) or getattr(mkt_res, 'deal', None)
@@ -960,7 +968,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         self._dump_mt5_state(label, f"FINAL SKIP: {skip_reason}")
     elif breakout_side is not None and slip > 15.0:
         skip_reason = f"slip ${slip:.2f} > $15 (move exhausted, would chase top/bottom)"
-    elif breakout_side is not None and slip < 0.5:
+    elif breakout_side is not None and slip < self.cfg.recovery_slip_min:
         skip_reason = f"slip ${slip:.2f} < $0.50 (price didn't actually break, broker quirk)"
     else:
         skip_reason = "no breakout confirmed"
@@ -1022,7 +1030,8 @@ def _confirm_a1_placement(self, label, lot, buy_leg, sell_leg):
                 f"Sent OK but no resting {side} stop @ ${price} found.")
             res = self.adapter.place_stop_order(
                 self.cfg.symbol, side, price, lot, sl=sl, tp=tp,
-                comment=f"AUR_{label[:2]}_{side[0]}_CFM", dry_run=self.paper)
+                comment=f"AUR_{label[:2]}_{side[0]}_CFM", dry_run=self.paper,
+                magic=int(getattr(self.cfg, 'anchor_magic', 20260522)))
             new_ticket = self._extract_ticket(res, f"paper_{label}_{side}")
             time.sleep(1)
             if new_ticket is not None and _present(side, price, new_ticket):
@@ -1191,15 +1200,15 @@ def _warmup_trade_channel(self, label: str) -> bool:
             self._dump_mt5_state(label, "WARMUP: tick read returned None")
             return self._attempt_mt5_reconnect(label)
 
-        ping_price = round(tick.ask + self.WARMUP_DISTANCE, 2)
+        ping_price = round(tick.ask + self.WARMUP_DISTANCE, _pdig(self.cfg))
         ping_req = {
             "action":       self.adapter.mt5.TRADE_ACTION_PENDING,
             "symbol":       self.cfg.symbol,
             "volume":       self.WARMUP_LOT,
             "type":         self.adapter.mt5.ORDER_TYPE_BUY_STOP,
             "price":        ping_price,
-            "sl":           round(ping_price - 20.0, 2),
-            "tp":           round(ping_price + 50.0, 2),
+            "sl":           round(ping_price - 20.0, _pdig(self.cfg)),
+            "tp":           round(ping_price + 50.0, _pdig(self.cfg)),
             "deviation":    20,
             "magic":        self.WARMUP_MAGIC,
             "comment":      mt5_comment(self.WARMUP_COMMENT),
