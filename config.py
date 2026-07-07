@@ -190,10 +190,16 @@ class Config:
     rogue_trail_gap_deep: float = 6.0  # wider once proven (don't shake out a real monster)
     rogue_trail_widen_at: float = 15.0 # profit ($) at which the trail widens 3 -> 6
     # GOVERNORS on the 10-cap (mandatory brakes for a thin edge):
-    rogue_daily_loss_stop: float = -1050.0  # PAIRED with rogue_init_sl (E-5 rule):
-    # stop = 3 x init-SL strike so the 3-consecutive-fail pause can fire BEFORE the
-    # daily halt. At the old -525 with a $10 SL the halt would fire at 1.5 strikes and
-    # the pause would be dead code (the original E-5 defect shape).
+    rogue_daily_loss_stop: float = -370.0   # changed 2026-07-08 (owner): was -1050 (D-13
+    # pairing). SUPERSEDED -- the engine day-loss is capped TIGHT to preserve the anchor
+    # budget. NOTE: at rogue_init_sl $10 (one strike = -$350) the halt is now reachable at
+    # 2 strikes (-$700 <= -$370), so the 3-consecutive-fail pause is UNREACHABLE for Rogue
+    # at these defaults. The pause code is KEPT (it re-arms automatically if the SL / stop
+    # values change) -- the selftest asserts the HALT fires and the pause is not reached
+    # first at current defaults.
+    rogue_daily_profit_stop: float = 400.0  # SOFT profit-lock: realized Rogue day P&L >=
+    # this -> manage-only (no NEW entries; open positions untouched). Overridable ONCE per
+    # broker day by /rogueseed (re-anchor at tick). 0 disables the gate entirely.
     rogue_consecutive_fail_stop: int = 3    # 3 init-SL fake-outs in a row -> pause new entries
     # E-4: at EOD, flatten an OPEN Rogue position instead of letting it ride overnight
     # on its own SL/TP. DEFAULT ON since 2026-07-02 (owner decision): an overnight /
@@ -585,10 +591,15 @@ class Config:
     fetcher_sl_dollars: float = 5.0         # broker-side SL at entry -/+ this (fixed, no trail)
     fetcher_max_entries_per_day: int = 20   # HARD ceiling on NEW entries/day (the cap)
     # GOVERNORS (mirror Rogue's paired-brake shape). One SL strike = fetcher_sl_dollars x
-    # lot x contract = $5 x 0.35 x 100 = $175. The daily loss stop is set to FOUR strikes
-    # (-$700) so the 3-consecutive-fail pause (-$525 = 3 strikes) is ALWAYS reachable
-    # BEFORE the daily halt -- the pause can never be dead code (E-5 lesson).
-    fetcher_daily_loss_stop: float = -700.0     # 4 x one $175 SL strike -> HALTS new entries
+    # lot x contract = $5 x 0.35 x 100 = $175.
+    fetcher_daily_loss_stop: float = -370.0     # changed 2026-07-08 (owner): was -700. Same
+    # intent as Rogue -- day-loss capped tight to preserve the anchor budget. The strike
+    # that takes the day <= -$370 HALTS new entries; worst realized day is -$525 (the halt
+    # fires on the 3rd strike). If 3 strikes happen to land first, the 3-fail pause may also
+    # engage at -$525 -- the selftest asserts a consistent single-halt state either way.
+    fetcher_daily_profit_stop: float = 400.0    # SOFT profit-lock: realized Fetcher day P&L
+    # >= this -> manage-only (no NEW entries; open positions untouched). Overridable ONCE
+    # per broker day by /fetchseed (re-anchor at tick). 0 disables the gate entirely.
     fetcher_consecutive_fail_stop: int = 3      # 3 SL strikes in a row -> pause new entries
     # EOD: flatten an OPEN Fetcher position at EOD instead of riding overnight (default ON,
     # mirrors rogue_flatten_at_eod). Fetcher-scoped (closes ONLY the Fetcher ticket).

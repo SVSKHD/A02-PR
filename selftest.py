@@ -246,7 +246,7 @@ STEP_NAMES = {
     181: "boost rescue unaff",
     182: "boost A1 replay",
     # E-5 / D-13: Rogue daily loss stop PAIRED to 3 x init-SL strike
-    183: "rogue stop = 3x init-SL",
+    183: "rogue pairing superseded",
     # F-B: trapped-leg capped late-rescue (No-OCO whipsaw), DEFAULT OFF
     184: "fb late rescue",
     # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
@@ -327,6 +327,13 @@ STEP_NAMES = {
     243: "manual reseed rails",    # open ticket / engine off / stale tick each refuse
     244: "manual seed entry+chain",# post-seed entry at trigger; close re-anchors; MANUAL propagates
     245: "manual seed gov cont",   # day governors keep counting across a same-day re-seed
+    # 2026-07-08 daily stops: Rogue E-20 rebuild + soft profit-lock + tight loss halt
+    246: "rogue e20 rebuild",      # same-day restart rebuilds Rogue gov from deal history (not zeroed)
+    247: "rogue loss halt 2strike",# -350 no halt; -700<=-370 halts; halt precedes 3-fail pause
+    248: "fetcher loss halt",      # -175 strikes; 3rd (-525<=-370) halts; single consistent reason
+    249: "daily profit lock",      # day>=+400 blocks new entries, one alert (both engines)
+    250: "daily stop reseed",      # reseed overrides profit lock (no re-lock, loss stays live); loss refuses
+    251: "daily stops disabled",   # profit_stop=0 / loss_stop=0 disable their gates (both engines)
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -7348,84 +7355,82 @@ class SelfTest:
         self._record(182, PASS if ok else FAIL, detail)
 
     def _step_e5_rogue_stop_525(self):
-        # 183 E-5 / D-13: rogue_daily_loss_stop is PAIRED to rogue_init_sl as exactly 3 x one
-        # init-SL strike, so the 3-consecutive-fail pause is reachable BEFORE the daily halt.
-        # Value-agnostic -- every threshold is READ from cfg. INVARIANT asserted:
-        #   |rogue_daily_loss_stop| == 3 x (rogue_init_sl x lot_size x contract_size).
-        # Ladder on init-SL strikes: 1 strike still trades, 2 still trades, 3 HALTS. And the
-        # 3-fail PAUSE fires on small fakeouts (-$5 x 3) while the loss stop stays clear --
-        # impossible at the old -$150 (a single strike halted first).
-        import rogue as _rogue
+        # 183 E-5 / D-13 pairing (SUPERSEDED 2026-07-08 -> loss stop tightened to -$370). The
+        # pause CODE is kept and re-arms if the SL/stop values change: under an explicitly
+        # PAIRED cfg (loss_stop = -3 x one init-SL strike) the 3-fail pause fires BEFORE the
+        # halt on small fakeouts, exactly as before. And at the PRODUCTION default the halt is
+        # reached first (2 strikes) -- the pause is intentionally unreachable now.
+        import rogue as _rogue, dataclasses
         try:
             per_strike = (float(self.cfg.rogue_init_sl)
                           * float(self.cfg.lot_size)
                           * float(self.cfg.contract_size))          # one init-SL strike ($)
-            loss_stop = float(self.cfg.rogue_daily_loss_stop)
-            # PAIRING INVARIANT: the stop is exactly 3 strikes deep.
-            invariant_ok = abs(loss_stop + 3.0 * per_strike) < 1e-6
-            # ladder on init-SL strikes (-per_strike each)
+            # PAIRED cfg proves the KEPT pause mechanism re-arms when values change.
+            pcfg = dataclasses.replace(self.cfg, rogue_daily_loss_stop=-3.0 * per_strike)
             gov = _rogue.new_day_state()
-            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
-            at_1 = _rogue.can_enter(gov, self.cfg)
-            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
-            at_2 = _rogue.can_enter(gov, self.cfg)
-            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)   # 3 strikes = stop
-            at_3_blocked, at_3_reason = _rogue.can_enter(gov, self.cfg)
-            # NOTE: at exactly 3 strikes both brakes trip; 'daily_loss_stop' OR
-            # 'consecutive_fail_pause' are both valid HALTS -- assert it halted.
-            ladder_ok = (at_1[0] is True and at_2[0] is True
-                         and at_3_blocked is False
+            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=pcfg)
+            at_1 = _rogue.can_enter(gov, pcfg)
+            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=pcfg)
+            at_2 = _rogue.can_enter(gov, pcfg)
+            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=pcfg)   # 3 strikes = stop
+            at_3_blocked, at_3_reason = _rogue.can_enter(gov, pcfg)
+            ladder_ok = (at_1[0] is True and at_2[0] is True and at_3_blocked is False
                          and at_3_reason in ('daily_loss_stop', 'consecutive_fail_pause')
                          and gov['loss_stopped'] is True)
-            # fail-pause fires BEFORE the loss stop on SMALL fakeouts (now reachable).
             g2 = _rogue.new_day_state()
             for _ in range(3):
-                _rogue.record_close(g2, -5.0, was_fail=True, cfg=self.cfg)   # -15 total
-            paused_blocked, paused_reason = _rogue.can_enter(g2, self.cfg)
+                _rogue.record_close(g2, -5.0, was_fail=True, cfg=pcfg)   # -15 total
+            paused_blocked, paused_reason = _rogue.can_enter(g2, pcfg)
             fail_before_loss = (g2['fail_paused'] is True and g2['loss_stopped'] is False
                                 and paused_blocked is False
                                 and paused_reason == 'consecutive_fail_pause')
-            ok = invariant_ok and ladder_ok and fail_before_loss
-            detail = (f"per_strike=${per_strike:.0f} stop=${loss_stop:.0f} "
-                      f"invariant_3x={invariant_ok} 1_ok={at_1[0]} 2_ok={at_2[0]} "
-                      f"3_halts={not at_3_blocked}({at_3_reason}) "
-                      f"fail_pause_before_loss={fail_before_loss}")
+            # PRODUCTION default (self.cfg, -$370): the HALT is reached first (2 strikes),
+            # the 3-fail pause is NOT reached -- the D-13 pairing is superseded.
+            gp = _rogue.new_day_state()
+            _rogue.record_close(gp, -per_strike, was_fail=True, cfg=self.cfg)
+            prod_1 = _rogue.can_enter(gp, self.cfg)[0]
+            _rogue.record_close(gp, -per_strike, was_fail=True, cfg=self.cfg)
+            prod_2_blocked, prod_2_reason = _rogue.can_enter(gp, self.cfg)
+            superseded_ok = (prod_1 is True and prod_2_blocked is False
+                             and prod_2_reason == 'daily_loss_stop'
+                             and gp['consec_fails'] == 2 and gp['fail_paused'] is False)
+            ok = ladder_ok and fail_before_loss and superseded_ok
+            detail = (f"per_strike=${per_strike:.0f} PAIRED[ladder={ladder_ok} "
+                      f"pause_before_loss={fail_before_loss}] "
+                      f"PROD_default[2strike_halt={prod_2_reason} pause_unreached={superseded_ok}]")
         except Exception as e:
             self._record(183, FAIL, f"raised: {e!r}"); return
         self._record(183, PASS if ok else FAIL, detail)
 
     def _step_d13_three_strike_pause(self):
-        # 232 D-13 ORDERING: three consecutive init-SL strikes. The 3-consecutive-fail PAUSE
-        # engages at the final strike (cumulative = 3 x one strike = the paired daily loss
-        # stop, i.e. -$1,050 at init_sl=10 x 0.35 x 100), and the daily loss stop has NOT
-        # fired INDEPENDENTLY before the pause -- after strikes 1 and 2 loss_stopped stays
-        # False, so the pause is reachable. (At the old -525 the halt fired at 1.5 strikes
-        # and this pause was dead code -- the original E-5 defect shape.)
-        import rogue as _rogue
+        # 232 D-13 ORDERING (SUPERSEDED 2026-07-08). The 3-fail pause code is KEPT and re-arms
+        # under a PAIRED cfg (loss_stop = -3 x one strike): three consecutive init-SL strikes
+        # engage the pause at the final strike, and the loss stop has NOT fired independently
+        # before it (loss_stopped False after strikes 1..n-1). At the production default
+        # (-$370) the halt fires at 2 strikes instead -- asserted in step 183.
+        import rogue as _rogue, dataclasses
         try:
             per_strike = (float(self.cfg.rogue_init_sl)
                           * float(self.cfg.lot_size)
                           * float(self.cfg.contract_size))
             fail_stop = int(getattr(self.cfg, 'rogue_consecutive_fail_stop', 3))
+            pcfg = dataclasses.replace(self.cfg, rogue_daily_loss_stop=-per_strike * fail_stop)
             gov = _rogue.new_day_state()
             snaps = []   # (loss_stopped, fail_paused, consec_fails, day_pnl) after each strike
             for _ in range(fail_stop):
-                _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+                _rogue.record_close(gov, -per_strike, was_fail=True, cfg=pcfg)
                 snaps.append((bool(gov['loss_stopped']), bool(gov['fail_paused']),
                               int(gov['consec_fails']), float(gov['day_pnl'])))
             # ORDERING: the loss stop must NOT have fired on strikes 1..n-1 (before the pause).
             before_pause_no_loss = all(not s[0] for s in snaps[:-1])
-            # the pause engages exactly at the fail_stop-th strike.
             pause_at_final = (snaps[-1][1] is True and snaps[-1][2] == fail_stop)
-            # cumulative loss at the pause == the paired daily loss stop (3 x strike).
             cum = snaps[-1][3]
-            at_paired_stop = abs(cum - float(self.cfg.rogue_daily_loss_stop)) < 1e-6
-            # can_enter now blocks (either brake reason is a valid HALT at the boundary).
-            blocked, reason = _rogue.can_enter(gov, self.cfg)
+            at_paired_stop = abs(cum - float(pcfg.rogue_daily_loss_stop)) < 1e-6
+            blocked, reason = _rogue.can_enter(gov, pcfg)
             blocked_ok = (blocked is False
                           and reason in ('consecutive_fail_pause', 'daily_loss_stop'))
             ok = before_pause_no_loss and pause_at_final and at_paired_stop and blocked_ok
-            detail = (f"per_strike=${per_strike:.0f} snaps={snaps} "
+            detail = (f"per_strike=${per_strike:.0f} PAIRED snaps={snaps} "
                       f"before_pause_no_loss={before_pause_no_loss} "
                       f"pause_at_{fail_stop}={pause_at_final} cum=${cum:.0f}==stop={at_paired_stop} "
                       f"reason={reason}")
@@ -7618,40 +7623,41 @@ class SelfTest:
         self._record(236, PASS if ok else FAIL, detail)
 
     def _step_fetcher_governors(self):
-        # 237 GOVERNORS: 3 consecutive SL strikes ($175 each) PAUSE new entries at -$525 with
-        # the -$700 daily stop NOT yet tripped (pause reachable BEFORE the halt); a 4th strike
-        # (-$700 total) trips the daily loss stop; and the 20-entry cap blocks entry 21.
-        import fetcher as _f
+        # 237 GOVERNORS (loss stop tightened to -$370 on 2026-07-08). At the PRODUCTION
+        # default: strikes of $175 -> after 2 (-$350) no halt, the 3rd (-$525 <= -$370) HALTS
+        # (worst realized -$525). The 20-entry cap still blocks entry 21. The 3-fail-pause
+        # mechanism is KEPT and re-arms under a PAIRED cfg (loss_stop deeper than 3 strikes),
+        # proven here so the pause code stays covered.
+        import fetcher as _f, dataclasses
         try:
             per_strike = (float(self.cfg.fetcher_sl_dollars)
                           * float(self.cfg.lot_size)
                           * float(self.cfg.contract_size))          # $175
-            # PAIRING INVARIANT: the daily stop is DEEPER than 3 strikes (pause reachable).
-            loss_stop = float(self.cfg.fetcher_daily_loss_stop)
-            invariant_ok = loss_stop <= -(3.0 * per_strike) and loss_stop > -(4.0 * per_strike) - 1
+            # PRODUCTION default (-$370): halt on the 3rd strike; pause not reached first.
             gov = _f.new_day_state()
-            snaps = []
-            for _ in range(3):
-                _f.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
-                snaps.append((bool(gov['loss_stopped']), bool(gov['fail_paused'])))
-            after3_blocked, after3_reason = _f.can_enter(gov, self.cfg)
-            pause_before_stop = (snaps[-1] == (False, True)      # paused, NOT loss-stopped
-                                 and after3_blocked is False
-                                 and after3_reason == 'consecutive_fail_pause'
-                                 and abs(gov['day_pnl'] + 3 * per_strike) < 1e-6)
-            _f.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)   # 4th -> -700
-            halt_at_4 = (gov['loss_stopped'] is True
-                         and abs(gov['day_pnl'] + 4 * per_strike) < 1e-6
-                         and _f.can_enter(gov, self.cfg)[1] == 'daily_loss_stop')
-            # the 20-entry cap: a clean gov at 20 entries blocks entry 21.
+            _f.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg); s1 = _f.can_enter(gov, self.cfg)
+            _f.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg); s2 = _f.can_enter(gov, self.cfg)
+            _f.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+            s3_blocked, s3_reason = _f.can_enter(gov, self.cfg)
+            prod_ok = (s1[0] is True and s2[0] is True and s3_blocked is False
+                       and s3_reason == 'daily_loss_stop' and gov['loss_stopped'] is True
+                       and abs(gov['day_pnl'] + 3 * per_strike) < 1e-6)   # -525
+            # 20-entry cap: a clean gov at 20 entries blocks entry 21.
             gcap = _f.new_day_state()
             gcap['entries'] = int(self.cfg.fetcher_max_entries_per_day)
             cap_blocked, cap_reason = _f.can_enter(gcap, self.cfg)
             cap_ok = (cap_blocked is False and cap_reason == 'daily_cap')
-            ok = invariant_ok and pause_before_stop and halt_at_4 and cap_ok
-            detail = (f"per_strike=${per_strike:.0f} invariant={invariant_ok} "
-                      f"pause@-525_before_stop={pause_before_stop} halt@-700={halt_at_4} "
-                      f"entry21_capped={cap_ok}")
+            # KEPT pause mechanism re-arms under a deeper (paired) loss stop.
+            pcfg = dataclasses.replace(self.cfg, fetcher_daily_loss_stop=-(4.0 * per_strike))
+            gp = _f.new_day_state()
+            for _ in range(3):
+                _f.record_close(gp, -per_strike, was_fail=True, cfg=pcfg)   # -525 > -700
+            pause_blocked, pause_reason = _f.can_enter(gp, pcfg)
+            pause_ok = (gp['fail_paused'] is True and gp['loss_stopped'] is False
+                        and pause_blocked is False and pause_reason == 'consecutive_fail_pause')
+            ok = prod_ok and cap_ok and pause_ok
+            detail = (f"per_strike=${per_strike:.0f} PROD[3rd_halts={s3_reason} "
+                      f"day=${gov['day_pnl']:.0f}] cap21={cap_ok} PAIRED_pause_rearms={pause_ok}")
         except Exception as e:
             self._record(237, FAIL, f"raised: {e!r}"); return
         self._record(237, PASS if ok else FAIL, detail)
@@ -7948,6 +7954,193 @@ class SelfTest:
         except Exception as e:
             self._record(245, FAIL, f"raised: {e!r}"); return
         self._record(245, PASS if ok else FAIL, detail)
+
+    # =====================================================================
+    # 2026-07-08 DAILY STOPS: Rogue E-20 rebuild + soft profit-lock + tight loss halt
+    # =====================================================================
+    def _step_rogue_e20_rebuild(self):
+        # 246 PART 1 (E-20): a same-day restart REBUILDS the Rogue day governor from broker
+        # deal history (magic 20260626) -- NEVER zeroed. Mock a -$625 day (2 entries + 2
+        # losing closes) -> reanchor_count=2, day_pnl=-625, loss_stopped True (-625 <= -370),
+        # consec_fails=2. A foreign-magic deal is ignored.
+        import types, rogue as _r
+        try:
+            def _deal(entry, pnl, t, magic=_r.ROGUE_MAGIC):
+                return types.SimpleNamespace(entry=entry, profit=pnl, swap=0.0,
+                                             commission=0.0, time=t, magic=magic)
+            hist = [_deal(0, 0.0, 1), _deal(1, -350.0, 2),
+                    _deal(0, 0.0, 3), _deal(1, -275.0, 4),
+                    _deal(1, -999.0, 5, magic=20260707)]     # foreign -> ignored
+            tr, _ = self._reseed_rogue_mk()
+            tr.adapter.mt5.history_deals_get = lambda *a, **k: hist
+            gov = _r.rebuild_gov_from_history(tr, dt_from=0, dt_to=999)
+            not_zeroed = gov is not None and not (gov['reanchor_count'] == 0
+                                                  and gov['day_pnl'] == 0.0)
+            rebuilt_ok = (gov is not None and gov['reanchor_count'] == 2
+                          and abs(gov['day_pnl'] + 625.0) < 1e-6
+                          and gov['loss_stopped'] is True and gov['consec_fails'] == 2)
+            ok = not_zeroed and rebuilt_ok
+            detail = f"rebuilt={gov} not_zeroed={not_zeroed}"
+        except Exception as e:
+            self._record(246, FAIL, f"raised: {e!r}"); return
+        self._record(246, PASS if ok else FAIL, detail)
+
+    def _step_rogue_loss_halt_2strike(self):
+        # 247 tightened loss stop (-$370): ONE init-SL strike (-$350) does NOT halt; the
+        # SECOND (-$700 <= -$370) HALTS. At current defaults the halt is reached at 2 strikes,
+        # so the 3-consecutive-fail pause (fails >= 3) is NOT reached first (consec_fails=2).
+        import rogue as _r
+        try:
+            strike = (float(self.cfg.rogue_init_sl) * float(self.cfg.lot_size)
+                      * float(self.cfg.contract_size))          # $350
+            g = _r.new_day_state()
+            _r.record_close(g, -strike, True, self.cfg)
+            at1 = _r.can_enter(g, self.cfg)
+            _r.record_close(g, -strike, True, self.cfg)
+            at2, reason2 = _r.can_enter(g, self.cfg)
+            halt_ok = (at1[0] is True and at2 is False and reason2 == 'daily_loss_stop'
+                       and g['loss_stopped'] is True)
+            pause_unreached = (g['consec_fails'] == 2 and g['fail_paused'] is False
+                               and g['consec_fails'] < int(self.cfg.rogue_consecutive_fail_stop))
+            ok = halt_ok and pause_unreached
+            detail = (f"strike=${strike:.0f} 1_ok={at1[0]} 2_halts({reason2}) "
+                      f"fails={g['consec_fails']} pause_unreached={pause_unreached}")
+        except Exception as e:
+            self._record(247, FAIL, f"raised: {e!r}"); return
+        self._record(247, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_loss_halt(self):
+        # 248 tightened Fetcher loss stop (-$370): strikes of -$175; after 2 (-$350) no halt,
+        # the 3rd (-$525 <= -$370) HALTS (worst realized -$525). At 3 strikes fail_paused also
+        # latches, but can_enter reports a SINGLE consistent 'daily_loss_stop' (no double).
+        import fetcher as _f
+        try:
+            strike = (float(self.cfg.fetcher_sl_dollars) * float(self.cfg.lot_size)
+                      * float(self.cfg.contract_size))          # $175
+            g = _f.new_day_state()
+            _f.record_close(g, -strike, True, self.cfg); a1 = _f.can_enter(g, self.cfg)
+            _f.record_close(g, -strike, True, self.cfg); a2 = _f.can_enter(g, self.cfg)
+            _f.record_close(g, -strike, True, self.cfg); a3, reason3 = _f.can_enter(g, self.cfg)
+            ladder = (a1[0] is True and a2[0] is True and a3 is False)
+            consistent = (reason3 == 'daily_loss_stop' and g['loss_stopped'] is True
+                          and abs(g['day_pnl'] + 3 * strike) < 1e-6)   # -525
+            ok = ladder and consistent
+            detail = (f"strike=${strike:.0f} 1_ok={a1[0]} 2_ok={a2[0]} 3_halts({reason3}) "
+                      f"day=${g['day_pnl']:.0f} fail_paused={g['fail_paused']}(latched,not double-reported)")
+        except Exception as e:
+            self._record(248, FAIL, f"raised: {e!r}"); return
+        self._record(248, PASS if ok else FAIL, detail)
+
+    def _step_daily_profit_lock(self):
+        # 249 SOFT profit lock: realized day P&L >= +$400 -> can_enter blocks NEW entries
+        # with ONE loud alert (idempotent across ticks); managing an OPEN leg never consults
+        # can_enter, so the lock is manage-only. Both engines.
+        import types, rogue as _r, fetcher as _f
+        try:
+            alerts = []
+
+            def _tele():
+                return types.SimpleNamespace(info=lambda *a, **k: None,
+                                             warn=lambda m='', **k: alerts.append(str(m)))
+            tr, _ = self._reseed_rogue_mk(); tr.tele = _tele()
+            tr._rogue = {'day': '2026-07-07', 'gov': _r.new_day_state(), 'anchor': 4000.0,
+                         'leg_dir': None, 'open': None, 'a1_last_close': 4000.0}
+            _r.record_close(tr._rogue['gov'], 420.0, False, tr.cfg)
+            r_block, r_reason = _r.can_enter(tr._rogue['gov'], tr.cfg)
+            _r.maybe_profit_lock_alert(tr, tr._rogue)
+            _r.maybe_profit_lock_alert(tr, tr._rogue)          # second call must NOT re-alert
+            rogue_ok = (r_block is False and r_reason == 'daily_profit_stop'
+                        and tr._rogue['gov']['profit_locked'] is True
+                        and sum(1 for m in alerts if 'DAY PROFIT STOP' in m) == 1)
+            alerts.clear()
+            trf, _ = self._fetch_mk(); trf.tele = _tele()
+            trf._fetcher = {'day': '2026-07-07', 'gov': _f.new_day_state(), 'anchor': 4000.0,
+                            'leg_dir': None, 'open': None}
+            _f.record_close(trf._fetcher['gov'], 420.0, False, trf.cfg)
+            f_block, f_reason = _f.can_enter(trf._fetcher['gov'], trf.cfg)
+            _f.maybe_profit_lock_alert(trf, trf._fetcher)
+            _f.maybe_profit_lock_alert(trf, trf._fetcher)
+            fetch_ok = (f_block is False and f_reason == 'daily_profit_stop'
+                        and sum(1 for m in alerts if 'DAY PROFIT STOP' in m) == 1)
+            ok = rogue_ok and fetch_ok
+            detail = f"rogue[block={r_reason} one_alert={rogue_ok}] fetch[block={f_reason} one_alert={fetch_ok}]"
+        except Exception as e:
+            self._record(249, FAIL, f"raised: {e!r}"); return
+        self._record(249, PASS if ok else FAIL, detail)
+
+    def _step_daily_stop_reseed(self):
+        # 250 reseed under PROFIT lock -> OVERRIDE: re-anchor, entries re-enabled, NO same-day
+        # re-lock, loud alert; the LOSS stop stays fully active afterwards. Reseed under the
+        # LOSS stop -> REFUSED (both engines, anchor untouched).
+        import types, rogue as _r, fetcher as _f
+        try:
+            alerts = []
+
+            def _tele():
+                return types.SimpleNamespace(info=lambda *a, **k: None,
+                                             warn=lambda m='', **k: alerts.append(str(m)))
+            tr, _ = self._reseed_rogue_mk(); tr.tele = _tele()
+            tr._rogue = {'day': '2026-07-07', 'gov': _r.new_day_state(), 'anchor': 3900.0,
+                         'leg_dir': None, 'open': None, 'a1_last_close': 3900.0}
+            _r.record_close(tr._rogue['gov'], 420.0, False, tr.cfg)   # profit locked
+            ok_s, reason_s, _px = _r.manual_seed(tr, 4000.0)
+            override_alert = any('OVERRIDDEN BY MANUAL RESEED' in m for m in alerts)
+            overrode_ok = (ok_s is True and tr._rogue['gov']['profit_override'] is True
+                           and abs(tr._rogue['a1_last_close'] - 4000.0) < 1e-9
+                           and _r.can_enter(tr._rogue['gov'], tr.cfg)[0] is True
+                           and override_alert)
+            _r.record_close(tr._rogue['gov'], 500.0, False, tr.cfg)   # no same-day re-lock
+            no_relock = _r.can_enter(tr._rogue['gov'], tr.cfg)[0] is True
+            _r.record_close(tr._rogue['gov'], -2000.0, True, tr.cfg)  # loss stop still live
+            loss_live = _r.can_enter(tr._rogue['gov'], tr.cfg)[1] == 'daily_loss_stop'
+            # reseed under LOSS stop -> refused (rogue + fetcher)
+            tr2, _ = self._reseed_rogue_mk()
+            tr2._rogue = {'day': '2026-07-07', 'gov': _r.new_day_state(), 'anchor': 3900.0,
+                          'leg_dir': None, 'open': None, 'a1_last_close': 3900.0}
+            tr2._rogue['gov']['loss_stopped'] = True
+            r2, reason2, _ = _r.manual_seed(tr2, 4000.0)
+            rogue_loss_refuse = (r2 is False and reason2 == 'loss_stop'
+                                 and tr2._rogue['a1_last_close'] == 3900.0)
+            trf, _ = self._fetch_mk()
+            trf._fetcher = {'day': '2026-07-07', 'gov': _f.new_day_state(), 'anchor': 3900.0,
+                            'leg_dir': None, 'open': None}
+            trf._fetcher['gov']['loss_stopped'] = True
+            f2, freason2, _ = _f.manual_seed(trf, 4000.0)
+            fetch_loss_refuse = (f2 is False and freason2 == 'loss_stop'
+                                 and trf._fetcher['anchor'] == 3900.0)
+            ok = (overrode_ok and no_relock and loss_live
+                  and rogue_loss_refuse and fetch_loss_refuse)
+            detail = (f"override={overrode_ok} no_relock={no_relock} loss_live={loss_live} "
+                      f"rogue_loss_refuse={rogue_loss_refuse} fetch_loss_refuse={fetch_loss_refuse}")
+        except Exception as e:
+            self._record(250, FAIL, f"raised: {e!r}"); return
+        self._record(250, PASS if ok else FAIL, detail)
+
+    def _step_daily_stops_disabled(self):
+        # 251 profit_stop == 0 AND loss_stop == 0 fully DISABLE their gates (both engines):
+        # a huge win or a huge loss never blocks can_enter, and record_close latches nothing.
+        import dataclasses, rogue as _r, fetcher as _f
+        try:
+            rc = dataclasses.replace(self.cfg, rogue_daily_profit_stop=0.0,
+                                     rogue_daily_loss_stop=0.0)
+            g = _r.new_day_state(); g['day_pnl'] = 9000.0
+            rprofit = _r.can_enter(g, rc)[0] is True
+            g = _r.new_day_state(); g['day_pnl'] = -9000.0
+            rloss = _r.can_enter(g, rc)[0] is True
+            g2 = _r.new_day_state(); _r.record_close(g2, -9000.0, True, rc)
+            rno_latch = (g2['loss_stopped'] is False)
+            fc = dataclasses.replace(self.cfg, fetcher_daily_profit_stop=0.0,
+                                     fetcher_daily_loss_stop=0.0)
+            g = _f.new_day_state(); g['day_pnl'] = 9000.0
+            fprofit = _f.can_enter(g, fc)[0] is True
+            g = _f.new_day_state(); g['day_pnl'] = -9000.0
+            floss = _f.can_enter(g, fc)[0] is True
+            ok = rprofit and rloss and rno_latch and fprofit and floss
+            detail = (f"rogue[profit_off={rprofit} loss_off={rloss} no_latch={rno_latch}] "
+                      f"fetch[profit_off={fprofit} loss_off={floss}]")
+        except Exception as e:
+            self._record(251, FAIL, f"raised: {e!r}"); return
+        self._record(251, PASS if ok else FAIL, detail)
 
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
@@ -9084,7 +9277,11 @@ class SelfTest:
                                       rogue_entry_confirm_redesign=10.0,
                                       rogue_chase_cap_dollars=0.0,
                                       rogue_chain_cooldown_sec=0.0,
-                                      rogue_chain_min_displacement=0.0)
+                                      rogue_chain_min_displacement=0.0,
+                                      # this step books a +$500 close to test the chase gates;
+                                      # disable the 2026-07-08 profit lock so it isn't what
+                                      # blocks the re-entry under test.
+                                      rogue_daily_profit_stop=0.0)
             tr, env = self._p3_mk(cfg)
             _r.manual_seed(tr, 4000.0)
             self._p3_tick(tr, env, 4025.0)                       # +$25 -> ENTERS (no cap)
@@ -9723,6 +9920,13 @@ class SelfTest:
             self._step_manual_reseed_rails()
             self._step_manual_seed_entry_chain()
             self._step_manual_seed_gov_continuity()
+            # 2026-07-08 daily stops: Rogue E-20 rebuild + soft profit-lock + tight loss halt
+            self._step_rogue_e20_rebuild()
+            self._step_rogue_loss_halt_2strike()
+            self._step_fetcher_loss_halt()
+            self._step_daily_profit_lock()
+            self._step_daily_stop_reseed()
+            self._step_daily_stops_disabled()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

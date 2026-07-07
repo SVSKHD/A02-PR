@@ -102,9 +102,13 @@ def promote_on_boot(trader):
 # --- the day governor: cap + loss-stop + consecutive-fail-stop (mirror rogue) ------
 def new_day_state():
     """Fresh per-day Fetcher counters. entries = NEW entries today (the cap counter);
-    day_pnl = cumulative Fetcher P&L; consec_fails = consecutive SL strikes."""
+    day_pnl = cumulative Fetcher P&L; consec_fails = consecutive SL strikes.
+    profit_locked/override/alerted drive the SOFT daily-profit lock (2026-07-08):
+    day_pnl >= fetcher_daily_profit_stop -> manage-only, overridable ONCE/day by /fetchseed
+    (profit_override), one-time alert (profit_alerted). Mirrors Rogue."""
     return {'entries': 0, 'day_pnl': 0.0, 'consec_fails': 0,
-            'loss_stopped': False, 'fail_paused': False}
+            'loss_stopped': False, 'fail_paused': False,
+            'profit_locked': False, 'profit_override': False, 'profit_alerted': False}
 
 
 def can_enter(state, cfg):
@@ -115,9 +119,15 @@ def can_enter(state, cfg):
     (3 strikes), so the pause is ALWAYS reachable first. Gates only NEW entries."""
     cap = int(getattr(cfg, 'fetcher_max_entries_per_day', 20))
     loss_stop = float(getattr(cfg, 'fetcher_daily_loss_stop', -700.0))
+    profit_stop = float(getattr(cfg, 'fetcher_daily_profit_stop', 0.0))
     fail_stop = int(getattr(cfg, 'fetcher_consecutive_fail_stop', 3))
-    if state.get('loss_stopped') or float(state.get('day_pnl', 0.0)) <= loss_stop:
-        return False, 'daily_loss_stop'
+    if loss_stop < 0.0 and (state.get('loss_stopped')
+                            or float(state.get('day_pnl', 0.0)) <= loss_stop):
+        return False, 'daily_loss_stop'          # loss_stop == 0 disables the gate
+    if (profit_stop > 0.0 and not state.get('profit_override')
+            and (state.get('profit_locked')
+                 or float(state.get('day_pnl', 0.0)) >= profit_stop)):
+        return False, 'daily_profit_stop'         # profit_stop == 0 disables the gate
     if state.get('fail_paused') or int(state.get('consec_fails', 0)) >= fail_stop:
         return False, 'consecutive_fail_pause'
     if int(state.get('entries', 0)) >= cap:
@@ -138,6 +148,7 @@ def record_close(state, pnl_dollars, was_fail, cfg):
     P&L but leaves the streak UNCHANGED (an unbooked close can't trip the pause). PURE."""
     fail_stop = int(getattr(cfg, 'fetcher_consecutive_fail_stop', 3))
     loss_stop = float(getattr(cfg, 'fetcher_daily_loss_stop', -700.0))
+    profit_stop = float(getattr(cfg, 'fetcher_daily_profit_stop', 0.0))
     state['day_pnl'] = float(state.get('day_pnl', 0.0)) + float(pnl_dollars)
     if was_fail is None:
         pass
@@ -145,11 +156,39 @@ def record_close(state, pnl_dollars, was_fail, cfg):
         state['consec_fails'] = int(state.get('consec_fails', 0)) + 1
     else:
         state['consec_fails'] = 0
-    if state['day_pnl'] <= loss_stop:
-        state['loss_stopped'] = True
+    if loss_stop < 0.0 and state['day_pnl'] <= loss_stop:
+        state['loss_stopped'] = True             # loss_stop == 0 disables the gate
     if int(state['consec_fails']) >= fail_stop:
         state['fail_paused'] = True
+    # SOFT profit lock: latch once realized day P&L reaches the target (unless already
+    # overridden for the day). The one-time alert fires in detect_close.
+    if (profit_stop > 0.0 and not state.get('profit_override')
+            and state['day_pnl'] >= profit_stop):
+        state['profit_locked'] = True
     return state
+
+
+def maybe_profit_lock_alert(trader, st):
+    """Fire the ONE-TIME loud PROFIT-LOCK alert (log + Discord) the first time the soft
+    daily-profit lock engages -- 'DAY PROFIT STOP +$X >= $400 — entries locked (reseed to
+    override)'. No-op once alerted, or when overridden. Guarded; never raises."""
+    try:
+        g = st.get('gov') or {}
+        if (g.get('profit_locked') and not g.get('profit_override')
+                and not g.get('profit_alerted')):
+            g['profit_alerted'] = True
+            ps = float(getattr(trader.cfg, 'fetcher_daily_profit_stop', 0.0))
+            msg = (f"{FETCHER_ALERT_PREFIX} {FETCHER_GLYPH} DAY PROFIT STOP "
+                   f"+${float(g.get('day_pnl', 0.0)):.0f} >= ${ps:.0f} — entries locked "
+                   f"(reseed to override)")
+            log.warning(msg)
+            try:
+                trader.tele.warn(msg)
+            except Exception:
+                pass
+            _persist(trader)
+    except Exception:
+        pass
 
 
 # --- PURE entry + TP/SL cores -----------------------------------------------------
@@ -386,6 +425,7 @@ def detect_close(trader, st):
     if exit_px is not None:
         st['anchor'] = round(float(exit_px), 2)
     _persist(trader)
+    maybe_profit_lock_alert(trader, st)  # one-time PROFIT-LOCK alert if this close engaged it
     if unresolved:
         try:
             log.warning(f"{FETCHER_ALERT_PREFIX} WARN pnl-unresolved ticket #{tk}")
@@ -613,6 +653,28 @@ def manual_seed(trader, price):
             except Exception:
                 pass
             return False, 'no_tick', None
+        # DAILY-STOP interaction (2026-07-08): a manual reseed is the SOFT override for the
+        # PROFIT lock, but the HARD loss stop is NEVER overridable -> refuse while it is
+        # active. Read the LIVE gov (before any re-init); a same-day reseed reuses this gov.
+        gov = (st_now.get('gov') or {}) if isinstance(st_now, dict) else {}
+        loss_stop = float(getattr(trader.cfg, 'fetcher_daily_loss_stop', 0.0))
+        if gov.get('loss_stopped') or (loss_stop < 0.0
+                                       and float(gov.get('day_pnl', 0.0)) <= loss_stop):
+            log.warning(f"{FETCHER_ALERT_PREFIX} MANUAL SEED refused (loss_stop): "
+                        f"daily loss stop active (not overridable)")
+            try:
+                trader.tele.warn(f"{FETCHER_ALERT_PREFIX} 🌱 manual seed refused — daily loss "
+                                 f"stop active (not overridable)")
+            except Exception:
+                pass
+            return False, 'loss_stop', None
+        overrode = False
+        profit_stop = float(getattr(trader.cfg, 'fetcher_daily_profit_stop', 0.0))
+        if (profit_stop > 0.0 and not gov.get('profit_override')
+                and (gov.get('profit_locked')
+                     or float(gov.get('day_pnl', 0.0)) >= profit_stop)):
+            gov['profit_override'] = True   # clears the lock for the REST of the broker day
+            overrode = True
         price = round(float(price), 2)
         # ensure per-day state (mirrors drive()). A SAME-day re-seed reuses it, so the day
         # governors (entries / day_pnl / fail streak) keep counting -- new anchor, not new day.
@@ -630,6 +692,14 @@ def manual_seed(trader, price):
         st['seed_source'] = _rogue.SEED_MANUAL     # provenance -> every fetcher_trades row
         _persist(trader)
         trig = float(getattr(trader.cfg, 'fetcher_trigger_dollars', 5.0))
+        if overrode:
+            omsg = (f"{FETCHER_ALERT_PREFIX} {FETCHER_GLYPH} PROFIT STOP OVERRIDDEN BY MANUAL "
+                    f"RESEED @ {price} — entries re-enabled for the day (no re-lock)")
+            log.warning(omsg)
+            try:
+                trader.tele.warn(omsg)
+            except Exception:
+                pass
         log.info(f"{FETCHER_ALERT_PREFIX} FETCH SEED via MANUAL @ {price} (current tick) -> "
                  f"hunting ${trig:.0f} move both directions")
         try:
@@ -718,11 +788,14 @@ def rebuild_gov_from_history(trader, dt_from=None, dt_to=None):
         gov['consec_fails'] = fails
         fail_stop = int(getattr(trader.cfg, 'fetcher_consecutive_fail_stop', 3))
         loss_stop = float(getattr(trader.cfg, 'fetcher_daily_loss_stop', -700.0))
-        gov['loss_stopped'] = bool(gov['day_pnl'] <= loss_stop)
+        profit_stop = float(getattr(trader.cfg, 'fetcher_daily_profit_stop', 0.0))
+        gov['loss_stopped'] = bool(loss_stop < 0.0 and gov['day_pnl'] <= loss_stop)
         gov['fail_paused'] = bool(gov['consec_fails'] >= fail_stop)
+        gov['profit_locked'] = bool(profit_stop > 0.0 and gov['day_pnl'] >= profit_stop)
         log.info(f"{FETCHER_ALERT_PREFIX} gov rebuilt from history: entries={gov['entries']} "
                  f"day_pnl=${gov['day_pnl']:+.2f} consec_fails={gov['consec_fails']} "
-                 f"loss_stopped={gov['loss_stopped']} fail_paused={gov['fail_paused']}")
+                 f"loss_stopped={gov['loss_stopped']} fail_paused={gov['fail_paused']} "
+                 f"profit_locked={gov['profit_locked']}")
         return gov
     except Exception as e:
         log.warning(f"{FETCHER_ALERT_PREFIX} rebuild parse failed: {e!r}")
