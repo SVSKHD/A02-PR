@@ -132,22 +132,33 @@ def trail_gap(profit_dollars, cfg):
 # --- the day governor: cap + loss-stop + consecutive-fail-stop --------------------
 def new_day_state():
     """Fresh per-day Rogue counters. reanchor_count = NEW entries today (the own
-    counter); day_pnl = cumulative Rogue P&L; consec_fails = consecutive init-SL hits."""
+    counter); day_pnl = cumulative Rogue P&L; consec_fails = consecutive init-SL hits.
+    profit_locked/override/alerted drive the SOFT daily-profit lock (2026-07-08):
+    day_pnl >= rogue_daily_profit_stop -> manage-only, overridable ONCE/day by a manual
+    reseed (profit_override), one-time alert (profit_alerted)."""
     return {'reanchor_count': 0, 'day_pnl': 0.0, 'consec_fails': 0,
-            'loss_stopped': False, 'fail_paused': False}
+            'loss_stopped': False, 'fail_paused': False,
+            'profit_locked': False, 'profit_override': False, 'profit_alerted': False}
 
 
 def can_enter(state, cfg):
     """PURE: may Rogue take a NEW entry now? Returns (ok, reason). Blocks when ANY brake
-    is tripped -- the cap (rogue_max_reentries_per_day, 10), the daily loss stop
-    (rogue_daily_loss_stop, -$150), or the consecutive-fail pause
-    (rogue_consecutive_fail_stop, 3). RIDE-WINNER-UNLIMITED: this gates only NEW entries,
-    never the trailing of an already-open winner."""
+    is tripped -- the daily loss stop (rogue_daily_loss_stop; HARD, never overridable), the
+    SOFT daily profit lock (rogue_daily_profit_stop; manage-only, cleared by profit_override
+    from a manual reseed), the consecutive-fail pause (rogue_consecutive_fail_stop), or the
+    cap (rogue_max_reentries_per_day). RIDE-WINNER-UNLIMITED: gates only NEW entries, never
+    the trailing of an already-open winner. profit_stop / loss_stop == 0 disable that gate."""
     cap = int(getattr(cfg, 'rogue_max_reentries_per_day', 10))
     loss_stop = float(getattr(cfg, 'rogue_daily_loss_stop', -150.0))
+    profit_stop = float(getattr(cfg, 'rogue_daily_profit_stop', 0.0))
     fail_stop = int(getattr(cfg, 'rogue_consecutive_fail_stop', 3))
-    if state.get('loss_stopped') or float(state.get('day_pnl', 0.0)) <= loss_stop:
-        return False, 'daily_loss_stop'
+    if loss_stop < 0.0 and (state.get('loss_stopped')
+                            or float(state.get('day_pnl', 0.0)) <= loss_stop):
+        return False, 'daily_loss_stop'          # loss_stop == 0 disables the gate
+    if (profit_stop > 0.0 and not state.get('profit_override')
+            and (state.get('profit_locked')
+                 or float(state.get('day_pnl', 0.0)) >= profit_stop)):
+        return False, 'daily_profit_stop'         # profit_stop == 0 disables the gate
     if state.get('fail_paused') or int(state.get('consec_fails', 0)) >= fail_stop:
         return False, 'consecutive_fail_pause'
     if int(state.get('reanchor_count', 0)) >= cap:
@@ -170,6 +181,7 @@ def record_close(state, pnl_dollars, was_fail, cfg):
     (neither increment nor reset), so an unbooked close can't trip the fail-pause. PURE."""
     fail_stop = int(getattr(cfg, 'rogue_consecutive_fail_stop', 3))
     loss_stop = float(getattr(cfg, 'rogue_daily_loss_stop', -150.0))
+    profit_stop = float(getattr(cfg, 'rogue_daily_profit_stop', 0.0))
     state['day_pnl'] = float(state.get('day_pnl', 0.0)) + float(pnl_dollars)
     if was_fail is None:
         pass                                       # E-14: pnl-unresolved -> streak untouched
@@ -177,11 +189,109 @@ def record_close(state, pnl_dollars, was_fail, cfg):
         state['consec_fails'] = int(state.get('consec_fails', 0)) + 1
     else:
         state['consec_fails'] = 0
-    if state['day_pnl'] <= loss_stop:
-        state['loss_stopped'] = True
+    if loss_stop < 0.0 and state['day_pnl'] <= loss_stop:
+        state['loss_stopped'] = True             # loss_stop == 0 disables the gate
     if int(state['consec_fails']) >= fail_stop:
         state['fail_paused'] = True
+    # SOFT profit lock: latch once realized day P&L reaches the target (unless a manual
+    # reseed already overrode it for the day). The one-time alert fires in detect_close.
+    if (profit_stop > 0.0 and not state.get('profit_override')
+            and state['day_pnl'] >= profit_stop):
+        state['profit_locked'] = True
     return state
+
+
+def maybe_profit_lock_alert(trader, st):
+    """Fire the ONE-TIME loud PROFIT-LOCK alert (log + Discord) the first time the soft
+    daily-profit lock engages -- 'DAY PROFIT STOP +$X >= $400 — entries locked (reseed to
+    override)'. No-op once alerted, or when overridden. Guarded; never raises."""
+    try:
+        g = st.get('gov') or {}
+        if (g.get('profit_locked') and not g.get('profit_override')
+                and not g.get('profit_alerted')):
+            g['profit_alerted'] = True
+            ps = float(getattr(trader.cfg, 'rogue_daily_profit_stop', 0.0))
+            msg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} DAY PROFIT STOP "
+                   f"+${float(g.get('day_pnl', 0.0)):.0f} >= ${ps:.0f} — entries locked "
+                   f"(reseed to override)")
+            log.warning(msg)
+            try:
+                trader.tele.warn(msg)
+            except Exception:
+                pass
+            _persist_state(trader)
+    except Exception:
+        pass
+
+
+# --- E-20: restart-recovery gov rebuild from BROKER deal history (mirror fetcher) ------
+def rebuild_gov_from_history(trader, dt_from=None, dt_to=None):
+    """E-20 LESSON (Rogue): on a SAME-DAY restart the day governor (day_pnl / reanchor_count
+    / consec_fails) must NOT reset to zero -- a restart mid-day would otherwise re-arm the
+    full cap and forget a tripped brake. REBUILD from BROKER truth: every magic-20260626
+    deal in the current broker day. reanchor_count (= NEW entries) = count of entry-IN deals;
+    day_pnl = sum(profit+swap+commission) over entry-OUT deals; consec_fails = the trailing
+    run of losing closes (time-ordered). Latches loss_stopped / fail_paused / profit_locked
+    per the cfg thresholds. profit_override / profit_alerted are RUNTIME decisions that can't
+    be derived from history -- the caller overlays them from the persisted snapshot. Returns
+    a rebuilt gov dict, or None if history is unavailable (caller keeps the snapshot).
+    READ-ONLY; guarded. Mirrors fetcher.rebuild_gov_from_history exactly."""
+    try:
+        if dt_from is None or dt_to is None:
+            dt_from, dt_to = _broker_day_range(trader)
+        deals = trader.adapter.mt5.history_deals_get(dt_from, dt_to) or []
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} rebuild history query failed: {e!r}")
+        return None
+    try:
+        ours = [d for d in deals if int(getattr(d, 'magic', 0) or 0) == ROGUE_MAGIC]
+        ins = [d for d in ours if getattr(d, 'entry', None) == 0]
+        outs = [d for d in ours if getattr(d, 'entry', None) == 1]
+        outs.sort(key=lambda d: getattr(d, 'time', 0) or 0)
+
+        def _pnl(d):
+            return (float(getattr(d, 'profit', 0.0) or 0.0)
+                    + float(getattr(d, 'swap', 0.0) or 0.0)
+                    + float(getattr(d, 'commission', 0.0) or 0.0))
+        gov = new_day_state()
+        gov['reanchor_count'] = len(ins)
+        gov['day_pnl'] = round(sum(_pnl(d) for d in outs), 2)
+        fails = 0
+        for d in reversed(outs):
+            if _pnl(d) <= 0.0:
+                fails += 1
+            else:
+                break
+        gov['consec_fails'] = fails
+        fail_stop = int(getattr(trader.cfg, 'rogue_consecutive_fail_stop', 3))
+        loss_stop = float(getattr(trader.cfg, 'rogue_daily_loss_stop', -150.0))
+        profit_stop = float(getattr(trader.cfg, 'rogue_daily_profit_stop', 0.0))
+        gov['loss_stopped'] = bool(loss_stop < 0.0 and gov['day_pnl'] <= loss_stop)
+        gov['fail_paused'] = bool(gov['consec_fails'] >= fail_stop)
+        gov['profit_locked'] = bool(profit_stop > 0.0 and gov['day_pnl'] >= profit_stop)
+        log.info(f"{ROGUE_ALERT_PREFIX} gov rebuilt from history: entries={gov['reanchor_count']} "
+                 f"day_pnl=${gov['day_pnl']:+.2f} consec_fails={gov['consec_fails']} "
+                 f"loss_stopped={gov['loss_stopped']} fail_paused={gov['fail_paused']} "
+                 f"profit_locked={gov['profit_locked']}")
+        return gov
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} rebuild parse failed: {e!r}")
+        return None
+
+
+def _broker_day_range(trader):
+    """(dt_from, dt_to) UTC datetimes bounding the CURRENT broker day, for the history
+    rebuild. Mirrors pnl_report's IST-day window. Guarded; (None, None) on any error."""
+    try:
+        import pandas as _pd
+        off = float(getattr(trader.cfg, 'broker_tz_offset_hours', 0.0) or 0.0)
+        now_utc = _pd.Timestamp.now(tz='UTC')
+        bdate = (now_utc + _pd.Timedelta(hours=off)).normalize()
+        dt_from = (bdate - _pd.Timedelta(hours=off)).to_pydatetime()
+        dt_to = (bdate + _pd.Timedelta(days=1) - _pd.Timedelta(hours=off)).to_pydatetime()
+        return dt_from, dt_to
+    except Exception:
+        return None, None
 
 
 # --- closure isolation: a rogue close only ever closes rogue legs -----------------
@@ -1070,6 +1180,7 @@ def detect_close(trader, st):
         pass
     st['open'] = None
     _persist_state(trader)               # Fix 5 (E-16): governors changed -> persist
+    maybe_profit_lock_alert(trader, st)  # one-time PROFIT-LOCK alert if this close engaged it
     if unresolved:
         try:
             log.warning(f"{ROGUE_ALERT_PREFIX} WARN pnl-unresolved ticket #{tk}")
@@ -1292,6 +1403,28 @@ def manual_seed(trader, price):
             except Exception:
                 pass
             return False, 'no_tick', None
+        # DAILY-STOP interaction (2026-07-08): a manual reseed is the SOFT override for the
+        # PROFIT lock, but the HARD loss stop is NEVER overridable -> refuse while it is
+        # active. Read the LIVE gov (before any re-init); a same-day reseed reuses this gov.
+        gov = (st_now.get('gov') or {}) if isinstance(st_now, dict) else {}
+        loss_stop = float(getattr(trader.cfg, 'rogue_daily_loss_stop', 0.0))
+        if gov.get('loss_stopped') or (loss_stop < 0.0
+                                       and float(gov.get('day_pnl', 0.0)) <= loss_stop):
+            log.warning(f"{ROGUE_ALERT_PREFIX} MANUAL SEED refused (loss_stop): "
+                        f"daily loss stop active (not overridable)")
+            try:
+                trader.tele.warn(f"{ROGUE_ALERT_PREFIX} 🌱 manual seed refused — daily loss "
+                                 f"stop active (not overridable)")
+            except Exception:
+                pass
+            return False, 'loss_stop', None
+        overrode = False
+        profit_stop = float(getattr(trader.cfg, 'rogue_daily_profit_stop', 0.0))
+        if (profit_stop > 0.0 and not gov.get('profit_override')
+                and (gov.get('profit_locked')
+                     or float(gov.get('day_pnl', 0.0)) >= profit_stop)):
+            gov['profit_override'] = True   # clears the lock for the REST of the broker day
+            overrode = True
         price = round(float(price), 2)
         # ensure the per-day Rogue state exists (mirrors drive()'s init on a fresh restart).
         # A SAME-day re-seed reuses the existing state -> the day governors (entries count,
@@ -1317,6 +1450,14 @@ def manual_seed(trader, price):
         st['chain_anchor'] = None
         _persist_state(trader)             # Fix 5 (E-16): seed changed -> persist
         confirm = float(getattr(trader.cfg, 'rogue_entry_confirm_redesign', 10.0))
+        if overrode:
+            omsg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} PROFIT STOP OVERRIDDEN BY MANUAL "
+                    f"RESEED @ {price} — entries re-enabled for the day (no re-lock)")
+            log.warning(omsg)
+            try:
+                trader.tele.warn(omsg)
+            except Exception:
+                pass
         log.info(f"{ROGUE_ALERT_PREFIX} ROGUE SEED via MANUAL @ {price} (current tick) -> "
                  f"hunting ${confirm:.0f} move both directions")
         try:

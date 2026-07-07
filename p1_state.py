@@ -123,7 +123,13 @@ def snapshot(trader):
                         'day_pnl': float(gov.get('day_pnl', 0.0)),
                         'consec_fails': int(gov.get('consec_fails', 0)),
                         'loss_stopped': bool(gov.get('loss_stopped', False)),
-                        'fail_paused': bool(gov.get('fail_paused', False))},
+                        'fail_paused': bool(gov.get('fail_paused', False)),
+                        # 2026-07-08 soft daily-profit lock: the override + alerted flags are
+                        # RUNTIME decisions that a same-day restart must preserve (rebuilt
+                        # numbers alone can't recover a mid-day manual override).
+                        'profit_locked': bool(gov.get('profit_locked', False)),
+                        'profit_override': bool(gov.get('profit_override', False)),
+                        'profit_alerted': bool(gov.get('profit_alerted', False))},
             }
     except Exception:
         pass
@@ -154,7 +160,10 @@ def snapshot(trader):
                         'day_pnl': float(fgov.get('day_pnl', 0.0)),
                         'consec_fails': int(fgov.get('consec_fails', 0)),
                         'loss_stopped': bool(fgov.get('loss_stopped', False)),
-                        'fail_paused': bool(fgov.get('fail_paused', False))},
+                        'fail_paused': bool(fgov.get('fail_paused', False)),
+                        'profit_locked': bool(fgov.get('profit_locked', False)),
+                        'profit_override': bool(fgov.get('profit_override', False)),
+                        'profit_alerted': bool(fgov.get('profit_alerted', False))},
             }
     except Exception:
         pass
@@ -277,11 +286,29 @@ def recover_on_boot(trader):
             import rogue as _rogue
             gov_s = r.get('gov', {}) or {}
             gov = _rogue.new_day_state()
+            # persisted snapshot as the BASE (fallback if the history query fails)...
             gov.update({'reanchor_count': int(gov_s.get('reanchor_count', 0)),
                         'day_pnl': float(gov_s.get('day_pnl', 0.0)),
                         'consec_fails': int(gov_s.get('consec_fails', 0)),
                         'loss_stopped': bool(gov_s.get('loss_stopped', False)),
-                        'fail_paused': bool(gov_s.get('fail_paused', False))})
+                        'fail_paused': bool(gov_s.get('fail_paused', False)),
+                        'profit_locked': bool(gov_s.get('profit_locked', False)),
+                        'profit_override': bool(gov_s.get('profit_override', False)),
+                        'profit_alerted': bool(gov_s.get('profit_alerted', False))})
+            # ...then PART 1 (E-20): REBUILD day_pnl / reanchor_count / consec_fails and the
+            # loss/fail/profit LATCHES from broker deal history for magic 20260626 (current
+            # broker day). A same-day restart must NEVER reset the governor to zero. Broker
+            # truth wins over the snapshot; the RUNTIME override/alerted flags (not derivable
+            # from deals) are overlaid FROM the snapshot so a mid-day manual override + its
+            # one-time alert survive the restart. Query failure -> keep the persisted gov.
+            try:
+                _rb = _rogue.rebuild_gov_from_history(trader)
+                if _rb is not None:
+                    _rb['profit_override'] = bool(gov_s.get('profit_override', False))
+                    _rb['profit_alerted'] = bool(gov_s.get('profit_alerted', False))
+                    gov = _rb
+            except Exception as e:
+                log.warning(f"rogue gov rebuild non-fatal: {e!r}")
             st = {'day': today, 'gov': gov, 'anchor': r.get('anchor'),
                   'leg_dir': r.get('leg_dir'), 'open': None,
                   'a1_last_close': r.get('a1_last_close'),
@@ -320,14 +347,20 @@ def recover_on_boot(trader):
                          'day_pnl': float(fgov_s.get('day_pnl', 0.0)),
                          'consec_fails': int(fgov_s.get('consec_fails', 0)),
                          'loss_stopped': bool(fgov_s.get('loss_stopped', False)),
-                         'fail_paused': bool(fgov_s.get('fail_paused', False))})
+                         'fail_paused': bool(fgov_s.get('fail_paused', False)),
+                         'profit_locked': bool(fgov_s.get('profit_locked', False)),
+                         'profit_override': bool(fgov_s.get('profit_override', False)),
+                         'profit_alerted': bool(fgov_s.get('profit_alerted', False))})
             # ...then E-20: REBUILD the gov from broker deal history for the current broker
             # day (magic 20260707). A same-day restart must NEVER reset day_pnl/entries/fails
             # to zero (that would re-arm the full cap and forget a tripped brake). Broker
-            # truth wins over the snapshot; if the query fails, we keep the persisted gov.
+            # truth wins over the snapshot; the RUNTIME profit override/alerted flags (not
+            # derivable from deals) are overlaid from the snapshot; query failure keeps gov.
             try:
                 rebuilt = _fetcher.rebuild_gov_from_history(trader)
                 if rebuilt is not None:
+                    rebuilt['profit_override'] = bool(fgov_s.get('profit_override', False))
+                    rebuilt['profit_alerted'] = bool(fgov_s.get('profit_alerted', False))
                     fgov = rebuilt
             except Exception as e:
                 log.warning(f"fetcher gov rebuild non-fatal: {e!r}")

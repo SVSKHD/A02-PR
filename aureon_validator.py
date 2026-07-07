@@ -32,6 +32,8 @@ _EXPECTED_FLAGS = (
     'fetcher_enabled', 'fetcher_trigger_dollars', 'fetcher_tp_dollars',
     'fetcher_sl_dollars', 'fetcher_max_entries_per_day', 'fetcher_daily_loss_stop',
     'fetcher_consecutive_fail_stop', 'fetcher_flatten_at_eod', 'fetcher_seed_fallback',
+    # 2026-07-08 daily stops (soft profit-lock + tightened loss halt), both engines
+    'rogue_daily_loss_stop', 'rogue_daily_profit_stop', 'fetcher_daily_profit_stop',
 )
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
@@ -115,15 +117,15 @@ def _probe(cfg):
           f'should_run={f_raw} fetcher_enabled={getattr(cfg, "fetcher_enabled", None)}')
         w('fetcher:funded_force_off', _f.should_run(cfg, is_funded=True) is False,
           'funded => forced OFF (mandatory gate)')
-        _one_strike = (float(getattr(cfg, 'fetcher_sl_dollars', 5.0))
-                       * float(getattr(cfg, 'lot_size', 0.35))
-                       * float(getattr(cfg, 'contract_size', 100.0)))
-        _fail_stop = int(getattr(cfg, 'fetcher_consecutive_fail_stop', 3))
-        _loss_stop = float(getattr(cfg, 'fetcher_daily_loss_stop', -700.0))
-        w('fetcher:pause_reachable_before_stop',
-          _loss_stop <= -(_fail_stop * _one_strike),
-          f'loss_stop={_loss_stop} <= -({_fail_stop} x one strike ${_one_strike:.0f}) '
-          f'= {-(_fail_stop * _one_strike):.0f}')
+        # 2026-07-08 DAILY STOPS: the loss stop is a non-positive $ bound (0 disables) and
+        # the profit stop is a non-negative $ bound (0 disables). The old D-13 "pause
+        # reachable before the loss stop" invariant is SUPERSEDED (owner tightened the loss
+        # stop to -$370, so the 3-fail pause is intentionally unreachable at current
+        # defaults); the pause code is kept and re-arms if the SL/stop values change.
+        _f_loss = float(getattr(cfg, 'fetcher_daily_loss_stop', 0.0))
+        _f_profit = float(getattr(cfg, 'fetcher_daily_profit_stop', 0.0))
+        w('fetcher:daily_stops_sane', _f_loss <= 0.0 and _f_profit >= 0.0,
+          f'loss_stop={_f_loss} (<=0; 0 disables) profit_stop={_f_profit} (>=0; 0 disables)')
         _f_seed = str(getattr(cfg, 'fetcher_seed_fallback', 'a1_time_snapshot')).lower()
         w('fetcher:seed_fallback_valid', _f_seed in ('a1_time_snapshot', 'market_open'),
           f'fetcher_seed_fallback={_f_seed!r}')
