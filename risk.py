@@ -117,7 +117,23 @@ def _flatten_all(self, reason: str = "Manual", scope: str = "ALL"):
     engine's book -- shadow_positions/shadow_pendings hold exclusively magic-
     20260522 legs (Rogue's ticket lives in self._rogue['open'], never here) and
     the Rogue force-close is skipped, so a scoped flatten can never close a
-    Rogue 20260626 ticket."""
+    Rogue 20260626 ticket.
+
+    v3.7.0 scope: "ALL" now ALSO force-closes the open Fetcher ticket (magic
+    20260707) on a non-EOD reason; "FETCHER" (the /fetcher flatten confirm command)
+    returns early having touched ONLY the Fetcher book (its ticket lives in
+    self._fetcher['open'], never in shadow_positions), so it can never close an
+    anchor or Rogue ticket -- the anchor shadow loop below is skipped entirely."""
+    if str(scope) == "FETCHER":
+        # scoped Fetcher flatten: magic 20260707 ONLY (never the anchor shadow book).
+        try:
+            import fetcher as _fetcher
+            self.tele.warn(f"FLATTEN ({reason}) [FETCHER-scoped: anchors + Rogue untouched]")
+            _fetcher.force_close_open(self, reason=reason)
+            _fetcher.cancel_pendings(self, reason=reason)
+        except Exception as e:
+            log.warning(f"fetcher scoped flatten failed (non-fatal): {e!r}")
+        return
     self.tele.warn(f"FLATTEN ({reason}) — closing {len(self.shadow_positions)} positions, "
                    f"cancelling {len(self.shadow_pendings)} pendings"
                    + (" [ANCHORS-scoped: Rogue untouched]" if scope == "ANCHORS" else ""))
@@ -199,6 +215,16 @@ def _flatten_all(self, reason: str = "Manual", scope: str = "ALL"):
             _rogue.force_close_open(self, reason=reason)
         except Exception as e:
             log.warning(f"rogue force_close_open during flatten failed (non-fatal): {e!r}")
+    # v3.7.0: the same kill-switch / manual flatten must ALSO close any open Fetcher ticket
+    # (magic 20260707) -- it rides its own magic, untouched by the anchor loop. EOD is
+    # EXCLUDED (fetcher.eod_flatten owns the EOD ride decision, default ON). An ANCHORS-
+    # scoped flatten skips it. Fetcher-scoped already returned early above.
+    if str(reason) != "EOD" and str(scope) != "ANCHORS":
+        try:
+            import fetcher as _fetcher
+            _fetcher.force_close_open(self, reason=reason)
+        except Exception as e:
+            log.warning(f"fetcher force_close_open during flatten failed (non-fatal): {e!r}")
 
     # Critical alert if anything failed to close — these are real money exposure
     if failed_closes or failed_cancels:

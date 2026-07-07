@@ -77,7 +77,8 @@ def snapshot(trader):
         eng = getattr(trader, 'engines', None)
         if isinstance(eng, dict):
             snap['engines'] = {'anchors': bool(eng.get('anchors', True)),
-                               'rogue': bool(eng.get('rogue', True))}
+                               'rogue': bool(eng.get('rogue', True)),
+                               'fetcher': bool(eng.get('fetcher', True))}
     except Exception:
         pass
     try:
@@ -123,6 +124,37 @@ def snapshot(trader):
                         'consec_fails': int(gov.get('consec_fails', 0)),
                         'loss_stopped': bool(gov.get('loss_stopped', False)),
                         'fail_paused': bool(gov.get('fail_paused', False))},
+            }
+    except Exception:
+        pass
+    try:
+        # v3.7.0 FETCHER runtime state (mirror the Rogue block): the switch + anchor +
+        # seed provenance + the open ticket + the day governor survive a same-day restart.
+        # The governor is ADDITIONALLY rebuilt from broker deal history on recover (E-20),
+        # but persisting it here keeps the snapshot self-describing + is the fallback if
+        # the history query fails.
+        fr = getattr(trader, '_fetcher', None)
+        if fr is not None:
+            fgov = fr.get('gov', {}) or {}
+            fo = fr.get('open') or None
+            snap['fetcher'] = {
+                'day': fr.get('day'),
+                'anchor': fr.get('anchor'),
+                'leg_dir': fr.get('leg_dir'),
+                'seed_px': fr.get('seed_px'),
+                'seed_source': fr.get('seed_source'),
+                'seed_recorded_px': fr.get('seed_recorded_px'),
+                'a1_snap_px': fr.get('a1_snap_px'),
+                'day_open_px': fr.get('day_open_px'),
+                'open': ({'ticket': fo.get('ticket'), 'side': fo.get('side'),
+                          'entry': fo.get('entry'), 'tp': fo.get('tp'), 'sl': fo.get('sl'),
+                          'magic': fo.get('magic'), 'leg_type': fo.get('leg_type')}
+                         if fo else None),
+                'gov': {'entries': int(fgov.get('entries', 0)),
+                        'day_pnl': float(fgov.get('day_pnl', 0.0)),
+                        'consec_fails': int(fgov.get('consec_fails', 0)),
+                        'loss_stopped': bool(fgov.get('loss_stopped', False)),
+                        'fail_paused': bool(fgov.get('fail_paused', False))},
             }
     except Exception:
         pass
@@ -219,8 +251,9 @@ def recover_on_boot(trader):
         if isinstance(eng_saved, dict) and isinstance(getattr(trader, 'engines', None), dict):
             defaults = getattr(trader, '_engine_boot_defaults', None) or {
                 'anchors': bool(getattr(trader.cfg, 'non_oco_enabled', True)),
-                'rogue': bool(getattr(trader.cfg, 'rogue_enabled', True))}
-            for name in ('anchors', 'rogue'):
+                'rogue': bool(getattr(trader.cfg, 'rogue_enabled', True)),
+                'fetcher': bool(getattr(trader.cfg, 'fetcher_enabled', True))}
+            for name in ('anchors', 'rogue', 'fetcher'):
                 if name not in eng_saved:
                     continue
                 restored = bool(eng_saved[name])
@@ -276,6 +309,44 @@ def recover_on_boot(trader):
                               'leg_type': o.get('leg_type', _rogue.ROGUE_LEG_TYPE)}
             trader._rogue = st
             summary['rogue'] = True
+        # --- restore FETCHER switch state + runtime + E-20 gov rebuild from history ---
+        fr = data.get('fetcher')
+        if isinstance(fr, dict):
+            import fetcher as _fetcher
+            fgov_s = fr.get('gov', {}) or {}
+            fgov = _fetcher.new_day_state()
+            # persisted snapshot as the BASE (the fallback if the history query fails)...
+            fgov.update({'entries': int(fgov_s.get('entries', 0)),
+                         'day_pnl': float(fgov_s.get('day_pnl', 0.0)),
+                         'consec_fails': int(fgov_s.get('consec_fails', 0)),
+                         'loss_stopped': bool(fgov_s.get('loss_stopped', False)),
+                         'fail_paused': bool(fgov_s.get('fail_paused', False))})
+            # ...then E-20: REBUILD the gov from broker deal history for the current broker
+            # day (magic 20260707). A same-day restart must NEVER reset day_pnl/entries/fails
+            # to zero (that would re-arm the full cap and forget a tripped brake). Broker
+            # truth wins over the snapshot; if the query fails, we keep the persisted gov.
+            try:
+                rebuilt = _fetcher.rebuild_gov_from_history(trader)
+                if rebuilt is not None:
+                    fgov = rebuilt
+            except Exception as e:
+                log.warning(f"fetcher gov rebuild non-fatal: {e!r}")
+            fst = {'day': today, 'gov': fgov,
+                   'anchor': fr.get('anchor'), 'leg_dir': fr.get('leg_dir'), 'open': None,
+                   'seed_px': fr.get('seed_px'), 'seed_source': fr.get('seed_source'),
+                   'seed_recorded_px': fr.get('seed_recorded_px'),
+                   'a1_snap_px': fr.get('a1_snap_px'),
+                   'day_open_px': fr.get('day_open_px')}
+            fo = fr.get('open')
+            if fo and fo.get('ticket') is not None and _position_open_at_broker(trader, fo.get('ticket')):
+                # ADOPT the already-open Fetcher position instead of ignoring it.
+                fst['open'] = {'ticket': fo.get('ticket'), 'side': fo.get('side'),
+                               'entry': fo.get('entry'), 'tp': fo.get('tp'),
+                               'sl': fo.get('sl'),
+                               'magic': fo.get('magic', _fetcher.FETCHER_MAGIC),
+                               'leg_type': fo.get('leg_type', _fetcher.FETCHER_LEG_TYPE)}
+            trader._fetcher = fst
+            summary['fetcher'] = True
         summary['boosts'] = len(data.get('boost_trails', {}) or {})
         summary['anchors'] = len(data.get('processed_anchors_today', []) or [])
         summary['recovered'] = True

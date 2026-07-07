@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.6.0"  # engine switches (/anchors /rogue) + Rogue seed independence
+__version__ = "3.7.0"  # FETCHER engine (/fetcher): fixed $5-grid chop scalper (magic 20260707)
 CODENAME = "Astra Hawk"
 
 

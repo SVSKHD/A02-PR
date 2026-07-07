@@ -313,6 +313,15 @@ STEP_NAMES = {
     # D-13: init-SL widened 5->10; daily loss stop paired to 3 x one init-SL strike
     232: "d13 3-strike pause",     # 3 consecutive init-SL strikes -> fail-pause at paired stop; loss stop not fired before it
     233: "d13 4th strike blocked", # a 4th strike while paused stays blocked (never re-opens the gate)
+    # v3.7.0 FETCHER engine (magic 20260707): the chop-harvesting scalper
+    234: "fetcher seed resolve",   # anchors on -> A1 seed; anchors off -> a1_time_snapshot fallback
+    235: "fetcher entry $5",       # $5 off anchor both dirs enters; $4.99 holds; TP/SL fixed
+    236: "fetcher tp/sl reanchor", # TP/SL exit re-anchors at the CLOSE px; next entry needs fresh $5
+    237: "fetcher governors",      # 3-fail pause before -700 halt; 4th strike halts; entry 21 capped
+    238: "fetcher manage-only",    # /fetcher off -> no new entry, open ticket's TP/SL/close still booked
+    239: "fetcher restart rebuild",# same-day restore rebuilds day_pnl/entries/fails from deal history (E-20)
+    240: "fetcher funded gate",    # funded -> should_run False + promote_on_boot forces OFF
+    241: "fetcher column guard",   # fetcher_trades.csv last column == seed_source
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -4776,7 +4785,7 @@ class SelfTest:
         # (DO-NOT-START); (d) seed_source is the LAST column of the boost ledger
         # and present in both pattern-log schemas (append-safe for old files).
         import aureon_validator as _v, dataclasses
-        import boost_metrics as _bm, rogue_patternlog as _pl
+        import boost_metrics as _bm, rogue_patternlog as _pl, fetcher as _fetch
         try:
             defaults_ok = (getattr(self.cfg, 'non_oco_enabled', None) is True
                            and getattr(self.cfg, 'rogue_enabled', None) is True
@@ -4797,6 +4806,7 @@ class SelfTest:
             schema_ok = (_bm.LEDGER_COLUMNS[-1] == 'seed_source'
                          and _pl.PATTERN_COLUMNS[-1] == 'seed_source'
                          and _pl.TRADE_COLUMNS[-1] == 'seed_source'
+                         and _fetch.TRADE_COLUMNS[-1] == 'seed_source'   # v3.7.0 fetcher CSV
                          and _bm.ledger_row({'ts': 't'})[-1] == '')
             ok = defaults_ok and wired and typo_blocks and schema_ok
             detail = (f"defaults_on={defaults_ok} validator_wired={wired} "
@@ -4968,8 +4978,8 @@ class SelfTest:
                 logs = []
                 t = types.SimpleNamespace(
                     cfg=self.cfg, paper=True, run_dir=tmp,
-                    engines={'anchors': True, 'rogue': True},
-                    _engine_boot_defaults={'anchors': True, 'rogue': True},
+                    engines={'anchors': True, 'rogue': True, 'fetcher': True},
+                    _engine_boot_defaults={'anchors': True, 'rogue': True, 'fetcher': True},
                     state={'last_broker_date': day},
                     shadow_positions={}, shadow_pendings={}, _rogue=None,
                     _post_engines_status=lambda note='': None,
@@ -4983,12 +4993,13 @@ class SelfTest:
             _lt.LiveTrader._set_engine(t1, 'anchors', False, source='selftest')
             with open(os.path.join(tmp, 'state.json')) as f:
                 snap = json.load(f)
-            persisted = (snap.get('engines') == {'anchors': False, 'rogue': True}
+            persisted = (snap.get('engines') == {'anchors': False, 'rogue': True,
+                                                 'fetcher': True}
                          and t1.engines['anchors'] is False)
 
             t2, logs2 = mk('2026-07-06')                    # SAME-day restart
             _p1.recover_on_boot(t2)
-            restored = (t2.engines == {'anchors': False, 'rogue': True})
+            restored = (t2.engines == {'anchors': False, 'rogue': True, 'fetcher': True})
             alert = [m for k, m in logs2
                      if k == 'warn' and 'ENGINE STATE OVERRIDE' in m]
             alert_names_both = (len(alert) == 1 and 'OFF' in alert[0]
@@ -4996,7 +5007,8 @@ class SelfTest:
 
             t3, logs3 = mk('2026-07-07')                    # NEW-day restart
             _p1.recover_on_boot(t3)
-            new_day_defaults = (t3.engines == {'anchors': True, 'rogue': True}
+            new_day_defaults = (t3.engines == {'anchors': True, 'rogue': True,
+                                               'fetcher': True}
                                 and not any('ENGINE STATE OVERRIDE' in m
                                             for _k, m in logs3))
 
@@ -7442,6 +7454,316 @@ class SelfTest:
             self._record(233, FAIL, f"raised: {e!r}"); return
         self._record(233, PASS if ok else FAIL, detail)
 
+    # =====================================================================
+    # v3.7.0 FETCHER engine (magic 20260707) — headless synthetic-tick tests
+    # =====================================================================
+    def _fetch_mk(self, cfg=None, anchors_on=True, funded=False, hist=None):
+        """A controllable FETCHER trader (paper) + its env. env['book'] = live broker
+        positions; env['deal'] = the per-ticket close deal surfaced once the ticket leaves
+        the book; env['hist'] = the date-ranged deal sweep for the E-20 rebuild."""
+        import types, dataclasses
+        import fetcher as _f
+        cfg = cfg or dataclasses.replace(self.cfg, fetcher_enabled=True)
+        env = {'price': None, 'book': {}, 'deal': None, 'orders': [], 'logs': [],
+               'closed': [], 'hist': hist or []}
+
+        def place_market_order(sym, side, lot, sl=None, tp=None, magic=None,
+                               comment=None, dry_run=False):
+            tk = 700000 + len(env['orders']) + 1
+            env['orders'].append({'ticket': tk, 'side': side, 'sl': sl, 'tp': tp})
+            env['book'][tk] = True
+            return types.SimpleNamespace(order=tk, deal=tk, retcode=10009)
+
+        def positions_get(ticket=None, symbol=None):
+            if ticket is not None:
+                return [object()] if env['book'].get(int(ticket)) else []
+            return [object() for _ in env['book']]
+
+        def history_deals_get(*args, position=None, **k):
+            if position is not None:                 # per-ticket close deal (keyword only)
+                d = env['deal']
+                return ([types.SimpleNamespace(entry=1, profit=d['pnl'], price=d['price'],
+                                               swap=0.0, commission=0.0,
+                                               magic=_f.FETCHER_MAGIC)]
+                        if (d and int(position) == int(d['ticket'])) else [])
+            return env['hist']                       # positional date-ranged sweep (E-20 rebuild)
+
+        def close_position(tk, dry_run=False):
+            env['book'].pop(int(tk), None)
+            env['closed'].append(int(tk))
+
+        mt5 = types.SimpleNamespace(
+            positions_get=positions_get, history_deals_get=history_deals_get,
+            orders_get=lambda *a, **k: [],
+            symbol_info_tick=lambda s=None: types.SimpleNamespace(
+                bid=env['price'], ask=env['price']),
+            account_info=lambda: types.SimpleNamespace(trade_mode=(1 if funded else 0)),
+            ACCOUNT_TRADE_MODE_DEMO=0)
+        ad = types.SimpleNamespace(
+            mt5=mt5, place_market_order=place_market_order,
+            place_with_retry=lambda send, describe=None, tele=None: send(1, False),
+            close_position=close_position, cancel_order=lambda tk, dry_run=False: None)
+        tr = types.SimpleNamespace(
+            cfg=cfg, paper=True, adapter=ad, run_dir='.', _last_boost_mid=None,
+            engines={'anchors': anchors_on, 'rogue': True, 'fetcher': True},
+            state={'last_broker_date': '2026-07-07', 'missed_anchors_today': []},
+            tele=types.SimpleNamespace(
+                info=lambda *a, **k: env['logs'].append(a[0] if a else ''),
+                warn=lambda *a, **k: env['logs'].append(a[0] if a else '')))
+        return tr, env
+
+    def _fetch_tick(self, tr, env, price, close=None, allow_new_entries=True):
+        """Drive fetcher.drive at one synthetic tick. close=(pnl, exit_px) makes the broker
+        close the open ticket at that P&L/price before the drive (TP/SL fired)."""
+        import fetcher as _f
+        env['price'] = float(price)
+        tr._last_boost_mid = float(price)
+        if close is not None:
+            o = (getattr(tr, '_fetcher', None) or {}).get('open') or {}
+            tk = o.get('ticket')
+            if tk is not None:
+                env['book'].pop(int(tk), None)
+                env['deal'] = {'ticket': tk, 'pnl': close[0], 'price': close[1]}
+        _f.drive(tr, allow_new_entries=allow_new_entries)
+
+    def _step_fetcher_seed_resolution(self):
+        # 234 SEED: the shared resolver (rogue.resolve_seed, fallback_key=
+        # 'fetcher_seed_fallback') gives the REAL A1 anchor when the anchor engine is ON,
+        # and the a1_time_snapshot fallback when it is OFF.
+        import rogue as _r
+        try:
+            tr_on, _ = self._fetch_mk(anchors_on=True)
+            tr_on.state['a1_anchor_price'] = 4000.0
+            st_on = {}
+            seed_on, src_on = _r.resolve_seed(tr_on, st_on, fallback_key='fetcher_seed_fallback')
+            on_ok = (abs((seed_on or 0) - 4000.0) < 1e-9 and src_on == _r.SEED_A1_ANCHOR)
+            tr_off, _ = self._fetch_mk(anchors_on=False)
+            st_off = {'a1_snap_px': 3990.0, 'day_open_px': 3980.0}
+            seed_off, src_off = _r.resolve_seed(tr_off, st_off, fallback_key='fetcher_seed_fallback')
+            off_ok = (abs((seed_off or 0) - 3990.0) < 1e-9
+                      and src_off == _r.SEED_A1_TIME_SNAPSHOT)
+            ok = on_ok and off_ok
+            detail = (f"anchors_on->A1@{seed_on}({src_on}) anchors_off->snap@{seed_off}({src_off})")
+        except Exception as e:
+            self._record(234, FAIL, f"raised: {e!r}"); return
+        self._record(234, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_entry_threshold(self):
+        # 235 ENTRY: a $5 move off the anchor fires a market entry in the move direction
+        # (BUY above, SELL below); $4.99 holds. PURE entry_decision + a live drive both dirs.
+        import fetcher as _f
+        try:
+            trig = float(self.cfg.fetcher_trigger_dollars)
+            e_buy = _f.entry_decision(4000.0, 4000.0 + trig, self.cfg)     # +$5 -> BUY
+            e_sell = _f.entry_decision(4000.0, 4000.0 - trig, self.cfg)    # -$5 -> SELL
+            e_hold = _f.entry_decision(4000.0, 4000.0 + trig - 0.01, self.cfg)  # +$4.99 -> none
+            pure_ok = (e_buy[:2] == (True, 'BUY') and abs(e_buy[2] - (4000.0 + trig)) < 1e-9
+                       and e_sell[:2] == (True, 'SELL') and abs(e_sell[2] - (4000.0 - trig)) < 1e-9
+                       and e_hold[0] is False)
+            # live drive: seed 4000, tick +$5 -> BUY at 4005 with TP 4010 / SL 4000.
+            tr, env = self._fetch_mk(anchors_on=False)
+            tr._fetcher = {'day': '2026-07-07', 'gov': _f.new_day_state(),
+                           'anchor': 4000.0, 'leg_dir': None, 'open': None}
+            self._fetch_tick(tr, env, 4005.0)
+            o = tr._fetcher.get('open') or {}
+            live_ok = (o.get('side') == 'BUY' and abs(o.get('entry', 0) - 4005.0) < 1e-9
+                       and abs(o.get('tp', 0) - 4010.0) < 1e-9
+                       and abs(o.get('sl', 0) - 4000.0) < 1e-9
+                       and tr._fetcher['gov']['entries'] == 1)
+            ok = pure_ok and live_ok
+            detail = (f"buy={e_buy} sell={e_sell} hold@4.99={e_hold[0]} "
+                      f"live_open={o.get('side')}@{o.get('entry')} tp={o.get('tp')} sl={o.get('sl')}")
+        except Exception as e:
+            self._record(235, FAIL, f"raised: {e!r}"); return
+        self._record(235, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_tp_sl_reanchor(self):
+        # 236 EXIT + RE-ANCHOR: a TP win ($5) and an SL strike (-$5) each book the close and
+        # RE-ANCHOR at the CLOSE price; the next entry then needs a fresh $5 off that close.
+        import fetcher as _f
+        try:
+            tr, env = self._fetch_mk(anchors_on=False)
+            tr._fetcher = {'day': '2026-07-07', 'gov': _f.new_day_state(),
+                           'anchor': 4000.0, 'leg_dir': None, 'open': None}
+            self._fetch_tick(tr, env, 4005.0)                       # ENTER BUY @4005
+            entered = tr._fetcher.get('open') is not None
+            # broker TP fires at 4010 (+$5 = +$175 win); re-anchor must land @4010.
+            self._fetch_tick(tr, env, 4010.0, close=(175.0, 4010.0))
+            tp_reanchor = (tr._fetcher.get('open') is None
+                           and abs(tr._fetcher.get('anchor', 0) - 4010.0) < 1e-9
+                           and abs(tr._fetcher['gov']['day_pnl'] - 175.0) < 1e-9
+                           and tr._fetcher['gov']['consec_fails'] == 0)   # a win resets
+            # a +$4 move off the 4010 re-anchor is NOT enough (needs $5).
+            self._fetch_tick(tr, env, 4014.0)
+            no_entry_under = tr._fetcher.get('open') is None
+            # a fresh +$5 (4015) DOES enter, off the close-price anchor.
+            self._fetch_tick(tr, env, 4015.0)
+            entry_on_fresh = tr._fetcher.get('open') is not None
+            # now an SL strike (-$175) re-anchors at its exit + advances the fail streak.
+            self._fetch_tick(tr, env, 4010.0, close=(-175.0, 4010.0))
+            sl_reanchor = (tr._fetcher.get('open') is None
+                           and abs(tr._fetcher.get('anchor', 0) - 4010.0) < 1e-9
+                           and tr._fetcher['gov']['consec_fails'] == 1)
+            ok = entered and tp_reanchor and no_entry_under and entry_on_fresh and sl_reanchor
+            detail = (f"entered={entered} tp_reanchor@4010={tp_reanchor} "
+                      f"no_entry@+4={no_entry_under} entry@+5={entry_on_fresh} "
+                      f"sl_reanchor+fail={sl_reanchor}")
+        except Exception as e:
+            self._record(236, FAIL, f"raised: {e!r}"); return
+        self._record(236, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_governors(self):
+        # 237 GOVERNORS: 3 consecutive SL strikes ($175 each) PAUSE new entries at -$525 with
+        # the -$700 daily stop NOT yet tripped (pause reachable BEFORE the halt); a 4th strike
+        # (-$700 total) trips the daily loss stop; and the 20-entry cap blocks entry 21.
+        import fetcher as _f
+        try:
+            per_strike = (float(self.cfg.fetcher_sl_dollars)
+                          * float(self.cfg.lot_size)
+                          * float(self.cfg.contract_size))          # $175
+            # PAIRING INVARIANT: the daily stop is DEEPER than 3 strikes (pause reachable).
+            loss_stop = float(self.cfg.fetcher_daily_loss_stop)
+            invariant_ok = loss_stop <= -(3.0 * per_strike) and loss_stop > -(4.0 * per_strike) - 1
+            gov = _f.new_day_state()
+            snaps = []
+            for _ in range(3):
+                _f.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+                snaps.append((bool(gov['loss_stopped']), bool(gov['fail_paused'])))
+            after3_blocked, after3_reason = _f.can_enter(gov, self.cfg)
+            pause_before_stop = (snaps[-1] == (False, True)      # paused, NOT loss-stopped
+                                 and after3_blocked is False
+                                 and after3_reason == 'consecutive_fail_pause'
+                                 and abs(gov['day_pnl'] + 3 * per_strike) < 1e-6)
+            _f.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)   # 4th -> -700
+            halt_at_4 = (gov['loss_stopped'] is True
+                         and abs(gov['day_pnl'] + 4 * per_strike) < 1e-6
+                         and _f.can_enter(gov, self.cfg)[1] == 'daily_loss_stop')
+            # the 20-entry cap: a clean gov at 20 entries blocks entry 21.
+            gcap = _f.new_day_state()
+            gcap['entries'] = int(self.cfg.fetcher_max_entries_per_day)
+            cap_blocked, cap_reason = _f.can_enter(gcap, self.cfg)
+            cap_ok = (cap_blocked is False and cap_reason == 'daily_cap')
+            ok = invariant_ok and pause_before_stop and halt_at_4 and cap_ok
+            detail = (f"per_strike=${per_strike:.0f} invariant={invariant_ok} "
+                      f"pause@-525_before_stop={pause_before_stop} halt@-700={halt_at_4} "
+                      f"entry21_capped={cap_ok}")
+        except Exception as e:
+            self._record(237, FAIL, f"raised: {e!r}"); return
+        self._record(237, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_manage_only(self):
+        # 238 MANAGE-ONLY: /fetcher off with an OPEN ticket -> drive takes NO new entry even
+        # on a $5 move, but the open ticket's broker close is STILL booked (never orphaned).
+        import fetcher as _f
+        try:
+            tr, env = self._fetch_mk(anchors_on=False)
+            tr._fetcher = {'day': '2026-07-07', 'gov': _f.new_day_state(),
+                           'anchor': 4000.0, 'leg_dir': None, 'open': None}
+            self._fetch_tick(tr, env, 4005.0)                       # ENTER BUY @4005 (engine on)
+            opened = tr._fetcher.get('open') is not None
+            entries_after_open = tr._fetcher['gov']['entries']
+            # engine OFF: manage-only. A big move must NOT open a second entry.
+            tr.engines['fetcher'] = False
+            self._fetch_tick(tr, env, 4020.0, allow_new_entries=False)
+            still_one = (tr._fetcher.get('open') is not None
+                         and tr._fetcher['gov']['entries'] == entries_after_open)
+            # the open ticket's TP/SL still honored: broker closes it -> drive books it.
+            self._fetch_tick(tr, env, 4010.0, close=(175.0, 4010.0), allow_new_entries=False)
+            booked = (tr._fetcher.get('open') is None
+                      and abs(tr._fetcher['gov']['day_pnl'] - 175.0) < 1e-9)
+            # and STILL no new entry while off, even after the close frees the slot.
+            self._fetch_tick(tr, env, 4030.0, allow_new_entries=False)
+            no_reentry = tr._fetcher.get('open') is None
+            ok = opened and still_one and booked and no_reentry
+            detail = (f"opened={opened} no_new_entry_while_off={still_one} "
+                      f"close_still_booked={booked} no_reentry_while_off={no_reentry}")
+        except Exception as e:
+            self._record(238, FAIL, f"raised: {e!r}"); return
+        self._record(238, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_restart_recovery(self):
+        # 239 RESTART-RECOVERY (E-20): a same-day restore REBUILDS day_pnl / entries / fails
+        # from BROKER deal history for magic 20260707 -- NEVER zeroed. Mock a day with 3
+        # entries + closes [+$50, -$175, -$175] -> entries=3, day_pnl=-$300, consec_fails=2.
+        import types
+        import fetcher as _f
+        try:
+            def _deal(entry, pnl, t):
+                return types.SimpleNamespace(entry=entry, profit=pnl, swap=0.0,
+                                             commission=0.0, time=t, magic=_f.FETCHER_MAGIC)
+            hist = [_deal(0, 0.0, 1), _deal(1, 50.0, 2),      # win
+                    _deal(0, 0.0, 3), _deal(1, -175.0, 4),    # loss
+                    _deal(0, 0.0, 5), _deal(1, -175.0, 6),    # loss (trailing)
+                    # a foreign-magic deal must be IGNORED by the rebuild:
+                    types.SimpleNamespace(entry=1, profit=-999.0, swap=0.0, commission=0.0,
+                                          time=7, magic=20260626)]
+            tr, env = self._fetch_mk(hist=hist)
+            gov = _f.rebuild_gov_from_history(tr, dt_from=0, dt_to=999)
+            not_zeroed = gov is not None and not (gov['entries'] == 0 and gov['day_pnl'] == 0.0)
+            rebuilt_ok = (gov is not None and gov['entries'] == 3
+                          and abs(gov['day_pnl'] + 300.0) < 1e-6
+                          and gov['consec_fails'] == 2          # trailing two losses
+                          and gov['loss_stopped'] is False      # -300 > -700
+                          and gov['fail_paused'] is False)      # 2 < 3
+            ok = not_zeroed and rebuilt_ok
+            detail = (f"rebuilt={gov} not_zeroed={not_zeroed} entries==3&pnl==-300&fails==2={rebuilt_ok}")
+        except Exception as e:
+            self._record(239, FAIL, f"raised: {e!r}"); return
+        self._record(239, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_funded_gate(self):
+        # 240 FUNDED GATE: should_run is False on a funded account regardless of the flag;
+        # promote_on_boot force-disables fetcher_enabled on a funded account.
+        import dataclasses
+        import fetcher as _f
+        try:
+            cfg_on = dataclasses.replace(self.cfg, fetcher_enabled=True)
+            demo_runs = _f.should_run(cfg_on, is_funded=False) is True
+            funded_refused = _f.should_run(cfg_on, is_funded=True) is False
+            # a flag ON but funded still refuses:
+            still_refused = _f.should_run(dataclasses.replace(self.cfg, fetcher_enabled=True),
+                                          is_funded=True) is False
+            # promote_on_boot on a FUNDED stub forces the flag OFF.
+            tr, _ = self._fetch_mk(cfg=dataclasses.replace(self.cfg, fetcher_enabled=True),
+                                   funded=True)
+            eff = _f.promote_on_boot(tr)
+            promote_off = (eff is False and tr.cfg.fetcher_enabled is False)
+            ok = demo_runs and funded_refused and still_refused and promote_off
+            detail = (f"demo_runs={demo_runs} funded_refused={funded_refused} "
+                      f"flag_on_still_refused={still_refused} promote_funded_off={promote_off}")
+        except Exception as e:
+            self._record(240, FAIL, f"raised: {e!r}"); return
+        self._record(240, PASS if ok else FAIL, detail)
+
+    def _step_fetcher_column_guard(self):
+        # 241 CSV COLUMN GUARD: fetcher_trades.csv's last column is seed_source (append-safe
+        # for old files); a written header + row round-trips with seed_source LAST.
+        import os, csv, tempfile, shutil
+        import fetcher as _f
+        tmp = None
+        try:
+            schema_ok = _f.TRADE_COLUMNS[-1] == 'seed_source'
+            tmp = tempfile.mkdtemp(prefix='aureon_fetch_')
+            tr, env = self._fetch_mk()
+            tr.run_dir = tmp
+            _f._log_trade(tr, event='enter', direction='BUY', anchor=4000.0, entry=4005.0,
+                          exit_px='', tp=4010.0, sl=4000.0, ticket=700001,
+                          seed_source='A1_TIME_SNAPSHOT')
+            path = os.path.join(tmp, _f.TRADES_CSV)
+            with open(path, newline='') as fh:
+                rows = list(csv.DictReader(fh))
+            header_ok = (rows and list(rows[0].keys())[-1] == 'seed_source'
+                         and rows[0]['seed_source'] == 'A1_TIME_SNAPSHOT')
+            ok = schema_ok and header_ok
+            detail = f"TRADE_COLUMNS[-1]={_f.TRADE_COLUMNS[-1]} row_seed_source={rows[0]['seed_source'] if rows else None}"
+        except Exception as e:
+            self._record(241, FAIL, f"raised: {e!r}")
+            if tmp: shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp: shutil.rmtree(tmp, ignore_errors=True)
+        self._record(241, PASS if ok else FAIL, detail)
+
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
         # PURE cores + gating + isolation:
@@ -9202,6 +9524,15 @@ class SelfTest:
             self._step_d13_three_strike_pause()
             # D-13: a 4th strike while paused stays blocked (never re-opens the gate)
             self._step_d13_fourth_strike_blocked()
+            # v3.7.0 FETCHER engine (magic 20260707): the chop-harvesting scalper
+            self._step_fetcher_seed_resolution()
+            self._step_fetcher_entry_threshold()
+            self._step_fetcher_tp_sl_reanchor()
+            self._step_fetcher_governors()
+            self._step_fetcher_manage_only()
+            self._step_fetcher_restart_recovery()
+            self._step_fetcher_funded_gate()
+            self._step_fetcher_column_guard()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

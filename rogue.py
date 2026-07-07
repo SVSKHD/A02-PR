@@ -433,7 +433,7 @@ def _capture_seed_snapshots(trader, st, price):
         pass
 
 
-def resolve_seed(trader, st):
+def resolve_seed(trader, st, fallback_key='rogue_seed_fallback'):
     """(seed_px, seed_source) for the A1-mode engine when NO chain target exists.
     Resolution happens AT SEED TIME from the CURRENT switch state:
 
@@ -441,9 +441,14 @@ def resolve_seed(trader, st):
          never double-seed or orphan the day's chain);
       2. anchor engine ON and A1 not given up -> the REAL A1 anchor read, per tick,
          exactly as master (byte-identical when non_oco_enabled=True);
-      3. else cfg.rogue_seed_fallback: 'a1_time_snapshot' (DEFAULT -- the price
+      3. else cfg.<fallback_key>: 'a1_time_snapshot' (DEFAULT -- the price
          captured at A1's scheduled time) or 'market_open' (first tick of the
          broker day).
+
+    fallback_key selects WHICH config knob names the fallback mode so a second
+    engine (Fetcher) can REUSE this resolver verbatim with its own
+    'fetcher_seed_fallback' knob -- the logic is shared, never forked. Default
+    'rogue_seed_fallback' keeps every existing caller byte-identical.
 
     Returns (None, source) while the chosen source has no price yet -- the engine
     WAITS, exactly like master waits for A1 to place. Guarded reads only."""
@@ -458,7 +463,7 @@ def resolve_seed(trader, st):
             and st.get('seed_recorded_px') is not None):
         st['seed_px'] = float(st['seed_recorded_px'])
         return st['seed_px'], SEED_A1_ANCHOR
-    mode = str(getattr(trader.cfg, 'rogue_seed_fallback', 'a1_time_snapshot')).lower()
+    mode = str(getattr(trader.cfg, fallback_key, 'a1_time_snapshot')).lower()
     if mode == 'market_open':
         return st.get('day_open_px'), SEED_MARKET_OPEN
     return st.get('a1_snap_px'), SEED_A1_TIME_SNAPSHOT
