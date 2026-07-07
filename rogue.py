@@ -1210,6 +1210,36 @@ def cancel_pendings(trader, reason="flatten"):
 
 
 # --- manual current-tick seed (mid-day restart: no A1 event to seed the A1-mode engine) --
+def manual_seed_rails_blocked(trader, engine, has_open):
+    """SHARED live-testing rails for /rogueseed + /fetchseed. Refuse a deliberate manual
+    re-seed when: the engine has an OPEN ticket (never re-anchor under a live position),
+    the runtime engine switch is OFF (/rogue|/fetcher off), the market is closed, or the
+    kill switch is active. Returns (blocked, reason) -- reason is a short human string for
+    the Discord refusal. EVERY check is GUARDED so a stub/old trader lacking the runtime
+    dict / state / market probe reads NOT blocked (switches only ever REMOVE behavior, never
+    invent it -- same philosophy as live_trader._engine_enabled). READ-ONLY; never raises."""
+    if has_open:
+        return True, 'open position — flatten it before re-seeding'
+    try:
+        eng = getattr(trader, 'engines', None)
+        if isinstance(eng, dict) and not bool(eng.get(engine, True)):
+            return True, f'{engine} engine switch is OFF (/{engine} on to re-enable)'
+    except Exception:
+        pass
+    try:
+        if (getattr(trader, 'state', {}) or {}).get('kill_switch_locked'):
+            return True, 'kill switch active'
+    except Exception:
+        pass
+    try:
+        probe = getattr(trader, '_market_closed_now', None)
+        if callable(probe) and probe():
+            return True, 'market closed'
+    except Exception:
+        pass
+    return False, 'ok'
+
+
 def manual_seed_ok(cfg, is_demo):
     """PURE gate for `rogueseed`. Returns (ok, reason). Valid ONLY when rogue_a1_anchor_mode
     is ON (else 'disabled' -- tell the user to enable it) AND the account is DEMO (funded
@@ -1241,11 +1271,31 @@ def manual_seed(trader, price):
             except Exception:
                 pass
             return False, reason, None
+        # RAILS: never re-anchor under a live position / with the engine switched off /
+        # market closed / kill-switch active (deliberate live testing must be SAFE). Guarded
+        # so an old stub trader (no runtime dict) is unaffected.
+        st_now = getattr(trader, '_rogue', None) or {}
+        blocked, rreason = manual_seed_rails_blocked(
+            trader, 'rogue', bool(st_now.get('open')))
+        if blocked:
+            log.warning(f"{ROGUE_ALERT_PREFIX} MANUAL SEED refused (rail): {rreason}")
+            try:
+                trader.tele.warn(f"{ROGUE_ALERT_PREFIX} 🌱 manual seed refused — {rreason}")
+            except Exception:
+                pass
+            return False, 'rail', None
         if price is None:
             log.warning(f"{ROGUE_ALERT_PREFIX} MANUAL SEED refused (no_tick): no sane tick")
+            try:
+                trader.tele.warn(f"{ROGUE_ALERT_PREFIX} 🌱 manual seed refused — "
+                                 f"no sane settled tick (stale/garbage feed)")
+            except Exception:
+                pass
             return False, 'no_tick', None
         price = round(float(price), 2)
         # ensure the per-day Rogue state exists (mirrors drive()'s init on a fresh restart).
+        # A SAME-day re-seed reuses the existing state -> the day governors (entries count,
+        # day_pnl, fail streak) keep counting: a manual seed is a NEW ANCHOR, not a new day.
         today = ''
         try:
             today = str(trader.state.get('last_broker_date', ''))
@@ -1267,11 +1317,12 @@ def manual_seed(trader, price):
         st['chain_anchor'] = None
         _persist_state(trader)             # Fix 5 (E-16): seed changed -> persist
         confirm = float(getattr(trader.cfg, 'rogue_entry_confirm_redesign', 10.0))
-        log.info(f"{ROGUE_ALERT_PREFIX} MANUAL SEED @ {price} (current tick) -> hunting "
-                 f"${confirm:.0f} move both directions")
+        log.info(f"{ROGUE_ALERT_PREFIX} ROGUE SEED via MANUAL @ {price} (current tick) -> "
+                 f"hunting ${confirm:.0f} move both directions")
         try:
-            trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} MANUAL SEED @ {price} "
-                             f"(current tick) — hunting ${confirm:.0f} move both directions")
+            trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ROGUE SEED via MANUAL @ "
+                             f"{price} (current tick) — hunting ${confirm:.0f} move both "
+                             f"directions")
         except Exception:
             pass
         return True, 'ok', price

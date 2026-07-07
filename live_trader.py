@@ -716,11 +716,23 @@ class LiveTrader:
             elif cmd == "rogueseed":
                 # Manual Rogue A1-mode seed at the CURRENT live tick (mid-day restart has no
                 # A1 event to seed Fix 4). DEMO-only + rogue_a1_anchor_mode-only + ROGUE-only
-                # (never an anchor 20260522 ticket) -- all enforced inside rogue.manual_seed.
-                # Fully guarded: a seed error never breaks the tick loop.
+                # (never an anchor 20260522 ticket) -- all enforced inside rogue.manual_seed
+                # (+ the shared open-ticket / engine-off / market / kill rails). Fully
+                # guarded: a seed error never breaks the tick loop.
                 try:
                     import rogue as _rogue
                     _rogue.manual_seed(self, _rogue.seed_tick_price(self))
+                except Exception:
+                    pass
+            elif cmd == "fetchseed":
+                # Manual FETCHER re-seed at the CURRENT live tick: plant the anchor here so
+                # trigger -> entry -> close -> re-anchor can be observed from a known point.
+                # DEMO-only + FETCHER-only (never anchor 20260522 / Rogue 20260626), + the
+                # SAME rails as rogueseed -- all enforced inside fetcher.manual_seed. Reuses
+                # rogue.seed_tick_price (the shared sane/settled-tick read). Fully guarded.
+                try:
+                    import fetcher as _fetcher, rogue as _rogue
+                    _fetcher.manual_seed(self, _rogue.seed_tick_price(self))
                 except Exception:
                     pass
 
