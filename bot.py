@@ -59,7 +59,8 @@ def main():
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
                                          'testfire', 'verifyfb', 'rescuestats',
-                                         'bescratchscan', 'rogueseed', 'dailyreport'])
+                                         'bescratchscan', 'rogueseed', 'fetchseed',
+                                         'dailyreport'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -203,6 +204,14 @@ def main():
         # only + ROGUE-only are enforced when the bot handles it. Adds NO trade logic.
         from rogue import enqueue_seed_command
         sys.exit(enqueue_seed_command(cfg))
+
+    elif args.mode == 'fetchseed':
+        # Manual Fetcher re-seed: enqueue a 'fetchseed' command so the live loop plants the
+        # Fetcher anchor at ITS current tick (deliberate live testing from a known point).
+        # DEMO-only + FETCHER-only + the open-ticket/engine-off/market/kill rails are
+        # enforced when the bot handles it. Adds NO trade logic.
+        from fetcher import enqueue_seed_command as _fetch_enqueue
+        sys.exit(_fetch_enqueue(cfg))
 
 
 if __name__ == '__main__':

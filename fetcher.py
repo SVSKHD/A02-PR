@@ -559,6 +559,124 @@ def cancel_pendings(trader, reason="flatten"):
     return n
 
 
+# --- manual current-tick re-seed (/fetchseed): deliberate live testing -------------
+def manual_seed_ok(cfg, is_demo):
+    """PURE gate for /fetchseed. Funded refuses (fail-closed, same mandatory gate as
+    fetcher promotion). Fetcher has no a1-mode flag (unlike Rogue), so DEMO is the only
+    config-level gate; the runtime engine switch + open-ticket + market/kill rails are the
+    shared manual_seed_rails_blocked. Returns (ok, reason). No side effects."""
+    if not bool(is_demo):
+        return False, 'funded'
+    return True, 'ok'
+
+
+def manual_seed(trader, price):
+    """Plant the Fetcher anchor at `price` (the current live tick) ON DEMAND so trigger ->
+    entry -> close -> re-anchor can be observed from a known point instead of a stale
+    anchor. Sets st['anchor'] = seed; the EXISTING drive() then enters on a
+    fetcher_trigger_dollars move off it, exactly as the morning seed. seed_source=MANUAL
+    (propagates to fetcher_trades.csv + the close re-anchor). Mirrors rogue.manual_seed:
+    DEMO-only + the shared rails (open ticket / engine off / market closed / kill switch);
+    FETCHER-only (never an anchor 20260522 / Rogue 20260626 ticket). Does NOT reset the day
+    governors -- a manual seed is a new ANCHOR, not a new day. Returns (ok, reason, price).
+    Guarded; never raises."""
+    try:
+        _rogue = _rg()
+        is_demo = _rogue.account_is_demo(trader)
+        ok, reason = manual_seed_ok(trader.cfg, is_demo)
+        if not ok:
+            log.warning(f"{FETCHER_ALERT_PREFIX} MANUAL SEED refused ({reason}): "
+                        f"DEMO-only (funded refused)")
+            try:
+                trader.tele.warn(f"{FETCHER_ALERT_PREFIX} 🌱 manual seed refused — "
+                                 f"DEMO-only (funded refused)")
+            except Exception:
+                pass
+            return False, reason, None
+        # RAILS (shared with Rogue): never re-anchor under a live position / with the
+        # engine switched off / market closed / kill-switch active. Guarded for old stubs.
+        st_now = getattr(trader, '_fetcher', None) or {}
+        blocked, rreason = _rogue.manual_seed_rails_blocked(
+            trader, 'fetcher', bool(st_now.get('open')))
+        if blocked:
+            log.warning(f"{FETCHER_ALERT_PREFIX} MANUAL SEED refused (rail): {rreason}")
+            try:
+                trader.tele.warn(f"{FETCHER_ALERT_PREFIX} 🌱 manual seed refused — {rreason}")
+            except Exception:
+                pass
+            return False, 'rail', None
+        if price is None:
+            log.warning(f"{FETCHER_ALERT_PREFIX} MANUAL SEED refused (no_tick): no sane tick")
+            try:
+                trader.tele.warn(f"{FETCHER_ALERT_PREFIX} 🌱 manual seed refused — "
+                                 f"no sane settled tick (stale/garbage feed)")
+            except Exception:
+                pass
+            return False, 'no_tick', None
+        price = round(float(price), 2)
+        # ensure per-day state (mirrors drive()). A SAME-day re-seed reuses it, so the day
+        # governors (entries / day_pnl / fail streak) keep counting -- new anchor, not new day.
+        today = ''
+        try:
+            today = str(trader.state.get('last_broker_date', ''))
+        except Exception:
+            today = ''
+        st = getattr(trader, '_fetcher', None)
+        if st is None or st.get('day') != today:
+            st = {'day': today, 'gov': new_day_state(),
+                  'anchor': None, 'leg_dir': None, 'open': None}
+            trader._fetcher = st
+        st['anchor'] = price                       # the level the next $5 move is measured off
+        st['seed_source'] = _rogue.SEED_MANUAL     # provenance -> every fetcher_trades row
+        _persist(trader)
+        trig = float(getattr(trader.cfg, 'fetcher_trigger_dollars', 5.0))
+        log.info(f"{FETCHER_ALERT_PREFIX} FETCH SEED via MANUAL @ {price} (current tick) -> "
+                 f"hunting ${trig:.0f} move both directions")
+        try:
+            trader.tele.info(f"{FETCHER_ALERT_PREFIX} {FETCHER_GLYPH} FETCH SEED via MANUAL @ "
+                             f"{price} (current tick) — hunting ${trig:.0f} move both "
+                             f"directions")
+        except Exception:
+            pass
+        return True, 'ok', price
+    except Exception as e:
+        log.warning(f"{FETCHER_ALERT_PREFIX} manual_seed non-fatal: {e!r}")
+        return False, 'error', None
+
+
+def enqueue_seed_command(cfg):
+    """CLI `python bot.py fetchseed`: enqueue a 'fetchseed' command onto the RUNNING bot's
+    command channel (AUREON_RUN_DIR/commands.json) so the live loop plants the Fetcher
+    anchor at ITS current tick. Returns 0 on enqueue, 2 on error. The DEMO gate + rails are
+    enforced by manual_seed when the bot handles it. Mirrors rogue.enqueue_seed_command."""
+    import json as _json
+    import os as _os
+    try:
+        run_dir = _os.environ.get("AUREON_RUN_DIR", "./run")
+        _os.makedirs(run_dir, exist_ok=True)
+        path = _os.path.join(run_dir, "commands.json")
+        cmds = []
+        if _os.path.exists(path):
+            try:
+                with open(path) as f:
+                    cmds = _json.load(f) or []
+            except Exception:
+                cmds = []
+        cmds.append({"cmd": "fetchseed"})
+        with open(path, "w") as f:
+            _json.dump(cmds, f)
+        abspath = _os.path.abspath(path)
+        log.info(f"{FETCHER_ALERT_PREFIX} fetchseed queued -> {abspath} "
+                 f"(AUREON_RUN_DIR={_os.environ.get('AUREON_RUN_DIR', '<unset:./run>')}). "
+                 f"The running bot consumes this each tick and plants the Fetcher anchor at "
+                 f"its current tick (DEMO-only; funded refuses). If nothing happens, confirm "
+                 f"this path matches the bot's run dir.")
+        return 0
+    except Exception as e:
+        log.error(f"{FETCHER_ALERT_PREFIX} fetchseed enqueue failed: {e!r}")
+        return 2
+
+
 # --- E-20: restart-recovery gov rebuild from BROKER deal history -------------------
 def rebuild_gov_from_history(trader, dt_from=None, dt_to=None):
     """E-20 LESSON: on a SAME-DAY restart the governor counters (day_pnl / entries /

@@ -322,6 +322,11 @@ STEP_NAMES = {
     239: "fetcher restart rebuild",# same-day restore rebuilds day_pnl/entries/fails from deal history (E-20)
     240: "fetcher funded gate",    # funded -> should_run False + promote_on_boot forces OFF
     241: "fetcher column guard",   # fetcher_trades.csv last column == seed_source
+    # v3.7.1 manual re-seed (/rogueseed + /fetchseed): deliberate live testing
+    242: "manual reseed plant",    # both engines plant at tick with seed_source=MANUAL (in CSV)
+    243: "manual reseed rails",    # open ticket / engine off / stale tick each refuse
+    244: "manual seed entry+chain",# post-seed entry at trigger; close re-anchors; MANUAL propagates
+    245: "manual seed gov cont",   # day governors keep counting across a same-day re-seed
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -7764,6 +7769,186 @@ class SelfTest:
             if tmp: shutil.rmtree(tmp, ignore_errors=True)
         self._record(241, PASS if ok else FAIL, detail)
 
+    # =====================================================================
+    # v3.7.1 MANUAL RE-SEED (/rogueseed + /fetchseed) — live-testing commands
+    # =====================================================================
+    def _reseed_rogue_mk(self, demo=True, a1_on=True):
+        """A controllable ROGUE trader (paper) for the manual-seed tests: DEMO/funded +
+        a1-mode toggles, an engines dict, a market-open probe. env['closed'] tracks any
+        close (to prove isolation). Mirrors the _fetch_mk shape."""
+        import types, dataclasses
+        cfg = dataclasses.replace(
+            self.cfg, rogue_enabled=True, rogue_a1_anchor_mode=a1_on,
+            rogue_entry_confirm_redesign=10.0, rogue_reversal_dollars=10.0, lot_size=0.01)
+        env = {'placed': [], 'closed': []}
+        mt5 = types.SimpleNamespace(
+            ACCOUNT_TRADE_MODE_DEMO=0,
+            account_info=lambda: types.SimpleNamespace(trade_mode=(0 if demo else 2)),
+            symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=3999.9, ask=4000.1),
+            positions_get=lambda ticket=None: [], history_deals_get=lambda position=None: [])
+        ad = types.SimpleNamespace(
+            mt5=mt5, get_latest_m5=lambda s, n: [],
+            place_market_order=lambda *a, **k: types.SimpleNamespace(
+                retcode=10009, order=7001, deal=7001),
+            modify_position_sl=lambda *a, **k: types.SimpleNamespace(retcode=10009),
+            close_position=lambda tk, dry_run=False: env['closed'].append(int(tk)))
+        tr = types.SimpleNamespace(
+            cfg=cfg, adapter=ad, paper=True, run_dir='.', _rogue=None, _last_boost_mid=4000.0,
+            engines={'anchors': True, 'rogue': True, 'fetcher': True},
+            state={'last_broker_date': '2026-07-07'}, _market_closed_now=lambda: False,
+            tele=types.SimpleNamespace(info=lambda *a, **k: None, warn=lambda *a, **k: None))
+        return tr, env
+
+    def _step_manual_reseed_plant(self):
+        # 242 /rogueseed + /fetchseed plant the engine anchor at the CURRENT tick with
+        # seed_source=MANUAL, which propagates to every CSV row (proven via the driven
+        # fetcher_trades.csv 'enter' row). Logs 'ROGUE/FETCH SEED via MANUAL @ px'.
+        import rogue as _r, fetcher as _f, os, csv, tempfile, shutil
+        tmp = None
+        try:
+            tr, _ = self._reseed_rogue_mk()
+            r_ok, r_reason, r_px = _r.manual_seed(tr, 4000.0)
+            rogue_ok = (r_ok is True and r_reason == 'ok' and abs(r_px - 4000.0) < 1e-9
+                        and abs(tr._rogue['a1_last_close'] - 4000.0) < 1e-9
+                        and tr._rogue['seed_source'] == _r.SEED_MANUAL == 'MANUAL')
+            tmp = tempfile.mkdtemp(prefix='aureon_reseed_')
+            trf, envf = self._fetch_mk(anchors_on=True)
+            trf.run_dir = tmp
+            f_ok, f_reason, f_px = _f.manual_seed(trf, 4000.0)
+            fetch_seed_ok = (f_ok is True and abs(f_px - 4000.0) < 1e-9
+                             and abs(trf._fetcher['anchor'] - 4000.0) < 1e-9
+                             and trf._fetcher['seed_source'] == 'MANUAL')
+            self._fetch_tick(trf, envf, 4005.0)          # +$5 -> BUY enters, writes a row
+            path = os.path.join(tmp, _f.TRADES_CSV)
+            rows = list(csv.DictReader(open(path))) if os.path.exists(path) else []
+            csv_manual = (len(rows) >= 1 and all(rw.get('seed_source') == 'MANUAL' for rw in rows))
+            ok = rogue_ok and fetch_seed_ok and csv_manual
+            detail = (f"rogue_manual@{r_px}(src={tr._rogue['seed_source']}) "
+                      f"fetch_manual@{f_px}(src={trf._fetcher['seed_source']}) "
+                      f"csv_rows={len(rows)} all_MANUAL={csv_manual}")
+        except Exception as e:
+            self._record(242, FAIL, f"raised: {e!r}")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(242, PASS if ok else FAIL, detail)
+
+    def _step_manual_reseed_rails(self):
+        # 243 refusal RAILS (both engines): an OPEN ticket, the engine switch OFF, and a
+        # stale/None tick each REFUSE the manual re-seed and leave the existing anchor
+        # untouched (never re-anchor under a live position / off engine / dead feed).
+        import rogue as _r, fetcher as _f
+        try:
+            # ROGUE: open ticket -> refuse, anchor unchanged
+            tr, _ = self._reseed_rogue_mk()
+            tr._rogue = {'day': '2026-07-07', 'gov': _r.new_day_state(), 'anchor': None,
+                         'leg_dir': 'BUY', 'open': {'ticket': 1}, 'a1_last_close': 3900.0}
+            ro, rr, _ = _r.manual_seed(tr, 4000.0)
+            rogue_open = (ro is False and rr == 'rail'
+                          and tr._rogue['a1_last_close'] == 3900.0)
+            # ROGUE: engine switch OFF -> refuse
+            tr2, _ = self._reseed_rogue_mk()
+            tr2.engines['rogue'] = False
+            r2, rr2, _ = _r.manual_seed(tr2, 4000.0)
+            rogue_off = (r2 is False and rr2 == 'rail')
+            # ROGUE: stale/None tick -> refuse
+            tr3, _ = self._reseed_rogue_mk()
+            r3, rr3, _ = _r.manual_seed(tr3, None)
+            rogue_stale = (r3 is False and rr3 == 'no_tick')
+            # FETCHER: open ticket -> refuse, anchor unchanged
+            trf, _ = self._fetch_mk()
+            trf._fetcher = {'day': '2026-07-07', 'gov': _f.new_day_state(), 'anchor': 3900.0,
+                            'leg_dir': 'BUY', 'open': {'ticket': 2}}
+            fo, fr, _ = _f.manual_seed(trf, 4000.0)
+            fetch_open = (fo is False and fr == 'rail' and trf._fetcher['anchor'] == 3900.0)
+            # FETCHER: engine switch OFF -> refuse
+            trf2, _ = self._fetch_mk()
+            trf2.engines['fetcher'] = False
+            f2, fr2, _ = _f.manual_seed(trf2, 4000.0)
+            fetch_off = (f2 is False and fr2 == 'rail')
+            # FETCHER: stale/None tick -> refuse
+            trf3, _ = self._fetch_mk()
+            f3, fr3, _ = _f.manual_seed(trf3, None)
+            fetch_stale = (f3 is False and fr3 == 'no_tick')
+            ok = all([rogue_open, rogue_off, rogue_stale, fetch_open, fetch_off, fetch_stale])
+            detail = (f"rogue[open={rogue_open} off={rogue_off} stale={rogue_stale}] "
+                      f"fetch[open={fetch_open} off={fetch_off} stale={fetch_stale}]")
+        except Exception as e:
+            self._record(243, FAIL, f"raised: {e!r}"); return
+        self._record(243, PASS if ok else FAIL, detail)
+
+    def _step_manual_seed_entry_chain(self):
+        # 244 post-manual-seed: an entry fires at EXACTLY the trigger distance off the manual
+        # anchor ($4.99 holds, $5 enters); the close re-anchors at the CLOSE price and
+        # seed_source=MANUAL propagates onto the exit row + the chain (Fetcher, end-to-end).
+        import fetcher as _f, os, csv, tempfile, shutil
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix='aureon_reseedchain_')
+            tr, env = self._fetch_mk(anchors_on=True)
+            tr.run_dir = tmp
+            _f.manual_seed(tr, 4000.0)
+            trig = float(self.cfg.fetcher_trigger_dollars)
+            self._fetch_tick(tr, env, 4000.0 + trig - 0.01)     # under trigger -> no entry
+            no_entry = tr._fetcher.get('open') is None
+            self._fetch_tick(tr, env, 4000.0 + trig)            # exactly trigger -> BUY
+            entered = ((tr._fetcher.get('open') or {}).get('side') == 'BUY'
+                       and abs((tr._fetcher['open'] or {}).get('entry', 0) - (4000.0 + trig)) < 1e-9)
+            exit_px = 4000.0 + trig + 5.0
+            self._fetch_tick(tr, env, exit_px, close=(175.0, exit_px))   # TP -> re-anchor here
+            reanchor = (tr._fetcher.get('open') is None
+                        and abs(tr._fetcher['anchor'] - exit_px) < 1e-9
+                        and tr._fetcher['seed_source'] == 'MANUAL')
+            rows = list(csv.DictReader(open(os.path.join(tmp, _f.TRADES_CSV))))
+            all_manual = (len(rows) >= 2 and all(rw.get('seed_source') == 'MANUAL' for rw in rows))
+            ok = no_entry and entered and reanchor and all_manual
+            detail = (f"no_entry@under={no_entry} entered@trigger={entered} "
+                      f"reanchor@close+MANUAL={reanchor} rows={len(rows)} all_MANUAL={all_manual}")
+        except Exception as e:
+            self._record(244, FAIL, f"raised: {e!r}")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._record(244, PASS if ok else FAIL, detail)
+
+    def _step_manual_seed_gov_continuity(self):
+        # 245 a manual seed is a NEW ANCHOR, not a new day: the day governors (entries count,
+        # day_pnl, fail streak) all KEEP their values across a same-day re-seed (both
+        # engines) while the anchor moves to the manual price.
+        import rogue as _r, fetcher as _f
+        try:
+            tr, _ = self._reseed_rogue_mk()
+            tr._rogue = {'day': '2026-07-07',
+                         'gov': {'reanchor_count': 5, 'day_pnl': -88.0, 'consec_fails': 2,
+                                 'loss_stopped': False, 'fail_paused': False},
+                         'anchor': 3900.0, 'leg_dir': None, 'open': None, 'a1_last_close': 3900.0}
+            _r.manual_seed(tr, 4000.0)
+            rg = tr._rogue['gov']
+            rogue_cont = (rg['reanchor_count'] == 5 and rg['day_pnl'] == -88.0
+                          and rg['consec_fails'] == 2
+                          and abs(tr._rogue['a1_last_close'] - 4000.0) < 1e-9)
+            trf, _ = self._fetch_mk()
+            trf._fetcher = {'day': '2026-07-07',
+                            'gov': {'entries': 9, 'day_pnl': -350.0, 'consec_fails': 1,
+                                    'loss_stopped': False, 'fail_paused': False},
+                            'anchor': 3900.0, 'leg_dir': None, 'open': None}
+            _f.manual_seed(trf, 4000.0)
+            fg = trf._fetcher['gov']
+            fetch_cont = (fg['entries'] == 9 and fg['day_pnl'] == -350.0
+                          and fg['consec_fails'] == 1
+                          and abs(trf._fetcher['anchor'] - 4000.0) < 1e-9)
+            ok = rogue_cont and fetch_cont
+            detail = f"rogue_gov_preserved={rogue_cont} fetch_gov_preserved={fetch_cont}"
+        except Exception as e:
+            self._record(245, FAIL, f"raised: {e!r}"); return
+        self._record(245, PASS if ok else FAIL, detail)
+
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
         # PURE cores + gating + isolation:
@@ -9533,6 +9718,11 @@ class SelfTest:
             self._step_fetcher_restart_recovery()
             self._step_fetcher_funded_gate()
             self._step_fetcher_column_guard()
+            # v3.7.1 manual re-seed (/rogueseed + /fetchseed): live-testing commands
+            self._step_manual_reseed_plant()
+            self._step_manual_reseed_rails()
+            self._step_manual_seed_entry_chain()
+            self._step_manual_seed_gov_continuity()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

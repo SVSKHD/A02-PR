@@ -95,7 +95,9 @@ ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
                     "resume","today","help","start",
                     # v3.6.0 engine switches (runtime, no restart)
                     # v3.7.0 adds /fetcher (mirrors /rogue)
-                    "anchors","rogue","fetcher","engines"}
+                    "anchors","rogue","fetcher","engines",
+                    # v3.7.1 manual current-tick re-seed (live testing)
+                    "rogueseed","fetchseed"}
 
 
 HELP_TEXT = """*AUREON v2 commands*
@@ -113,6 +115,8 @@ HELP_TEXT = """*AUREON v2 commands*
 🦏 `/rogue flatten confirm` — close ONLY Rogue-magic (20260626) positions
 🪣 `/fetcher on|off|status` — Fetcher engine switch (off = manage-only)
 🪣 `/fetcher flatten confirm` — close ONLY Fetcher-magic (20260707) positions
+🌱 `/rogueseed` — re-anchor Rogue at the current tick (live testing; DEMO-only)
+🌱 `/fetchseed` — re-anchor Fetcher at the current tick (live testing; DEMO-only)
 ⚙️ `/engines status` — all engines' state + open count per magic
 ❓ `/help` — this message
 """
@@ -527,6 +531,17 @@ class Watchdog:
         elif cmd == "resume":
             self._write_command("resume")
             self.tele.info("▶️ Resume queued — anchor processing back on")
+        elif cmd == "rogueseed":
+            # v3.7.1 manual Rogue re-seed: the watchdog only PARSES + queues; the bot
+            # plants the anchor at ITS current tick next tick and replies (DEMO-only;
+            # refuses under an open ticket / engine off / market closed / kill switch).
+            self._write_command("rogueseed")
+            self.tele.info("🌱 `/rogueseed` queued — bot re-anchors Rogue at its current "
+                           "tick next tick (or replies with the refusal reason).")
+        elif cmd == "fetchseed":
+            self._write_command("fetchseed")
+            self.tele.info("🌱 `/fetchseed` queued — bot re-anchors Fetcher at its current "
+                           "tick next tick (or replies with the refusal reason).")
         elif cmd == "today":
             self.tele.info(self._format_today_summary())
         elif cmd in ("anchors", "rogue", "fetcher"):
