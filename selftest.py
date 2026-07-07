@@ -245,8 +245,8 @@ STEP_NAMES = {
     180: "boost isolation",
     181: "boost rescue unaff",
     182: "boost A1 replay",
-    # E-5: Rogue daily loss stop -150 -> -525
-    183: "rogue stop -525",
+    # E-5 / D-13: Rogue daily loss stop PAIRED to 3 x init-SL strike
+    183: "rogue stop = 3x init-SL",
     # F-B: trapped-leg capped late-rescue (No-OCO whipsaw), DEFAULT OFF
     184: "fb late rescue",
     # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
@@ -310,6 +310,9 @@ STEP_NAMES = {
     229: "no mid-day re-seed",     # toggling anchors mid-day never re-seeds/orphans an existing seed or chain
     230: "switch+friday compose",  # per-engine seam blocks on EITHER (engine off OR friday window)
     231: "scoped flatten confirm", # /anchors|/rogue flatten touch only their magic and require confirm
+    # D-13: init-SL widened 5->10; daily loss stop paired to 3 x one init-SL strike
+    232: "d13 3-strike pause",     # 3 consecutive init-SL strikes -> fail-pause at paired stop; loss stop not fired before it
+    233: "d13 4th strike blocked", # a 4th strike while paused stays blocked (never re-opens the gate)
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -6400,17 +6403,19 @@ class SelfTest:
         self._record(135, PASS if ok else FAIL, detail)
 
     def _step_rogue_early_entry(self):
-        # 136 EARLY ENTRY (Jun26): anchor 3983, next leg BUY. Enter ~$20 in (4003), SL $5
-        # tight (3998) -- NOT chasing the obvious top (~4080). A too-early move ($12 in,
+        # 136 EARLY ENTRY (Jun26): anchor 3983, next leg BUY. Enter ~$20 in (4003), SL
+        # init_sl tight (entry - rogue_init_sl, READ from cfg -- value-agnostic to the D-13
+        # 5->10 widening) -- NOT chasing the obvious top (~4080). A too-early move ($12 in,
         # 3995) does NOT enter.
         import rogue as _rogue
         try:
+            _isl = float(self.cfg.rogue_init_sl)
             en, epx, sl = _rogue.entry_decision(3983.0, 'BUY', 4003.0, self.cfg)
-            early_ok = (en is True and abs(epx - 4003.0) < 1e-9 and abs(sl - 3998.0) < 1e-9
+            early_ok = (en is True and abs(epx - 4003.0) < 1e-9 and abs(sl - (epx - _isl)) < 1e-9
                         and epx < 4080.0)
             too_early = _rogue.entry_decision(3983.0, 'BUY', 3995.0, self.cfg)[0]
             ok = early_ok and (too_early is False)
-            detail = f"enter@{epx}(~$20 in) SL@{sl}($5) not_top(<4080)={epx<4080} 12in_no_enter={not too_early}"
+            detail = f"enter@{epx}(~$20 in) SL@{sl}(entry-${_isl:.0f}) not_top(<4080)={epx<4080} 12in_no_enter={not too_early}"
         except Exception as e:
             self._record(136, FAIL, f"raised: {e!r}"); return
         self._record(136, PASS if ok else FAIL, detail)
@@ -6430,18 +6435,21 @@ class SelfTest:
         self._record(137, PASS if ok else FAIL, detail)
 
     def _step_rogue_loss_stop(self):
-        # 138 GOVERNOR: cumulative day P&L <= rogue_daily_loss_stop (E-5: -$525) STOPS new
-        # entries for the day.
+        # 138 GOVERNOR: cumulative day P&L <= rogue_daily_loss_stop STOPS new entries for the
+        # day. Value-agnostic: thresholds are READ from cfg (half the stop still trades; a
+        # cumulative push past the stop halts).
         import rogue as _rogue
         try:
+            loss_stop = float(self.cfg.rogue_daily_loss_stop)
             gov = _rogue.new_day_state()
-            _rogue.record_close(gov, -300.0, was_fail=True, cfg=self.cfg)
-            still_ok = _rogue.can_enter(gov, self.cfg)[0]            # -300 > -525 -> ok
-            _rogue.record_close(gov, -260.0, was_fail=False, cfg=self.cfg)  # -560 -> stop
+            _rogue.record_close(gov, loss_stop * 0.5, was_fail=True, cfg=self.cfg)
+            still_ok = _rogue.can_enter(gov, self.cfg)[0]            # half the stop -> ok
+            _rogue.record_close(gov, loss_stop * 0.6, was_fail=False, cfg=self.cfg)  # 1.1x stop -> halt
             blocked, reason = _rogue.can_enter(gov, self.cfg)
             ok = (still_ok is True and gov['loss_stopped'] is True
                   and blocked is False and reason == 'daily_loss_stop')
-            detail = f"at_-300_ok={still_ok} at_-560_stops={gov['loss_stopped']} reason={reason}"
+            detail = (f"at_half_ok={still_ok} at_1.1x_stops={gov['loss_stopped']} "
+                      f"stop=${loss_stop:.0f} reason={reason}")
         except Exception as e:
             self._record(138, FAIL, f"raised: {e!r}"); return
         self._record(138, PASS if ok else FAIL, detail)
@@ -7138,12 +7146,13 @@ class SelfTest:
 
     def _step_r4_rogue_loss_stop_trips(self):
         # 174 (T-R4): with the governor now fed (E-2), a losing day that crosses the daily
-        # loss stop (E-5: -$525) trips loss_stopped -> can_enter blocks. No longer inert.
-        # (E-5 raised the stop -150 -> -525, so a single -$175 strike no longer halts; a
-        # -$600 day does -- proven here via the live close path.)
+        # loss stop trips loss_stopped -> can_enter blocks. No longer inert. Value-agnostic:
+        # the losing close is READ from cfg (one strike past the daily stop), so a single
+        # init-SL strike no longer halts but a day beyond the paired stop does.
         import rogue as _R
         try:
-            tr, _ = self._r_trader(open_at_broker=False, pnl=-600.0)
+            _deep_loss = float(self.cfg.rogue_daily_loss_stop) - 75.0   # just past the stop
+            tr, _ = self._r_trader(open_at_broker=False, pnl=_deep_loss)
             _R.detect_close(tr, tr._rogue)
             ok_enter, reason = _R.can_enter(tr._rogue['gov'], tr.cfg)
             ok = (tr._rogue['gov']['loss_stopped'] and not ok_enter
@@ -7322,26 +7331,34 @@ class SelfTest:
         self._record(182, PASS if ok else FAIL, detail)
 
     def _step_e5_rogue_stop_525(self):
-        # 183 E-5: rogue_daily_loss_stop -150 -> -525. Ladder: at -$175 (one init-SL strike)
-        # Rogue still trades, at -$350 (two) still trades, at -$525 (three) it HALTS
-        # (reason=daily_loss_stop). And the 3-consecutive-fail PAUSE can now fire BEFORE the
-        # loss stop (3 small fakeouts of -$5 = -$15, far above -$525) -- which was impossible
-        # at the old -$150 (a single -$175 strike halted first).
+        # 183 E-5 / D-13: rogue_daily_loss_stop is PAIRED to rogue_init_sl as exactly 3 x one
+        # init-SL strike, so the 3-consecutive-fail pause is reachable BEFORE the daily halt.
+        # Value-agnostic -- every threshold is READ from cfg. INVARIANT asserted:
+        #   |rogue_daily_loss_stop| == 3 x (rogue_init_sl x lot_size x contract_size).
+        # Ladder on init-SL strikes: 1 strike still trades, 2 still trades, 3 HALTS. And the
+        # 3-fail PAUSE fires on small fakeouts (-$5 x 3) while the loss stop stays clear --
+        # impossible at the old -$150 (a single strike halted first).
         import rogue as _rogue
         try:
-            # ladder on init-SL strikes (-$175 each)
+            per_strike = (float(self.cfg.rogue_init_sl)
+                          * float(self.cfg.lot_size)
+                          * float(self.cfg.contract_size))          # one init-SL strike ($)
+            loss_stop = float(self.cfg.rogue_daily_loss_stop)
+            # PAIRING INVARIANT: the stop is exactly 3 strikes deep.
+            invariant_ok = abs(loss_stop + 3.0 * per_strike) < 1e-6
+            # ladder on init-SL strikes (-per_strike each)
             gov = _rogue.new_day_state()
-            _rogue.record_close(gov, -175.0, was_fail=True, cfg=self.cfg)
-            at_175 = _rogue.can_enter(gov, self.cfg)
-            _rogue.record_close(gov, -175.0, was_fail=True, cfg=self.cfg)
-            at_350 = _rogue.can_enter(gov, self.cfg)
-            _rogue.record_close(gov, -175.0, was_fail=True, cfg=self.cfg)   # -525
-            at_525_blocked, at_525_reason = _rogue.can_enter(gov, self.cfg)
+            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+            at_1 = _rogue.can_enter(gov, self.cfg)
+            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+            at_2 = _rogue.can_enter(gov, self.cfg)
+            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)   # 3 strikes = stop
+            at_3_blocked, at_3_reason = _rogue.can_enter(gov, self.cfg)
             # NOTE: at exactly 3 strikes both brakes trip; 'daily_loss_stop' OR
             # 'consecutive_fail_pause' are both valid HALTS -- assert it halted.
-            ladder_ok = (at_175[0] is True and at_350[0] is True
-                         and at_525_blocked is False
-                         and at_525_reason in ('daily_loss_stop', 'consecutive_fail_pause')
+            ladder_ok = (at_1[0] is True and at_2[0] is True
+                         and at_3_blocked is False
+                         and at_3_reason in ('daily_loss_stop', 'consecutive_fail_pause')
                          and gov['loss_stopped'] is True)
             # fail-pause fires BEFORE the loss stop on SMALL fakeouts (now reachable).
             g2 = _rogue.new_day_state()
@@ -7351,15 +7368,79 @@ class SelfTest:
             fail_before_loss = (g2['fail_paused'] is True and g2['loss_stopped'] is False
                                 and paused_blocked is False
                                 and paused_reason == 'consecutive_fail_pause')
-            # the config value itself
-            stop_val = (abs(float(getattr(self.cfg, 'rogue_daily_loss_stop')) + 525.0) < 1e-9)
-            ok = ladder_ok and fail_before_loss and stop_val
-            detail = (f"-175_ok={at_175[0]} -350_ok={at_350[0]} -525_halts={not at_525_blocked}"
-                      f"({at_525_reason}) fail_pause_before_loss={fail_before_loss} "
-                      f"stop=-525={stop_val}")
+            ok = invariant_ok and ladder_ok and fail_before_loss
+            detail = (f"per_strike=${per_strike:.0f} stop=${loss_stop:.0f} "
+                      f"invariant_3x={invariant_ok} 1_ok={at_1[0]} 2_ok={at_2[0]} "
+                      f"3_halts={not at_3_blocked}({at_3_reason}) "
+                      f"fail_pause_before_loss={fail_before_loss}")
         except Exception as e:
             self._record(183, FAIL, f"raised: {e!r}"); return
         self._record(183, PASS if ok else FAIL, detail)
+
+    def _step_d13_three_strike_pause(self):
+        # 232 D-13 ORDERING: three consecutive init-SL strikes. The 3-consecutive-fail PAUSE
+        # engages at the final strike (cumulative = 3 x one strike = the paired daily loss
+        # stop, i.e. -$1,050 at init_sl=10 x 0.35 x 100), and the daily loss stop has NOT
+        # fired INDEPENDENTLY before the pause -- after strikes 1 and 2 loss_stopped stays
+        # False, so the pause is reachable. (At the old -525 the halt fired at 1.5 strikes
+        # and this pause was dead code -- the original E-5 defect shape.)
+        import rogue as _rogue
+        try:
+            per_strike = (float(self.cfg.rogue_init_sl)
+                          * float(self.cfg.lot_size)
+                          * float(self.cfg.contract_size))
+            fail_stop = int(getattr(self.cfg, 'rogue_consecutive_fail_stop', 3))
+            gov = _rogue.new_day_state()
+            snaps = []   # (loss_stopped, fail_paused, consec_fails, day_pnl) after each strike
+            for _ in range(fail_stop):
+                _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+                snaps.append((bool(gov['loss_stopped']), bool(gov['fail_paused']),
+                              int(gov['consec_fails']), float(gov['day_pnl'])))
+            # ORDERING: the loss stop must NOT have fired on strikes 1..n-1 (before the pause).
+            before_pause_no_loss = all(not s[0] for s in snaps[:-1])
+            # the pause engages exactly at the fail_stop-th strike.
+            pause_at_final = (snaps[-1][1] is True and snaps[-1][2] == fail_stop)
+            # cumulative loss at the pause == the paired daily loss stop (3 x strike).
+            cum = snaps[-1][3]
+            at_paired_stop = abs(cum - float(self.cfg.rogue_daily_loss_stop)) < 1e-6
+            # can_enter now blocks (either brake reason is a valid HALT at the boundary).
+            blocked, reason = _rogue.can_enter(gov, self.cfg)
+            blocked_ok = (blocked is False
+                          and reason in ('consecutive_fail_pause', 'daily_loss_stop'))
+            ok = before_pause_no_loss and pause_at_final and at_paired_stop and blocked_ok
+            detail = (f"per_strike=${per_strike:.0f} snaps={snaps} "
+                      f"before_pause_no_loss={before_pause_no_loss} "
+                      f"pause_at_{fail_stop}={pause_at_final} cum=${cum:.0f}==stop={at_paired_stop} "
+                      f"reason={reason}")
+        except Exception as e:
+            self._record(232, FAIL, f"raised: {e!r}"); return
+        self._record(232, PASS if ok else FAIL, detail)
+
+    def _step_d13_fourth_strike_blocked(self):
+        # 233 D-13: a 4th init-SL strike ATTEMPTED while the governor is already paused/stopped
+        # is refused -- can_enter stays blocked after the 3rd strike AND after the 4th, the
+        # fail streak advances, and a further strike never re-opens the gate.
+        import rogue as _rogue
+        try:
+            per_strike = (float(self.cfg.rogue_init_sl)
+                          * float(self.cfg.lot_size)
+                          * float(self.cfg.contract_size))
+            fail_stop = int(getattr(self.cfg, 'rogue_consecutive_fail_stop', 3))
+            gov = _rogue.new_day_state()
+            for _ in range(fail_stop):
+                _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+            blocked_after_3 = _rogue.can_enter(gov, self.cfg)[0]        # False == blocked
+            # a 4th strike while paused: still blocked, consec_fails advances, never re-opens.
+            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=self.cfg)
+            blocked_after_4, reason4 = _rogue.can_enter(gov, self.cfg)
+            ok = (blocked_after_3 is False and blocked_after_4 is False
+                  and int(gov['consec_fails']) == fail_stop + 1
+                  and reason4 in ('daily_loss_stop', 'consecutive_fail_pause'))
+            detail = (f"blocked_after_3={not blocked_after_3} blocked_after_4={not blocked_after_4} "
+                      f"consec_fails={gov['consec_fails']} reason={reason4}")
+        except Exception as e:
+            self._record(233, FAIL, f"raised: {e!r}"); return
+        self._record(233, PASS if ok else FAIL, detail)
 
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
@@ -7382,13 +7463,15 @@ class SelfTest:
             # (b) seed / chain
             seed_a1 = (_r.a1_seed_anchor(None, 4000.0) == 4000.0)
             chain = (_r.a1_seed_anchor(4050.0, 4000.0) == 4050.0)
-            # (c) entry
+            # (c) entry (init-SL distance READ from cfg: BUY SL = entry - init_sl,
+            # SELL SL = entry + init_sl -- value-agnostic to the D-13 5->10 widening).
+            _isl = float(cfg.rogue_init_sl)
             e_buy = _r.a1_entry_decision(4000.0, 4010.0, cfg)   # +$10 -> BUY
             e_sell = _r.a1_entry_decision(4000.0, 3990.0, cfg)  # -$10 -> SELL
             e_hold = _r.a1_entry_decision(4000.0, 4005.0, cfg)  # +$5 -> none
             entry_ok = (e_buy[:2] == (True, 'BUY') and abs(e_buy[2] - 4010.0) < 1e-9
-                        and abs(e_buy[3] - 4005.0) < 1e-9
-                        and e_sell[:2] == (True, 'SELL') and abs(e_sell[3] - 3995.0) < 1e-9
+                        and abs(e_buy[3] - (4010.0 - _isl)) < 1e-9
+                        and e_sell[:2] == (True, 'SELL') and abs(e_sell[3] - (3990.0 + _isl)) < 1e-9
                         and e_hold[0] is False)
             # (d) reversal
             rev_buy = _r.a1_reversal_confirmed(4010.0, 'BUY', 4000.0, cfg)   # -$10 -> True
@@ -7791,7 +7874,7 @@ class SelfTest:
         try:
             cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
                                       rogue_entry_confirm_redesign=10.0,
-                                      rogue_reversal_dollars=10.0, rogue_daily_loss_stop=-525.0)
+                                      rogue_reversal_dollars=10.0)   # daily stop inherits cfg
 
             def mk():
                 # a controllable A1-mode trader: env['book'] = live broker positions;
@@ -7885,7 +7968,8 @@ class SelfTest:
             _r.manual_seed(trC, 4000.0)
             tick(trC, envC, 4008.0)                    # +$8 -> no entry yet (holds)
             tick(trC, envC, 4010.0)                    # +$10 -> ENTER BUY #1
-            tick(trC, envC, 4002.0, close=(-600.0, 4002.0))    # catastrophic CLOSE (< -$525)
+            tick(trC, envC, 4002.0,
+                 close=(float(cfg.rogue_daily_loss_stop) - 75.0, 4002.0))  # past the daily stop
             stoppedC = trC._rogue['gov']['loss_stopped'] is True
             cntC = trC._rogue['gov']['reanchor_count']
             self._p3_warp(trC)                         # P3: cooldown elapses, so the BRAKE
@@ -9112,8 +9196,12 @@ class SelfTest:
             self._step_b4_boost_isolation()
             self._step_b5_boost_rescue_unaffected()
             self._step_b6_boost_a1_replay()
-            # E-5: Rogue daily loss stop -150 -> -525
+            # E-5 / D-13: Rogue daily loss stop paired to 3 x init-SL strike
             self._step_e5_rogue_stop_525()
+            # D-13: 3 consecutive init-SL strikes -> fail-pause at the paired stop (ordering)
+            self._step_d13_three_strike_pause()
+            # D-13: a 4th strike while paused stays blocked (never re-opens the gate)
+            self._step_d13_fourth_strike_blocked()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
