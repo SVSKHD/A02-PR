@@ -566,6 +566,37 @@ class Config:
     # stays segmentable per seed source).
     rogue_seed_fallback: str = "a1_time_snapshot"   # or "market_open"
 
+    # --- FETCHER: the chop-harvesting scalper (SEPARATE engine, magic 20260707) -------
+    # A fixed-grid scalper that harvests chop: seed a morning anchor (same resolver as
+    # Rogue -- real A1 when anchors on, a1_time_snapshot fallback otherwise), then on
+    # every tick where price is >= fetcher_trigger_dollars ($5) off the ACTIVE anchor in
+    # EITHER direction, market-enter in the move direction with a broker-side TP at
+    # entry +/- fetcher_tp_dollars ($5) and SL at entry -/+ fetcher_sl_dollars ($5). NO
+    # software trail, NO breakeven, NO ladder. After ANY close, re-anchor at the CLOSE
+    # PRICE and hunt the next $5 move both ways -- high re-entry count by design.
+    # fetcher_enabled is the boot default of the runtime engine switch
+    # (live_trader.engines['fetcher'], /fetcher on|off), which ANDs with the demo/funded
+    # promotion gate: a FUNDED account force-disables it on every boot (un-proven engine
+    # never runs on real capital), identical to Rogue. NEVER reads/closes an anchor
+    # 20260522 or Rogue 20260626 ticket. Lot READS cfg.lot_size and never mutates it.
+    fetcher_enabled: bool = True        # MASTER SWITCH (boot default ON; funded forced OFF)
+    fetcher_trigger_dollars: float = 5.0    # move ($) off the anchor (either dir) -> enter
+    fetcher_tp_dollars: float = 5.0         # broker-side TP at entry +/- this (fixed, no trail)
+    fetcher_sl_dollars: float = 5.0         # broker-side SL at entry -/+ this (fixed, no trail)
+    fetcher_max_entries_per_day: int = 20   # HARD ceiling on NEW entries/day (the cap)
+    # GOVERNORS (mirror Rogue's paired-brake shape). One SL strike = fetcher_sl_dollars x
+    # lot x contract = $5 x 0.35 x 100 = $175. The daily loss stop is set to FOUR strikes
+    # (-$700) so the 3-consecutive-fail pause (-$525 = 3 strikes) is ALWAYS reachable
+    # BEFORE the daily halt -- the pause can never be dead code (E-5 lesson).
+    fetcher_daily_loss_stop: float = -700.0     # 4 x one $175 SL strike -> HALTS new entries
+    fetcher_consecutive_fail_stop: int = 3      # 3 SL strikes in a row -> pause new entries
+    # EOD: flatten an OPEN Fetcher position at EOD instead of riding overnight (default ON,
+    # mirrors rogue_flatten_at_eod). Fetcher-scoped (closes ONLY the Fetcher ticket).
+    fetcher_flatten_at_eod: bool = True
+    # Morning seed source when the anchor engine did not place A1 (reuses rogue.resolve_seed
+    # via fallback_key='fetcher_seed_fallback'): "a1_time_snapshot" (DEFAULT) or "market_open".
+    fetcher_seed_fallback: str = "a1_time_snapshot"   # or "market_open"
+
     # Risk
     starting_balance: float = 50000.0
     # --- v3.2.9 manual TESTFIRE collision guard ---------------------------------

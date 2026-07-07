@@ -23,7 +23,9 @@ for _p in (_REPO_ROOT, _THIS_DIR):
         sys.path.insert(0, _p)
 
 from config import Config              # live config
-import fetcher
+import tick_fetcher as fetcher         # backtest tick-data fetcher (renamed from
+#   backtest/fetcher.py to avoid colliding with the root-level fetcher.py engine
+#   module, which shares sys.modules['fetcher'] once backtest/ is on the path).
 
 # Import the replay engine by absolute file path so it can never be shadowed by
 # the repo-root backtest.py or the backtest/ namespace-package directory (both

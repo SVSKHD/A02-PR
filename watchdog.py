@@ -94,7 +94,8 @@ def relaunch_policy(exit_code, consecutive_selfrestarts,
 ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
                     "resume","today","help","start",
                     # v3.6.0 engine switches (runtime, no restart)
-                    "anchors","rogue","engines"}
+                    # v3.7.0 adds /fetcher (mirrors /rogue)
+                    "anchors","rogue","fetcher","engines"}
 
 
 HELP_TEXT = """*AUREON v2 commands*
@@ -110,7 +111,9 @@ HELP_TEXT = """*AUREON v2 commands*
 ⚓ `/anchors flatten confirm` — close ONLY anchor-magic (20260522) positions
 🦏 `/rogue on|off|status` — Rogue engine switch (off = manage-only)
 🦏 `/rogue flatten confirm` — close ONLY Rogue-magic (20260626) positions
-⚙️ `/engines status` — both engines' state + open count per magic
+🪣 `/fetcher on|off|status` — Fetcher engine switch (off = manage-only)
+🪣 `/fetcher flatten confirm` — close ONLY Fetcher-magic (20260707) positions
+⚙️ `/engines status` — all engines' state + open count per magic
 ❓ `/help` — this message
 """
 
@@ -526,11 +529,12 @@ class Watchdog:
             self.tele.info("▶️ Resume queued — anchor processing back on")
         elif cmd == "today":
             self.tele.info(self._format_today_summary())
-        elif cmd in ("anchors", "rogue"):
+        elif cmd in ("anchors", "rogue", "fetcher"):
             # v3.6.0 engine switches: /anchors on|off|status|flatten [confirm] ·
-            # /rogue on|off|status|flatten [confirm]. The watchdog only PARSES and
-            # queues; the bot applies the toggle next tick and posts the confirm
-            # embed itself (engines state + open-position count per magic).
+            # /rogue on|off|status|flatten [confirm] · v3.7.0 /fetcher on|off|status|
+            # flatten [confirm]. The watchdog only PARSES and queues; the bot applies
+            # the toggle next tick and posts the confirm embed itself (engines state +
+            # open-position count per magic).
             toks = (raw_text or "").split()[1:]
             sub = toks[0].lower() if toks else "status"
             if sub in ("on", "off"):

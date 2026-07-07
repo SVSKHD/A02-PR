@@ -27,6 +27,7 @@ today_trades.csv
 boost_ledger.csv
 rogue_patterns.csv
 rogue_trades.csv
+fetcher_trades.csv
 
 # Backtest/analysis outputs
 output/

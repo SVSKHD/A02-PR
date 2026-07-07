@@ -261,7 +261,8 @@ class LiveTrader:
         # Friday-flatten/kill-switch continue on all open positions of both magics
         # -- OFF never orphans a leg).
         self.engines = {'anchors': bool(getattr(cfg, 'non_oco_enabled', True)),
-                        'rogue': bool(getattr(cfg, 'rogue_enabled', True))}
+                        'rogue': bool(getattr(cfg, 'rogue_enabled', True)),
+                        'fetcher': bool(getattr(cfg, 'fetcher_enabled', True))}
         # the boot defaults, frozen at init, for the restore-override comparison
         # (cfg.rogue_enabled itself is mutated later by rogue.promote_on_boot).
         self._engine_boot_defaults = dict(self.engines)
@@ -694,7 +695,7 @@ class LiveTrader:
                     self._post_engines_status()
                 except Exception as e:
                     log.warning(f"engines status command failed (non-fatal): {e!r}")
-            elif cmd in ("anchors_flatten", "rogue_flatten"):
+            elif cmd in ("anchors_flatten", "rogue_flatten", "fetcher_flatten"):
                 # v3.6.0 confirm-gated per-magic flatten (see _handle_engine_flatten).
                 try:
                     self._handle_engine_flatten(cmd.split("_", 1)[0],
@@ -770,16 +771,19 @@ class LiveTrader:
                 return int(getattr(o, 'magic', -1))
             except (TypeError, ValueError):
                 return -1
+        import fetcher as _fetcher
         anchor_m, rogue_m = self._FRIDAY_ANCHOR_MAGIC, _rogue.ROGUE_MAGIC
+        fetch_m = _fetcher.FETCHER_MAGIC
+        _known = (anchor_m, rogue_m, fetch_m)
         counts = {
             'anchor_positions': sum(1 for p in positions if _magic(p) == anchor_m),
             'rogue_positions': sum(1 for p in positions if _magic(p) == rogue_m),
-            'other_positions': sum(1 for p in positions
-                                   if _magic(p) not in (anchor_m, rogue_m)),
+            'fetcher_positions': sum(1 for p in positions if _magic(p) == fetch_m),
+            'other_positions': sum(1 for p in positions if _magic(p) not in _known),
             'anchor_pendings': sum(1 for o in pendings if _magic(o) == anchor_m),
             'rogue_pendings': sum(1 for o in pendings if _magic(o) == rogue_m),
-            'other_pendings': sum(1 for o in pendings
-                                  if _magic(o) not in (anchor_m, rogue_m)),
+            'fetcher_pendings': sum(1 for o in pendings if _magic(o) == fetch_m),
+            'other_pendings': sum(1 for o in pendings if _magic(o) not in _known),
         }
         return (len(positions) == 0 and len(pendings) == 0), counts
 
@@ -899,8 +903,8 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def _engine_enabled(self, engine: str) -> bool:
-        """Runtime engine-switch read ('anchors' | 'rogue'). GUARDED: a trader
-        without the engines dict (selftest stubs, old snapshots) reads ENABLED --
+        """Runtime engine-switch read ('anchors' | 'rogue' | 'fetcher'). GUARDED: a
+        trader without the engines dict (selftest stubs, old snapshots) reads ENABLED --
         the switches can only ever REMOVE behavior, never invent it."""
         eng = getattr(self, 'engines', None)
         if not isinstance(eng, dict):
@@ -911,7 +915,7 @@ class LiveTrader:
         """Flip a runtime engine switch (effective next tick, no restart), persist it
         to run/state.json (p1_state, like the governors), and post the confirm embed
         (both engines' state + open-position count per magic). Guarded."""
-        if engine not in ('anchors', 'rogue'):
+        if engine not in ('anchors', 'rogue', 'fetcher'):
             return
         prev = self._engine_enabled(engine)
         self.engines[engine] = bool(on)
@@ -925,8 +929,9 @@ class LiveTrader:
             _p1.save(self, force=True)   # a toggle must survive a restart (paper too)
         except Exception:
             pass
+        _glyph = {'anchors': '⚓', 'rogue': '🦏', 'fetcher': '🪣'}.get(engine, '⚙️')
         self._post_engines_status(
-            note=f"{'⚓' if engine == 'anchors' else '🦏'} "
+            note=f"{_glyph} "
                  f"`/{engine} {'on' if on else 'off'}` applied — effective next tick"
                  + ("" if on else " (manage-only: existing positions keep trailing)"))
 
@@ -946,6 +951,14 @@ class LiveTrader:
         return (self._friday_entries_blocked(broker_date, utc_now)
                 or not self._engine_enabled('rogue'))
 
+    def _fetcher_entries_blocked(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
+        """v3.7.0 shared entries-blocked seam for the FETCHER engine: effective_block =
+        friday_window OR engine_disabled. Feeds fetcher.drive(allow_new_entries=...) -- with
+        it blocked, drive() still books a close on an existing open Fetcher position
+        (manage-only), it just takes no new $5-move entry. Mirrors _rogue_entries_blocked."""
+        return (self._friday_entries_blocked(broker_date, utc_now)
+                or not self._engine_enabled('fetcher'))
+
     def _open_counts_per_magic(self):
         """Broker-truth open-position/pending counts per magic (anchor 20260522 /
         Rogue 20260626 / other) for the engines confirm embed. Reuses the D-6
@@ -959,6 +972,8 @@ class LiveTrader:
         return {'anchor_positions': len(getattr(self, 'shadow_positions', {}) or {}),
                 'rogue_positions': (1 if (getattr(self, '_rogue', None) or {}).get('open')
                                     else 0),
+                'fetcher_positions': (1 if (getattr(self, '_fetcher', None) or {}).get('open')
+                                      else 0),
                 'anchor_pendings': len(getattr(self, 'shadow_pendings', {}) or {})}
 
     def _post_engines_status(self, note: str = ""):
@@ -966,18 +981,24 @@ class LiveTrader:
         state + open-position count per magic. Guarded; never raises onto the tick."""
         try:
             import rogue as _rogue
+            import fetcher as _fetcher
             counts = self._open_counts_per_magic()
             snap = {
                 "Anchors engine": ("🟢 ON" if self._engine_enabled('anchors')
                                    else "🔴 OFF (manage-only)"),
                 "Rogue engine": ("🟢 ON" if self._engine_enabled('rogue')
                                  else "🔴 OFF (manage-only)"),
+                "Fetcher engine": ("🟢 ON" if self._engine_enabled('fetcher')
+                                   else "🔴 OFF (manage-only)"),
                 f"Open {self._FRIDAY_ANCHOR_MAGIC} (anchor)":
                     f"{counts.get('anchor_positions', 0)} pos / "
                     f"{counts.get('anchor_pendings', 0)} pend",
                 f"Open {_rogue.ROGUE_MAGIC} (Rogue)":
                     f"{counts.get('rogue_positions', 0)} pos / "
                     f"{counts.get('rogue_pendings', 0)} pend",
+                f"Open {_fetcher.FETCHER_MAGIC} (Fetcher)":
+                    f"{counts.get('fetcher_positions', 0)} pos / "
+                    f"{counts.get('fetcher_pendings', 0)} pend",
                 "Seed fallback": str(getattr(self.cfg, 'rogue_seed_fallback',
                                              'a1_time_snapshot')),
             }
@@ -1030,6 +1051,21 @@ class LiveTrader:
                 _rogue.cancel_pendings(self)
             except Exception as e:
                 log.warning(f"rogue flatten pending-cancel failed (non-fatal): {e!r}")
+        elif engine == 'fetcher':
+            import fetcher as _fetcher
+            n = counts.get('fetcher_positions', 0)
+            n_pend = counts.get('fetcher_pendings', 0)
+            if not confirm:
+                self.tele.warn(
+                    f"🪣 */fetcher flatten* — {n} open position(s), {n_pend} pending(s) "
+                    f"on magic {_fetcher.FETCHER_MAGIC}. NOT closed. "
+                    f"Send `/fetcher flatten confirm` to execute.")
+                return
+            self.tele.warn(f"🪣🚨 /fetcher flatten CONFIRMED — closing {n} position(s) "
+                           f"+ cancelling {n_pend} pending(s) on magic "
+                           f"{_fetcher.FETCHER_MAGIC} (anchors + Rogue untouched)")
+            # scoped flatten (magic 20260707 ONLY) via risk._flatten_all's FETCHER scope.
+            self._flatten_all(reason="FetcherFlatten", scope="FETCHER")
 
     # ------------------------------------------------------------------------
     # v3.0.0 commit 4: weekend self-sleep + Monday auto-resume
@@ -1559,6 +1595,12 @@ class LiveTrader:
             _rogue.promote_on_boot(self)
         except Exception:
             pass
+        # FETCHER: demo default-ON promotion / funded force-OFF gate (same shape as Rogue).
+        try:
+            import fetcher as _fetcher
+            _fetcher.promote_on_boot(self)
+        except Exception:
+            pass
         return True
 
     # ------------------------------------------------------------------------
@@ -1825,6 +1867,17 @@ class LiveTrader:
                     _rogue.drive(self, allow_new_entries=False)
             except Exception:
                 pass
+            # FETCHER EOD flatten (flag fetcher_flatten_at_eod, default ON -> closes).
+            # Fetcher-scoped (closes ONLY the Fetcher ticket); guarded so it never blocks
+            # EOD. If NOT flattened at EOD, keep booking an existing position's broker
+            # close post-EOD with NEW entries hard-blocked (allow_new_entries=False).
+            try:
+                import fetcher as _fetcher
+                _fetcher.eod_flatten(self)
+                if not bool(getattr(self.cfg, 'fetcher_flatten_at_eod', True)):
+                    _fetcher.drive(self, allow_new_entries=False)
+            except Exception:
+                pass
             # v3.0.0 commit 3: Firebase EOD journal -- ONCE per broker day, after
             # the book is flat and the day's P&L is final (never during anchor
             # capture). Guarded so it fires once and never blocks the EOD path.
@@ -1891,6 +1944,18 @@ class LiveTrader:
         try:
             import rogue as _rogue
             _rogue.drive(self, allow_new_entries=not self._rogue_entries_blocked(broker_date, utc_now))
+        except Exception:
+            pass
+
+        # 6c. FETCHER per-tick driver: mirrors 6b exactly (runs AFTER the kill-switch and
+        # EOD returns, so a NEW Fetcher entry only opens on a live, non-killed, pre-EOD
+        # tick). No-op unless fetcher is ON (demo-promoted, never funded). Gated on the
+        # shared per-engine seam _fetcher_entries_blocked (= friday_window OR fetcher
+        # switch OFF); with entries blocked, drive() still books a close on an existing
+        # open Fetcher position (manage-only) -- the switch never orphans a leg.
+        try:
+            import fetcher as _fetcher
+            _fetcher.drive(self, allow_new_entries=not self._fetcher_entries_blocked(broker_date, utc_now))
         except Exception:
             pass
 

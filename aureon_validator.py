@@ -28,15 +28,21 @@ _EXPECTED_FLAGS = (
     'rogue_enabled', 'rogue_daywatch',
     # v3.6.0 engine switches + rogue seed independence
     'non_oco_enabled', 'rogue_seed_fallback',
+    # v3.7.0 FETCHER engine: master switch, grid knobs, governors, seed fallback
+    'fetcher_enabled', 'fetcher_trigger_dollars', 'fetcher_tp_dollars',
+    'fetcher_sl_dollars', 'fetcher_max_entries_per_day', 'fetcher_daily_loss_stop',
+    'fetcher_consecutive_fail_stop', 'fetcher_flatten_at_eod', 'fetcher_seed_fallback',
 )
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
-                    'boosts_common', 'strategy', 'break_hold')
+                    'boosts_common', 'strategy', 'break_hold', 'fetcher')
 # the LiveTrader seams that MUST be bound for the per-tick flow to dispatch.
 _SEAMS = ('_break_and_hold_ok', '_rescue_entry_ok', '_check_boost_triggers',
           '_resolved_anchor_hm', '_process_anchor_if_due',
           # v3.6.0 engine switches: the shared entries-blocked seams + the runtime read
-          '_engine_enabled', '_anchor_entries_blocked', '_rogue_entries_blocked')
+          '_engine_enabled', '_anchor_entries_blocked', '_rogue_entries_blocked',
+          # v3.7.0 FETCHER engine: its shared entries-blocked seam
+          '_fetcher_entries_blocked')
 
 
 def _probe(cfg):
@@ -93,6 +99,36 @@ def _probe(cfg):
     _seed_mode = str(getattr(cfg, 'rogue_seed_fallback', 'a1_time_snapshot')).lower()
     w('rogue:seed_fallback_valid', _seed_mode in ('a1_time_snapshot', 'market_open'),
       f'rogue_seed_fallback={_seed_mode!r}')
+
+    # 4c. v3.7.0 FETCHER wiring: distinct magic + the same freeze invariant as Rogue
+    #     (should_run matches fetcher_enabled; funded forced OFF), the seed-fallback knob
+    #     is a known mode, and the PAIRED-governor invariant holds -- the daily loss stop
+    #     must be DEEPER than the 3-fail pause (loss_stop <= -fail_stop x one SL strike) so
+    #     the pause is always reachable BEFORE the halt (never dead code; the E-5 lesson).
+    try:
+        import fetcher as _f
+        w('fetcher:magic_distinct',
+          _f.FETCHER_MAGIC not in (20260522, 20260626, 9999998),
+          f'FETCHER_MAGIC={_f.FETCHER_MAGIC}')
+        f_raw = _f.should_run(cfg, is_funded=False)
+        w('fetcher:run_matches_flag', f_raw == bool(getattr(cfg, 'fetcher_enabled', False)),
+          f'should_run={f_raw} fetcher_enabled={getattr(cfg, "fetcher_enabled", None)}')
+        w('fetcher:funded_force_off', _f.should_run(cfg, is_funded=True) is False,
+          'funded => forced OFF (mandatory gate)')
+        _one_strike = (float(getattr(cfg, 'fetcher_sl_dollars', 5.0))
+                       * float(getattr(cfg, 'lot_size', 0.35))
+                       * float(getattr(cfg, 'contract_size', 100.0)))
+        _fail_stop = int(getattr(cfg, 'fetcher_consecutive_fail_stop', 3))
+        _loss_stop = float(getattr(cfg, 'fetcher_daily_loss_stop', -700.0))
+        w('fetcher:pause_reachable_before_stop',
+          _loss_stop <= -(_fail_stop * _one_strike),
+          f'loss_stop={_loss_stop} <= -({_fail_stop} x one strike ${_one_strike:.0f}) '
+          f'= {-(_fail_stop * _one_strike):.0f}')
+        _f_seed = str(getattr(cfg, 'fetcher_seed_fallback', 'a1_time_snapshot')).lower()
+        w('fetcher:seed_fallback_valid', _f_seed in ('a1_time_snapshot', 'market_open'),
+          f'fetcher_seed_fallback={_f_seed!r}')
+    except Exception as e:
+        w('fetcher:import', False, f'fetcher import FAILED: {e!r}')
 
     # 5. derived-cap discipline present (rescue/rally caps resolvable).
     try:

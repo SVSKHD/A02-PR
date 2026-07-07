@@ -88,17 +88,22 @@ _EVENT_TYPE_TO_LEG_CLASS = {
 }
 
 ROGUE_MAGIC_DEFAULT = 20260626
+FETCHER_ENGINE = "FETCHER"
+FETCHER_LEG = "FETCHER"
+FETCHER_MAGIC_DEFAULT = 20260707
 
 _ANCHOR_ORIG_RE = re.compile(r'^AUR_([A-Z0-9]{2})_(BUY|SELL)(?:_(G|RCV|CFM))?(?:_R\d+)?$')
 _ANCHOR_BOOST_RE = re.compile(r'^AUR_([A-Z0-9]{2})_([BS])_B(\d+)$')
 _ROGUE_RE = re.compile(r'^AUR_ROGUE_([BS])$')
+_FETCH_RE = re.compile(r'^AUR_FETCH_([BS])$')
 
 _SIDE_FROM_CHAR = {'B': 'BUY', 'S': 'SELL'}
 
 
-def classify_comment(comment, magic=None, rogue_magic=ROGUE_MAGIC_DEFAULT):
+def classify_comment(comment, magic=None, rogue_magic=ROGUE_MAGIC_DEFAULT,
+                     fetcher_magic=FETCHER_MAGIC_DEFAULT):
     """PURE: classify one MT5 deal's (comment, magic) into a dict:
-      {'engine': 'ANCHOR'|'ROGUE'|None, 'anchor2': '<2-char anchor code>'|None,
+      {'engine': 'ANCHOR'|'ROGUE'|'FETCHER'|None, 'anchor2': '<2-char code>'|None,
        'side': 'BUY'|'SELL'|None, 'leg_class': ..., 'boost_seq': int|None}
     Magic is checked FIRST (more reliable than string matching per the MT5
     API); the comment is the fallback / cross-check. An unmatched comment
@@ -110,6 +115,11 @@ def classify_comment(comment, magic=None, rogue_magic=ROGUE_MAGIC_DEFAULT):
         side = _SIDE_FROM_CHAR.get(m.group(1)) if m else None
         return {'engine': ROGUE_ENGINE, 'anchor2': None, 'side': side,
                 'leg_class': ROGUE_LEG, 'boost_seq': None}
+    if magic == fetcher_magic or c.startswith('AUR_FETCH_'):
+        m = _FETCH_RE.match(c)
+        side = _SIDE_FROM_CHAR.get(m.group(1)) if m else None
+        return {'engine': FETCHER_ENGINE, 'anchor2': None, 'side': side,
+                'leg_class': FETCHER_LEG, 'boost_seq': None}
     m = _ANCHOR_BOOST_RE.match(c)
     if m:
         anchor2, sidechar, seq = m.group(1), m.group(2), int(m.group(3))
@@ -394,6 +404,24 @@ def rogue_stats(trades, log_counts=None):
     return out
 
 
+def fetcher_stats(trades, log_counts=None):
+    """PURE: {entries, wins, fails, day_pnl, biggest_win, reanchors, brake_events,
+    loss_stop_events, fail_pause_events} from FETCHER-engine trades + the (already
+    log-parsed) event counts. Entries/wins/fails/day_pnl are UNIQUE broker trades
+    (one per closed position), never log lines (R-7)."""
+    log_counts = log_counts or {}
+    fg = [t for t in trades if t['engine'] == FETCHER_ENGINE]
+    wins = sum(1 for t in fg if t['pnl'] > 0)
+    fails = sum(1 for t in fg if t['pnl'] <= 0)
+    day_pnl = round(sum(t['pnl'] for t in fg), 2)
+    biggest_win = round(max((t['pnl'] for t in fg), default=0.0), 2)
+    out = {'entries': len(fg), 'wins': wins, 'fails': fails, 'day_pnl': day_pnl,
+           'biggest_win': biggest_win}
+    for k in ('reanchors', 'brake_events', 'loss_stop_events', 'fail_pause_events'):
+        out[k] = int(log_counts.get(k, 0))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # aureon*.log parsing (PURE given lines; impure file read isolated below)
 # ---------------------------------------------------------------------------
@@ -434,6 +462,30 @@ def count_rogue_log_events(log_lines):
             'brake_events': loss_stop + fail_pause}
 
 
+_FETCH_REANCHOR_RE = re.compile(r'\[FETCHER\][^\n]*re-anchor @')
+_FETCH_CLOSE_BRAKE_RE = re.compile(
+    r'\[FETCHER\][^\n]*\bCLOSE\b.*\|\s*(LOSS-STOP|FAIL-PAUSE|live)\s*\|')
+
+
+def count_fetcher_log_events(log_lines):
+    """PURE: count Fetcher re-anchor + brake lines from aureon.log text lines. Each
+    Fetcher CLOSE logs ONE line carrying both the brake tag and the re-anchor level, so a
+    close contributes at most one re-anchor and one brake tag -- UNIQUE events, not raw
+    duplicated log/telemetry lines (R-7). Never raises on a malformed line."""
+    reanchor = loss_stop = fail_pause = 0
+    for line in log_lines:
+        if _FETCH_REANCHOR_RE.search(line):
+            reanchor += 1
+        m = _FETCH_CLOSE_BRAKE_RE.search(line)
+        if m:
+            if m.group(1) == 'LOSS-STOP':
+                loss_stop += 1
+            elif m.group(1) == 'FAIL-PAUSE':
+                fail_pause += 1
+    return {'reanchors': reanchor, 'loss_stop_events': loss_stop,
+            'fail_pause_events': fail_pause, 'brake_events': loss_stop + fail_pause}
+
+
 # ---------------------------------------------------------------------------
 # Markdown + CSV ledger rendering (PURE)
 # ---------------------------------------------------------------------------
@@ -445,14 +497,19 @@ PNL_LEDGER_COLUMNS = (
     'rogue_biggest_win', 'rogue_chain_reanchors', 'rogue_chase_rejects',
     'rogue_cooldown_rejects', 'rogue_displacement_rejects',
     'rogue_brake_events',
+    # v3.7.0 Fetcher engine columns (appended LAST -> old ledger files stay
+    # positional-safe; a FETCHER scope row fills these, other rows leave them '').
+    'fetcher_entries', 'fetcher_wins', 'fetcher_fails', 'fetcher_day_pnl',
+    'fetcher_biggest_win', 'fetcher_reanchors', 'fetcher_brake_events',
 )
 
 
-def ledger_rows(date_str, per_anchor, rogue):
+def ledger_rows(date_str, per_anchor, rogue, fetcher=None):
     """PURE: one PNL_LEDGER_COLUMNS row per anchor scope + one 'ROGUE' row +
-    one 'TOTAL' row (anchors summed; Rogue kept separate per the isolation
-    rule -- TOTAL never mixes engines). Long/stable schema: adding or cutting
-    an anchor never changes the column set."""
+    (when `fetcher` is supplied) one 'FETCHER' row + one 'TOTAL' row (anchors
+    summed; Rogue and Fetcher kept separate per the isolation rule -- TOTAL never
+    mixes engines). Long/stable schema: adding or cutting an anchor never changes
+    the column set."""
     rows = []
     total = {k: 0 for k in _RAW_ANCHOR_KEYS}
     for a in sorted(per_anchor):
@@ -476,6 +533,22 @@ def ledger_rows(date_str, per_anchor, rogue):
         'rogue_displacement_rejects': rogue['displacement_rejects'],
         'rogue_brake_events': rogue['brake_events'],
     })
+    if fetcher is not None:
+        rows.append({
+            'date': date_str, 'scope': 'FETCHER', 'trades': fetcher['entries'],
+            'net': '', 'gross_win': '', 'gross_loss': '', 'pf': '', 'win_pct': '',
+            'orig_pnl': '', 'rally_pnl': '', 'rescue_boost_pnl': '', 'fb_pnl': '',
+            'unclassified_pnl': '', 'unclassified_n': '', 'whipsaw_count': '',
+            'fetcher_entries': fetcher['entries'], 'fetcher_wins': fetcher['wins'],
+            'fetcher_fails': fetcher['fails'], 'fetcher_day_pnl': fetcher['day_pnl'],
+            'fetcher_biggest_win': fetcher['biggest_win'],
+            'fetcher_reanchors': fetcher['reanchors'],
+            'fetcher_brake_events': fetcher['brake_events'],
+        })
+    # stable schema: every row carries the FULL PNL_LEDGER_COLUMNS set (a scope that
+    # doesn't populate a column leaves it '') so adding an engine's columns never makes
+    # an older scope's row miss keys.
+    rows = [{k: r.get(k, '') for k in PNL_LEDGER_COLUMNS} for r in rows]
     return rows
 
 
@@ -499,9 +572,10 @@ def _anchor_row(date_str, scope, s):
 
 def render_markdown(date_str, per_anchor, rogue, whipsaw_counts=None,
                     w2=None, month_rollup_stats=None, month_str=None,
-                    unclassified_note=None):
+                    unclassified_note=None, fetcher=None):
     """PURE: the full markdown report body for one day (+ optional month
-    roll-up table when `month_rollup_stats` is supplied)."""
+    roll-up table when `month_rollup_stats` is supplied). `fetcher` (when supplied)
+    adds a Fetcher engine section."""
     whipsaw_counts = whipsaw_counts or {}
     w2 = w2 or {}
     lines = [f"# AUREON daily P&L report — {date_str}", ""]
@@ -545,6 +619,18 @@ def render_markdown(date_str, per_anchor, rogue, whipsaw_counts=None,
              f"(loss-stop {rogue['loss_stop_events']} / "
              f"fail-pause {rogue['fail_pause_events']})",
              ""]
+
+    if fetcher is not None:
+        lines += ["## Fetcher", "",
+                 f"- Entries: {fetcher['entries']} (wins {fetcher['wins']} / "
+                 f"fails {fetcher['fails']})",
+                 f"- Day P&L: ${fetcher['day_pnl']:+.2f}",
+                 f"- Biggest win: ${fetcher['biggest_win']:+.2f}",
+                 f"- Re-anchors: {fetcher['reanchors']}",
+                 f"- Brake events: {fetcher['brake_events']} "
+                 f"(loss-stop {fetcher['loss_stop_events']} / "
+                 f"fail-pause {fetcher['fail_pause_events']})",
+                 ""]
 
     if month_rollup_stats:
         lines += [f"## Month-to-date ({month_str or date_str[:7]}) — cut/keep table",
@@ -717,10 +803,11 @@ def build_day_report(adapter, date_str, run_dir=None, logs_dir=None,
     log_lines = read_log_lines_for_date(logs_dir, date_str)
     log_counts = count_rogue_log_events(log_lines)
     rogue = rogue_stats(trades, log_counts)
+    fetcher = fetcher_stats(trades, count_fetcher_log_events(log_lines))
     unclassified = [t for t in trades if t['leg_class'] in (UNKNOWN, BOOST_UNCLASSIFIED)]
     return {'date': date_str, 'trades': trades, 'per_anchor': per_anchor,
-            'whipsaw_counts': whipsaw_counts, 'rogue': rogue, 'w2': w2,
-            'unclassified': unclassified}
+            'whipsaw_counts': whipsaw_counts, 'rogue': rogue, 'fetcher': fetcher,
+            'w2': w2, 'unclassified': unclassified}
 
 
 def _unclassified_note(unclassified):
@@ -754,12 +841,14 @@ def write_report_files(day_report, run_dir=None, month_rollup_stats=None,
     md = render_markdown(date_str, day_report['per_anchor'], day_report['rogue'],
                          whipsaw_counts=day_report['whipsaw_counts'],
                          w2=day_report['w2'], month_rollup_stats=month_rollup_stats,
-                         month_str=month_str, unclassified_note=note)
+                         month_str=month_str, unclassified_note=note,
+                         fetcher=day_report.get('fetcher'))
     md_path = os.path.join(out_dir, f"daily_{date_str}.md")
     with open(md_path, 'w') as f:
         f.write(md)
     csv_path = os.path.join(out_dir, 'pnl_ledger.csv')
-    rows = ledger_rows(date_str, day_report['per_anchor'], day_report['rogue'])
+    rows = ledger_rows(date_str, day_report['per_anchor'], day_report['rogue'],
+                       fetcher=day_report.get('fetcher'))
     upsert_ledger_rows(csv_path, date_str, rows)
     return md_path, csv_path
 
