@@ -334,6 +334,13 @@ STEP_NAMES = {
     249: "daily profit lock",      # day>=+400 blocks new entries, one alert (both engines)
     250: "daily stop reseed",      # reseed overrides profit lock (no re-lock, loss stays live); loss refuses
     251: "daily stops disabled",   # profit_stop=0 / loss_stop=0 disable their gates (both engines)
+    # v3.7.3 anchors-engine daily stops + the (inert) account-level lock
+    252: "anchors e20 rebuild",    # anchors day P&L rebuilt from magic-20260522 history (not zeroed)
+    253: "anchors profit lock",    # anchors +400 blocks; ONE alert; other two engines still enter
+    254: "anchors loss halt",      # one full anchor SL (-630) halts; -629 doesn't; loss not overridable
+    255: "anchors daylock+skip",   # scheduled anchor skipped once while locked; /daylock off then fires
+    256: "account lock inert",     # account lock inert at pct=0; armed >0 locks; /daylock off overrides
+    257: "daylock day roll reset", # all locks/overrides/alerts reset at the broker day roll
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -8142,6 +8149,178 @@ class SelfTest:
             self._record(251, FAIL, f"raised: {e!r}"); return
         self._record(251, PASS if ok else FAIL, detail)
 
+    # =====================================================================
+    # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
+    # =====================================================================
+    def _daylock_mk(self, cfg=None):
+        """A stub LiveTrader carrying the anchors/account day-stop methods bound onto it +
+        an alerts list, for headless daily-stop tests. state['daily_pnl'] is the anchors
+        realized day P&L; _rogue/_fetcher hold each engine's governor day P&L."""
+        import types
+        import live_trader as _lt
+        cfg = cfg or self.cfg
+        alerts = []
+        t = types.SimpleNamespace(
+            cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0},
+            _rogue=None, _fetcher=None, _save_state=lambda: None,
+            tele=types.SimpleNamespace(info=lambda *a, **k: None, send=lambda *a, **k: None,
+                                       warn=lambda m='', **k: alerts.append(str(m))))
+        for m in ('_engine_day_pnls', '_anchors_daystop', '_anchors_daystop_blocked',
+                  '_anchors_profit_alert', '_account_locked', '_anchors_daystop_skip',
+                  '_daylock_override', '_daylock_lines', '_post_daylock_status'):
+            setattr(t, m, getattr(_lt.LiveTrader, m).__get__(t))
+        return t, alerts
+
+    def _step_anchors_e20_rebuild(self):
+        # 252 PART 1 (E-20 for anchors): a same-day restart rebuilds the anchors realized day
+        # P&L (state['daily_pnl']) from broker deal history for magic 20260522 -- never zeroed.
+        # Foreign-magic (Rogue/Fetcher) closes are ignored.
+        import types, daystops as _ds, rogue as _r, fetcher as _f
+        try:
+            def _deal(pnl, magic, entry=1):
+                return types.SimpleNamespace(entry=entry, profit=pnl, swap=0.0,
+                                             commission=0.0, time=1, magic=magic)
+            hist = [_deal(120.0, _ds.ANCHORS_MAGIC), _deal(-300.0, _ds.ANCHORS_MAGIC),
+                    _deal(-999.0, _r.ROGUE_MAGIC), _deal(-999.0, _f.FETCHER_MAGIC),
+                    _deal(0.0, _ds.ANCHORS_MAGIC, entry=0)]           # entry-IN ignored for P&L
+            tr = types.SimpleNamespace(cfg=self.cfg, adapter=types.SimpleNamespace(
+                mt5=types.SimpleNamespace(history_deals_get=lambda *a, **k: hist)))
+            dp = _ds.rebuild_anchors_day_pnl(tr, dt_from=0, dt_to=999)
+            ok = (dp is not None and abs(dp + 180.0) < 1e-6)          # 120 - 300 = -180
+            detail = f"rebuilt_anchors_day_pnl={dp} (expect -180, foreign magics ignored)"
+        except Exception as e:
+            self._record(252, FAIL, f"raised: {e!r}"); return
+        self._record(252, PASS if ok else FAIL, detail)
+
+    def _step_anchors_profit_lock(self):
+        # 253 anchors PROFIT lock at +$400: the anchors engine goes manage-only (blocked),
+        # exactly ONE alert fires, and the OTHER TWO engines still enter (independence).
+        import rogue as _r, fetcher as _f
+        try:
+            tr, alerts = self._daylock_mk()
+            tr.state['daily_pnl'] = 420.0                            # anchors +$420 -> lock
+            tr._rogue = {'gov': _r.new_day_state()}                  # rogue flat
+            tr._fetcher = {'gov': _f.new_day_state()}                # fetcher flat
+            blocked1 = tr._anchors_daystop_blocked()
+            blocked2 = tr._anchors_daystop_blocked()                 # idempotent; no 2nd alert
+            one_alert = sum(1 for m in alerts if 'DAY PROFIT STOP' in m) == 1
+            # INDEPENDENCE: rogue + fetcher still ENTER (their own govs are flat/clean).
+            rogue_ok = _r.can_enter(tr._rogue['gov'], self.cfg)[0] is True
+            fetch_ok = _f.can_enter(tr._fetcher['gov'], self.cfg)[0] is True
+            ok = (blocked1 is True and blocked2 is True and one_alert
+                  and rogue_ok and fetch_ok)
+            detail = (f"anchors_blocked={blocked1} one_alert={one_alert} "
+                      f"independence[rogue_enters={rogue_ok} fetch_enters={fetch_ok}]")
+        except Exception as e:
+            self._record(253, FAIL, f"raised: {e!r}"); return
+        self._record(253, PASS if ok else FAIL, detail)
+
+    def _step_anchors_loss_halt(self):
+        # 254 anchors LOSS halt: ONE full anchor SL (-$630 == sl_dist $18 x lot 0.35 x 100)
+        # trips the halt (boundary at <=); -$629 does not. The halt is HARD -- /daylock
+        # anchors off is IGNORED (loss is not overridable).
+        try:
+            full_sl = -(float(self.cfg.sl_dist) * float(self.cfg.lot_size)
+                        * float(self.cfg.contract_size))              # -$630
+            same = abs(full_sl - float(self.cfg.anchors_daily_loss_stop)) < 1e-6
+            tr, _ = self._daylock_mk()
+            tr.state['daily_pnl'] = full_sl
+            halt_at_630 = tr._anchors_daystop_blocked()
+            tr2, _ = self._daylock_mk()
+            tr2.state['daily_pnl'] = full_sl + 1.0                    # -$629
+            no_halt_629 = tr2._anchors_daystop_blocked()
+            # loss override refused (stays blocked)
+            tr._daylock_override('anchors')
+            still_blocked = tr._anchors_daystop_blocked()
+            not_overridden = not tr.state.get('anchors_profit_override')
+            ok = (same and halt_at_630 is True and no_halt_629 is False
+                  and still_blocked is True and not_overridden)
+            detail = (f"full_SL=${full_sl:.0f}==cfg({same}) halt@-630={halt_at_630} "
+                      f"no_halt@-629={no_halt_629} loss_override_ignored={still_blocked and not_overridden}")
+        except Exception as e:
+            self._record(254, FAIL, f"raised: {e!r}"); return
+        self._record(254, PASS if ok else FAIL, detail)
+
+    def _step_anchors_daylock_override_skip(self):
+        # 255 a scheduled anchor DUE while anchors is profit-locked is SKIPPED ONCE (marked
+        # missed, no retry); /daylock anchors off clears the lock (no same-day re-lock), and
+        # a subsequently-due anchor is NO longer skipped.
+        import pandas as _pd
+        try:
+            tr, alerts = self._daylock_mk()
+            tr.state['daily_pnl'] = 500.0                            # profit-locked
+            tr.state['missed_anchors_today'] = []
+            now = _pd.Timestamp('2026-07-08T06:00:00Z')
+            tr._anchors_daystop_skip('A4', now, now)                 # DUE while locked -> skip
+            skipped_once = ('A4' in tr.state['missed_anchors_today']
+                            and any('A4 skipped' in m for m in alerts))
+            tr._anchors_daystop_skip('A4', now, now)                 # idempotent: still one entry
+            skip_idempotent = tr.state['missed_anchors_today'].count('A4') == 1
+            # /daylock anchors off -> clears the lock; a DIFFERENT anchor no longer skips
+            # (mirror the production gate: _process_anchor_if_due only calls skip when
+            # _anchors_daystop_blocked() is True).
+            tr._daylock_override('anchors')
+            cleared = tr._anchors_daystop_blocked() is False
+            if tr._anchors_daystop_blocked():
+                tr._anchors_daystop_skip('A5', now, now)
+            a5_not_skipped = 'A5' not in tr.state['missed_anchors_today']
+            ok = skipped_once and skip_idempotent and cleared and a5_not_skipped
+            detail = (f"A4_skipped_once={skipped_once} idempotent={skip_idempotent} "
+                      f"override_cleared={cleared} A5_fires_after_override={a5_not_skipped}")
+        except Exception as e:
+            self._record(255, FAIL, f"raised: {e!r}"); return
+        self._record(255, PASS if ok else FAIL, detail)
+
+    def _step_account_lock_inert(self):
+        # 256 the account-level lock is INERT at pct=0 (owner default): a huge combined P&L
+        # never locks. Armed (pct>0): combined >= pct x day-start equity locks all engines;
+        # /daylock off overrides it (no re-lock).
+        import dataclasses
+        try:
+            tr, _ = self._daylock_mk()
+            tr.state['daily_pnl'] = 5000.0
+            tr._rogue = {'gov': {'day_pnl': 5000.0}}
+            tr._fetcher = {'gov': {'day_pnl': 5000.0}}               # combined $15k
+            inert = tr._account_locked() is False                   # pct=0 -> never locks
+            # arm at 2% of $50k = $1,000; combined $15k >= -> locks
+            armed_cfg = dataclasses.replace(self.cfg, account_daily_profit_stop_pct=0.02)
+            tr2, _ = self._daylock_mk(cfg=armed_cfg)
+            tr2.state['daily_pnl'] = 600.0
+            tr2._rogue = {'gov': {'day_pnl': 300.0}}
+            tr2._fetcher = {'gov': {'day_pnl': 200.0}}               # combined $1,100 >= $1,000
+            armed_locks = tr2._account_locked() is True
+            tr2._daylock_override('account')
+            override_clears = tr2._account_locked() is False
+            ok = inert and armed_locks and override_clears
+            detail = (f"inert@pct0={inert} armed@2pct_locks={armed_locks} "
+                      f"daylock_off_clears={override_clears}")
+        except Exception as e:
+            self._record(256, FAIL, f"raised: {e!r}"); return
+        self._record(256, PASS if ok else FAIL, detail)
+
+    def _step_daylock_day_roll_reset(self):
+        # 257 DAY ROLL: every anchors/account lock + override + alert flag resets at the
+        # broker day roll (daystops.reset_day_state) -- no carryover. Next day enters clean.
+        import daystops as _ds
+        try:
+            st = {'anchors_profit_locked': True, 'anchors_profit_override': True,
+                  'anchors_profit_alerted': True, 'account_profit_locked': True,
+                  'account_profit_override': True, 'account_profit_alerted': True}
+            _ds.reset_day_state(st)
+            all_cleared = all(st.get(k) is False for k in (
+                'anchors_profit_locked', 'anchors_profit_override', 'anchors_profit_alerted',
+                'account_profit_locked', 'account_profit_override', 'account_profit_alerted'))
+            # a fresh day (day_pnl 0, flags cleared) -> anchors NOT blocked, enters clean.
+            tr, _ = self._daylock_mk()
+            tr.state.update(st)
+            tr.state['daily_pnl'] = 0.0
+            clean_next_day = tr._anchors_daystop_blocked() is False
+            ok = all_cleared and clean_next_day
+            detail = f"all_flags_cleared={all_cleared} clean_next_day={clean_next_day}"
+        except Exception as e:
+            self._record(257, FAIL, f"raised: {e!r}"); return
+        self._record(257, PASS if ok else FAIL, detail)
+
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
         # PURE cores + gating + isolation:
@@ -9927,6 +10106,13 @@ class SelfTest:
             self._step_daily_profit_lock()
             self._step_daily_stop_reseed()
             self._step_daily_stops_disabled()
+            # v3.7.3 anchors-engine daily stops + the (inert) account-level lock
+            self._step_anchors_e20_rebuild()
+            self._step_anchors_profit_lock()
+            self._step_anchors_loss_halt()
+            self._step_anchors_daylock_override_skip()
+            self._step_account_lock_inert()
+            self._step_daylock_day_roll_reset()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

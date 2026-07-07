@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.7.2"  # daily profit-lock + tightened loss halt + Rogue E-20 governor rebuild
+__version__ = "3.7.3"  # anchors-engine daily stops + account lock (inert) + anchors E-20 rebuild
 CODENAME = "Astra Hawk"
 
 

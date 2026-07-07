@@ -608,6 +608,24 @@ class Config:
     # via fallback_key='fetcher_seed_fallback'): "a1_time_snapshot" (DEFAULT) or "market_open".
     fetcher_seed_fallback: str = "a1_time_snapshot"   # or "market_open"
 
+    # --- ANCHORS engine daily stops + the (inert) account-level lock (2026-07-08) --------
+    # The ANCHORS engine (magic 20260522, incl. its boost / rescue / F-B legs) gets the same
+    # per-engine daily brakes Rogue/Fetcher carry -- realized day P&L is state['daily_pnl']
+    # (Rogue/Fetcher are NOT mixed in; they have their own governors). Independent latches:
+    # one engine locking/halting NEVER affects the others.
+    anchors_daily_profit_stop: float = 400.0   # SOFT profit-lock: realized anchors day P&L
+    # >= this -> manage-only (no NEW straddles / boosts; open legs trail/exit normally).
+    # Overridable ONCE per broker day by `/daylock anchors off`. 0 disables the gate.
+    anchors_daily_loss_stop: float = -630.0    # HARD halt: == exactly one full anchor SL
+    # (sl_dist $18 x lot 0.35 x contract 100 = $630). One full-SL leg halts NEW anchor risk
+    # (straddles AND the boost family) for the broker day (boundary trips at <=). Never
+    # overridable. 0 disables the gate.
+    account_daily_profit_stop_pct: float = 0.0  # ACCOUNT-level lock, DISABLED by owner
+    # design (0): the per-engine ceilings (sum ~$1,200) define the day. The mechanism is
+    # implemented anyway -- combined realized P&L across ALL magics >= this pct of day-start
+    # equity -> all three engines go manage-only, overridable by `/daylock off` -- but stays
+    # inert while 0. Set >0 (e.g. 0.02 = 2%) to arm it.
+
     # Risk
     starting_balance: float = 50000.0
     # --- v3.2.9 manual TESTFIRE collision guard ---------------------------------

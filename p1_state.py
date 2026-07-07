@@ -380,13 +380,28 @@ def recover_on_boot(trader):
                                'leg_type': fo.get('leg_type', _fetcher.FETCHER_LEG_TYPE)}
             trader._fetcher = fst
             summary['fetcher'] = True
+        # --- v3.7.3 PART 1 (E-20 for anchors): rebuild the ANCHORS realized day P&L
+        # (state['daily_pnl'], magic 20260522) from broker deal history so a same-day
+        # restart never trusts a stale persisted value. Broker truth wins; a query failure
+        # keeps the persisted value. The anchors/account lock override + alert flags live in
+        # state.json (loaded by _load_state) and are preserved. ---
+        try:
+            import daystops as _ds
+            _rebuilt_anchors = _ds.rebuild_anchors_day_pnl(trader)
+            if _rebuilt_anchors is not None and isinstance(getattr(trader, 'state', None), dict):
+                trader.state['daily_pnl'] = float(_rebuilt_anchors)
+                summary['anchors_day_pnl'] = float(_rebuilt_anchors)
+        except Exception as e:
+            log.warning(f"anchors day-pnl rebuild non-fatal: {e!r}")
         summary['boosts'] = len(data.get('boost_trails', {}) or {})
         summary['anchors'] = len(data.get('processed_anchors_today', []) or [])
         summary['recovered'] = True
         rg = _rogue_summary(trader)
+        _anchors_dp = float((getattr(trader, 'state', {}) or {}).get('daily_pnl', 0.0) or 0.0)
         try:
             log.info(f"RESTART-RECOVERY OK | day {today} | anchors_placed={summary['anchors']} "
-                     f"(skipped on re-fire) | {rg} | boost_trails={summary['boosts']}")
+                     f"(skipped on re-fire) | anchors_day_pnl=${_anchors_dp:+.2f} "
+                     f"| {rg} | boost_trails={summary['boosts']}")
             trader.tele.info(f"♻️ *RESTART-RECOVERY OK* — day {today}; "
                              f"{summary['anchors']} anchor(s) already placed (skipped); "
                              f"{rg}; {summary['boosts']} boost trail(s) resumed.")

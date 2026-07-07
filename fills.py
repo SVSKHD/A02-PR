@@ -399,6 +399,15 @@ def _reconcile_with_broker(self):
             if close_deal:
                 pnl_usd = float(close_deal.profit) + float(close_deal.swap) + float(close_deal.commission)
                 self.state['daily_pnl'] += pnl_usd
+                # v3.7.3: this anchor-leg close just moved the anchors realized day P&L --
+                # latch the profit lock + fire its one-time alert if it now crosses the
+                # target (guarded; never affects the close path).
+                try:
+                    _ad = getattr(self, '_anchors_daystop', None)
+                    if callable(_ad):
+                        _ad()
+                except Exception:
+                    pass
                 close_price = float(close_deal.price)
                 # v3.0.6 OBSERVER: attribute this close to its fleet event (if any)
                 # and finalize the event once all members have closed. Wrapped so a
@@ -595,8 +604,14 @@ def _check_boost_triggers(self):
     # runs: hard-closing a breaching boost protects an OPEN position, it is not a
     # new entry. GUARDED read (a stub trader without the runtime dict reads
     # ENABLED -- see live_trader._engine_enabled).
+    # v3.7.3: the anchors engine takes NO new boost risk when it is switched OFF OR its
+    # daily stop is active (loss halt / profit lock / account lock) -- the boost family is
+    # entry-side. The whipsaw-cap enforcement still runs (protective close of a breaching
+    # boost). GUARDED: a stub without either seam reads ENABLED.
     _eng = getattr(self, 'engines', None)
-    if isinstance(_eng, dict) and not bool(_eng.get('anchors', True)):
+    _dsb = getattr(self, '_anchors_daystop_blocked', None)
+    _daystop_blocked = bool(callable(_dsb) and _dsb())
+    if (isinstance(_eng, dict) and not bool(_eng.get('anchors', True))) or _daystop_blocked:
         try:
             self._enforce_boost_cap(mid)
         except Exception as e:
