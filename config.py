@@ -234,7 +234,7 @@ class Config:
     # E-1 ghost: the stale "DEFAULT OFF / legacy monster is live" comment no longer
     # matched the live config.)
     rogue_a1_anchor_mode: bool = True           # Fix 4 master flag (DEFAULT ON, live engine)
-    rogue_entry_confirm_redesign: float = 10.0  # $ off the anchor to ENTER in the move dir
+    rogue_entry_confirm_redesign: float = 5.0  # $ off the anchor to ENTER in the move dir
     rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
     rogue_daily_soft_lock: float = 30.0         # soft banked floor ($) -- NEVER a hard stop
     rogue_rescue_cap_dollars: float = 13.0      # per-recovery-leg SL cap on a reversal
