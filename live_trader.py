@@ -399,6 +399,14 @@ class LiveTrader:
             self.state['missed_anchors_today'] = []   # v3.0.5: reset late-window give-ups
             self._last_anchor_attempt = {}            # v3.0.5: clear late-retry throttle
             self.state['kill_switch_locked'] = False
+            # v3.7.3: EVERYTHING resets at the broker day roll -- the anchors + account
+            # profit lock / override / alert flags carry NOTHING into the new day (the day
+            # P&L above is already zeroed; Rogue/Fetcher govs reset in their own new-day path).
+            try:
+                import daystops as _ds
+                _ds.reset_day_state(self.state)
+            except Exception:
+                pass
             self.state['friday_flatten_done'] = False  # Friday weekend-hold-ban gate, daily reset
             # v2.5.4: re-baseline the daily kill switch to TODAY's opening equity.
             # Prevents prior-day losses (and the start-of-day gap from a fixed
@@ -735,6 +743,21 @@ class LiveTrader:
                     _fetcher.manual_seed(self, _rogue.seed_tick_price(self))
                 except Exception:
                     pass
+            elif cmd == "daylock_status":
+                # v3.7.3 /daylock status -> per-engine day P&L vs both thresholds + lock
+                # state for all three engines (+ the disabled-by-default account lock).
+                try:
+                    self._post_daylock_status()
+                except Exception as e:
+                    log.warning(f"daylock status failed (non-fatal): {e!r}")
+            elif cmd == "daylock_override":
+                # v3.7.3 /daylock anchors off | off -> clear the anchors profit lock OR the
+                # account lock for the rest of the broker day (no same-day re-lock). The HARD
+                # loss stop is NOT affected. Fully guarded.
+                try:
+                    self._daylock_override(str(args.get("which", "")).lower())
+                except Exception as e:
+                    log.warning(f"daylock override failed (non-fatal): {e!r}")
 
     def _eod_reached(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
         eod = self._eod_datetime_utc(broker_date, self.cfg)
@@ -959,17 +982,190 @@ class LiveTrader:
         """v3.6.0 shared entries-blocked seam for the ROGUE engine: effective_block =
         friday_window OR engine_disabled. Feeds drive(allow_new_entries=...) -- with
         it blocked, drive() still trail-manages and books closes on an existing open
-        Rogue position (manage-only), it just takes no seed/chain/reversal entry."""
+        Rogue position (manage-only), it just takes no seed/chain/reversal entry.
+        v3.7.3: the (inert-by-default) account-level day lock also blocks new Rogue risk."""
         return (self._friday_entries_blocked(broker_date, utc_now)
-                or not self._engine_enabled('rogue'))
+                or not self._engine_enabled('rogue')
+                or bool(getattr(self, '_account_locked', lambda: False)()))
 
     def _fetcher_entries_blocked(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
         """v3.7.0 shared entries-blocked seam for the FETCHER engine: effective_block =
         friday_window OR engine_disabled. Feeds fetcher.drive(allow_new_entries=...) -- with
         it blocked, drive() still books a close on an existing open Fetcher position
-        (manage-only), it just takes no new $5-move entry. Mirrors _rogue_entries_blocked."""
+        (manage-only), it just takes no new $5-move entry. Mirrors _rogue_entries_blocked.
+        v3.7.3: the (inert-by-default) account-level day lock also blocks new Fetcher risk."""
         return (self._friday_entries_blocked(broker_date, utc_now)
-                or not self._engine_enabled('fetcher'))
+                or not self._engine_enabled('fetcher')
+                or bool(getattr(self, '_account_locked', lambda: False)()))
+
+    # ------------------------------------------------------------------------
+    # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
+    # ------------------------------------------------------------------------
+    def _engine_day_pnls(self):
+        """(anchors, rogue, fetcher) realized day P&L. Anchors = state['daily_pnl'] (magic
+        20260522, already EXCLUDES Rogue/Fetcher); Rogue/Fetcher from their governors.
+        Guarded -- a missing piece reads $0."""
+        st = getattr(self, 'state', {}) or {}
+        anchors = float(st.get('daily_pnl', 0.0) or 0.0)
+        rogue = float(((getattr(self, '_rogue', None) or {}).get('gov') or {}).get('day_pnl', 0.0) or 0.0)
+        fetcher = float(((getattr(self, '_fetcher', None) or {}).get('gov') or {}).get('day_pnl', 0.0) or 0.0)
+        return anchors, rogue, fetcher
+
+    def _anchors_daystop(self):
+        """(blocked, reason, kind) for the ANCHORS engine day stop -- LOSS halt (hard) or
+        PROFIT lock (soft, /daylock-overridable). Latches the profit lock + fires the
+        one-time alert when it first engages. Guarded -> (False,'ok','')."""
+        try:
+            import daystops as _ds
+            dp = float((self.state or {}).get('daily_pnl', 0.0) or 0.0)
+            if _ds.latch_profit(dp, self.cfg, self.state):
+                self._anchors_profit_alert(dp)
+            return _ds.anchors_daystop(dp, self.cfg, self.state)
+        except Exception:
+            return False, 'ok', ''
+
+    def _anchors_daystop_blocked(self) -> bool:
+        """True iff the ANCHORS engine may take NO new risk today -- its own loss halt /
+        profit lock OR the account lock. Consulted by the straddle-skip + the boost gate.
+        GUARDED: a stub without state reads NOT blocked. Manage-only never routes here."""
+        try:
+            blocked, _r, _k = self._anchors_daystop()
+            return bool(blocked) or self._account_locked()
+        except Exception:
+            return False
+
+    def _anchors_profit_alert(self, day_pnl):
+        """One-time loud PROFIT-LOCK alert for the anchors engine (log + Discord). Guarded."""
+        try:
+            if (self.state or {}).get('anchors_profit_alerted'):
+                return
+            self.state['anchors_profit_alerted'] = True
+            ps = float(getattr(self.cfg, 'anchors_daily_profit_stop', 0.0))
+            msg = (f"⚓ [ANCHORS] DAY PROFIT STOP +${float(day_pnl):.0f} >= ${ps:.0f} — "
+                   f"entries locked (/daylock anchors off to override)")
+            log.warning(msg)
+            try:
+                self.tele.warn(msg)
+            except Exception:
+                pass
+            try:
+                import p1_state as _p1
+                _p1.save(self, force=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _account_locked(self) -> bool:
+        """True iff the (inert-by-default) account-level lock is engaged: combined realized
+        P&L across all magics >= account_daily_profit_stop_pct x day-start equity. pct == 0
+        -> always False (owner default). Latches + one-time alert on engage. Guarded."""
+        try:
+            import daystops as _ds
+            a, r, f = self._engine_day_pnls()
+            combined = a + r + f
+            dse = float((self.state or {}).get('day_start_equity')
+                        or getattr(self.cfg, 'starting_balance', 0.0))
+            blocked, _reason = _ds.account_daystop(combined, dse, self.cfg, self.state)
+            if blocked and not self.state.get('account_profit_locked'):
+                self.state['account_profit_locked'] = True
+                if not self.state.get('account_profit_alerted'):
+                    self.state['account_profit_alerted'] = True
+                    pct = float(getattr(self.cfg, 'account_daily_profit_stop_pct', 0.0))
+                    msg = (f"💰 ACCOUNT DAY LOCK — combined +${combined:.0f} >= {pct*100:g}% "
+                           f"of day-start equity — all engines manage-only "
+                           f"(/daylock off to override)")
+                    log.warning(msg)
+                    try:
+                        self.tele.warn(msg)
+                    except Exception:
+                        pass
+            return bool(blocked)
+        except Exception:
+            return False
+
+    def _anchors_daystop_skip(self, label, anchor_utc, utc_now):
+        """A scheduled anchor came DUE while the anchors engine is halted/locked: mark it
+        missed (skip ONCE per anchor per day, no late-window retry) with a loud one-time
+        message. Manage-only -- open legs untouched. Guarded."""
+        try:
+            missed = self.state.setdefault('missed_anchors_today', [])
+            if label in missed:
+                return
+            missed.append(label)
+            _b, _reason, kind = self._anchors_daystop()
+            if not _b and self._account_locked():
+                kind = 'account'
+            a, _r, _f = self._engine_day_pnls()
+            names = {'loss': 'loss halt', 'profit': 'profit lock', 'account': 'account lock'}
+            msg = (f"⚓ {label} skipped: anchors {names.get(kind, kind or 'day stop')} "
+                   f"(day ${a:+.0f} vs profit "
+                   f"${float(getattr(self.cfg, 'anchors_daily_profit_stop', 0.0)):.0f} / "
+                   f"loss ${float(getattr(self.cfg, 'anchors_daily_loss_stop', 0.0)):.0f}) "
+                   f"— no new straddle today")
+            log.warning(msg)
+            try:
+                self.tele.warn(msg)
+            except Exception:
+                pass
+            self._save_state()
+        except Exception as e:
+            log.warning(f"anchors daystop skip failed (non-fatal): {e!r}")
+
+    def _daylock_lines(self):
+        """The /daylock status lines (also reused in the /engines embed). Guarded -> []."""
+        try:
+            import daystops as _ds
+            a, r, f = self._engine_day_pnls()
+            dse = float((self.state or {}).get('day_start_equity')
+                        or getattr(self.cfg, 'starting_balance', 0.0))
+            return _ds.render_status(a, r, f, a + r + f, dse, self.cfg, self.state)
+        except Exception:
+            return []
+
+    def _post_daylock_status(self, note: str = ""):
+        """The /daylock status embed: each engine's realized day P&L vs BOTH thresholds +
+        lock/halt state, plus the (disabled-by-default) account lock. Guarded."""
+        try:
+            lines = ([note] if note else []) + self._daylock_lines()
+            self.tele.send("🔒 *DAY LOCKS*\n" + "\n".join(lines), Severity.INFO)
+        except Exception as e:
+            log.warning(f"daylock status post failed (non-fatal): {e!r}")
+
+    def _daylock_override(self, which: str):
+        """Clear the ANCHORS profit lock (which='anchors') or the ACCOUNT lock
+        (which='account') for the rest of the broker day -- no same-day re-lock. The HARD
+        loss stop is NEVER cleared. Loud one-time alert. Guarded."""
+        import daystops as _ds
+        if which == 'anchors':
+            _b, _reason, kind = self._anchors_daystop()
+            if kind == 'loss':
+                self.tele.warn("⚓ /daylock anchors off IGNORED — anchors is in a LOSS HALT "
+                               "(not overridable), not a profit lock.")
+                return
+            self.state[_ds.K_ANCHORS_OVERRIDE] = True
+            a, _r, _f = self._engine_day_pnls()
+            msg = (f"⚓ [ANCHORS] PROFIT STOP OVERRIDDEN BY /daylock anchors off "
+                   f"(day ${a:+.0f}) — entries re-enabled for the day (no re-lock)")
+        elif which == 'account':
+            self.state[_ds.K_ACCOUNT_OVERRIDE] = True
+            a, r, f = self._engine_day_pnls()
+            msg = (f"💰 ACCOUNT LOCK OVERRIDDEN BY /daylock off (combined ${a + r + f:+.0f}) "
+                   f"— all engines re-enabled for the day (no re-lock)")
+        else:
+            self.tele.info("Usage: `/daylock anchors off` or `/daylock off`")
+            return
+        log.warning(msg)
+        try:
+            self.tele.warn(msg)
+        except Exception:
+            pass
+        try:
+            import p1_state as _p1
+            _p1.save(self, force=True)
+        except Exception:
+            pass
+        self._post_daylock_status()
 
     def _open_counts_per_magic(self):
         """Broker-truth open-position/pending counts per magic (anchor 20260522 /
@@ -1014,6 +1210,14 @@ class LiveTrader:
                 "Seed fallback": str(getattr(self.cfg, 'rogue_seed_fallback',
                                              'a1_time_snapshot')),
             }
+            # v3.7.3: fold the per-engine day-lock states into the engines embed.
+            try:
+                for _ln in self._daylock_lines():
+                    _k, _, _v = str(_ln).partition(': ')
+                    if _v:
+                        snap[f"Day {_k}"] = _v
+            except Exception:
+                pass
             lines = ([note] if note else []) + [
                 f"{k}: {v}" for k, v in snap.items()]
             self.tele.send("⚙️ *ENGINES*\n" + "\n".join(lines), Severity.INFO,

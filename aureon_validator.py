@@ -34,17 +34,21 @@ _EXPECTED_FLAGS = (
     'fetcher_consecutive_fail_stop', 'fetcher_flatten_at_eod', 'fetcher_seed_fallback',
     # 2026-07-08 daily stops (soft profit-lock + tightened loss halt), both engines
     'rogue_daily_loss_stop', 'rogue_daily_profit_stop', 'fetcher_daily_profit_stop',
+    # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
+    'anchors_daily_profit_stop', 'anchors_daily_loss_stop', 'account_daily_profit_stop_pct',
 )
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
-                    'boosts_common', 'strategy', 'break_hold', 'fetcher')
+                    'boosts_common', 'strategy', 'break_hold', 'fetcher', 'daystops')
 # the LiveTrader seams that MUST be bound for the per-tick flow to dispatch.
 _SEAMS = ('_break_and_hold_ok', '_rescue_entry_ok', '_check_boost_triggers',
           '_resolved_anchor_hm', '_process_anchor_if_due',
           # v3.6.0 engine switches: the shared entries-blocked seams + the runtime read
           '_engine_enabled', '_anchor_entries_blocked', '_rogue_entries_blocked',
           # v3.7.0 FETCHER engine: its shared entries-blocked seam
-          '_fetcher_entries_blocked')
+          '_fetcher_entries_blocked',
+          # v3.7.3 ANCHORS daily stops + account lock seams
+          '_anchors_daystop_blocked', '_account_locked')
 
 
 def _probe(cfg):
@@ -131,6 +135,21 @@ def _probe(cfg):
           f'fetcher_seed_fallback={_f_seed!r}')
     except Exception as e:
         w('fetcher:import', False, f'fetcher import FAILED: {e!r}')
+
+    # 4d. v3.7.3 ANCHORS daily stops + account lock: the daystops module imports, the
+    # thresholds are sane bounds (loss <= 0, profit >= 0, account pct >= 0; 0 disables),
+    # and the anchors day P&L rebuild (Part 1) exists.
+    try:
+        import daystops as _ds
+        _a_loss = float(getattr(cfg, 'anchors_daily_loss_stop', 0.0))
+        _a_profit = float(getattr(cfg, 'anchors_daily_profit_stop', 0.0))
+        _acct_pct = float(getattr(cfg, 'account_daily_profit_stop_pct', 0.0))
+        w('anchors:daily_stops_sane', _a_loss <= 0.0 and _a_profit >= 0.0 and _acct_pct >= 0.0,
+          f'anchors loss={_a_loss} (<=0) profit={_a_profit} (>=0) account_pct={_acct_pct} (>=0)')
+        w('anchors:daypnl_rebuild_present', callable(getattr(_ds, 'rebuild_anchors_day_pnl', None)),
+          'daystops.rebuild_anchors_day_pnl present (E-20 for anchors)')
+    except Exception as e:
+        w('daystops:import', False, f'daystops import FAILED: {e!r}')
 
     # 5. derived-cap discipline present (rescue/rally caps resolvable).
     try:

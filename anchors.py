@@ -222,6 +222,14 @@ def _process_anchor_if_due(self, broker_date: DateType, utc_now: pd.Timestamp):
         delta = (utc_now - anchor_utc).total_seconds()
         if delta < 0:
             continue
+        # v3.7.3 ANCHORS DAILY STOP: a scheduled anchor that comes DUE while the anchors
+        # engine is halted (loss) / profit-locked / account-locked is SKIPPED ONCE, loudly,
+        # and marked missed -- NO late-window retry. Manage-only: open legs are untouched.
+        # Guarded read (a stub without the seam reads NOT blocked -> unchanged behavior).
+        _dsb = getattr(self, '_anchors_daystop_blocked', None)
+        if callable(_dsb) and _dsb():
+            self._anchors_daystop_skip(label, anchor_utc, utc_now)
+            continue
         if delta < window_s:
             # On-time OR inside the late window: (re-)attempt placement.
             # Skip if an attempt is already in flight (single deferred slot) so we

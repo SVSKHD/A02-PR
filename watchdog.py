@@ -97,7 +97,9 @@ ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
                     # v3.7.0 adds /fetcher (mirrors /rogue)
                     "anchors","rogue","fetcher","engines",
                     # v3.7.1 manual current-tick re-seed (live testing)
-                    "rogueseed","fetchseed"}
+                    "rogueseed","fetchseed",
+                    # v3.7.3 per-engine daily stops status + overrides
+                    "daylock"}
 
 
 HELP_TEXT = """*AUREON v2 commands*
@@ -117,6 +119,9 @@ HELP_TEXT = """*AUREON v2 commands*
 🪣 `/fetcher flatten confirm` — close ONLY Fetcher-magic (20260707) positions
 🌱 `/rogueseed` — re-anchor Rogue at the current tick (live testing; DEMO-only)
 🌱 `/fetchseed` — re-anchor Fetcher at the current tick (live testing; DEMO-only)
+🔒 `/daylock status` — per-engine day P&L vs profit/loss stops + lock state
+🔓 `/daylock anchors off` — override the anchors profit lock (loss stop stays)
+🔓 `/daylock off` — override the account lock (disabled by default)
 ⚙️ `/engines status` — all engines' state + open count per magic
 ❓ `/help` — this message
 """
@@ -542,6 +547,24 @@ class Watchdog:
             self._write_command("fetchseed")
             self.tele.info("🌱 `/fetchseed` queued — bot re-anchors Fetcher at its current "
                            "tick next tick (or replies with the refusal reason).")
+        elif cmd == "daylock":
+            # v3.7.3 /daylock status | anchors off | off. The watchdog only PARSES + queues;
+            # the bot renders / applies next tick. 'anchors off' overrides the anchors
+            # profit lock; bare 'off' overrides the account lock.
+            toks = (raw_text or "").split()[1:]
+            sub = toks[0].lower() if toks else "status"
+            if sub == "anchors" and len(toks) >= 2 and toks[1].lower() == "off":
+                self._write_command("daylock_override", {"which": "anchors"})
+                self.tele.info("🔓 `/daylock anchors off` queued — clears the anchors "
+                               "profit lock next tick (loss stop stays active).")
+            elif sub == "off":
+                self._write_command("daylock_override", {"which": "account"})
+                self.tele.info("🔓 `/daylock off` queued — clears the account lock next tick.")
+            elif sub == "status":
+                self._write_command("daylock_status")
+            else:
+                self.tele.info("Usage: `/daylock status` · `/daylock anchors off` · "
+                               "`/daylock off`")
         elif cmd == "today":
             self.tele.info(self._format_today_summary())
         elif cmd in ("anchors", "rogue", "fetcher"):
