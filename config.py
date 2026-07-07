@@ -182,18 +182,18 @@ class Config:
     rogue_min_range: float = 15.0      # ... AND total range >= $15
     rogue_body_mult: float = 1.5       # ... AND combined body >= this x avg bar range (thrust)
     rogue_entry_confirm: float = 20.0  # early entry: enter ~$20 in off the anchor (not the top)
-    rogue_init_sl: float = 5.0         # tight initial stop -> a fake-out is a small capped loss
+    rogue_init_sl: float = 10.0        # changed 2026-07-07 (D-13). 07-07 live: four
+    # wave-retrace strikes at $5 SL inside a genuine $38 trend day; $5 stop sits inside
+    # ordinary counterwave amplitude. One strike now = -$350 (10 x 0.35 x 100).
     rogue_trail_arm: float = 5.0       # profit ($) before the adaptive trail engages
     rogue_trail_gap_early: float = 3.0 # tight trail until deep in profit (protect vs fake-out)
     rogue_trail_gap_deep: float = 6.0  # wider once proven (don't shake out a real monster)
     rogue_trail_widen_at: float = 15.0 # profit ($) at which the trail widens 3 -> 6
     # GOVERNORS on the 10-cap (mandatory brakes for a thin edge):
-    rogue_daily_loss_stop: float = -525.0   # E-5 (owner decision): Rogue STOPS new entries
-    # for the day at -$525 (was -$150). Rationale: one init-SL strike is -$175 (rogue_init_sl
-    # $5 x 0.35 x 100), so the old -$150 halted Rogue on the FIRST fake-out -- the
-    # 3-consecutive-fail pause and the 10/day cap could never engage. At -$525 = 3 init-SL
-    # strikes, the 3-fail pause (and small-fakeout streaks) can fire BEFORE the daily halt,
-    # while a genuine whipsaw day still hard-stops at -$525.
+    rogue_daily_loss_stop: float = -1050.0  # PAIRED with rogue_init_sl (E-5 rule):
+    # stop = 3 x init-SL strike so the 3-consecutive-fail pause can fire BEFORE the
+    # daily halt. At the old -525 with a $10 SL the halt would fire at 1.5 strikes and
+    # the pause would be dead code (the original E-5 defect shape).
     rogue_consecutive_fail_stop: int = 3    # 3 init-SL fake-outs in a row -> pause new entries
     # E-4: at EOD, flatten an OPEN Rogue position instead of letting it ride overnight
     # on its own SL/TP. DEFAULT ON since 2026-07-02 (owner decision): an overnight /
