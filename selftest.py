@@ -342,7 +342,7 @@ STEP_NAMES = {
     256: "account lock inert",     # account lock inert at pct=0; armed >0 locks; /daylock off overrides
     257: "daylock day roll reset", # all locks/overrides/alerts reset at the broker day roll
     # v3.7.4 /status per-engine day P&L display
-    258: "status per-engine pnl",  # /status card shows 3 engine rows + account total; P&L == daystops source
+    258: "status per-engine pnl",  # /status: additive 'Realized P&L by engine (today)' -- 3 rows + Total; reconciles w/ existing line
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -8324,10 +8324,13 @@ class SelfTest:
         self._record(257, PASS if ok else FAIL, detail)
 
     def _step_status_per_engine_pnl(self):
-        # 258 v3.7.4 /status DISPLAY: the per-engine day-P&L payload the bot writes carries
-        # all three engines + the account total, its P&L values EQUAL the daystops source
-        # (_engine_day_pnls -- no second computation), lock states are read from the govs,
-        # and the watchdog card renders a row per engine + the account total.
+        # 258 v3.7.4 /status DISPLAY (ADDITIVE): the bot writes a per-engine day-P&L payload
+        # whose values EQUAL the daystops source (_engine_day_pnls -- no second computation);
+        # the watchdog renders ONE new 'Realized P&L by engine (today)' section -- 3 signed
+        # engine rows + Total -- while EVERY existing /status field is left unchanged.
+        # RECONCILIATION (surfaced as a build FAIL, never masked): the existing account-wide
+        # 'Realized P&L' line is anchors-only (state['daily_pnl']); it must equal the Non-OCO
+        # (anchors) row exactly, and the 3 rows must sum to the Total.
         import types
         import live_trader as _lt, watchdog as _wd, rogue as _r, fetcher as _f
         try:
@@ -8338,30 +8341,74 @@ class SelfTest:
             tr._day_pnl_by_engine_payload = _lt.LiveTrader._day_pnl_by_engine_payload.__get__(tr)
             tr._gov_lock_label = _lt.LiveTrader._gov_lock_label      # @staticmethod
             payload = tr._day_pnl_by_engine_payload()
-            has_all = all(k in payload for k in ('anchors', 'rogue', 'fetcher', 'account'))
             # SINGLE SOURCE: the payload P&L equals _engine_day_pnls() exactly.
             a, r, f = tr._engine_day_pnls()
             same_source = (payload['anchors']['pnl'] == round(a, 2)
                            and payload['rogue']['pnl'] == round(r, 2)
                            and payload['fetcher']['pnl'] == round(f, 2)
                            and payload['account']['pnl'] == round(a + r + f, 2))
-            # lock states read from the govs (not recomputed)
-            locks_ok = (payload['rogue']['lock'] == 'PROFIT-LOCKED'
-                        and payload['fetcher']['lock'] == 'LOSS-HALTED'
-                        and payload['anchors']['lock'] == 'active')
-            # the watchdog card renders a row per engine + the account total.
+
+            # A status dict exactly as the bot writes it: the existing account-wide
+            # 'Realized P&L' line == state['daily_pnl'] (anchors-only), alongside the payload.
+            realized_line = tr.state['daily_pnl']
+            status = {'broker_login': 12345, 'broker_server': 'Demo', 'broker_date': '2026-07-08',
+                      'broker_balance': 100000.0, 'broker_equity': 100280.0, 'lot_size': 1.0,
+                      'kill_threshold_usd': 3000.0, 'daily_loss_pct': 0.03,
+                      'daily_pnl_realized': realized_line, 'open_positions': 2, 'pending_orders': 1,
+                      'anchors_processed_today': ['A1'], 'kill_switch_locked': False,
+                      'day_pnl_by_engine': payload}
+
             wd = types.SimpleNamespace()
             wd._day_pnl_by_engine_rows = _wd.Watchdog._day_pnl_by_engine_rows.__get__(wd)
-            rows = wd._day_pnl_by_engine_rows({'day_pnl_by_engine': payload})
+            wd._heartbeat_age = lambda: 5.0
+            wd._format_status = _wd.Watchdog._format_status.__get__(wd)
+
+            rows = wd._day_pnl_by_engine_rows(status)
             labels = [k for k, _v in rows]
-            rows_ok = (labels == ['Anchors (non-oco)', 'Rogue', 'Fetcher', 'Account total']
-                       and any('420' in v for k, v in rows if k == 'Rogue')
-                       and any('3% kill' in v for k, v in rows if k == 'Account total'))
-            # an older bot (no payload) renders NO rows (no crash).
+            rows_ok = labels == ['Non-OCO (anchors)', 'Rogue', 'Fetcher', 'Total']
+
+            def _parse(s):                                           # '+$250.00' / '-$390.00' -> float
+                neg = s.strip().startswith('-')
+                num = float(s.replace('+', '').replace('-', '').replace('$', '').replace(',', ''))
+                return -num if neg else num
+            vals = {k: _parse(v) for k, v in rows}
+            # signs: anchors + and fetcher - render with the right prefix.
+            signs_ok = (dict(rows)['Non-OCO (anchors)'].startswith('+$')
+                        and dict(rows)['Fetcher'].startswith('-$'))
+            # the 3 engine rows SUM to the Total row (internal arithmetic invariant).
+            rows_sum_to_total = (abs((vals['Non-OCO (anchors)'] + vals['Rogue'] + vals['Fetcher'])
+                                     - vals['Total']) < 0.005)
+            # RECONCILIATION: the Non-OCO (anchors) row == the existing account-wide
+            # 'Realized P&L' line (both are state['daily_pnl']). A drift here is the attribution
+            # gap the spec wants surfaced -- it FAILS the build rather than being masked.
+            reconciles = abs(vals['Non-OCO (anchors)'] - round(realized_line, 2)) < 0.005
+            # the Total is the true 3-engine sum and exceeds the anchors-only line by exactly
+            # Rogue+Fetcher (here +$280 total vs +$250 realized line).
+            total_is_all_engines = abs(vals['Total'] - round(a + r + f, 2)) < 0.005
+
+            # ADDITIVE: EVERY existing /status field is still present, unchanged, in the render.
+            txt = wd._format_status(status)
+            existing_fields = ['Account:', 'Balance:', 'Equity:', 'Floating P&L:',
+                               'Kill switch at:', 'Realized P&L:', 'Open positions:',
+                               'Pending orders:', 'Anchors today:', 'Heartbeat:']
+            existing_ok = all(lbl in txt for lbl in existing_fields)
+            # the existing Realized P&L line still shows the anchors-only figure ($250.00),
+            # untouched by the new section.
+            realized_untouched = 'Realized P&L: `$250.00`' in txt
+            section_present = 'Realized P&L by engine (today):' in txt
+
+            # an older bot (no payload) renders NO new rows (no crash), card otherwise intact.
             empty_ok = wd._day_pnl_by_engine_rows({}) == []
-            ok = has_all and same_source and locks_ok and rows_ok and empty_ok
-            detail = (f"has_all={has_all} same_source={same_source} locks_ok={locks_ok} "
-                      f"rows={labels} rows_ok={rows_ok} empty_safe={empty_ok}")
+
+            ok = (same_source and rows_ok and signs_ok and rows_sum_to_total and reconciles
+                  and total_is_all_engines and existing_ok and realized_untouched
+                  and section_present and empty_ok)
+            detail = (f"same_source={same_source} rows={labels} rows_ok={rows_ok} "
+                      f"signs_ok={signs_ok} rows_sum_to_total={rows_sum_to_total} "
+                      f"reconciles(anchors=={realized_line:.2f})={reconciles} "
+                      f"total={vals.get('Total')}(all_engines={total_is_all_engines}) "
+                      f"existing_fields_ok={existing_ok} realized_untouched={realized_untouched} "
+                      f"section_present={section_present} empty_safe={empty_ok}")
         except Exception as e:
             self._record(258, FAIL, f"raised: {e!r}"); return
         self._record(258, PASS if ok else FAIL, detail)

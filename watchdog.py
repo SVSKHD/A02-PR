@@ -371,10 +371,11 @@ class Watchdog:
     # ------------------------------------------------------------------------
 
     def _day_pnl_by_engine_rows(self, status: dict):
-        """v3.7.4: (label, value) rows for the /status 'Day P&L by engine' section, built
-        from the bot-written day_pnl_by_engine payload (the SAME realized day P&L the daily
-        stops act on). Returns [] when the payload is absent (older bot) -- never recomputes
-        P&L here. Guarded."""
+        """(label, value) rows for the /status 'Realized P&L by engine (today)' section, built
+        from the bot-written day_pnl_by_engine payload -- the SAME realized day P&L the daily
+        stops read (_engine_day_pnls; never recomputed here). Signed per-engine realized values
+        -- Non-OCO (anchors), Rogue, Fetcher -- then Total (their sum). Returns [] when the
+        payload is absent (older bot) so the rest of the card renders unchanged. Guarded."""
         try:
             dpe = status.get("day_pnl_by_engine") or {}
             if not dpe:
@@ -383,31 +384,25 @@ class Watchdog:
             def _m(v):
                 try:
                     f = float(v)
-                    return f"{'+' if f >= 0 else '-'}${abs(f):,.0f}"
+                    return f"{'+' if f >= 0 else '-'}${abs(f):,.2f}"
                 except (TypeError, ValueError):
                     return "n/a"
 
-            _lock = {'active': '🟢 active', 'PROFIT-LOCKED': '🟡 PROFIT-LOCKED',
-                     'LOSS-HALTED': '🔴 LOSS-HALTED', 'override': '🟠 override'}
             rows = []
-            for key, name in (('anchors', 'Anchors (non-oco)'), ('rogue', 'Rogue'),
+            for key, name in (('anchors', 'Non-OCO (anchors)'), ('rogue', 'Rogue'),
                               ('fetcher', 'Fetcher')):
                 e = dpe.get(key) or {}
-                rows.append((name,
-                             f"{_m(e.get('pnl'))}   [+${float(e.get('profit', 0)):,.0f} / "
-                             f"-${abs(float(e.get('loss', 0))):,.0f}]   "
-                             f"{_lock.get(e.get('lock'), e.get('lock') or 'active')}"))
+                rows.append((name, _m(e.get('pnl'))))
             acct = dpe.get('account') or {}
-            rows.append(("Account total",
-                         f"{_m(acct.get('pnl'))}   [{float(acct.get('kill_pct', 0)):.0f}% kill: "
-                         f"-${abs(float(acct.get('kill_threshold', 0))):,.0f}]"))
+            rows.append(("Total", _m(acct.get('pnl'))))
             return rows
         except Exception:
             return []
 
     def _status_card(self, status: dict):
         """v3.1.2: /status as a clean field-grid card (account · P&L · positions).
-        v3.7.4: + a 'Day P&L by engine' section (per-engine realized day P&L vs stops)."""
+        v3.7.4: + a 'Realized P&L by engine (today)' section -- ADDITIVE, every existing
+        field (Account..Heartbeat, incl. the account-wide Realized P&L line) is unchanged."""
         def _money(v):
             try:
                 f = float(v)
@@ -441,11 +436,14 @@ class Watchdog:
         snap["Kill switch"] = (("🔴 LOCKED" if locked else "🟢 OK")
                                + (f" (-${kill_th:,.0f})" if kill_th else ""))
         snap["Heartbeat"] = f"{hb_age:.0f}s ago" if hb_age is not None else "none yet"
-        # v3.7.4 Day P&L by engine (per-magic realized day P&L vs profit/loss stops + lock)
+        # v3.7.4 Realized P&L by engine (today) -- ADDITIVE section: signed per-magic realized
+        # day P&L (Non-OCO/Rogue/Fetcher) + Total, from the SAME source the daystops read.
         _rows = self._day_pnl_by_engine_rows(status)
         if _rows:
-            snap["── Day P&L by engine ──"] = ""
+            snap["── Realized P&L by engine (today) ──"] = ""
             for _k, _v in _rows:
+                if _k == "Total":
+                    snap["─────────"] = ""
                 snap[_k] = _v
         return dc.card_status(snap)
 
@@ -483,12 +481,12 @@ class Watchdog:
             f"   {', '.join(anchors) if anchors else '(none yet)'}",
             f"💓 Heartbeat: {hb_str}",
         ]
-        # v3.7.4 Day P&L by engine (per-magic realized day P&L vs profit/loss stops + lock)
+        # v3.7.4 Realized P&L by engine (today) -- ADDITIVE section (signed per-magic + Total).
         _rows = self._day_pnl_by_engine_rows(status)
         if _rows:
-            lines.append("📊 *Day P&L by engine:*")
+            lines.append("📊 *Realized P&L by engine (today):*")
             for _k, _v in _rows:
-                if _k == "Account total":
+                if _k == "Total":
                     lines.append("   ─────────────")
                 lines.append(f"   {_k}: `{_v}`")
         return "\n".join(lines)
