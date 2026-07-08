@@ -611,6 +611,8 @@ class LiveTrader:
             # v3.7.4 per-engine realized day P&L + thresholds + lock state (display-only;
             # SAME source the daily stops read -- _engine_day_pnls / govs / daystops).
             "day_pnl_by_engine": self._day_pnl_by_engine_payload(),
+            # v3.7.6 daily 2% target with the A4 gate (display-only; [] when disabled).
+            "target_lines": self._target_status_lines_payload(),
             "mode": "paper" if self.paper else "live",
             "lot_size": self.cfg.lot_size,
             "starting_balance": self.cfg.starting_balance,
@@ -1030,10 +1032,21 @@ class LiveTrader:
     def _anchors_daystop_blocked(self) -> bool:
         """True iff the ANCHORS engine may take NO new risk today -- its own loss halt /
         profit lock OR the account lock. Consulted by the straddle-skip + the boost gate.
-        GUARDED: a stub without state reads NOT blocked. Manage-only never routes here."""
+        GUARDED: a stub without state reads NOT blocked. Manage-only never routes here.
+        v3.7.6: post-A4 the only remaining anchor is A5 -- when the account lock is engaged
+        SOLELY by the daily-target SECURED state and account_target_skip_a5_when_met is OFF,
+        the anchor (A5) is still allowed; a give-back / legacy account lock always blocks."""
         try:
             blocked, _r, _k = self._anchors_daystop()
-            return bool(blocked) or self._account_locked()
+            if bool(blocked):
+                return True
+            if not self._account_locked():
+                return False
+            _tb, _tr, tkind = self._account_target()
+            if (tkind == 'secured'
+                    and not bool(getattr(self.cfg, 'account_target_skip_a5_when_met', True))):
+                return False   # secured but A5-skip disabled -> let A5 fire (rogue/fetcher stay blocked)
+            return True
         except Exception:
             return False
 
@@ -1060,9 +1073,20 @@ class LiveTrader:
             pass
 
     def _account_locked(self) -> bool:
-        """True iff the (inert-by-default) account-level lock is engaged: combined realized
-        P&L across all magics >= account_daily_profit_stop_pct x day-start equity. pct == 0
-        -> always False (owner default). Latches + one-time alert on engage. Guarded."""
+        """True iff the account-level lock is engaged. TWO mechanisms share this seam (either
+        one blocking -> all three engines go manage-only; the per-engine loss stops, kill
+        switch and EOD/Friday flatten all OUTRANK it):
+          (1) the daily 2% TARGET lock (secured post-A4 / give-back) -- the owner-facing
+              default (account_target_pct = 0.02);
+          (2) the legacy inert account profit-stop pct (account_daily_profit_stop_pct, 0 by
+              default) -- kept for back-compat, disabled unless armed.
+        Guarded -> False."""
+        try:
+            tb, _tr, _tk = self._account_target()
+            if bool(tb):
+                return True
+        except Exception:
+            pass
         try:
             import daystops as _ds
             a, r, f = self._engine_day_pnls()
@@ -1086,6 +1110,80 @@ class LiveTrader:
             return bool(blocked)
         except Exception:
             return False
+
+    def _post_a4_complete(self) -> bool:
+        """True once the final-entry anchor (account_target_final_anchor, A4) has FIRED today
+        AND fully CLOSED -- it is in processed_anchors_today AND no OPEN shadow leg is still
+        tagged with that anchor. Before this the day is still building and the target NEVER
+        gates entries. Other engines' open legs (Rogue/Fetcher/earlier anchors) may ride
+        freely -- only an unclosed A4 leg holds this False. Guarded -> False."""
+        try:
+            final = str(getattr(self.cfg, 'account_target_final_anchor', 'A4_1640_NYopen'))
+            processed = (self.state or {}).get('processed_anchors_today', []) or []
+            if final not in processed:
+                return False
+            prefix = final[:2]  # 'A4'
+            for sh in (getattr(self, 'shadow_positions', {}) or {}).values():
+                lbl = (sh.get('anchor_label') if hasattr(sh, 'get') else None) or ''
+                if str(lbl).startswith(prefix):
+                    return False   # an A4 leg is still open -> not yet closed
+            return True
+        except Exception:
+            return False
+
+    def _account_target(self):
+        """(blocked, reason, kind) for the daily 2% TARGET lock (repurposed account lock).
+        Updates the running peak of COMBINED NET realized day P&L, latches SECURED (post-A4,
+        net >= min_target) / GIVE-BACK (peak banked >= min then retreat >= giveback) and fires
+        each one-time alert. kind in ('secured','giveback',''). Disabled when
+        account_target_pct <= 0 or overridden. Read-only on order flow; guarded -> not-blocked."""
+        try:
+            import daystops as _ds
+            if float(getattr(self.cfg, 'account_target_pct', 0.0) or 0.0) <= 0.0:
+                return False, 'ok', ''
+            a, r, f = self._engine_day_pnls()
+            net = a + r + f
+            dse = float((self.state or {}).get('day_start_equity')
+                        or getattr(self.cfg, 'starting_balance', 0.0))
+            _ds.update_peak(net, self.state)
+            post_a4 = self._post_a4_complete()
+            just_secured, just_giveback = _ds.latch_target(net, dse, post_a4, self.cfg, self.state)
+            if just_secured:
+                self._account_target_alert('secured', net, dse)
+            if just_giveback:
+                self._account_target_alert('giveback', net, dse)
+            return _ds.target_daystop(net, dse, post_a4, self.cfg, self.state)
+        except Exception:
+            return False, 'ok', ''
+
+    def _account_target_alert(self, kind, net, dse):
+        """One-time loud alert when the daily target SECURES or a GIVE-BACK lock engages
+        (log + Discord + a forced state persist). Guarded; never touches order flow."""
+        try:
+            import daystops as _ds
+            full, min_t = _ds.target_levels(dse, self.cfg)
+            skip_a5 = bool(getattr(self.cfg, 'account_target_skip_a5_when_met', True))
+            if kind == 'secured':
+                tail = ", A5 skipped" if skip_a5 else ""
+                msg = (f"✅ DAY SECURED +${float(net):,.0f} (>=80% of ${full:,.0f} post-A4) — "
+                       f"new entries stopped, riding open to 2% (${full:,.0f}){tail}")
+            else:  # giveback
+                peak = float((self.state or {}).get(_ds.K_TARGET_PEAK, 0.0) or 0.0)
+                gb = float(getattr(self.cfg, 'account_target_giveback_dollars', 0.0) or 0.0)
+                msg = (f"🛟 GIVE-BACK LOCK — banked +${peak:,.0f}, retreated to +${float(net):,.0f} "
+                       f"(>=${gb:,.0f} give-back) — new entries stopped, open legs ride")
+            log.warning(msg)
+            try:
+                self.tele.warn(msg)
+            except Exception:
+                pass
+            try:
+                import p1_state as _p1
+                _p1.save(self, force=True)
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"account target alert failed (non-fatal): {e!r}")
 
     def _anchors_daystop_skip(self, label, anchor_utc, utc_now):
         """A scheduled anchor came DUE while the anchors engine is halted/locked: mark it
@@ -1122,7 +1220,14 @@ class LiveTrader:
             a, r, f = self._engine_day_pnls()
             dse = float((self.state or {}).get('day_start_equity')
                         or getattr(self.cfg, 'starting_balance', 0.0))
-            return _ds.render_status(a, r, f, a + r + f, dse, self.cfg, self.state)
+            lines = _ds.render_status(a, r, f, a + r + f, dse, self.cfg, self.state)
+            # v3.7.6 daily 2% target with the A4 gate (appended; [] when target disabled).
+            try:
+                lines = lines + _ds.target_status_lines(
+                    a + r + f, dse, self._post_a4_complete(), self.cfg, self.state)
+            except Exception:
+                pass
+            return lines
         except Exception:
             return []
 
@@ -1183,6 +1288,21 @@ class LiveTrader:
         except Exception:
             return {}
 
+    def _target_status_lines_payload(self):
+        """DISPLAY-ONLY: the daily-target /status lines (day-start equity, full/min targets,
+        combined net, pre/post-A4 state, secured flag, A5-skip flag, give-back distance).
+        Read-only -- uses the SAME target core the lock reads and NEVER latches / mutates lock
+        state here. [] when the target is disabled (account_target_pct <= 0). Guarded."""
+        try:
+            import daystops as _ds
+            a, r, f = self._engine_day_pnls()
+            dse = float((self.state or {}).get('day_start_equity')
+                        or getattr(self.cfg, 'starting_balance', 0.0))
+            return _ds.target_status_lines(
+                a + r + f, dse, self._post_a4_complete(), self.cfg, self.state)
+        except Exception:
+            return []
+
     def _post_daylock_status(self, note: str = ""):
         """The /daylock status embed: each engine's realized day P&L vs BOTH thresholds +
         lock/halt state, plus the (disabled-by-default) account lock. Guarded."""
@@ -1208,10 +1328,16 @@ class LiveTrader:
             msg = (f"⚓ [ANCHORS] PROFIT STOP OVERRIDDEN BY /daylock anchors off "
                    f"(day ${a:+.0f}) — entries re-enabled for the day (no re-lock)")
         elif which == 'account':
+            # clears BOTH the (repurposed) daily-target lock and the legacy account lock, and
+            # resumes trading incl. A5 for the rest of the day -- no same-day re-lock. The
+            # per-engine loss stops stay HARD (this never touches them).
             self.state[_ds.K_ACCOUNT_OVERRIDE] = True
+            self.state[_ds.K_TARGET_OVERRIDE] = True
+            self.state[_ds.K_TARGET_SECURED] = False
+            self.state[_ds.K_TARGET_GIVEBACK_LOCKED] = False
             a, r, f = self._engine_day_pnls()
-            msg = (f"💰 ACCOUNT LOCK OVERRIDDEN BY /daylock off (combined ${a + r + f:+.0f}) "
-                   f"— all engines re-enabled for the day (no re-lock)")
+            msg = (f"💰 ACCOUNT / TARGET LOCK OVERRIDDEN BY /daylock off (combined ${a + r + f:+.0f}) "
+                   f"— all engines re-enabled for the day incl. A5 (no re-lock)")
         else:
             self.tele.info("Usage: `/daylock anchors off` or `/daylock off`")
             return

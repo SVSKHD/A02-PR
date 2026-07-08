@@ -343,6 +343,14 @@ STEP_NAMES = {
     257: "daylock day roll reset", # all locks/overrides/alerts reset at the broker day roll
     # v3.7.4 /status per-engine day P&L display
     258: "status per-engine pnl",  # /status: additive 'Realized P&L by engine (today)' -- 3 rows + Total; reconciles w/ existing line
+    # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
+    259: "target levels resolve",     # 2% full / 80% min per day-start equity (50k->1000/800, 60k->1200/960)
+    260: "target pre-A4 no gate",     # net >=80% BEFORE A4 completes does NOT stop entries
+    261: "target post-A4 secured",    # post-A4 >=80% -> all engines blocked + A5 skip + 1 alert + loss coverage
+    262: "target post-A4 under",      # post-A4 <80% -> A5 fires normally, no early close
+    263: "target give-back lock",     # peak >=80% then retreat >=giveback -> locks; open legs unaffected
+    264: "target override resume",    # /daylock off resumes incl A5, no same-day re-lock, loss stops hard
+    265: "target day-roll+disable",   # day roll resets all target state; account_target_pct=0 disables
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -8413,6 +8421,208 @@ class SelfTest:
             self._record(258, FAIL, f"raised: {e!r}"); return
         self._record(258, PASS if ok else FAIL, detail)
 
+    # ------------------------------------------------------------------------
+    # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
+    # ------------------------------------------------------------------------
+    def _target_mk(self, cfg=None):
+        """A stub LiveTrader carrying the daily-2%-target methods (repurposed account lock)
+        bound onto it, for headless target tests. state carries day-start equity + the placed
+        anchors; _rogue/_fetcher hold each engine governor's day P&L; shadow_positions tags
+        open legs (so _post_a4_complete can see whether an A4 leg is still open). warn() alerts
+        are captured for one-time-alert assertions."""
+        import types
+        import live_trader as _lt
+        cfg = cfg or self.cfg
+        alerts = []
+        t = types.SimpleNamespace(
+            cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0,
+                            'processed_anchors_today': []},
+            _rogue=None, _fetcher=None, shadow_positions={}, _save_state=lambda: None,
+            paper=True, run_dir='./run',
+            tele=types.SimpleNamespace(info=lambda *a, **k: None, send=lambda *a, **k: None,
+                                       warn=lambda m='', **k: alerts.append(str(m))))
+        for m in ('_engine_day_pnls', '_account_locked', '_account_target', '_post_a4_complete',
+                  '_account_target_alert', '_anchors_daystop', '_anchors_daystop_blocked',
+                  '_anchors_daystop_skip', '_daylock_override', '_post_daylock_status',
+                  '_daylock_lines', '_target_status_lines_payload'):
+            setattr(t, m, getattr(_lt.LiveTrader, m).__get__(t))
+        return t, alerts
+
+    def _step_target_levels(self):
+        # 259 the daily target resolves off day-start equity: full = account_target_pct (2%),
+        # min = account_target_min_pct (80%) x full. 50k -> 1000/800; 60k -> 1200/960.
+        import daystops as _ds
+        try:
+            f50, m50 = _ds.target_levels(50000, self.cfg)
+            f60, m60 = _ds.target_levels(60000, self.cfg)
+            ok = (abs(f50 - 1000) < 1e-6 and abs(m50 - 800) < 1e-6
+                  and abs(f60 - 1200) < 1e-6 and abs(m60 - 960) < 1e-6)
+            detail = f"50k->full {f50}/min {m50}  60k->full {f60}/min {m60}"
+        except Exception as e:
+            self._record(259, FAIL, f"raised: {e!r}"); return
+        self._record(259, PASS if ok else FAIL, detail)
+
+    def _step_target_pre_a4(self):
+        # 260 BEFORE A4 completes the day is still building: a combined net >=80% ($850) does
+        # NOT stop entries. post_a4=False (A4 not yet placed) -> account NOT locked, anchors
+        # NOT blocked. (Nothing pre-A4 is gated on the target.)
+        import rogue as _r, fetcher as _f
+        try:
+            t, _ = self._target_mk()
+            t.state['daily_pnl'] = 250.0
+            t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=400.0)}
+            t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=200.0)}   # net = 850 (>=800)
+            t.state['processed_anchors_today'] = ['A1_02h_Asia', 'A2_10h_London']  # A4 NOT fired
+            post = t._post_a4_complete()
+            locked = t._account_locked()
+            ablk = t._anchors_daystop_blocked()
+            secured = bool(t.state.get('account_target_secured'))
+            ok = (post is False and locked is False and ablk is False and not secured)
+            detail = (f"net=850 post_a4={post} account_locked={locked} anchors_blocked={ablk} "
+                      f"secured={secured} (entries allowed pre-A4)")
+        except Exception as e:
+            self._record(260, FAIL, f"raised: {e!r}"); return
+        self._record(260, PASS if ok else FAIL, detail)
+
+    def _step_target_post_a4_secured(self):
+        # 261 AT/AFTER A4 fires+closes with combined net >=80%: DAY SECURED -- all three
+        # engines go manage-only (shared _account_locked seam), the remaining anchor A5 is
+        # skipped, exactly ONE alert fires, and open legs keep riding (never force-closed).
+        # LOSS COVERAGE: anchors LOSE -$390 while Rogue/Fetcher carry the day (net still $850);
+        # the losing engine is NOT re-seeded (manage-only leaves its day P&L untouched).
+        import rogue as _r, fetcher as _f
+        try:
+            t, alerts = self._target_mk()
+            t.state['daily_pnl'] = -390.0                       # anchors LOSER (not re-seeded)
+            t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=800.0)}
+            t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=440.0)}   # net = 850
+            t.state['processed_anchors_today'] = ['A1_02h_Asia', 'A4_1640_NYopen']
+            # a WINNING earlier leg (A1, not A4) is still OPEN and riding.
+            t.shadow_positions = {101: {'anchor_label': 'A1_02h_Asia', 'side': 'BUY'}}
+            post = t._post_a4_complete()                        # A4 fired, no A4 leg open -> True
+            net = sum(t._engine_day_pnls())
+            locked = t._account_locked()                        # latches secured + fires alert
+            a5_blk = t._anchors_daystop_blocked()               # A5 skipped (all-engines seam)
+            secured = bool(t.state.get('account_target_secured'))
+            # repeated evaluation must not re-alert nor re-trade the loser.
+            t._account_locked(); t._account_locked()
+            secured_alerts = [m for m in alerts if 'DAY SECURED' in m]
+            loser_untouched = abs(t.state['daily_pnl'] - (-390.0)) < 1e-6
+            open_rides = 101 in t.shadow_positions              # never force-closed
+            ok = (post and abs(net - 850) < 1e-6 and locked and a5_blk and secured
+                  and len(secured_alerts) == 1 and loser_untouched and open_rides)
+            detail = (f"net={net} post_a4={post} all_engine_lock={locked} a5_skip={a5_blk} "
+                      f"secured={secured} secured_alerts={len(secured_alerts)} "
+                      f"loser_anchors=${t.state['daily_pnl']:.0f}(untouched={loser_untouched}) "
+                      f"open_rides={open_rides}")
+        except Exception as e:
+            self._record(261, FAIL, f"raised: {e!r}"); return
+        self._record(261, PASS if ok else FAIL, detail)
+
+    def _step_target_post_a4_under(self):
+        # 262 post-A4 but combined net < 80% ($700): normal course -- the target does NOT
+        # secure, A5 fires normally, no early close, no alert.
+        import rogue as _r, fetcher as _f
+        try:
+            t, alerts = self._target_mk()
+            t.state['daily_pnl'] = 300.0
+            t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=250.0)}
+            t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=150.0)}   # net = 700 (<800)
+            t.state['processed_anchors_today'] = ['A4_1640_NYopen']
+            post = t._post_a4_complete()
+            locked = t._account_locked()
+            a5_fires = t._anchors_daystop_blocked() is False
+            secured = bool(t.state.get('account_target_secured'))
+            no_alert = not any('DAY SECURED' in m for m in alerts)
+            ok = (post and locked is False and a5_fires and not secured and no_alert)
+            detail = (f"net=700 post_a4={post} account_locked={locked} a5_fires={a5_fires} "
+                      f"secured={secured} no_secured_alert={no_alert}")
+        except Exception as e:
+            self._record(262, FAIL, f"raised: {e!r}"); return
+        self._record(262, PASS if ok else FAIL, detail)
+
+    def _step_target_giveback(self):
+        # 263 GIVE-BACK protection (applies once >=80% at any point, pre- OR post-A4): peak
+        # banks +$1000, net retreats to +$780 (give-back $220 >= $200) -> lock new entries
+        # immediately, ONE alert. At the peak itself (net==peak) nothing locks. Open legs are
+        # unaffected (the lock is manage-only -- it mutates no position).
+        try:
+            t, alerts = self._target_mk()
+            t.state['daily_pnl'] = 1000.0                       # peak (pre-A4, not secured)
+            at_peak = t._account_locked()                       # updates peak; net==peak -> no lock
+            peak_hi = float(t.state.get('account_target_peak_net', 0.0))
+            t.state['daily_pnl'] = 780.0                        # retreat $220 from peak
+            locked = t._account_locked()                        # give-back engages (pre-A4 ok)
+            gblock = bool(t.state.get('account_target_giveback_locked'))
+            t._account_locked()                                 # idempotent -- no second alert
+            gb_alerts = [m for m in alerts if 'GIVE-BACK' in m]
+            ok = (abs(peak_hi - 1000) < 1e-6 and at_peak is False and locked is True
+                  and gblock and len(gb_alerts) == 1)
+            detail = (f"peak={peak_hi} at_peak_locked={at_peak} retreat220->locked={locked} "
+                      f"giveback_latched={gblock} gb_alerts={len(gb_alerts)}")
+        except Exception as e:
+            self._record(263, FAIL, f"raised: {e!r}"); return
+        self._record(263, PASS if ok else FAIL, detail)
+
+    def _step_target_override(self):
+        # 264 /daylock off overrides the target lock: resumes ALL engines incl. A5, with NO
+        # same-day re-lock (even at the full target). The per-engine / anchors LOSS halt stays
+        # HARD -- the account override never clears it.
+        try:
+            t, _ = self._target_mk()
+            t.state['daily_pnl'] = 850.0
+            t.state['processed_anchors_today'] = ['A4_1640_NYopen']
+            secured_first = t._account_locked()                 # secured
+            t._daylock_override('account')                      # /daylock off
+            resumed = t._account_locked() is False
+            a5_ok = t._anchors_daystop_blocked() is False
+            override = bool(t.state.get('account_target_override'))
+            t.state['daily_pnl'] = 1000.0                       # full target -> still no re-lock
+            no_relock = t._account_locked() is False
+            # anchors LOSS halt is un-overridable by the account/target override.
+            t.state['daily_pnl'] = -700.0                       # <= anchors_daily_loss_stop (-630)
+            loss_hard = t._anchors_daystop_blocked() is True
+            ok = (secured_first and resumed and a5_ok and override and no_relock and loss_hard)
+            detail = (f"secured_first={secured_first} resumed={resumed} a5_ok={a5_ok} "
+                      f"override={override} no_relock_at_full={no_relock} "
+                      f"anchors_loss_still_hard={loss_hard}")
+        except Exception as e:
+            self._record(264, FAIL, f"raised: {e!r}"); return
+        self._record(264, PASS if ok else FAIL, detail)
+
+    def _step_target_dayroll_disable(self):
+        # 265 the broker day roll resets ALL target state (secured/give-back/override -> False,
+        # peak -> 0.0); the target flags are ordinary state keys so they persist across a
+        # restart via the whole-state.json round-trip (net itself rebuilds from each engine's
+        # E-20 deal-history rebuild). account_target_pct == 0 disables the whole mechanism.
+        import daystops as _ds, dataclasses, json
+        try:
+            st = {'account_target_secured': True, 'account_target_giveback_locked': True,
+                  'account_target_override': True, 'account_target_peak_net': 950.0,
+                  'account_profit_locked': True, 'anchors_profit_locked': True}
+            _ds.reset_day_state(st)
+            cleared = (st['account_target_secured'] is False
+                       and st['account_target_giveback_locked'] is False
+                       and st['account_target_override'] is False
+                       and st['account_target_peak_net'] == 0.0)
+            # persistence: the flags survive the state.json dump/load (whole-dict) round-trip.
+            rt = json.loads(json.dumps({'account_target_secured': True,
+                                        'account_target_peak_net': 640.0}))
+            persist_ok = (rt.get('account_target_secured') is True
+                          and rt.get('account_target_peak_net') == 640.0)
+            # account_target_pct == 0 disables levels / latch / lock / status.
+            cfg0 = dataclasses.replace(self.cfg, account_target_pct=0.0)
+            st2 = {}; _ds.reset_day_state(st2); _ds.update_peak(5000, st2)
+            disabled = (_ds.target_levels(50000, cfg0) == (0.0, 0.0)
+                        and _ds.latch_target(5000, 50000, True, cfg0, st2) == (False, False)
+                        and _ds.target_daystop(5000, 50000, True, cfg0, st2) == (False, 'ok', '')
+                        and _ds.target_status_lines(5000, 50000, True, cfg0, st2) == [])
+            ok = cleared and persist_ok and disabled
+            detail = f"dayroll_cleared={cleared} persist_roundtrip={persist_ok} pct0_disabled={disabled}"
+        except Exception as e:
+            self._record(265, FAIL, f"raised: {e!r}"); return
+        self._record(265, PASS if ok else FAIL, detail)
+
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
         # PURE cores + gating + isolation:
@@ -10207,6 +10417,14 @@ class SelfTest:
             self._step_daylock_day_roll_reset()
             # v3.7.4 /status per-engine day P&L display
             self._step_status_per_engine_pnl()
+            # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
+            self._step_target_levels()
+            self._step_target_pre_a4()
+            self._step_target_post_a4_secured()
+            self._step_target_post_a4_under()
+            self._step_target_giveback()
+            self._step_target_override()
+            self._step_target_dayroll_disable()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

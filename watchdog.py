@@ -445,6 +445,12 @@ class Watchdog:
                 if _k == "Total":
                     snap["─────────"] = ""
                 snap[_k] = _v
+        # v3.7.6 daily 2% target with the A4 gate (ADDITIVE; skipped when disabled/absent).
+        _tl = status.get("target_lines") or []
+        if _tl:
+            snap["── Daily 2% target ──"] = ""
+            for _i, _line in enumerate(_tl):
+                snap[f"target_{_i}"] = str(_line)
         return dc.card_status(snap)
 
     def _format_status(self, status: dict) -> str:
@@ -489,6 +495,10 @@ class Watchdog:
                 if _k == "Total":
                     lines.append("   ─────────────")
                 lines.append(f"   {_k}: `{_v}`")
+        # v3.7.6 daily 2% target with the A4 gate (ADDITIVE; skipped when disabled/absent).
+        _tl = status.get("target_lines") or []
+        for _line in _tl:
+            lines.append(str(_line))
         return "\n".join(lines)
 
     def _format_sleeping_status(self, status: dict) -> str:

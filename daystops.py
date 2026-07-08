@@ -28,8 +28,14 @@ K_ANCHORS_ALERTED = 'anchors_profit_alerted'
 K_ACCOUNT_LOCKED = 'account_profit_locked'
 K_ACCOUNT_OVERRIDE = 'account_profit_override'
 K_ACCOUNT_ALERTED = 'account_profit_alerted'
+# daily 2% target (repurposed account lock) -- persisted via state.json, reset at day roll
+K_TARGET_SECURED = 'account_target_secured'          # latched: post-A4 net >= min_target
+K_TARGET_GIVEBACK_LOCKED = 'account_target_giveback_locked'  # latched: peak>=min then retreat
+K_TARGET_OVERRIDE = 'account_target_override'         # /daylock off clears any target lock
+K_TARGET_PEAK = 'account_target_peak_net'             # running peak of combined net (float)
 _DAY_KEYS = (K_ANCHORS_LOCKED, K_ANCHORS_OVERRIDE, K_ANCHORS_ALERTED,
-             K_ACCOUNT_LOCKED, K_ACCOUNT_OVERRIDE, K_ACCOUNT_ALERTED)
+             K_ACCOUNT_LOCKED, K_ACCOUNT_OVERRIDE, K_ACCOUNT_ALERTED,
+             K_TARGET_SECURED, K_TARGET_GIVEBACK_LOCKED, K_TARGET_OVERRIDE)
 
 
 def reset_day_state(state):
@@ -37,7 +43,108 @@ def reset_day_state(state):
     no carryover of locks, overrides or alerts. (day P&L is reset separately.) PURE."""
     for k in _DAY_KEYS:
         state[k] = False
+    state[K_TARGET_PEAK] = 0.0     # running peak resets to flat, not False
     return state
+
+
+# --- DAILY 2% TARGET with the A4 decision gate (repurposed account lock) -----------------
+
+def target_levels(day_start_equity, cfg):
+    """PURE: (full_target, min_target) in dollars. full = account_target_pct x day-start
+    equity; min = account_target_min_pct x full. account_target_pct <= 0 disables -> (0,0)."""
+    pct = float(getattr(cfg, 'account_target_pct', 0.0) or 0.0)
+    if pct <= 0.0:
+        return 0.0, 0.0
+    full = pct * float(day_start_equity or 0.0)
+    minp = float(getattr(cfg, 'account_target_min_pct', 0.0) or 0.0)
+    return round(full, 2), round(minp * full, 2)
+
+
+def update_peak(combined_net, state):
+    """Track the running peak of COMBINED NET realized day P&L. Returns the (new) peak.
+    Mutates only state[K_TARGET_PEAK]. PURE w.r.t. IO."""
+    peak = float(state.get(K_TARGET_PEAK, 0.0) or 0.0)
+    net = float(combined_net or 0.0)
+    if net > peak:
+        peak = round(net, 2)
+        state[K_TARGET_PEAK] = peak
+    return peak
+
+
+def latch_target(combined_net, day_start_equity, post_a4, cfg, state):
+    """Latch SECURED / GIVE-BACK once their condition first holds (unless overridden). Returns
+    (just_secured, just_giveback) so the caller fires each one-time alert. Assumes update_peak
+    already ran this tick. PURE w.r.t. IO.
+      GIVE-BACK: peak banked >= min_target AND net retreated >= giveback from peak (applies
+                 pre- OR post-A4 -- round-trip protection for an already-good day).
+      SECURED:   post_a4 AND net >= min_target (the day's minimum acceptable close is booked)."""
+    pct = float(getattr(cfg, 'account_target_pct', 0.0) or 0.0)
+    if pct <= 0.0 or state.get(K_TARGET_OVERRIDE):
+        return False, False
+    _full, min_t = target_levels(day_start_equity, cfg)
+    net = float(combined_net or 0.0)
+    peak = float(state.get(K_TARGET_PEAK, 0.0) or 0.0)
+    giveback = float(getattr(cfg, 'account_target_giveback_dollars', 0.0) or 0.0)
+    just_secured = just_giveback = False
+    if (min_t > 0.0 and peak >= min_t and giveback > 0.0 and (peak - net) >= giveback
+            and not state.get(K_TARGET_GIVEBACK_LOCKED)):
+        state[K_TARGET_GIVEBACK_LOCKED] = True
+        just_giveback = True
+    if (post_a4 and min_t > 0.0 and net >= min_t and not state.get(K_TARGET_SECURED)):
+        state[K_TARGET_SECURED] = True
+        just_secured = True
+    return just_secured, just_giveback
+
+
+def target_daystop(combined_net, day_start_equity, post_a4, cfg, state):
+    """PURE: (blocked, reason, kind) for the daily 2% target lock. kind in
+    ('secured','giveback',''). Disabled when account_target_pct <= 0; never blocks while
+    K_TARGET_OVERRIDE is set. GIVE-BACK ranks above SECURED (both stop NEW entries only;
+    the per-engine loss stops, kill switch and EOD/Friday flatten all outrank this soft lock)."""
+    pct = float(getattr(cfg, 'account_target_pct', 0.0) or 0.0)
+    if pct <= 0.0 or state.get(K_TARGET_OVERRIDE):
+        return False, 'ok', ''
+    _full, min_t = target_levels(day_start_equity, cfg)
+    net = float(combined_net or 0.0)
+    peak = float(state.get(K_TARGET_PEAK, 0.0) or 0.0)
+    giveback = float(getattr(cfg, 'account_target_giveback_dollars', 0.0) or 0.0)
+    if (state.get(K_TARGET_GIVEBACK_LOCKED)
+            or (min_t > 0.0 and peak >= min_t and giveback > 0.0 and (peak - net) >= giveback)):
+        return True, 'account_target_giveback', 'giveback'
+    if (state.get(K_TARGET_SECURED)
+            or (post_a4 and min_t > 0.0 and net >= min_t)):
+        return True, 'account_target_secured', 'secured'
+    return False, 'ok', ''
+
+
+def target_status_lines(combined_net, day_start_equity, post_a4, cfg, state):
+    """PURE: the /daylock + /status lines for the daily 2% target -- day-start equity,
+    full/min targets, combined net, pre/post-A4 state, secured flag, A5-skip flag, and the
+    give-back distance. Returns [] when the target is disabled (account_target_pct <= 0)."""
+    pct = float(getattr(cfg, 'account_target_pct', 0.0) or 0.0)
+    if pct <= 0.0:
+        return []
+    full, min_t = target_levels(day_start_equity, cfg)
+    net = float(combined_net or 0.0)
+    peak = float(state.get(K_TARGET_PEAK, 0.0) or 0.0)
+    giveback = float(getattr(cfg, 'account_target_giveback_dollars', 0.0) or 0.0)
+    blocked, _reason, kind = target_daystop(net, day_start_equity, post_a4, cfg, state)
+    if state.get(K_TARGET_OVERRIDE):
+        state_str = '🟠 OVERRIDDEN (no re-lock today)'
+    elif kind == 'secured':
+        state_str = '✅ SECURED'
+    elif kind == 'giveback':
+        state_str = '🛟 GIVE-BACK LOCK'
+    else:
+        state_str = '🟢 building'
+    gb_dist = max(0.0, peak - net)
+    a5 = 'skip' if bool(getattr(cfg, 'account_target_skip_a5_when_met', True)) else 'keep'
+    return [
+        f"🎯 Daily target: net ${net:+,.0f} / min ${min_t:,.0f} / full ${full:,.0f} "
+        f"({pct*100:g}% of ${float(day_start_equity or 0.0):,.0f}) -> {state_str}",
+        f"   gate: {'POST-A4' if post_a4 else 'PRE-A4 (building)'} · peak ${peak:+,.0f} · "
+        f"give-back ${gb_dist:,.0f}/{giveback:,.0f} · A5={a5}",
+    ]
 
 
 def anchors_daystop(day_pnl, cfg, state):
