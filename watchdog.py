@@ -370,8 +370,44 @@ class Watchdog:
     # Command handling
     # ------------------------------------------------------------------------
 
+    def _day_pnl_by_engine_rows(self, status: dict):
+        """v3.7.4: (label, value) rows for the /status 'Day P&L by engine' section, built
+        from the bot-written day_pnl_by_engine payload (the SAME realized day P&L the daily
+        stops act on). Returns [] when the payload is absent (older bot) -- never recomputes
+        P&L here. Guarded."""
+        try:
+            dpe = status.get("day_pnl_by_engine") or {}
+            if not dpe:
+                return []
+
+            def _m(v):
+                try:
+                    f = float(v)
+                    return f"{'+' if f >= 0 else '-'}${abs(f):,.0f}"
+                except (TypeError, ValueError):
+                    return "n/a"
+
+            _lock = {'active': '🟢 active', 'PROFIT-LOCKED': '🟡 PROFIT-LOCKED',
+                     'LOSS-HALTED': '🔴 LOSS-HALTED', 'override': '🟠 override'}
+            rows = []
+            for key, name in (('anchors', 'Anchors (non-oco)'), ('rogue', 'Rogue'),
+                              ('fetcher', 'Fetcher')):
+                e = dpe.get(key) or {}
+                rows.append((name,
+                             f"{_m(e.get('pnl'))}   [+${float(e.get('profit', 0)):,.0f} / "
+                             f"-${abs(float(e.get('loss', 0))):,.0f}]   "
+                             f"{_lock.get(e.get('lock'), e.get('lock') or 'active')}"))
+            acct = dpe.get('account') or {}
+            rows.append(("Account total",
+                         f"{_m(acct.get('pnl'))}   [{float(acct.get('kill_pct', 0)):.0f}% kill: "
+                         f"-${abs(float(acct.get('kill_threshold', 0))):,.0f}]"))
+            return rows
+        except Exception:
+            return []
+
     def _status_card(self, status: dict):
-        """v3.1.2: /status as a clean field-grid card (account · P&L · positions)."""
+        """v3.1.2: /status as a clean field-grid card (account · P&L · positions).
+        v3.7.4: + a 'Day P&L by engine' section (per-engine realized day P&L vs stops)."""
         def _money(v):
             try:
                 f = float(v)
@@ -405,6 +441,12 @@ class Watchdog:
         snap["Kill switch"] = (("🔴 LOCKED" if locked else "🟢 OK")
                                + (f" (-${kill_th:,.0f})" if kill_th else ""))
         snap["Heartbeat"] = f"{hb_age:.0f}s ago" if hb_age is not None else "none yet"
+        # v3.7.4 Day P&L by engine (per-magic realized day P&L vs profit/loss stops + lock)
+        _rows = self._day_pnl_by_engine_rows(status)
+        if _rows:
+            snap["── Day P&L by engine ──"] = ""
+            for _k, _v in _rows:
+                snap[_k] = _v
         return dc.card_status(snap)
 
     def _format_status(self, status: dict) -> str:
@@ -441,6 +483,14 @@ class Watchdog:
             f"   {', '.join(anchors) if anchors else '(none yet)'}",
             f"💓 Heartbeat: {hb_str}",
         ]
+        # v3.7.4 Day P&L by engine (per-magic realized day P&L vs profit/loss stops + lock)
+        _rows = self._day_pnl_by_engine_rows(status)
+        if _rows:
+            lines.append("📊 *Day P&L by engine:*")
+            for _k, _v in _rows:
+                if _k == "Account total":
+                    lines.append("   ─────────────")
+                lines.append(f"   {_k}: `{_v}`")
         return "\n".join(lines)
 
     def _format_sleeping_status(self, status: dict) -> str:
