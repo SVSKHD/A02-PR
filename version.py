@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.7.6"  # daily 2% target + A4 decision gate (repurposed account lock)
+__version__ = "3.7.7"  # DAY LOCKED card: distinct 🔒 alert when the daily target secures / gives back
 CODENAME = "Astra Hawk"
 
 
