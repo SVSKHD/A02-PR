@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.7.5"  # /status additive 'Realized P&L by engine (today)': 3 rows + reconciling Total
+__version__ = "3.7.6"  # daily 2% target + A4 decision gate (repurposed account lock)
 CODENAME = "Astra Hawk"
 
 

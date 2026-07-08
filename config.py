@@ -626,6 +626,22 @@ class Config:
     # equity -> all three engines go manage-only, overridable by `/daylock off` -- but stays
     # inert while 0. Set >0 (e.g. 0.02 = 2%) to arm it.
 
+    # --- DAILY 2% TARGET with the A4 decision gate (2026-07-08) --------------------------
+    # Repurposes the account-level lock into a daily PROFIT-TARGET brake driven by the
+    # COMBINED NET realized day P&L across all three magics (20260522 incl boost/rescue/F-B,
+    # 20260626, 20260707). Signed net -- a losing engine subtracts (net is the loss-coverage
+    # mechanism; a losing engine is NOT re-traded). No rollover; everything resets at the
+    # broker day roll (scaling is done via lot size, never by moving the target %).
+    account_target_pct: float = 0.02             # full target = 2% of day-start equity ($1,000@50k)
+    account_target_min_pct: float = 0.80         # accepted minimum (80% of full = $800@50k)
+    account_target_final_anchor: str = "A4_1640_NYopen"  # last entry opportunity; the
+    # target NEVER gates entries BEFORE this anchor completes (the day is still building).
+    account_target_skip_a5_when_met: bool = True  # skip A5_1930_LateUS if >=80% secured post-A4
+    account_target_giveback_dollars: float = 200.0  # once >=80% banked at the peak, a retreat of
+    # >= this many dollars from the peak locks new entries immediately (round-trip protection).
+    # account_target_pct == 0 disables the whole target mechanism (falls back to the legacy
+    # inert account lock above).
+
     # Risk
     starting_balance: float = 50000.0
     # --- v3.2.9 manual TESTFIRE collision guard ---------------------------------
