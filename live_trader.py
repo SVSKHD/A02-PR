@@ -608,6 +608,9 @@ class LiveTrader:
             # v3.6.0 engine switches (runtime state; config keys are boot defaults)
             "engines": {"anchors": self._engine_enabled('anchors'),
                         "rogue": self._engine_enabled('rogue')},
+            # v3.7.4 per-engine realized day P&L + thresholds + lock state (display-only;
+            # SAME source the daily stops read -- _engine_day_pnls / govs / daystops).
+            "day_pnl_by_engine": self._day_pnl_by_engine_payload(),
             "mode": "paper" if self.paper else "live",
             "lot_size": self.cfg.lot_size,
             "starting_balance": self.cfg.starting_balance,
@@ -1122,6 +1125,63 @@ class LiveTrader:
             return _ds.render_status(a, r, f, a + r + f, dse, self.cfg, self.state)
         except Exception:
             return []
+
+    @staticmethod
+    def _gov_lock_label(gov):
+        """PURE: a Rogue/Fetcher governor's lock state string for the /status display --
+        'LOSS-HALTED' | 'override' | 'PROFIT-LOCKED' | 'active'. Read from the persisted
+        latches, NOT recomputed. Loss ranks first (mirrors can_enter)."""
+        gov = gov or {}
+        if gov.get('loss_stopped'):
+            return 'LOSS-HALTED'
+        if gov.get('profit_override'):
+            return 'override'
+        if gov.get('profit_locked'):
+            return 'PROFIT-LOCKED'
+        return 'active'
+
+    def _day_pnl_by_engine_payload(self):
+        """DISPLAY-ONLY structured per-engine realized day P&L + thresholds + lock state for
+        the /status card. SINGLE SOURCE OF TRUTH: reuses _engine_day_pnls() -- the SAME
+        numbers the daily stops act on -- and reads each lock state from the govs /
+        _anchors_daystop (never recomputed). Read-only; guarded -> {} on any error."""
+        try:
+            a, r, f = self._engine_day_pnls()
+            cfg = self.cfg
+            # anchors lock state via the daystop reader (loss ranks first); override maps
+            # to 'override' since the reader reports NOT blocked once overridden.
+            _blk, _reason, akind = self._anchors_daystop()
+            if akind == 'loss':
+                anchors_lock = 'LOSS-HALTED'
+            elif (self.state or {}).get('anchors_profit_override'):
+                anchors_lock = 'override'
+            elif akind == 'profit':
+                anchors_lock = 'PROFIT-LOCKED'
+            else:
+                anchors_lock = 'active'
+            rgov = (getattr(self, '_rogue', None) or {}).get('gov') or {}
+            fgov = (getattr(self, '_fetcher', None) or {}).get('gov') or {}
+            dse = float((self.state or {}).get('day_start_equity')
+                        or getattr(cfg, 'starting_balance', 0.0))
+            kill_th = round(float(getattr(cfg, 'daily_loss_pct', 0.0)) * dse, 2)
+            return {
+                'anchors': {'pnl': round(a, 2),
+                            'profit': float(getattr(cfg, 'anchors_daily_profit_stop', 0.0)),
+                            'loss': float(getattr(cfg, 'anchors_daily_loss_stop', 0.0)),
+                            'lock': anchors_lock},
+                'rogue': {'pnl': round(r, 2),
+                          'profit': float(getattr(cfg, 'rogue_daily_profit_stop', 0.0)),
+                          'loss': float(getattr(cfg, 'rogue_daily_loss_stop', 0.0)),
+                          'lock': self._gov_lock_label(rgov)},
+                'fetcher': {'pnl': round(f, 2),
+                            'profit': float(getattr(cfg, 'fetcher_daily_profit_stop', 0.0)),
+                            'loss': float(getattr(cfg, 'fetcher_daily_loss_stop', 0.0)),
+                            'lock': self._gov_lock_label(fgov)},
+                'account': {'pnl': round(a + r + f, 2), 'kill_threshold': kill_th,
+                            'kill_pct': round(float(getattr(cfg, 'daily_loss_pct', 0.0)) * 100.0, 1)},
+            }
+        except Exception:
+            return {}
 
     def _post_daylock_status(self, note: str = ""):
         """The /daylock status embed: each engine's realized day P&L vs BOTH thresholds +

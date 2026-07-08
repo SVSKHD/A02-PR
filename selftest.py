@@ -341,6 +341,8 @@ STEP_NAMES = {
     255: "anchors daylock+skip",   # scheduled anchor skipped once while locked; /daylock off then fires
     256: "account lock inert",     # account lock inert at pct=0; armed >0 locks; /daylock off overrides
     257: "daylock day roll reset", # all locks/overrides/alerts reset at the broker day roll
+    # v3.7.4 /status per-engine day P&L display
+    258: "status per-engine pnl",  # /status card shows 3 engine rows + account total; P&L == daystops source
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -8321,6 +8323,49 @@ class SelfTest:
             self._record(257, FAIL, f"raised: {e!r}"); return
         self._record(257, PASS if ok else FAIL, detail)
 
+    def _step_status_per_engine_pnl(self):
+        # 258 v3.7.4 /status DISPLAY: the per-engine day-P&L payload the bot writes carries
+        # all three engines + the account total, its P&L values EQUAL the daystops source
+        # (_engine_day_pnls -- no second computation), lock states are read from the govs,
+        # and the watchdog card renders a row per engine + the account total.
+        import types
+        import live_trader as _lt, watchdog as _wd, rogue as _r, fetcher as _f
+        try:
+            tr, _ = self._daylock_mk()
+            tr.state['daily_pnl'] = 250.0                            # anchors +$250 (active)
+            tr._rogue = {'gov': dict(_r.new_day_state(), day_pnl=420.0, profit_locked=True)}
+            tr._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=-390.0, loss_stopped=True)}
+            tr._day_pnl_by_engine_payload = _lt.LiveTrader._day_pnl_by_engine_payload.__get__(tr)
+            tr._gov_lock_label = _lt.LiveTrader._gov_lock_label      # @staticmethod
+            payload = tr._day_pnl_by_engine_payload()
+            has_all = all(k in payload for k in ('anchors', 'rogue', 'fetcher', 'account'))
+            # SINGLE SOURCE: the payload P&L equals _engine_day_pnls() exactly.
+            a, r, f = tr._engine_day_pnls()
+            same_source = (payload['anchors']['pnl'] == round(a, 2)
+                           and payload['rogue']['pnl'] == round(r, 2)
+                           and payload['fetcher']['pnl'] == round(f, 2)
+                           and payload['account']['pnl'] == round(a + r + f, 2))
+            # lock states read from the govs (not recomputed)
+            locks_ok = (payload['rogue']['lock'] == 'PROFIT-LOCKED'
+                        and payload['fetcher']['lock'] == 'LOSS-HALTED'
+                        and payload['anchors']['lock'] == 'active')
+            # the watchdog card renders a row per engine + the account total.
+            wd = types.SimpleNamespace()
+            wd._day_pnl_by_engine_rows = _wd.Watchdog._day_pnl_by_engine_rows.__get__(wd)
+            rows = wd._day_pnl_by_engine_rows({'day_pnl_by_engine': payload})
+            labels = [k for k, _v in rows]
+            rows_ok = (labels == ['Anchors (non-oco)', 'Rogue', 'Fetcher', 'Account total']
+                       and any('420' in v for k, v in rows if k == 'Rogue')
+                       and any('3% kill' in v for k, v in rows if k == 'Account total'))
+            # an older bot (no payload) renders NO rows (no crash).
+            empty_ok = wd._day_pnl_by_engine_rows({}) == []
+            ok = has_all and same_source and locks_ok and rows_ok and empty_ok
+            detail = (f"has_all={has_all} same_source={same_source} locks_ok={locks_ok} "
+                      f"rows={labels} rows_ok={rows_ok} empty_safe={empty_ok}")
+        except Exception as e:
+            self._record(258, FAIL, f"raised: {e!r}"); return
+        self._record(258, PASS if ok else FAIL, detail)
+
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
         # PURE cores + gating + isolation:
@@ -10113,6 +10158,8 @@ class SelfTest:
             self._step_anchors_daylock_override_skip()
             self._step_account_lock_inert()
             self._step_daylock_day_roll_reset()
+            # v3.7.4 /status per-engine day P&L display
+            self._step_status_per_engine_pnl()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
