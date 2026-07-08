@@ -1158,25 +1158,37 @@ class LiveTrader:
 
     def _account_target_alert(self, kind, net, dse):
         """One-time loud alert when the daily target SECURES or a GIVE-BACK lock engages
-        (log + Discord + a forced state persist). Guarded; never touches order flow."""
+        (log + a DISTINCT 🔒 DAY LOCKED Discord card + a forced state persist). Guarded; never
+        touches order flow. Fires once per day per kind -- the caller latches the state BEFORE
+        calling, so a repeated tick never re-alerts; the card's event_key adds belt-and-braces
+        dedup so a Discord reconnect/queue-flush can't double-post either."""
         try:
             import daystops as _ds
             full, min_t = _ds.target_levels(dse, self.cfg)
+            pct = float(getattr(self.cfg, 'account_target_pct', 0.0) or 0.0)
             skip_a5 = bool(getattr(self.cfg, 'account_target_skip_a5_when_met', True))
+            a, r, f = self._engine_day_pnls()
+            peak = float((self.state or {}).get(_ds.K_TARGET_PEAK, 0.0) or 0.0)
+            gb = float(getattr(self.cfg, 'account_target_giveback_dollars', 0.0) or 0.0)
             if kind == 'secured':
                 tail = ", A5 skipped" if skip_a5 else ""
                 msg = (f"✅ DAY SECURED +${float(net):,.0f} (>=80% of ${full:,.0f} post-A4) — "
                        f"new entries stopped, riding open to 2% (${full:,.0f}){tail}")
             else:  # giveback
-                peak = float((self.state or {}).get(_ds.K_TARGET_PEAK, 0.0) or 0.0)
-                gb = float(getattr(self.cfg, 'account_target_giveback_dollars', 0.0) or 0.0)
                 msg = (f"🛟 GIVE-BACK LOCK — banked +${peak:,.0f}, retreated to +${float(net):,.0f} "
                        f"(>=${gb:,.0f} give-back) — new entries stopped, open legs ride")
             log.warning(msg)
             try:
-                self.tele.warn(msg)
+                card = dc.card_day_locked(kind, float(net), full, min_t, dse, pct,
+                                          a, r, f, skip_a5=skip_a5, peak=peak, giveback=gb)
+                self.tele.send(msg,
+                               Severity.SUCCESS if kind == 'secured' else Severity.WARN,
+                               card=card, important=True, event_key=f"day_locked:{kind}")
             except Exception:
-                pass
+                try:
+                    self.tele.warn(msg)
+                except Exception:
+                    pass
             try:
                 import p1_state as _p1
                 _p1.save(self, force=True)

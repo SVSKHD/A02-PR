@@ -351,6 +351,7 @@ STEP_NAMES = {
     263: "target give-back lock",     # peak >=80% then retreat >=giveback -> locks; open legs unaffected
     264: "target override resume",    # /daylock off resumes incl A5, no same-day re-lock, loss stops hard
     265: "target day-roll+disable",   # day roll resets all target state; account_target_pct=0 disables
+    266: "day-locked card",           # DAY SECURED / GIVE-BACK fires a DISTINCT 🔒 card (per-engine split + % of target)
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -1163,6 +1164,10 @@ class SelfTest:
                 dc.card_status({'Balance': '$50,465', 'Open': 1, 'Pending': 1}),
                 dc.card_connect(), dc.card_intent_warning(),
                 dc.card_generic('AUREON INFO', 'plain text', dc.BLUE),
+                dc.card_day_locked('secured', 820.0, 1000.0, 800.0, 50000.0, 0.02,
+                                   650.0, 120.0, 50.0, skip_a5=True),
+                dc.card_day_locked('giveback', 780.0, 1000.0, 800.0, 50000.0, 0.02,
+                                   500.0, 180.0, 100.0, peak=1000.0, giveback=200.0),
             ]
             bad = []
             for c in cards:
@@ -8439,7 +8444,8 @@ class SelfTest:
                             'processed_anchors_today': []},
             _rogue=None, _fetcher=None, shadow_positions={}, _save_state=lambda: None,
             paper=True, run_dir='./run',
-            tele=types.SimpleNamespace(info=lambda *a, **k: None, send=lambda *a, **k: None,
+            tele=types.SimpleNamespace(info=lambda *a, **k: None,
+                                       send=lambda m='', *a, **k: alerts.append(str(m)),
                                        warn=lambda m='', **k: alerts.append(str(m))))
         for m in ('_engine_day_pnls', '_account_locked', '_account_target', '_post_a4_complete',
                   '_account_target_alert', '_anchors_daystop', '_anchors_daystop_blocked',
@@ -8622,6 +8628,52 @@ class SelfTest:
         except Exception as e:
             self._record(265, FAIL, f"raised: {e!r}"); return
         self._record(265, PASS if ok else FAIL, detail)
+
+    def _step_target_daylocked_card(self):
+        # 266 when the target SECURES (post-A4) or a GIVE-BACK lock engages, _account_target_alert
+        # posts a DISTINCT 🔒 DAY LOCKED card (not just a log/text line): its 🔒 title separates it
+        # from the per-engine ⚓/💰 profit-lock alerts, it carries the per-engine P&L split (same
+        # source as /status) and the net's % OF THE FULL TARGET, and it fires exactly ONCE.
+        import discord_cards as dc
+        try:
+            # (a) builder — SECURED: 🔒 title, 82% of full, per-engine split, A5 skipped, GREEN.
+            sec = dc.card_day_locked('secured', 820.0, 1000.0, 800.0, 50000.0, 0.02,
+                                     650.0, 120.0, 50.0, skip_a5=True)
+            sflat = " ".join(f["name"] + " " + f["value"] for f in sec.get("fields", []))
+            sec_ok = (sec["title"].startswith("🔒") and "SECURED" in sec["title"]
+                      and sec["color"] == dc.GREEN and "82% of" in sflat
+                      and "Non-OCO +$650" in sflat and "Rogue +$120" in sflat
+                      and "Fetcher +$50" in sflat and "A5 SKIPPED" in sflat
+                      and "/daylock off" in sflat)
+            # distinct from the per-engine profit-lock alert emoji/title (⚓ [ANCHORS] / 💰 ACCOUNT).
+            distinct = ("⚓" not in sec["title"] and "💰" not in sec["title"])
+            # (b) builder — GIVE-BACK variant: peak / gave-back line, AMBER, 105% reads through.
+            gb = dc.card_day_locked('giveback', 1050.0, 1000.0, 800.0, 50000.0, 0.02,
+                                    900.0, 100.0, 50.0, peak=1250.0, giveback=200.0)
+            gflat = " ".join(f["name"] + " " + f["value"] for f in gb.get("fields", []))
+            gb_ok = (gb["color"] == dc.AMBER and "give-back" in gflat.lower()
+                     and "peak +$1,250" in gflat and "gave back $200" in gflat
+                     and "105% of" in gflat)
+            # (c) wiring — the alert path fires the card ONCE and only once (latched by the caller).
+            t, alerts = self._target_mk()
+            t.state['daily_pnl'] = -390.0
+            import rogue as _r, fetcher as _f
+            t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=800.0)}
+            t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=440.0)}     # net 850
+            t.state['processed_anchors_today'] = ['A1_02h_Asia', 'A4_1640_NYopen']
+            posted = []
+            t.tele.send = (lambda m='', *a, **k:
+                           posted.append((str(m), k.get('card'), k.get('event_key'))))
+            t._account_locked(); t._account_locked()                          # latch + re-tick
+            card_posts = [p for p in posted if p[1] is not None
+                          and str(p[1].get('title', '')).startswith('🔒')]
+            once = (len(card_posts) == 1 and card_posts[0][2] == 'day_locked:secured')
+            ok = sec_ok and distinct and gb_ok and once
+            detail = (f"secured_card={sec_ok} distinct={distinct} giveback_card={gb_ok} "
+                      f"fired_once={once} (card_posts={len(card_posts)})")
+        except Exception as e:
+            self._record(266, FAIL, f"raised: {e!r}"); return
+        self._record(266, PASS if ok else FAIL, detail)
 
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
@@ -10425,6 +10477,7 @@ class SelfTest:
             self._step_target_giveback()
             self._step_target_override()
             self._step_target_dayroll_disable()
+            self._step_target_daylocked_card()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

@@ -302,6 +302,58 @@ def _tg_clean(text):
     return s
 
 
+def card_day_locked(kind, net, full_target, min_target, day_start_equity, target_pct,
+                    anchors_pnl, rogue_pnl, fetcher_pnl, skip_a5=True,
+                    peak=None, giveback=None, footer=None):
+    """Account-level DAY LOCKED card — the daily 2% target SECURED post-A4 (net >= min) or a
+    GIVE-BACK retreat from the peak. Its 🔒 emoji + 'DAY LOCKED' title are DISTINCT from the
+    per-engine profit-lock alerts (⚓ [ANCHORS] / 💰 ACCOUNT) so an account-level lock is
+    unmistakable in the channel at a glance. Fields: the combined net + its % of the FULL
+    target (so 80% vs 95% vs 105% reads instantly), the per-engine P&L split
+    (Non-OCO/Rogue/Fetcher, the SAME source as /status), the ride/A5 status, the day-start
+    equity + full/min levels, and the /daylock override. kind in ('secured','giveback');
+    anything but 'giveback' renders the secured layout. Pure dict factory; NEVER raises."""
+    def _pct_of(v, base):
+        try:
+            return f"{100.0 * float(v) / float(base):.0f}%"
+        except (TypeError, ValueError, ZeroDivisionError):
+            return "—"
+
+    secured = (str(kind) != 'giveback')
+    tgt_pct = f"{float(target_pct or 0.0) * 100:g}%" if target_pct else "—"
+    min_pct = _pct_of(min_target, full_target)
+    a5_txt = "A5 SKIPPED" if skip_a5 else "A5 kept"
+    breakdown = (f"Non-OCO {_money(anchors_pnl)} · Rogue {_money(rogue_pnl)} · "
+                 f"Fetcher {_money(fetcher_pnl)}")
+    if secured:
+        title = f"🔒 DAY LOCKED — {min_pct}+ SECURED (post-A4)"
+        color = GREEN
+        status = f"New entries STOPPED · riding open to {tgt_pct} · {a5_txt}"
+    else:
+        title = "🔒 DAY LOCKED — GIVE-BACK PROTECTION"
+        color = AMBER
+        try:
+            gave = float(peak) - float(net)
+        except (TypeError, ValueError):
+            gave = None
+        if gave is not None:
+            trig = f" (>= ${abs(float(giveback)):,.2f} trigger)" if giveback else ""
+            head = f"locked on give-back — peak {_money(peak)}, gave back ${abs(gave):,.2f}{trig}"
+        else:
+            head = "locked on give-back — retreat from peak"
+        status = f"{head} · New entries STOPPED · open legs ride"
+    return build_embed(title, color, fields=[
+        ("Combined net",
+         f"{_money(net)}  ({_pct_of(net, full_target)} of {_price(full_target)} target)", False),
+        ("Breakdown", breakdown, False),
+        ("Status", status, False),
+        ("Day-start eq", _price(day_start_equity)),
+        ("Target", f"{_price(full_target)} ({tgt_pct})"),
+        ("Min", f"{_price(min_target)} ({min_pct})"),
+        ("Override", "/daylock off to resume", False),
+    ], footer=footer)
+
+
 def card_startup(version, mode, lot, kill, hold_tstop, ladder, boost_sl, alerts,
                  footer=None):
     """🚀 startup banner as a field grid (Title + bold-label fields), not a blob."""
