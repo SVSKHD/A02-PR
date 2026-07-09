@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.7.7"  # DAY LOCKED card: distinct 🔒 alert when the daily target secures / gives back
+__version__ = "3.8.0"  # $10-break seed anchor + earned trade budget for Rogue & Fetcher
 CODENAME = "Astra Hawk"
 
 

@@ -36,10 +36,14 @@ _EXPECTED_FLAGS = (
     'rogue_daily_loss_stop', 'rogue_daily_profit_stop', 'fetcher_daily_profit_stop',
     # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
     'anchors_daily_profit_stop', 'anchors_daily_loss_stop', 'account_daily_profit_stop_pct',
+    # 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2), both engines
+    'seed_break_dollars', 'engine_base_trades_per_anchor', 'engine_extend_requires_wins',
+    'engine_exhausted_gap_sec',
 )
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
-                    'boosts_common', 'strategy', 'break_hold', 'fetcher', 'daystops')
+                    'boosts_common', 'strategy', 'break_hold', 'fetcher', 'daystops',
+                    'seed_budget')
 # the LiveTrader seams that MUST be bound for the per-tick flow to dispatch.
 _SEAMS = ('_break_and_hold_ok', '_rescue_entry_ok', '_check_boost_triggers',
           '_resolved_anchor_hm', '_process_anchor_if_due',
@@ -150,6 +154,27 @@ def _probe(cfg):
           'daystops.rebuild_anchors_day_pnl present (E-20 for anchors)')
     except Exception as e:
         w('daystops:import', False, f'daystops import FAILED: {e!r}')
+
+    # 4e. 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2): the shared
+    # seed_budget cores import and are SANE for the REAL cfg -- break_dollars a non-negative $
+    # bound (0 disables), base/gap non-negative (0 disables the budget), and the pure cores
+    # actually gate (a $10 break latches; a spent budget with a non-all-win window exhausts).
+    try:
+        import seed_budget as _sbmod
+        _brk = float(getattr(cfg, 'seed_break_dollars', 0.0) or 0.0)
+        _base = int(getattr(cfg, 'engine_base_trades_per_anchor', 0) or 0)
+        _gap = float(getattr(cfg, 'engine_exhausted_gap_sec', 0.0) or 0.0)
+        w('seed_budget:knobs_sane', _brk >= 0.0 and _base >= 0 and _gap >= 0.0,
+          f'break=${_brk:g} (>=0; 0 disables) base={_base} (>=0; 0 disables) gap={_gap:g}s')
+        _stx = {}
+        _latch = (_sbmod.break_seed_anchor(_stx, 4000.0, 4000.0 + max(_brk, 1.0), max(_brk, 1.0))[0]
+                  is not None)
+        _bx = _sbmod.new_budget(); _bx['trades'] = max(_base, 1); _bx['wl'] = [True, False]
+        _exh = (_sbmod.budget_can_trade(_bx, cfg)[0] is False) if _base > 0 else True
+        w('seed_budget:cores_gate', _latch and _exh,
+          f'break_latches={_latch} budget_exhausts_on_non_allwin={_exh}')
+    except Exception as e:
+        w('seed_budget:import', False, f'seed_budget import FAILED: {e!r}')
 
     # 5. derived-cap discipline present (rescue/rally caps resolvable).
     try:
