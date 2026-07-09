@@ -208,15 +208,14 @@ def rebuild_anchors_day_pnl(trader, dt_from=None, dt_to=None):
         log.warning(f"{ANCHORS_ALERT_PREFIX} day-pnl rebuild query failed: {e!r}")
         return None
     try:
-        outs = [d for d in deals
-                if int(getattr(d, 'magic', 0) or 0) == ANCHORS_MAGIC
-                and getattr(d, 'entry', None) == 1]
-        day_pnl = round(sum(
-            float(getattr(d, 'profit', 0.0) or 0.0)
-            + float(getattr(d, 'swap', 0.0) or 0.0)
-            + float(getattr(d, 'commission', 0.0) or 0.0) for d in outs), 2)
+        import pnl_source as _ps
+        # SINGLE SOURCE OF TRUTH: anchors realized day P&L via pnl_source.magic_day_net
+        # (the SAME function the report / reconcile / rogue+fetcher rebuilds use, by magic).
+        day_pnl = _ps.magic_day_net(deals, ANCHORS_MAGIC)
+        n_out = sum(1 for d in deals if int(getattr(d, 'magic', 0) or 0) == ANCHORS_MAGIC
+                    and getattr(d, 'entry', None) == 1)
         log.info(f"{ANCHORS_ALERT_PREFIX} day P&L rebuilt from history: ${day_pnl:+.2f} "
-                 f"({len(outs)} closes, magic {ANCHORS_MAGIC})")
+                 f"({n_out} closes, magic {ANCHORS_MAGIC})")
         return day_pnl
     except Exception as e:
         log.warning(f"{ANCHORS_ALERT_PREFIX} day-pnl rebuild parse failed: {e!r}")

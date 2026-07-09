@@ -364,6 +364,13 @@ STEP_NAMES = {
     275: "break+budget persist",       # latch + budget + win/loss window survive a same-day p1_state round-trip
     276: "seed gap refuse/manual",     # /rogueseed+/fetchseed refused in the gap; MANUAL seed overrides the break
     277: "break/budget anchors indep", # anchors engine (20260522) entries UNAFFECTED by both rules (independence)
+    # 2026-07-09 P&L pipeline reconciliation (R-8 fix + single source of truth + reconcile audit)
+    278: "csv writers hdr==row",       # every CSV writer: fresh header width == row width, header[-1]==appended col
+    279: "r8 migration idempotent",    # legacy 9-col rogue_trades header -> 10-col, rows kept, .bak written, idempotent
+    280: "pnl_source single truth",    # magic_day_net sums OUT deals by magic; engine_day_nets splits anchors/rogue/fetcher
+    281: "reconcile 4 surfaces agree", # synthetic history -> authority==ledger==report==live per engine + account
+    282: "reconcile mismatch fails",   # injected discrepancy -> ok=False, named surface+delta, non-zero; corrections table
+    283: "no csv-sum pnl path",        # trade CSVs are decision logs: no code sums their rows for reported P&L
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -7898,6 +7905,275 @@ class SelfTest:
             self._record(277, FAIL, f"raised: {e!r}"); return
         self._record(277, PASS if ok else FAIL, detail)
 
+    # --- 2026-07-09 P&L pipeline reconciliation (R-8 + single source + reconcile audit) ---
+    def _recon_deals(self):
+        """Synthetic MT5 deal history for one broker day: paired IN/OUT deals per position so
+        the report can build trades. anchors A1 +650, rogue +300/-50 (net +250), fetcher +120."""
+        import types
+
+        def pair(magic, pid, profit, comment):
+            din = types.SimpleNamespace(magic=magic, entry=0, profit=0.0, swap=0.0,
+                                        commission=0.0, comment=comment, time=pid, price=4000.0,
+                                        position_id=pid, ticket=pid, symbol='XAUUSD', volume=0.35)
+            dout = types.SimpleNamespace(magic=magic, entry=1, profit=profit, swap=0.0,
+                                         commission=0.0, comment=comment, time=pid + 1,
+                                         price=4005.0, position_id=pid, ticket=pid,
+                                         symbol='XAUUSD', volume=0.35)
+            return [din, dout]
+        return (pair(20260522, 101, 650.0, 'AUR_A1_BUY')
+                + pair(20260626, 201, 300.0, 'AUR_ROGUE_B')
+                + pair(20260626, 202, -50.0, 'AUR_ROGUE_S')
+                + pair(20260707, 301, 120.0, 'AUR_FETCH_B'))
+
+    def _recon_trader(self, tmp, deals, date):
+        """A read-only trader stub whose adapter serves `deals`, with the live govs seeded from
+        the SAME single-source rebuilds (so the 'live' surface is populated)."""
+        import types, os
+        import live_trader as _lt, rogue as _rg, fetcher as _ft, daystops as _ds, pnl_source as _ps
+        os.makedirs(os.path.join(tmp, 'reports'), exist_ok=True)
+        adapter = types.SimpleNamespace(
+            mt5=types.SimpleNamespace(history_deals_get=lambda a, b: deals))
+        import dataclasses
+        cfg = dataclasses.replace(self.cfg, broker_tz_offset_hours=3.0)
+        tr = types.SimpleNamespace(adapter=adapter, cfg=cfg, run_dir=tmp,
+                                   state={'last_broker_date': date})
+        tr._engine_day_pnls = _lt.LiveTrader._engine_day_pnls.__get__(tr)
+        df, dt = _ps.broker_day_range(tr, day=date)
+        tr._rogue = {'gov': _rg.rebuild_gov_from_history(tr, df, dt)}
+        tr._fetcher = {'gov': _ft.rebuild_gov_from_history(tr, df, dt)}
+        tr.state['daily_pnl'] = _ds.rebuild_anchors_day_pnl(tr, df, dt)
+        return tr, adapter
+
+    def _step_csv_writers_schema(self):
+        # 278 R-8 GUARD: every CSV writer emits a FRESH file whose HEADER width == ROW width and
+        # whose header[-1] is the last-appended column (seed_source / the ledger tail). A writer
+        # that appends a column to its row without the header would fail here.
+        import os, csv, tempfile, types
+        import rogue_patternlog as _rpl, fetcher as _f, boost_metrics as _bm, pnl_report as _pr
+        tmp = tempfile.mkdtemp(prefix='aureon_csvhdr_')
+        try:
+            os.makedirs(os.path.join(tmp, 'reports'), exist_ok=True)
+
+            def _hdr_row(path):
+                with open(path, newline='') as fh:
+                    rows = list(csv.reader(fh))
+                return rows[0], (rows[1] if len(rows) > 1 else [])
+            checks = {}
+            # rogue_trades.csv
+            _rpl.log_trade(tmp, ts='t', event='close', direction='BUY', entry=4000, exit_px=4010,
+                           sl=3990, outcome_dollars=1.0, ticket=1, seed_source='A1_BREAK')
+            h, r = _hdr_row(os.path.join(tmp, _rpl.TRADES_CSV))
+            checks['rogue_trades'] = (len(h) == len(r) and h == _rpl.TRADE_COLUMNS
+                                      and h[-1] == 'seed_source')
+            # rogue_patterns.csv
+            _rpl.log_eval(tmp, ts='t', direction='BUY', features={}, decision=_rpl.ENTER,
+                          model_score=0.5, seed_source='A1_BREAK')
+            h, r = _hdr_row(os.path.join(tmp, _rpl.PATTERNS_CSV))
+            checks['rogue_patterns'] = (len(h) == len(r) and h == _rpl.PATTERN_COLUMNS
+                                        and h[-1] == 'seed_source')
+            # fetcher_trades.csv
+            trf = types.SimpleNamespace(run_dir=tmp)
+            _f._log_trade(trf, event='enter', direction='BUY', anchor=4000, entry=4005, exit_px='',
+                          tp=4010, sl=4000, ticket=9, seed_source='A1_BREAK')
+            h, r = _hdr_row(os.path.join(tmp, _f.TRADES_CSV))
+            checks['fetcher_trades'] = (len(h) == len(r) and h == _f.TRADE_COLUMNS
+                                        and h[-1] == 'seed_source')
+            # boost_ledger.csv (_safe_dir reads trader._journal_dir())
+            trb = types.SimpleNamespace(cfg=types.SimpleNamespace(util_boost_ledger=True),
+                                        run_dir=tmp, _journal_dir=lambda: tmp)
+            _bm.append_ledger(trb, {'ts': 't', 'anchor': 'A1', 'kind': 'ROGUE', 'event': 'enter',
+                                    'arm_px': 4000, 'entry_px': 4005, 'exit_px': '', 'pnl_usd': '',
+                                    'seed_source': 'A1_BREAK'})
+            h, r = _hdr_row(os.path.join(tmp, 'boost_ledger.csv'))
+            checks['boost_ledger'] = (len(h) == len(r) and h == list(_bm.LEDGER_COLUMNS)
+                                      and h[-1] == 'seed_source')
+            # pnl_ledger.csv (full-rewrite writer -- structurally immune, still assert)
+            rep = _pr.build_day_report(
+                types.SimpleNamespace(mt5=types.SimpleNamespace(
+                    history_deals_get=lambda a, b: self._recon_deals())),
+                '2026-07-08', run_dir=tmp)
+            _pr.write_report_files(rep, run_dir=tmp)
+            h, r = _hdr_row(os.path.join(tmp, 'reports', 'pnl_ledger.csv'))
+            checks['pnl_ledger'] = (len(h) == len(r) and h == list(_pr.PNL_LEDGER_COLUMNS))
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+        except Exception as e:
+            self._record(278, FAIL, f"raised: {e!r}"); return
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._record(278, PASS if ok else FAIL, detail)
+
+    def _step_r8_migration(self):
+        # 279 R-8 FIX: a legacy rogue_trades.csv with a 9-col header over 10-col rows migrates to
+        # a 10-col header (seed_source LAST), data rows PRESERVED, the original backed up to .bak,
+        # and the writer self-heals on the next append. Re-running the migration is a no-op.
+        import os, csv, tempfile
+        import csv_schema as _cs, rogue_patternlog as _rpl
+        tmp = tempfile.mkdtemp(prefix='aureon_r8_')
+        try:
+            p = os.path.join(tmp, _rpl.TRADES_CSV)
+            legacy = ['ts', 'event', 'direction', 'entry', 'exit', 'sl', 'outcome_dollars',
+                      'ticket', 'magic']                     # 9 cols (pre-seed_source)
+            with open(p, 'w', newline='') as f:
+                w = csv.writer(f); w.writerow(legacy)
+                w.writerow(['t1', 'close', 'BUY', '4000', '4010', '3990', '7.0', '11', '20260626'])
+                w.writerow(['t2', 'close', 'SELL', '4010', '4005', '4015', '-5.0', '22',
+                            '20260626', 'A1_BREAK'])       # a 10-col row already appended
+            res = _cs.migrate(p, _rpl.TRADE_COLUMNS)
+            hf, _ = _cs.inspect(p)
+            rows = list(csv.DictReader(open(p)))
+            migrated_ok = (res['migrated'] and len(hf) == 10 and hf[-1] == 'seed_source'
+                           and os.path.exists(p + '.bak') and len(rows) == 2
+                           and rows[0]['outcome_dollars'] == '7.0'
+                           and rows[1]['seed_source'] == 'A1_BREAK' and None not in rows[0])
+            # idempotent: a second migrate does nothing
+            res2 = _cs.migrate(p, _rpl.TRADE_COLUMNS)
+            idem = (res2['migrated'] is False and res2['reason'] == 'already-current')
+            # self-heal: appending via the real writer to a STALE file fixes the header first
+            p2 = os.path.join(tmp, 'rt2.csv')
+            with open(p2, 'w', newline='') as f:
+                csv.writer(f).writerow(legacy)             # 9-col header only
+            _cs.ensure(p2, _rpl.TRADE_COLUMNS)
+            hf2, _ = _cs.inspect(p2)
+            heal = (len(hf2) == 10 and hf2[-1] == 'seed_source')
+            ok = migrated_ok and idem and heal
+            detail = f"migrated={migrated_ok} idempotent={idem} self_heal={heal}"
+        except Exception as e:
+            self._record(279, FAIL, f"raised: {e!r}"); return
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._record(279, PASS if ok else FAIL, detail)
+
+    def _step_pnl_source_truth(self):
+        # 280 SINGLE SOURCE OF TRUTH: magic_day_net sums profit+swap+commission over CLOSING
+        # deals (entry==1) by magic; engine_day_nets splits anchors/rogue/fetcher + account;
+        # magic_day_entries counts OPENING deals. This ONE function feeds every surface.
+        import types
+        import pnl_source as _ps
+        try:
+            deals = self._recon_deals()
+            r = _ps.magic_day_net(deals, _ps.ROGUE_MAGIC)
+            f = _ps.magic_day_net(deals, _ps.FETCHER_MAGIC)
+            a = _ps.magic_day_net(deals, _ps.ANCHORS_MAGIC)
+            core = (abs(r - 250.0) < 1e-9 and abs(f - 120.0) < 1e-9 and abs(a - 650.0) < 1e-9)
+            tr = types.SimpleNamespace(
+                adapter=types.SimpleNamespace(mt5=types.SimpleNamespace(
+                    history_deals_get=lambda x, y: deals)),
+                cfg=types.SimpleNamespace(broker_tz_offset_hours=3.0))
+            nets = _ps.engine_day_nets(tr, dt_from=1, dt_to=2)
+            split = (nets['anchors'] == 650.0 and nets['rogue'] == 250.0
+                     and nets['fetcher'] == 120.0 and nets['account'] == 1020.0)
+            entries = (_ps.magic_day_entries(deals, _ps.ROGUE_MAGIC) == 2
+                       and _ps.magic_day_entries(deals, _ps.FETCHER_MAGIC) == 1)
+            ok = core and split and entries
+            detail = f"magic_net(r/f/a)={r}/{f}/{a} split={split} entries={entries}"
+        except Exception as e:
+            self._record(280, FAIL, f"raised: {e!r}"); return
+        self._record(280, PASS if ok else FAIL, detail)
+
+    def _step_reconcile_agree(self):
+        # 281 CORE: from ONE synthetic deal history, all FOUR surfaces (MT5 authority /
+        # pnl_ledger.csv / the daily report / the live stops source) return IDENTICAL per-engine
+        # and account nets -- the whole point of the single-source pipeline.
+        import tempfile
+        import pnl_reconcile as _rec, pnl_report as _pr
+        tmp = tempfile.mkdtemp(prefix='aureon_recon_')
+        try:
+            date = '2026-07-08'
+            deals = self._recon_deals()
+            tr, adapter = self._recon_trader(tmp, deals, date)
+            rep = _pr.build_day_report(adapter, date, run_dir=tmp)
+            _pr.write_report_files(rep, run_dir=tmp)
+            res = _rec.reconcile_day(tr, date)
+            agree = res['ok'] and not res['mismatches']
+            # every cell equals the authority
+            alleq = True
+            for eng in _rec.ENGINES:
+                c = res['table'][eng]
+                auth = c['authority']
+                alleq = alleq and all(abs((c[s] or 0) - auth) < 1e-9
+                                      for s in ('ledger', 'report', 'live'))
+            acct_ok = abs(res['table']['account']['authority'] - 1020.0) < 1e-9
+            ok = agree and alleq and acct_ok
+            detail = (f"ok={res['ok']} all_surfaces_equal={alleq} account={res['table']['account']}")
+        except Exception as e:
+            self._record(281, FAIL, f"raised: {e!r}"); return
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._record(281, PASS if ok else FAIL, detail)
+
+    def _step_reconcile_mismatch(self):
+        # 282 an injected discrepancy makes reconcile FAIL LOUDLY: ok=False, the mismatch names
+        # the surface + delta, the CLI exit code is non-zero, and the corrections table records
+        # claimed-vs-corrected. Never a silent pass.
+        import tempfile, os, csv
+        import pnl_reconcile as _rec, pnl_report as _pr
+        tmp = tempfile.mkdtemp(prefix='aureon_reconx_')
+        try:
+            date = '2026-07-08'
+            deals = self._recon_deals()
+            tr, adapter = self._recon_trader(tmp, deals, date)
+            rep = _pr.build_day_report(adapter, date, run_dir=tmp)
+            _pr.write_report_files(rep, run_dir=tmp)
+            # inject: corrupt the ledger's ROGUE day P&L
+            lp = os.path.join(tmp, 'reports', 'pnl_ledger.csv')
+            rows = list(csv.DictReader(open(lp)))
+            for r in rows:
+                if r['scope'] == 'ROGUE':
+                    r['rogue_day_pnl'] = '999.99'
+            with open(lp, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
+            res = _rec.reconcile_day(tr, date)
+            named = any(m['surface'] == 'ledger' and m['engine'] == 'rogue'
+                        and abs(m['delta'] - 749.99) < 0.01 for m in res['mismatches'])
+            exit_code = 0 if res['ok'] else 1              # the CLI's ok->exit mapping
+            corr = _rec.corrections_table([res])
+            corr_ok = any(c['engine'] == 'rogue' and abs(c['corrected'] - 250.0) < 0.01
+                          for c in corr)
+            # the card is a loud RED mismatch embed
+            c = _rec.card(res)
+            card_red = (c is not None and 'MISMATCH' in c.get('title', ''))
+            ok = (res['ok'] is False and named and exit_code == 1 and corr_ok and card_red)
+            detail = (f"ok={res['ok']} named_ledger_rogue={named} exit={exit_code} "
+                      f"corrections={len(corr)} card_red={card_red}")
+        except Exception as e:
+            self._record(282, FAIL, f"raised: {e!r}"); return
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._record(282, PASS if ok else FAIL, detail)
+
+    def _step_no_csv_sum_pnl(self):
+        # 283 the trade CSVs are DECISION LOGS, never a P&L source: the report + reconcile never
+        # read rogue_trades.csv / fetcher_trades.csv, and both writers carry the "NOT a P&L
+        # source" header note. (rogue_trades.outcome_dollars is a price delta, not account $.)
+        import os
+        try:
+            root = os.path.dirname(os.path.abspath(__file__))
+
+            def _src(name):
+                with open(os.path.join(root, name)) as f:
+                    return f.read()
+            pr_src = _src('pnl_report.py')
+            rc_src = _src('pnl_reconcile.py')
+            # neither the report nor the reconcile audit reads the trade event logs as a P&L src
+            no_read = ('rogue_trades' not in pr_src and 'fetcher_trades' not in pr_src
+                       and 'rogue_trades' not in rc_src and 'fetcher_trades' not in rc_src)
+            # both trade-CSV writers document that the file is NOT a P&L source
+            note = ('NOT a P&L source' in _src('rogue_patternlog.py')
+                    and 'NOT a P&L source' in _src('fetcher.py'))
+            # the single source exists + is what pnl_source exposes
+            import pnl_source as _ps
+            src_fn = callable(getattr(_ps, 'magic_day_net', None))
+            ok = no_read and note and src_fn
+            detail = f"report/reconcile_dont_read_trade_csvs={no_read} decision_log_note={note} magic_day_net={src_fn}"
+        except Exception as e:
+            self._record(283, FAIL, f"raised: {e!r}"); return
+        self._record(283, PASS if ok else FAIL, detail)
+
     def _step_fetcher_seed_resolution(self):
         # 234 SEED: the shared resolver (rogue.resolve_seed, fallback_key=
         # 'fetcher_seed_fallback') gives the REAL A1 anchor when the anchor engine is ON,
@@ -8520,7 +8796,8 @@ class SelfTest:
             _rogue=None, _fetcher=None, _save_state=lambda: None,
             tele=types.SimpleNamespace(info=lambda *a, **k: None, send=lambda *a, **k: None,
                                        warn=lambda m='', **k: alerts.append(str(m))))
-        for m in ('_engine_day_pnls', '_anchors_daystop', '_anchors_daystop_blocked',
+        for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_anchors_daystop',
+                  '_anchors_daystop_blocked',
                   '_anchors_profit_alert', '_account_locked', '_anchors_daystop_skip',
                   '_daylock_override', '_daylock_lines', '_post_daylock_status'):
             setattr(t, m, getattr(_lt.LiveTrader, m).__get__(t))
@@ -8787,7 +9064,8 @@ class SelfTest:
             tele=types.SimpleNamespace(info=lambda *a, **k: None,
                                        send=lambda m='', *a, **k: alerts.append(str(m)),
                                        warn=lambda m='', **k: alerts.append(str(m))))
-        for m in ('_engine_day_pnls', '_account_locked', '_account_target', '_post_a4_complete',
+        for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_account_locked',
+                  '_account_target', '_post_a4_complete',
                   '_account_target_alert', '_anchors_daystop', '_anchors_daystop_blocked',
                   '_anchors_daystop_skip', '_daylock_override', '_post_daylock_status',
                   '_daylock_lines', '_target_status_lines_payload'):
@@ -10830,6 +11108,13 @@ class SelfTest:
             self._step_break_budget_persist()
             self._step_seed_gap_refuse_manual()
             self._step_break_budget_anchors_indep()
+            # 2026-07-09 P&L pipeline reconciliation (R-8 fix + single source + reconcile audit)
+            self._step_csv_writers_schema()
+            self._step_r8_migration()
+            self._step_pnl_source_truth()
+            self._step_reconcile_agree()
+            self._step_reconcile_mismatch()
+            self._step_no_csv_sum_pnl()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

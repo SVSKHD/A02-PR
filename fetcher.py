@@ -44,6 +44,9 @@ FETCHER_LEG_TYPE = "fetcher"
 FETCHER_ALERT_PREFIX = "[FETCHER]"
 FETCHER_GLYPH = "🪣"                 # a bucket: scoop the chop
 TRADES_CSV = "fetcher_trades.csv"
+# fetcher_trades.csv is a DECISION LOG (entry/exit reasoning + provenance), NOT a P&L source.
+# Realized day P&L comes ONLY from MT5 deal history by magic (pnl_source.magic_day_net) --
+# NEVER sum outcome_dollars over these rows to produce a reported number.
 # seed_source is the LAST column (D-8 provenance; appending keeps old files positional-safe)
 TRADE_COLUMNS = ['ts', 'event', 'direction', 'anchor', 'entry', 'exit', 'tp', 'sl',
                  'outcome_dollars', 'ticket', 'magic', 'seed_source']
@@ -241,6 +244,12 @@ def _log_trade(trader, *, event, direction, anchor, entry, exit_px, tp, sl,
                'direction': direction or '', 'anchor': anchor, 'entry': entry,
                'exit': exit_px, 'tp': tp, 'sl': sl, 'outcome_dollars': outcome_dollars,
                'ticket': ticket, 'magic': FETCHER_MAGIC, 'seed_source': seed_source or ''}
+        # R-8 self-heal: migrate a stale narrower header to TRADE_COLUMNS before appending.
+        try:
+            import csv_schema
+            csv_schema.ensure(path, TRADE_COLUMNS)
+        except Exception:
+            pass
         new = not os.path.exists(path)
         with open(path, 'a', newline='') as f:
             w = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
@@ -867,16 +876,15 @@ def rebuild_gov_from_history(trader, dt_from=None, dt_to=None):
         log.warning(f"{FETCHER_ALERT_PREFIX} rebuild history query failed: {e!r}")
         return None
     try:
+        import pnl_source as _ps
         ours = [d for d in deals if int(getattr(d, 'magic', 0) or 0) == FETCHER_MAGIC]
         ins = [d for d in ours if getattr(d, 'entry', None) == 0]
         outs = [d for d in ours if getattr(d, 'entry', None) == 1]
         outs.sort(key=lambda d: getattr(d, 'time', 0) or 0)
         gov = new_day_state()
         gov['entries'] = len(ins)
-        gov['day_pnl'] = round(sum(
-            float(getattr(d, 'profit', 0.0) or 0.0)
-            + float(getattr(d, 'swap', 0.0) or 0.0)
-            + float(getattr(d, 'commission', 0.0) or 0.0) for d in outs), 2)
+        # SINGLE SOURCE OF TRUTH: realized day P&L via pnl_source.magic_day_net (by magic).
+        gov['day_pnl'] = _ps.magic_day_net(deals, FETCHER_MAGIC)
         # trailing consecutive losing closes (a win breaks the streak)
         fails = 0
         for d in reversed(outs):

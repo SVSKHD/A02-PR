@@ -43,7 +43,10 @@ _EXPECTED_FLAGS = (
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
                     'boosts_common', 'strategy', 'break_hold', 'fetcher', 'daystops',
-                    'seed_budget')
+                    'seed_budget',
+                    # 2026-07-09 P&L pipeline: the single source of truth + the R-8 CSV
+                    # self-heal + the reconcile audit must all import cleanly.
+                    'pnl_source', 'csv_schema', 'pnl_reconcile')
 # the LiveTrader seams that MUST be bound for the per-tick flow to dispatch.
 _SEAMS = ('_break_and_hold_ok', '_rescue_entry_ok', '_check_boost_triggers',
           '_resolved_anchor_hm', '_process_anchor_if_due',
