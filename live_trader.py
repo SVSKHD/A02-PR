@@ -277,7 +277,7 @@ class LiveTrader:
 
         # Today's trade log header
         if not os.path.exists(self.daylog_path):
-            with open(self.daylog_path, "w", newline="") as f:
+            with open(self.daylog_path, "w", newline="", encoding='utf-8') as f:
                 csv.writer(f).writerow(
                     ["date", "anchor", "side", "entry", "exit",
                      "outcome", "pnl_usd", "ticket"])
@@ -432,7 +432,7 @@ class LiveTrader:
             )
             self._save_state()
             # Reset today's trade log
-            with open(self.daylog_path, "w", newline="") as f:
+            with open(self.daylog_path, "w", newline="", encoding='utf-8') as f:
                 csv.writer(f).writerow(
                     ["date", "anchor", "side", "entry", "exit",
                      "outcome", "pnl_usd", "ticket"])
@@ -473,7 +473,7 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def _touch_heartbeat(self):
-        with open(self.heartbeat_path, "w") as f:
+        with open(self.heartbeat_path, "w", encoding='utf-8') as f:
             f.write(datetime.now(timezone.utc).isoformat())
 
     def _rl_ok(self, key: str, period_s: float = 60.0) -> bool:
@@ -586,7 +586,7 @@ class LiveTrader:
 
             csv_path = os.path.join(self.price_log_dir, f"price_{broker_date}.csv")
             need_header = not os.path.exists(csv_path)
-            with open(csv_path, "a", newline="") as f:
+            with open(csv_path, "a", newline="", encoding='utf-8') as f:
                 w = csv.writer(f)
                 if need_header:
                     w.writerow(["utc", "broker_time", "bid", "ask", "mid", "spread", "m1_close"])
@@ -681,7 +681,7 @@ class LiveTrader:
                 log.debug(f"weekend stats skipped (non-fatal): {e!r}")
         tmp = self.status_path + ".tmp"
         try:
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding='utf-8') as f:
                 json.dump(status, f, indent=2, default=str)
             os.replace(tmp, self.status_path)
         except (PermissionError, OSError) as e:
@@ -691,13 +691,13 @@ class LiveTrader:
         if not os.path.exists(self.commands_path):
             return []
         try:
-            with open(self.commands_path) as f:
+            with open(self.commands_path, encoding='utf-8') as f:
                 cmds = json.load(f)
         except Exception:
             return []
         # Clear the file by overwriting with []
         try:
-            with open(self.commands_path, "w") as f:
+            with open(self.commands_path, "w", encoding='utf-8') as f:
                 json.dump([], f)
         except Exception:
             pass
@@ -1907,7 +1907,7 @@ class LiveTrader:
             # Hand off: a restart-request file the watchdog acts on (relaunch via the
             # venv python). We deliberately do NOT close/modify any position/pending.
             try:
-                with open(os.path.join(self.run_dir, "restart.request"), "w") as f:
+                with open(os.path.join(self.run_dir, "restart.request"), "w", encoding='utf-8') as f:
                     f.write(json.dumps({"reason": reason, "ts": time.time(),
                                         "positions_left_open": len(plan["left_open"])}))
             except Exception as e:

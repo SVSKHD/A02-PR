@@ -695,7 +695,7 @@ def load_rescue_event_index(run_dir):
     if not os.path.exists(path):
         return idx
     try:
-        with open(path, newline='') as f:
+        with open(path, newline='', encoding='utf-8') as f:
             for r in csv.DictReader(f):
                 et = (r.get('event_type') or '').strip()
                 if not et:
@@ -724,7 +724,7 @@ def load_journal_index(run_dir, date_str):
     if not os.path.exists(path):
         return idx
     try:
-        with open(path, newline='') as f:
+        with open(path, newline='', encoding='utf-8') as f:
             for r in csv.DictReader(f):
                 if r.get('date_ist') != date_str:
                     continue
@@ -844,7 +844,7 @@ def write_report_files(day_report, run_dir=None, month_rollup_stats=None,
                          month_str=month_str, unclassified_note=note,
                          fetcher=day_report.get('fetcher'))
     md_path = os.path.join(out_dir, f"daily_{date_str}.md")
-    with open(md_path, 'w') as f:
+    with open(md_path, 'w', encoding='utf-8') as f:
         f.write(md)
     csv_path = os.path.join(out_dir, 'pnl_ledger.csv')
     rows = ledger_rows(date_str, day_report['per_anchor'], day_report['rogue'],
@@ -862,12 +862,12 @@ def upsert_ledger_rows(csv_path, date_str, new_rows):
     existing = []
     if os.path.exists(csv_path):
         try:
-            with open(csv_path, newline='') as f:
+            with open(csv_path, newline='', encoding='utf-8') as f:
                 existing = [r for r in csv.DictReader(f) if r.get('date') != date_str]
         except (OSError, csv.Error) as e:
             log.warning(f"pnl_report: pnl_ledger.csv read failed (rewriting fresh): {e!r}")
             existing = []
-    with open(csv_path, 'w', newline='') as f:
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=PNL_LEDGER_COLUMNS)
         w.writeheader()
         for r in existing:

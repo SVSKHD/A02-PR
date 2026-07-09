@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.4"  # selftest truth: config-drift tests assert behavior-vs-cfg (not values), utf-8 on every open(), emoji-safe stdout under redirect
+__version__ = "3.8.5"  # explicit encoding='utf-8' on all repo file I/O (writers+readers); daily report em-dash round-trips regardless of ambient locale
 CODENAME = "Astra Hawk"
 
 

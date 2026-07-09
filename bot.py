@@ -130,7 +130,7 @@ def main():
         trades_path = os.path.join(args.output_dir, 'trades.csv')
         stats_path = os.path.join(args.output_dir, 'stats.json')
         df.to_csv(trades_path, index=False)
-        with open(stats_path, 'w') as f:
+        with open(stats_path, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2)
         log.info(f"\nWrote {trades_path} and {stats_path}")
 

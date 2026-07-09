@@ -49,7 +49,7 @@ def inspect(path):
     try:
         if not os.path.exists(path):
             return None, None
-        with open(path, newline="") as f:
+        with open(path, newline="", encoding='utf-8') as f:
             header = f.readline()
             if header == "":
                 return None, None
@@ -79,7 +79,7 @@ def migrate(path, columns, backup=True):
         if not os.path.exists(path):
             out["reason"] = "absent"
             return out
-        with open(path, newline="") as f:
+        with open(path, newline="", encoding='utf-8') as f:
             content = f.read()
         if content == "":
             out["reason"] = "empty"
@@ -96,13 +96,13 @@ def migrate(path, columns, backup=True):
         bak = path + ".bak"
         if backup and not os.path.exists(bak):
             try:
-                with open(bak, "w", newline="") as bf:
+                with open(bak, "w", newline="", encoding='utf-8') as bf:
                     bf.write(content)
                 out["backup"] = bak
             except Exception as e:
                 log.warning(f"csv_schema: backup {bak} failed (continuing): {e!r}")
         tmp = path + ".tmp"
-        with open(tmp, "w", newline="") as f:
+        with open(tmp, "w", newline="", encoding='utf-8') as f:
             f.write(new_header + "\n" + rest)
         os.replace(tmp, path)
         out["migrated"] = True

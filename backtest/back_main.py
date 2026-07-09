@@ -205,7 +205,7 @@ def main(argv):
     cols = ['date', 'anchor', 'label', 'role', 'side', 'entry', 'exit',
             'exit_reason', 'pnl_usd', 'held_min', 'slip', 'is_monday_a1',
             'event_type', 'branch', 'boost']
-    with open(csv_path, 'w', newline='') as f:
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for t in trades:

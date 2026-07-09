@@ -47,7 +47,7 @@ def ledger_nets(run_dir, date_str):
     if not os.path.exists(path):
         return None
     try:
-        with open(path, newline='') as fh:
+        with open(path, newline='', encoding='utf-8') as fh:
             rows = [r for r in csv.DictReader(fh) if str(r.get('date')) == str(date_str)]
         if not rows:
             return None

@@ -251,7 +251,7 @@ def _log_trade(trader, *, event, direction, anchor, entry, exit_px, tp, sl,
         except Exception:
             pass
         new = not os.path.exists(path)
-        with open(path, 'a', newline='') as f:
+        with open(path, 'a', newline='', encoding='utf-8') as f:
             w = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
             if new:
                 w.writeheader()
@@ -839,12 +839,12 @@ def enqueue_seed_command(cfg):
         cmds = []
         if _os.path.exists(path):
             try:
-                with open(path) as f:
+                with open(path, encoding='utf-8') as f:
                     cmds = _json.load(f) or []
             except Exception:
                 cmds = []
         cmds.append({"cmd": "fetchseed"})
-        with open(path, "w") as f:
+        with open(path, "w", encoding='utf-8') as f:
             _json.dump(cmds, f)
         abspath = _os.path.abspath(path)
         log.info(f"{FETCHER_ALERT_PREFIX} fetchseed queued -> {abspath} "

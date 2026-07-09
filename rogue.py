@@ -1626,12 +1626,12 @@ def enqueue_seed_command(cfg):
         cmds = []
         if _os.path.exists(path):
             try:
-                with open(path) as f:
+                with open(path, encoding='utf-8') as f:
                     cmds = _json.load(f) or []
             except Exception:
                 cmds = []
         cmds.append({"cmd": "rogueseed"})
-        with open(path, "w") as f:
+        with open(path, "w", encoding='utf-8') as f:
             _json.dump(cmds, f)
         # Log the ABSOLUTE path so a run_dir mismatch (the launcher and the running bot
         # resolving AUREON_RUN_DIR / cwd differently) is immediately visible: this path MUST

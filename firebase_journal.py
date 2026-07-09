@@ -197,7 +197,7 @@ def _days_from_csvs(journal_dir):
     try:
         for path in sorted(glob.glob(os.path.join(journal_dir, "trades_*.csv"))):
             try:
-                with open(path, newline="") as f:
+                with open(path, newline="", encoding='utf-8') as f:
                     for r in csv.DictReader(f):
                         day = r.get(_CSV_DATE)
                         if not day:

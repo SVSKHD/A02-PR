@@ -202,7 +202,7 @@ def save(trader, force=False):
         path = _path(trader)
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         tmp = path + '.tmp'
-        with open(tmp, 'w') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             f.write(blob)
         os.replace(tmp, path)
         trader._p1_last_blob = blob
@@ -218,7 +218,7 @@ def load(run_dir):
         path = os.path.join(run_dir or "./run", STATE_FILENAME)
         if not os.path.exists(path):
             return {}
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             return json.load(f) or {}
     except Exception as e:
         log.warning(f"p1_state.load non-fatal: {e!r}")

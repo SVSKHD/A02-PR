@@ -78,7 +78,7 @@ def load_examples(run_dir, archive_dir):
     seen, items = set(), []
     for p in paths:
         try:
-            with open(p, newline='') as f:
+            with open(p, newline='', encoding='utf-8') as f:
                 for row in csv.DictReader(f):
                     xy = _row_to_xy(row)
                     if xy is None:

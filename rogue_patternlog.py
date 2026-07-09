@@ -131,7 +131,7 @@ def _append_row(path, columns, row):
     except Exception:
         pass
     new = not os.path.exists(path)
-    with open(path, 'a', newline='') as f:
+    with open(path, 'a', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=columns)
         if new:
             w.writeheader()
@@ -186,7 +186,7 @@ def backfill_exit(run_dir, enter_ts, exit_fields, decision=None):
     if not os.path.exists(path):
         return False
     try:
-        with open(path, newline='') as f:
+        with open(path, newline='', encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
         hit = False
         for r in rows:
@@ -202,7 +202,7 @@ def backfill_exit(run_dir, enter_ts, exit_fields, decision=None):
         if not hit:
             return False
         tmp = path + ".tmp"
-        with open(tmp, 'w', newline='') as f:
+        with open(tmp, 'w', newline='', encoding='utf-8') as f:
             w = csv.DictWriter(f, fieldnames=PATTERN_COLUMNS)
             w.writeheader()
             for r in rows:
