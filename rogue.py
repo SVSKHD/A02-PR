@@ -320,21 +320,28 @@ def account_is_demo(trader):
         return False
 
 
+# rogue.py promote_on_boot
 def promote_on_boot(trader):
-    """DEMO default-ON / FUNDED forced-OFF: on every boot the account type sets
-    rogue_enabled -- ON for a demo (non-funded) account, forced OFF for funded (v3.6.0:
-    the config boot default is True, but this per-account stamp stays authoritative).
-    Returns the effective rogue_enabled. Guarded; never raises."""
+    """DEMO default-ON / FUNDED forced-OFF, UNLESS the owner set an explicit
+    bool in config. None = auto-promote by account type (legacy behavior).
+    True/False = owner's explicit choice; funded still forces OFF regardless
+    (the mandatory gate is never overridable upward)."""
     try:
         is_demo = account_is_demo(trader)
         is_funded = not is_demo
-        if funded_default(is_demo, is_funded):
-            trader.cfg.rogue_enabled = True
-            log.info(f"{ROGUE_ALERT_PREFIX} demo account -> rogue PROMOTED ON (trial).")
-        elif is_funded:
+        explicit = getattr(trader.cfg, 'rogue_enabled', None)
+
+        if is_funded:                       # mandatory gate — always wins
             trader.cfg.rogue_enabled = False
             log.info(f"{ROGUE_ALERT_PREFIX} funded account -> rogue FORCED OFF (gate).")
-        return bool(getattr(trader.cfg, 'rogue_enabled', False))
+        elif explicit is None:              # no owner opinion -> auto-promote
+            trader.cfg.rogue_enabled = True
+            log.info(f"{ROGUE_ALERT_PREFIX} demo account -> rogue PROMOTED ON (trial).")
+        else:                               # owner said so, respect it
+            trader.cfg.rogue_enabled = bool(explicit)
+            log.info(f"{ROGUE_ALERT_PREFIX} demo account -> rogue {'ON' if explicit else 'OFF'} "
+                     f"(explicit config override; promotion skipped).")
+        return bool(trader.cfg.rogue_enabled)
     except Exception as e:
         log.warning(f"{ROGUE_ALERT_PREFIX} promote_on_boot non-fatal: {e!r}")
         return bool(getattr(trader.cfg, 'rogue_enabled', False))

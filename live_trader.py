@@ -2264,15 +2264,29 @@ class LiveTrader:
             kill_limit = self.cfg.daily_loss_pct * kill_base
             # v2.5.4: persist to file log, not just Telegram, so any future gating
             # of anchors is always reconstructable on disk.
+            # E-22 (07-09): the old line printed state['daily_pnl'] (anchors realized)
+            # next to an ACCOUNT-EQUITY limit — the switch never reads that variable.
+            # _check_kill_switch compares (day_start_equity - live_equity) >= limit,
+            # i.e. account equity drawdown INCLUDING unrealized. Print what was compared.
+            _eq = self._live_equity()
+            if _eq is not None:
+                _dd = kill_base - _eq
+                _basis = (f"account equity drawdown=${_dd:,.2f} "
+                          f"(equity=${_eq:,.2f} vs day_start=${kill_base:,.2f}) [incl. unrealized]")
+            else:
+                _basis = (f"realized daily_pnl=${self.state['daily_pnl']:,.2f} "
+                          f"[equity unavailable — paper/MT5 fallback path]")
             log.warning(
-                f"KILL SWITCH TRIGGERED — daily_pnl=${self.state['daily_pnl']:.2f} "
-                f"limit=-${kill_limit:.0f} (base day_start_equity=${kill_base:,.2f}). "
+                f"KILL SWITCH TRIGGERED — {_basis} "
+                f"limit=-${kill_limit:,.0f} ({self.cfg.daily_loss_pct * 100:.1f}% of day-start). "
+                f"[context: anchors realized daily_pnl=${self.state['daily_pnl']:,.2f}] "
                 f"Flattening; no new anchors today."
             )
             self.tele.critical(
                 f"🚨 *KILL SWITCH TRIGGERED*\n"
-                f"Daily P&L: `${self.state['daily_pnl']:.2f}` "
-                f"(limit `-${kill_limit:.0f}`, from day-open `${kill_base:,.0f}`)\n"
+                f"{_basis}\n"
+                f"Limit: `-${kill_limit:,.0f}` (`{self.cfg.daily_loss_pct * 100:.1f}%` of day-open `${kill_base:,.0f}`)\n"
+                f"_Anchors realized today: `${self.state['daily_pnl']:,.2f}` (context only — not the trigger)_\n"
                 f"Flattening everything, no more trades today."
             )
             self._flatten_all(reason="KillSwitch")

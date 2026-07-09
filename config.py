@@ -123,8 +123,8 @@ class Config:
     # SEPARATE keys / flag / call-site from rally (standing rule); shares ONLY the pure
     # pullback_entry.step helper. DEFAULT OFF -> today's immediate bypass-fire preserved
     # (byte-identical). Rescue SL stays $10 (boost_sl_dollars) and the cap stays -$700;
-    # the $10->$13 question is a SEPARATE month-end decision (it would move the cap).
-    rescue_entry_enabled: bool = False  # v3.5.0 MASTER FLAG, DEFAULT OFF (freeze-safe).
+    # the $10->$13 question is a SEPARATE month-end decision (it would move the cap).promote_on_boot
+    rescue_entry_enabled: bool = True  # v3.5.0 MASTER FLAG, DEFAULT OFF (freeze-safe).
     rescue_entry_bounce_dollars: float = 6.0  # bounce $ UP toward the parent fill that
     #   qualifies the retrace before the SELL entry on the rollover. Trial-tunable.
     rescue_entry_arm_timeout_candles: int = 4  # M5 candles before SKIP (no hedge).
@@ -175,7 +175,7 @@ class Config:
     # This config default is the BOOT DEFAULT of the LiveTrader's runtime engine switch
     # (live_trader.engines['rogue'], /rogue on|off) which ANDs with -- never replaces --
     # rogue_a1_anchor_mode and the demo/funded promotion gate above.
-    rogue_enabled: bool = True         # MASTER SWITCH (v3.6.0 boot default ON; funded still forced OFF)
+    rogue_enabled: bool = False      # MASTER SWITCH (v3.6.0 boot default ON; funded still forced OFF)
     rogue_daywatch: bool = True        # continuous M5 vision (only meaningful when rogue_enabled)
     rogue_max_reentries_per_day: int = 10   # HARD ceiling on NEW entries/day (the cap)
     rogue_min_candles: int = 4         # strong-move trigger: >= this many same-dir M5 closes
@@ -585,7 +585,7 @@ class Config:
     # promotion gate: a FUNDED account force-disables it on every boot (un-proven engine
     # never runs on real capital), identical to Rogue. NEVER reads/closes an anchor
     # 20260522 or Rogue 20260626 ticket. Lot READS cfg.lot_size and never mutates it.
-    fetcher_enabled: bool = True        # MASTER SWITCH (boot default ON; funded forced OFF)
+    fetcher_enabled: bool = False        # MASTER SWITCH (boot default ON; funded forced OFF)
     fetcher_trigger_dollars: float = 5.0    # move ($) off the anchor (either dir) -> enter
     fetcher_tp_dollars: float = 5.0         # broker-side TP at entry +/- this (fixed, no trail)
     fetcher_sl_dollars: float = 5.0         # broker-side SL at entry -/+ this (fixed, no trail)
@@ -640,7 +640,7 @@ class Config:
     # per-engine daily brakes Rogue/Fetcher carry -- realized day P&L is state['daily_pnl']
     # (Rogue/Fetcher are NOT mixed in; they have their own governors). Independent latches:
     # one engine locking/halting NEVER affects the others.
-    anchors_daily_profit_stop: float = 400.0   # SOFT profit-lock: realized anchors day P&L
+    anchors_daily_profit_stop: float = 800.0   # SOFT profit-lock: realized anchors day P&L
     # >= this -> manage-only (no NEW straddles / boosts; open legs trail/exit normally).
     # Overridable ONCE per broker day by `/daylock anchors off`. 0 disables the gate.
     anchors_daily_loss_stop: float = -630.0    # HARD halt: == exactly one full anchor SL
@@ -659,7 +659,7 @@ class Config:
     # 20260626, 20260707). Signed net -- a losing engine subtracts (net is the loss-coverage
     # mechanism; a losing engine is NOT re-traded). No rollover; everything resets at the
     # broker day roll (scaling is done via lot size, never by moving the target %).
-    account_target_pct: float = 0.02             # full target = 2% of day-start equity ($1,000@50k)
+    account_target_pct: float = 0.00             # full target = 2% of day-start equity ($1,000@50k)
     account_target_min_pct: float = 0.80         # accepted minimum (80% of full = $800@50k)
     account_target_final_anchor: str = "A4_1640_NYopen"  # last entry opportunity; the
     # target NEVER gates entries BEFORE this anchor completes (the day is still building).
