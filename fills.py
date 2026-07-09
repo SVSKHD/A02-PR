@@ -509,7 +509,7 @@ def _reconcile_with_broker(self):
                     event_key=f"close:{ticket}",
                 )
                 # Append to today's trade log
-                with open(self.daylog_path, "a", newline="") as f:
+                with open(self.daylog_path, "a", newline="", encoding='utf-8') as f:
                     csv.writer(f).writerow([
                         self.state['last_broker_date'],
                         shadow['anchor_label'], shadow['side'],

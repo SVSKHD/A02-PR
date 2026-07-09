@@ -395,6 +395,7 @@ STEP_NAMES = {
     291: "e23 tf ordering",            # run_testfire primes the day-P&L rebuild BEFORE preflight (source + functional)
     292: "r8 rescue+journal heal",     # rescue_events + journal writers self-heal; migrate_run_dir sweeps both
     293: "r10 engine surfaces",        # disabled engine reads OFF; registry + day_pnl_by_engine key sets match across surfaces
+    294: "utf-8 md round-trip",        # daily report em-dash round-trips via explicit utf-8; legacy cp1252 tolerated with errors='replace'
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9394,6 +9395,69 @@ class SelfTest:
             self._record(293, FAIL, f"raised: {e!r}"); return
         self._record(293, PASS if ok else FAIL, detail)
 
+    def _step_encoding_md_roundtrip(self):
+        # 294 UTF-8 TRUTH: a daily report carries an em-dash (—). Because every open() now pins
+        # encoding='utf-8', the write->read round-trip is byte-identical REGARDLESS of the
+        # ambient locale (cp1252 vs utf-8 default no longer matters) -- proven by (a) the REAL
+        # run_daily_report writer emitting genuine utf-8 bytes (E2 80 94, never the cp1252 0x97)
+        # and reading back identical, and (b) a LEGACY cp1252-written report being UNREADABLE as
+        # strict utf-8 (the two-hats crash that hit selftest 218/283) yet TOLERATED with
+        # errors='replace' -- the (a) mitigation for historical files. Both hats covered.
+        import tempfile, os, types
+        import boost_metrics as _bm
+        tmp = tempfile.mkdtemp(prefix='aureon_enc_')
+        try:
+            EM = '—'  # em-dash — the exact character that becomes 0x97 under cp1252
+            # the report FORMATTER puts an em-dash in the header unconditionally.
+            md = _bm.daily_report_md([{'anchor': 'A1', 'pnl': 100.0}], '2026-07-02')
+            content_has_emdash = (EM in md)
+            # the REAL production writer (run_daily_report) -> a daily_report_*.md on disk.
+            with open(os.path.join(tmp, 'trades_2026-07.csv'), 'w', newline='',
+                      encoding='utf-8') as f:
+                import csv as _csv
+                w = _csv.writer(f)
+                w.writerow(['date_ist', 'anchor', 'realized_pnl_usd'])
+                w.writerow(['2026-07-02', 'A1', '100.00'])
+            trader = types.SimpleNamespace(
+                cfg=types.SimpleNamespace(util_daily_report=True),
+                _journal_dir=lambda: tmp, shadow_positions={})
+            out_path = _bm.run_daily_report(trader, date_str='2026-07-02')
+            # bytes on disk are genuine utf-8 (em-dash = E2 80 94), NOT cp1252 (single 0x97),
+            # so the writer is locale-INDEPENDENT -- a Windows cp1252 default cannot corrupt it.
+            raw = open(out_path, 'rb').read()
+            utf8_bytes_ok = (b'\xe2\x80\x94' in raw and b'\x97' not in raw)
+            # utf-8 read round-trips the em-dash (what selftest 218 reads back).
+            with open(out_path, encoding='utf-8') as f:
+                back = f.read()
+            roundtrip_ok = (EM in back)
+            # (b) LEGACY cp1252 report (pre-fix Windows writer stored the em-dash as 0x97).
+            pl = os.path.join(tmp, 'legacy_cp1252.md')
+            with open(pl, 'w', encoding='cp1252') as f:
+                f.write(f'# AUREON daily report {EM} 2026-06-01')
+            legacy_is_cp1252 = (b'\x97' in open(pl, 'rb').read())
+            # strict utf-8 read of the legacy file RAISES (the exact two-hats crash) ...
+            crashed_strict = False
+            try:
+                with open(pl, encoding='utf-8') as f:
+                    f.read()
+            except UnicodeDecodeError:
+                crashed_strict = True
+            # ... and errors='replace' TOLERATES it (mitigation (a): never rewrite history).
+            with open(pl, encoding='utf-8', errors='replace') as f:
+                tolerant = f.read()
+            replace_tolerates = ('2026-06-01' in tolerant)   # readable; 0x97 -> U+FFFD, no crash
+            ok = (content_has_emdash and utf8_bytes_ok and roundtrip_ok
+                  and legacy_is_cp1252 and crashed_strict and replace_tolerates)
+            detail = (f"content_emdash={content_has_emdash} utf8_bytes={utf8_bytes_ok} "
+                      f"utf8_roundtrip={roundtrip_ok} legacy_cp1252_byte={legacy_is_cp1252} "
+                      f"strict_utf8_crashes={crashed_strict} replace_tolerates={replace_tolerates}")
+        except Exception as e:
+            self._record(294, FAIL, f"raised: {e!r}"); return
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._record(294, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -11631,6 +11695,8 @@ class SelfTest:
             self._step_status_per_engine_pnl()
             # R-10 (07-09): engine-state surfaces render from ONE registry + computed governors
             self._step_r10_engine_surfaces()
+            # UTF-8 truth: daily report em-dash round-trips regardless of ambient locale
+            self._step_encoding_md_roundtrip()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

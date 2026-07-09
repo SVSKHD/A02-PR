@@ -28,7 +28,7 @@ def _load_state(self) -> Dict:
                         (self.state_path + ".bak", "backup")]:
         if os.path.exists(path):
             try:
-                with open(path) as f:
+                with open(path, encoding='utf-8') as f:
                     s = json.load(f)
                 log.info(f"Restored state from {label}: {path}")
                 return s
@@ -91,7 +91,7 @@ def _save_state(self):
             shutil.copyfile(self.state_path, bak)
         except Exception:
             pass  # backup failure is not fatal
-    with open(tmp, 'w') as f:
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(self.state, f, indent=2, default=str)
     os.replace(tmp, self.state_path)
     # Fix 5 (E-16): mirror the P1 snapshot to run/state.json on every state change (anchor
@@ -117,7 +117,7 @@ def _acquire_pid_lock(self):
 
     def _holder_is_live_aureon() -> bool:
         try:
-            with open(self.pid_lock_path) as f:
+            with open(self.pid_lock_path, encoding='utf-8') as f:
                 other_pid = int(f.read().strip())
         except (ValueError, OSError):
             return False  # malformed -> stale
@@ -161,7 +161,7 @@ def _acquire_pid_lock(self):
 def _release_pid_lock(self):
     try:
         if os.path.exists(self.pid_lock_path):
-            with open(self.pid_lock_path) as f:
+            with open(self.pid_lock_path, encoding='utf-8') as f:
                 locked_pid = int(f.read().strip())
             if locked_pid == os.getpid():
                 os.remove(self.pid_lock_path)

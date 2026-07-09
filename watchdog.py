@@ -272,7 +272,7 @@ class Watchdog:
             return False, "ff-only merge failed"
         new_sha = self._git_head_sha() or sha
         try:
-            with open(self.deployed_sha_path, "w") as f:
+            with open(self.deployed_sha_path, "w", encoding='utf-8') as f:
                 f.write(new_sha + "\n")
         except Exception:
             pass
@@ -342,7 +342,7 @@ class Watchdog:
         if not os.path.exists(self.status_path):
             return None
         try:
-            with open(self.status_path) as f:
+            with open(self.status_path, encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
             return None
@@ -351,7 +351,7 @@ class Watchdog:
         existing = []
         if os.path.exists(self.commands_path):
             try:
-                with open(self.commands_path) as f:
+                with open(self.commands_path, encoding='utf-8') as f:
                     existing = json.load(f)
             except Exception:
                 existing = []
@@ -362,7 +362,7 @@ class Watchdog:
             "ts": time.time(),
         })
         tmp = self.commands_path + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding='utf-8') as f:
             json.dump(existing, f, indent=2)
         os.replace(tmp, self.commands_path)
 
@@ -580,7 +580,7 @@ class Watchdog:
             return "No trades yet today."
         try:
             import csv
-            with open(self.daylog_path) as f:
+            with open(self.daylog_path, encoding='utf-8') as f:
                 rows = list(csv.DictReader(f))
         except Exception as e:
             return f"Could not read today's trades: {e}"

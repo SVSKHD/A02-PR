@@ -86,7 +86,7 @@ def load_trades_from_journal(journal_dir) -> List[Trade]:
     out: List[Trade] = []
     for path in sorted(glob.glob(os.path.join(journal_dir, "trades_*.csv"))):
         try:
-            with open(path, newline="") as f:
+            with open(path, newline="", encoding='utf-8') as f:
                 for r in csv.DictReader(f):
                     try:
                         entry = float(r.get("entry_price") or 0)

@@ -54,7 +54,7 @@ def ensure_rescue_events_csv(run_dir):
     try:
         if not os.path.exists(path):
             os.makedirs(run_dir, exist_ok=True)
-            with open(path, "w", newline="") as f:
+            with open(path, "w", newline="", encoding='utf-8') as f:
                 csv.DictWriter(f, fieldnames=RESCUE_CSV_HEADER).writeheader()
             log.info(f"rescue_events.csv created (header only) at {path}")
     except Exception as e:
@@ -68,7 +68,7 @@ def rescue_tally(csv_path):
     try:
         if not os.path.exists(csv_path):
             return tally
-        with open(csv_path, newline="") as f:
+        with open(csv_path, newline="", encoding='utf-8') as f:
             for r in csv.DictReader(f):
                 b = (r.get("branch") or "").strip()
                 if b in tally:
@@ -192,7 +192,7 @@ def _rescue_event_finalize(self, ev):
         except Exception:
             pass
         new = not os.path.exists(path)
-        with open(path, "a", newline="") as f:
+        with open(path, "a", newline="", encoding='utf-8') as f:
             w = csv.DictWriter(f, fieldnames=RESCUE_CSV_HEADER)
             if new:
                 w.writeheader()
@@ -305,7 +305,7 @@ def run_rescuestats():
                   f"({wins}/{decisive})")
     print("")
     try:
-        with open(path, newline="") as f:
+        with open(path, newline="", encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
         hdr = f"{'date':<11} {'anchor':<18} {'branch':<13} {'net':>9} {'boosts':>7}"
         print(hdr)

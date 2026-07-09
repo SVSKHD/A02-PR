@@ -215,7 +215,7 @@ class Telemetry:
         self._fh = None
         if log_file:
             try:
-                self._fh = open(log_file, "a", buffering=1)  # line-buffered
+                self._fh = open(log_file, "a", buffering=1, encoding='utf-8')  # line-buffered
             except OSError as e:
                 self._log.warning(f"Could not open log file {log_file}: {e}")
 

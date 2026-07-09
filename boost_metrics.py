@@ -149,7 +149,7 @@ def record_pullback_event(trader, anchor, kind, event):
         import pandas as _pd
         day = _pd.Timestamp.now(tz='Asia/Kolkata').strftime('%Y-%m-%d')
         path = os.path.join(_safe_dir(trader), f"pullback_log_{day}.json")
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(pullback_json(counts, day))
     except Exception as e:
         log.warning(f"util_pullback_log non-fatal: {e!r}")
@@ -206,7 +206,7 @@ def run_daily_report(trader, date_str=None):
         src = os.path.join(jdir, f"trades_{date_str[:7]}.csv")
         rows = []
         if os.path.exists(src):
-            with open(src) as f:
+            with open(src, encoding='utf-8') as f:
                 for r in _csv.DictReader(f):
                     if r.get('date_ist') != date_str:
                         continue
@@ -217,7 +217,7 @@ def run_daily_report(trader, date_str=None):
         md = daily_report_md(rows, date_str, rogue_rows=rogue_rows,
                              open_anchors=open_anchors)
         out = os.path.join(jdir, f"daily_report_{date_str}.md")
-        with open(out, 'w') as f:
+        with open(out, 'w', encoding='utf-8') as f:
             f.write(md)
         return out
     except Exception as e:
@@ -240,7 +240,7 @@ def load_rogue_closes(jdir, date_str):
     if not os.path.exists(path):
         return out
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             for r in _csv.DictReader(f):
                 if r.get('kind') != 'ROGUE' or r.get('event') != 'exit':
                     continue
@@ -295,7 +295,7 @@ def append_ledger(trader, event: dict):
         except Exception:
             pass
         new = not os.path.exists(path)
-        with open(path, 'a', newline='') as f:
+        with open(path, 'a', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
             if new:
                 w.writerow(LEDGER_COLUMNS)

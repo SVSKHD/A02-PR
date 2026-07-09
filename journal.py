@@ -87,7 +87,7 @@ def summarize_recent(csv_path, today=None):
         if not p or not os.path.exists(p):
             continue
         try:
-            with open(p, newline="") as f:
+            with open(p, newline="", encoding='utf-8') as f:
                 for r in csv.DictReader(f):
                     d = _parse_day(r.get('date_ist'))
                     if d is None:
@@ -202,7 +202,7 @@ def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, tick
     except Exception:
         pass
     new_file = not _os.path.exists(jpath)
-    with open(jpath, "a", newline="") as f:
+    with open(jpath, "a", newline="", encoding='utf-8') as f:
         w = csv.writer(f)
         if new_file:
             w.writerow(JOURNAL_COLUMNS)
@@ -216,7 +216,7 @@ def _send_daily_summary(self, day_str: str, pnl: float):
     # Try to read today_trades.csv for richer detail
     n_trades = 0; wins = 0; sls = 0
     try:
-        with open(self.daylog_path) as f:
+        with open(self.daylog_path, encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
         n_trades = len(rows)
         wins = sum(1 for r in rows if float(r["pnl_usd"]) > 0)
@@ -273,7 +273,7 @@ def _firebase_save_daily(self, broker_date):
             log.info(f"firebase EOD: no journal CSV for {day_str}; nothing to save")
             return
         rows = []
-        with open(jpath, newline="") as f:
+        with open(jpath, newline="", encoding='utf-8') as f:
             for r in csv.DictReader(f):
                 if r.get('date_ist') == day_str:
                     rows.append(r)
