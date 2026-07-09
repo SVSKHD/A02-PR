@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.1"  # P&L pipeline reconciliation: R-8 CSV fix + single source of truth + reconcile audit
+__version__ = "3.8.2"  # E-22: anchors day-P&L single source — governors compute from broker deal history, not the flatten-bypassed accumulator
 CODENAME = "Astra Hawk"
 
 

@@ -73,7 +73,9 @@ def _check_kill_switch(self) -> bool:
     gap — that's what gated A2/A3/A4 off after A1's loss on 2026-05-28.
     In LIVE mode: uses live equity (includes unrealized P&L), which matches how
                   Funding Pips actually measures the daily loss rule.
-    In PAPER mode: falls back to internal daily_pnl (realized only).
+    In PAPER mode: falls back to the COMPUTED anchors realized day P&L (E-22:
+                  broker deal history via daystops.computed_anchors_day_pnl, NOT the
+                  state['daily_pnl'] accumulator the flatten path bypasses).
     """
     self._ensure_day_start_equity()
     base = self.state.get('day_start_equity') or self.cfg.starting_balance
@@ -82,8 +84,24 @@ def _check_kill_switch(self) -> bool:
     if equity is not None:
         live_daily_loss = base - equity
         return live_daily_loss >= threshold
-    # Fallback (paper or MT5 query failure)
-    return self.state['daily_pnl'] <= -threshold
+    # Fallback (paper or MT5 query failure): the COMPUTED realized day P&L, never the mirror.
+    return self._anchors_day_pnl_computed() <= -threshold
+
+
+def _kill_switch_drawdown(self):
+    """E-22: (measured_loss, threshold) -- the value the kill switch actually COMPARES so the
+    trigger + GATED logs print the real number instead of the state['daily_pnl'] mirror (which
+    the flatten path had frozen at +$140 on the -$821 07-09 day). measured_loss = equity
+    drawdown from day-open (live), or the computed realized loss (paper / query failure). Both
+    positive == a loss. Guarded."""
+    self._ensure_day_start_equity()
+    base = self.state.get('day_start_equity') or self.cfg.starting_balance
+    threshold = round(self.cfg.daily_loss_pct * base, 2)
+    equity = self._live_equity()
+    if equity is not None:
+        return round(base - equity, 2), threshold
+    # paper / query failure: fall back to the COMPUTED anchors realized loss (E-22 single source)
+    return round(-self._anchors_day_pnl_computed(), 2), threshold
 
 
 def _ensure_day_start_equity(self):
@@ -225,6 +243,17 @@ def _flatten_all(self, reason: str = "Manual", scope: str = "ALL"):
             _fetcher.force_close_open(self, reason=reason)
         except Exception as e:
             log.warning(f"fetcher force_close_open during flatten failed (non-fatal): {e!r}")
+
+    # E-22: this flatten closed anchor positions DIRECTLY via the MT5 adapter, bypassing the
+    # fills.py reconcile loop that increments state['daily_pnl']. Invalidate the computed-P&L
+    # cache so the next governor read recomputes the anchors day P&L from broker deal history
+    # (now including these closes) -- the exact fix for the -$821 day that read +$140 and never
+    # tripped the -$630 loss stop. Guarded; never blocks the flatten.
+    try:
+        import daystops as _ds
+        _ds.invalidate_pnl_cache(self)
+    except Exception:
+        pass
 
     # Critical alert if anything failed to close — these are real money exposure
     if failed_closes or failed_cancels:

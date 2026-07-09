@@ -2,8 +2,16 @@
 account-level lock.
 
 Rogue and Fetcher carry their own governor stops inside their engine modules; this module
-holds the ANCHORS-engine daily brakes (realized day P&L = state['daily_pnl'], magic
-20260522, which already EXCLUDES Rogue/Fetcher) and the combined ACCOUNT-level lock.
+holds the ANCHORS-engine daily brakes and the combined ACCOUNT-level lock.
+
+E-22 (07-09): the anchors realized day P&L that the governors act on is COMPUTED from broker
+deal history (pnl_source.magic_day_net, magic 20260522, which already EXCLUDES Rogue/Fetcher)
+via computed_anchors_day_pnl() -- NOT the state['daily_pnl'] accumulator. That accumulator is
+incremented only in the fill-reconcile loop (fills.py); risk._flatten_all closes positions
+directly through the MT5 adapter, bypassing that loop, so kill-switch / EOD / Friday flattens
+never reached it. On 07-09 it froze at +$140 on a -$821 day and the -$630 loss stop NEVER
+FIRED. state['daily_pnl'] is now a persisted MIRROR of the computed truth, authoritative for
+nothing (only a fallback when history is unavailable).
 
 PURE threshold cores (no IO); the LiveTrader binds thin methods that read state + cfg and
 call these. Independent latches -- one engine locking/halting NEVER affects the others.
@@ -220,6 +228,70 @@ def rebuild_anchors_day_pnl(trader, dt_from=None, dt_to=None):
     except Exception as e:
         log.warning(f"{ANCHORS_ALERT_PREFIX} day-pnl rebuild parse failed: {e!r}")
         return None
+
+
+# --- E-22: the anchors DECISION-path day P&L, COMPUTED from broker deal history ------------
+# The deals query is not free, so the value is cached per tick (keyed on trader._tick_counter)
+# and invalidated on any close (fills reconcile) or flatten (risk._flatten_all) -- the only
+# events that move realized P&L.
+_PNL_CACHE_TICK = '_anchors_pnl_cache_tick'
+_PNL_CACHE_VAL = '_anchors_pnl_cache_value'
+
+
+def invalidate_pnl_cache(trader):
+    """E-22: drop the per-tick computed anchors day-P&L cache so the NEXT governor read
+    recomputes from broker deal history. MUST be called on any anchor close (fills reconcile
+    loop) or flatten (risk._flatten_all) -- the events that move realized P&L outside the
+    accumulator. Guarded."""
+    try:
+        setattr(trader, _PNL_CACHE_TICK, None)
+        setattr(trader, _PNL_CACHE_VAL, None)
+    except Exception:
+        pass
+
+
+def computed_anchors_day_pnl(trader, deals=None):
+    """E-22 SINGLE TRUTH for the anchors DECISION path: realized ANCHORS day P&L (magic
+    20260522) from BROKER deal history via pnl_source.magic_day_net for the CURRENT broker day
+    -- the value the loss/profit governors, the kill-switch paper fallback and the account-
+    target combined net all read. The result is MIRRORED back into state['daily_pnl'] so the
+    persisted value tracks broker truth; state['daily_pnl'] is authoritative for NOTHING -- it
+    is only the fallback when history is unavailable (paper / query failure). Cached on
+    trader._tick_counter; invalidate_pnl_cache() drops it on any close/flatten. `deals` may be
+    passed to force a recompute over a supplied history (tests). READ-ONLY on the broker;
+    guarded -> the state['daily_pnl'] mirror on any error."""
+    state = getattr(trader, 'state', None)
+    if not isinstance(state, dict):
+        return 0.0
+    tick = getattr(trader, '_tick_counter', None)
+    if (deals is None and tick is not None
+            and getattr(trader, _PNL_CACHE_TICK, None) == tick):
+        cached = getattr(trader, _PNL_CACHE_VAL, None)
+        if cached is not None:
+            return float(cached)
+    computed = None
+    try:
+        import pnl_source as _ps
+        if deals is None:
+            deals = _ps.fetch_day_deals(trader)
+        if deals is not None:
+            computed = _ps.magic_day_net(deals, ANCHORS_MAGIC)
+    except Exception as e:
+        log.warning(f"{ANCHORS_ALERT_PREFIX} computed day-pnl read failed: {e!r}")
+        computed = None
+    if computed is not None:
+        state['daily_pnl'] = float(computed)   # MIRROR: broker truth overwrites the accumulator
+        value = float(computed)
+    else:
+        # history unavailable -> fall back to the optimistic accumulator (paper / query failure)
+        value = float(state.get('daily_pnl', 0.0) or 0.0)
+    try:
+        if tick is not None:
+            setattr(trader, _PNL_CACHE_TICK, tick)
+            setattr(trader, _PNL_CACHE_VAL, value)
+    except Exception:
+        pass
+    return value
 
 
 def _broker_day_range(trader):

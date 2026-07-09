@@ -342,6 +342,59 @@ fires, and it wakes only once offset detection succeeds).
 
 ---
 
+## E-22 — anchors day-P&L accumulator froze on the flatten path; the −$630 loss stop went blind — **FIXED**
+
+**Status:** FIXED — 2026-07-09 — branch `claude/anchors-pnl-truth-defect-i8cp16`.
+
+**Symptom (live, 2026-07-09):** `state['daily_pnl']` (the anchors realized day
+P&L, magic 20260522) froze at **+$140.00** — A1's first close — while
+`pnl_source.magic_day_net(deals, 20260522)` correctly reported **−$821.10**
+across 5 closes for the same broker day. `anchors_daily_loss_stop` (−$630)
+NEVER FIRED on a −$821 day; the engine's own hard brake was blind, and the
+account-level kill switch had to catch the loss. A risk-control failure, not a
+reporting bug. The "Anchor processing GATED" warning also spammed the log
+(~10/min) and both the kill-switch trigger + GATED lines printed the frozen
+`daily_pnl` mirror instead of the value the switch actually compared.
+
+**Root cause:** `state['daily_pnl']` was accumulated ONLY in the fill-reconcile
+loop (`fills.py`, `self.state['daily_pnl'] += pnl_usd` on a detected close).
+`risk._flatten_all()` closes positions DIRECTLY through the MT5 adapter and pops
+them from `shadow_positions`, so the reconcile loop never sees those closes and
+never accumulates them. Every kill-switch / EOD / Friday flatten therefore
+bypassed the accumulator, freezing it at whatever the last fill-loop close left
+it. The anchors loss/profit governors, the account-target combined net and the
+kill-switch paper fallback all READ that frozen accumulator as authoritative.
+
+**Fix:** the anchors DECISION-path day P&L is now COMPUTED from broker deal
+history (`pnl_source.magic_day_net`, magic 20260522) for the current broker day
+via `daystops.computed_anchors_day_pnl()`, cached per tick and invalidated on
+any close (`fills.py`) or flatten (`risk._flatten_all`). `state['daily_pnl']`
+becomes a persisted MIRROR — overwritten from the computed truth on every read,
+authoritative for nothing, only a fallback when history is unavailable
+(paper / query failure); the `fills.py` increment stays as an optimistic
+display value corrected on the next recompute. Every DECISION read-site now
+reads the computed value: the anchors loss/profit governors (`_anchors_daystop`),
+the account-target combined net (`_engine_day_pnls`), and the kill-switch paper
+fallback (`risk._check_kill_switch`). The kill-switch trigger + the (now
+once-per-lock-event) GATED warning print the COMPARED value (equity drawdown vs
+threshold) via `risk._kill_switch_drawdown`. Display-only surfaces may still show
+the mirror but are labelled.
+
+**Files:** `daystops.py` (`computed_anchors_day_pnl`, `invalidate_pnl_cache`),
+`live_trader.py` (`_anchors_day_pnl_computed`, `_engine_day_pnls`,
+`_anchors_daystop`, `_log_kill_gated_once`, kill-switch block, day-roll reset),
+`risk.py` (`_check_kill_switch`, `_kill_switch_drawdown`, `_flatten_all`),
+`fills.py` (close-path cache invalidation). **Self-test:** 284 (`e22 flatten
+truth` — synthetic 07-09 history incl. flatten-path closes: computed ==
+magic_day_net == −$821.10, the accumulator diverges at +$140, the mirror is
+corrected), 285 (`e22 flatten 3 closes` — `_flatten_all` closes 3 positions and
+the day P&L reflects them within ONE tick via cache invalidation), 286 (`e22
+loss over accum` — the loss stop fires at ≤−$630 computed even while the
+accumulator reads +$140), 287 (`e22 gated once` — the GATED warning fires once
+per lock event, not per tick, printing the compared value).
+
+---
+
 ## Watch Ledger — patterns under observation (NOT confirmed bugs, NO lever pulled)
 
 ### W-2 — evidence append — 2026-07-02
