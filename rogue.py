@@ -246,18 +246,17 @@ def rebuild_gov_from_history(trader, dt_from=None, dt_to=None):
         log.warning(f"{ROGUE_ALERT_PREFIX} rebuild history query failed: {e!r}")
         return None
     try:
+        import pnl_source as _ps
         ours = [d for d in deals if int(getattr(d, 'magic', 0) or 0) == ROGUE_MAGIC]
         ins = [d for d in ours if getattr(d, 'entry', None) == 0]
         outs = [d for d in ours if getattr(d, 'entry', None) == 1]
         outs.sort(key=lambda d: getattr(d, 'time', 0) or 0)
-
-        def _pnl(d):
-            return (float(getattr(d, 'profit', 0.0) or 0.0)
-                    + float(getattr(d, 'swap', 0.0) or 0.0)
-                    + float(getattr(d, 'commission', 0.0) or 0.0))
+        _pnl = _ps.deal_pnl                            # single source: profit+swap+commission
         gov = new_day_state()
         gov['reanchor_count'] = len(ins)
-        gov['day_pnl'] = round(sum(_pnl(d) for d in outs), 2)
+        # SINGLE SOURCE OF TRUTH: realized day P&L = pnl_source.magic_day_net over the SAME
+        # deal sweep, by magic (identical to what the report + reconcile + /status read).
+        gov['day_pnl'] = _ps.magic_day_net(deals, ROGUE_MAGIC)
         fails = 0
         for d in reversed(outs):
             if _pnl(d) <= 0.0:

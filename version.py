@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.0"  # $10-break seed anchor + earned trade budget for Rogue & Fetcher
+__version__ = "3.8.1"  # P&L pipeline reconciliation: R-8 CSV fix + single source of truth + reconcile audit
 CODENAME = "Astra Hawk"
 
 

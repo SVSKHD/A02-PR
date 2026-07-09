@@ -288,6 +288,12 @@ def append_ledger(trader, event: dict):
             return
         import csv
         path = os.path.join(_safe_dir(trader), "boost_ledger.csv")
+        # R-8 self-heal: migrate a stale narrower header to LEDGER_COLUMNS before appending.
+        try:
+            import csv_schema
+            csv_schema.ensure(path, LEDGER_COLUMNS)
+        except Exception:
+            pass
         new = not os.path.exists(path)
         with open(path, 'a', newline='') as f:
             w = csv.writer(f)

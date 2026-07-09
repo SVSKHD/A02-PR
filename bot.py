@@ -60,7 +60,7 @@ def main():
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
                                          'testfire', 'verifyfb', 'rescuestats',
                                          'bescratchscan', 'rogueseed', 'fetchseed',
-                                         'dailyreport'])
+                                         'dailyreport', 'reconcile'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -94,8 +94,8 @@ def main():
     parser.add_argument('--run-dir', default=None,
                         help="bescratchscan: run dir holding journal/ + price_log/ (default $AUREON_RUN_DIR or ./run)")
     parser.add_argument('--date', default=None, metavar='YYYY-MM-DD|YYYY-MM',
-                        help="dailyreport: the day (or whole month) to report on. "
-                             "Default: today (UTC).")
+                        help="dailyreport: the day (or whole month) to report on; "
+                             "reconcile: the broker day to audit. Default: today.")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
 
@@ -196,6 +196,15 @@ def main():
         # day; YYYY-MM runs the whole month (each day + a month roll-up).
         from pnl_report import run_dailyreport
         sys.exit(run_dailyreport(date_arg=args.date))
+
+    elif args.mode == 'reconcile':
+        # READ-ONLY P&L RECONCILE AUDIT: for --date (broker day; default today) compute the
+        # per-engine + account net from all four surfaces (MT5 history / pnl_ledger.csv / the
+        # daily report / the live stops source) and print a table. Exit 0 iff every surface
+        # agrees with MT5 deal history within $0.01; exit 1 on any mismatch. Opens MT5 for
+        # HISTORY reads only -- never touches the order book.
+        from pnl_reconcile import run_cli
+        sys.exit(run_cli(date_arg=args.date))
 
     elif args.mode == 'rogueseed':
         # Manual Rogue A1-mode seed: enqueue a 'rogueseed' command onto the RUNNING bot's

@@ -41,6 +41,10 @@ PATTERN_COLUMNS = ['ts', 'direction', 'range_dollars', 'body_ratio', 'candle_cou
                    'model_score',
                    'entry_price', 'max_fav', 'trail_path_summary', 'exit_price',
                    'held_minutes', 'outcome_dollars', 'magic', 'seed_source']
+# rogue_trades.csv is a DECISION LOG (entry/exit reasoning + provenance), NOT a P&L source.
+# Realized day P&L comes ONLY from MT5 deal history by magic (pnl_source.magic_day_net) --
+# NEVER sum outcome_dollars over these rows to produce a reported number (that path is the
+# R-8 corruption source: a stale header mis-indexes the columns).
 TRADE_COLUMNS = ['ts', 'event', 'direction', 'entry', 'exit', 'sl',
                  'outcome_dollars', 'ticket', 'magic', 'seed_source']
 
@@ -118,6 +122,14 @@ def build_features(bars, *, spread=0.0, confirm_dollars=0.0, ts=None):
 
 # --- append-only CSV sinks (header-on-create; never raise to the caller) -----------
 def _append_row(path, columns, row):
+    # R-8 self-heal: a file created before a column was appended to `columns` carries a stale
+    # narrower header; migrate it (rewrite header, back up to .bak) BEFORE appending so the
+    # header always matches the rows. No-op for a missing/current file. Guarded.
+    try:
+        import csv_schema
+        csv_schema.ensure(path, columns)
+    except Exception:
+        pass
     new = not os.path.exists(path)
     with open(path, 'a', newline='') as f:
         w = csv.DictWriter(f, fieldnames=columns)

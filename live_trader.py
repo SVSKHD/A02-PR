@@ -1007,14 +1007,33 @@ class LiveTrader:
     # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
     # ------------------------------------------------------------------------
     def _engine_day_pnls(self):
-        """(anchors, rogue, fetcher) realized day P&L. Anchors = state['daily_pnl'] (magic
-        20260522, already EXCLUDES Rogue/Fetcher); Rogue/Fetcher from their governors.
-        Guarded -- a missing piece reads $0."""
+        """(anchors, rogue, fetcher) realized day P&L -- the LIVE, per-tick source the daily
+        STOPS act on: anchors = state['daily_pnl'] (magic 20260522, already EXCLUDES Rogue/
+        Fetcher); Rogue/Fetcher from their governors. All three are seeded from the SINGLE
+        SOURCE (pnl_source.magic_day_net, via the E-20 rebuilds) and accumulated live by
+        record_close. Guarded -- a missing piece reads $0."""
         st = getattr(self, 'state', {}) or {}
         anchors = float(st.get('daily_pnl', 0.0) or 0.0)
         rogue = float(((getattr(self, '_rogue', None) or {}).get('gov') or {}).get('day_pnl', 0.0) or 0.0)
         fetcher = float(((getattr(self, '_fetcher', None) or {}).get('gov') or {}).get('day_pnl', 0.0) or 0.0)
         return anchors, rogue, fetcher
+
+    def _engine_day_pnls_authoritative(self):
+        """(anchors, rogue, fetcher) realized day P&L read DIRECTLY from MT5 deal history by
+        magic (pnl_source.engine_day_nets) -- the SINGLE SOURCE OF TRUTH used by the DISPLAY
+        surfaces (/status card, /daylock) so what the operator SEES always matches the daily
+        report + the reconcile authority. Falls back to the live govs (_engine_day_pnls) when
+        history is unavailable (paper / query failure). NOT used on the per-tick stop path
+        (history is too slow / laggy there; the govs are the reconciled real-time mirror).
+        Guarded."""
+        try:
+            import pnl_source as _ps
+            nets = _ps.engine_day_nets(self)
+            if nets is not None:
+                return nets['anchors'], nets['rogue'], nets['fetcher']
+        except Exception:
+            pass
+        return self._engine_day_pnls()
 
     def _anchors_daystop(self):
         """(blocked, reason, kind) for the ANCHORS engine day stop -- LOSS halt (hard) or
@@ -1226,10 +1245,12 @@ class LiveTrader:
             log.warning(f"anchors daystop skip failed (non-fatal): {e!r}")
 
     def _daylock_lines(self):
-        """The /daylock status lines (also reused in the /engines embed). Guarded -> []."""
+        """The /daylock status lines (also reused in the /engines embed). Per-engine P&L reads
+        from the authoritative MT5-history source so /daylock matches /status + the report.
+        Guarded -> []."""
         try:
             import daystops as _ds
-            a, r, f = self._engine_day_pnls()
+            a, r, f = self._engine_day_pnls_authoritative()
             dse = float((self.state or {}).get('day_start_equity')
                         or getattr(self.cfg, 'starting_balance', 0.0))
             lines = _ds.render_status(a, r, f, a + r + f, dse, self.cfg, self.state)
@@ -1259,11 +1280,12 @@ class LiveTrader:
 
     def _day_pnl_by_engine_payload(self):
         """DISPLAY-ONLY structured per-engine realized day P&L + thresholds + lock state for
-        the /status card. SINGLE SOURCE OF TRUTH: reuses _engine_day_pnls() -- the SAME
-        numbers the daily stops act on -- and reads each lock state from the govs /
+        the /status card. SINGLE SOURCE OF TRUTH: per-engine P&L reads DIRECTLY from MT5 deal
+        history by magic (_engine_day_pnls_authoritative -> pnl_source), so /status matches the
+        daily report + the reconcile authority; lock state is read from the govs /
         _anchors_daystop (never recomputed). Read-only; guarded -> {} on any error."""
         try:
-            a, r, f = self._engine_day_pnls()
+            a, r, f = self._engine_day_pnls_authoritative()
             cfg = self.cfg
             # anchors lock state via the daystop reader (loss ranks first); override maps
             # to 'override' since the reader reports NOT blocked once overridden.
@@ -2190,6 +2212,24 @@ class LiveTrader:
                 _p1.recover_on_boot(self)
             except Exception:
                 pass
+            # R-8 one-shot: migrate any CSV whose on-disk header is stale (narrower than its
+            # appended rows) so every reader sees header==rows. Idempotent + guarded; runs
+            # once at boot (the writers also self-heal on first append). Loud receipt only
+            # when a file was actually rewritten.
+            try:
+                import csv_schema as _cs
+                _migrated = _cs.migrate_run_dir(getattr(self, 'run_dir', './run'))
+                if _migrated:
+                    names = ", ".join(m.get('file', '?') for m in _migrated)
+                    log.warning(f"R-8 CSV migration: rewrote stale header(s) in {names} "
+                                f"(.bak backed up)")
+                    try:
+                        self.tele.warn(f"🧹 R-8 CSV migration — corrected stale header(s): "
+                                       f"{names} (original(s) backed up to .bak)")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             self._p1_recovered = True
 
         # 3. Reconcile broker state
@@ -2314,6 +2354,15 @@ class LiveTrader:
                 try:
                     import pnl_report as _pnl
                     _pnl.run_eod_report(self, broker_date)
+                except Exception:
+                    pass
+                # P&L RECONCILE AUDIT (observer): right after the report, prove all four P&L
+                # surfaces (MT5 history / pnl_ledger.csv / the report / the live stops source)
+                # agree. A mismatch posts a loud '⚠️ P&L RECONCILE MISMATCH' card -- never a
+                # silent pass. Read-only; guarded so it can never block the EOD path.
+                try:
+                    import pnl_reconcile as _rec
+                    _rec.run_and_alert(self, str(broker_date))
                 except Exception:
                     pass
                 # ROGUE dated EOD archive: freeze this day's rogue_patterns.csv +
