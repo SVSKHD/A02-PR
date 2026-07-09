@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.2"  # E-22: anchors day-P&L single source — governors compute from broker deal history, not the flatten-bypassed accumulator
+__version__ = "3.8.3"  # E-23 testfire loss-halt rail 6 + R-8 rescue/journal self-heal + R-10 engine-surface unification + comment/ERRORS.md truth
 CODENAME = "Astra Hawk"
 
 

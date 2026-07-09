@@ -13,7 +13,7 @@ It REUSES the live placement path — it does NOT fork a parallel copy:
   rescue(-10) boost logic — all identical to a scheduled anchor. The ONLY
   differences are the trigger source (manual) and the timestamp.
 
-SAFETY (fail-closed; rails 1/2/3/5 mandatory, no override):
+SAFETY (fail-closed; rails 1/2/3/5/6 mandatory, no override):
   1. DEMO ONLY     — account_info.trade_mode must be ACCOUNT_TRADE_MODE_DEMO.
   2. NOT FP/funded — account_profile must be STANDARD_5PCT (FPZERO_1PCT and any
                      other profile are refused even on demo).
@@ -23,8 +23,18 @@ SAFETY (fail-closed; rails 1/2/3/5 mandatory, no override):
   4. NO COLLISION  — no scheduled anchor active or within testfire_collision_min.
                      v3.3.1: this is the ONLY bypassable rail — `--force-window`
                      skips it (loud warning, never silent) so the owner can test
-                     off-schedule. Rails 1/2/3/5 are NEVER bypassable.
+                     off-schedule. Rails 1/2/3/5/6 are NEVER bypassable.
   5. ONE AT A TIME — refuse if a prior test-fire event is still open.
+  6. ANCHORS BRAKE — (E-23, v3.8.3) refuse while the anchors engine may take NO
+                     new risk today: the daily LOSS halt (hard) / PROFIT lock /
+                     account lock, OR the Friday weekend-hold window / anchors
+                     engine switch OFF. A test-fire is NEW anchor risk and obeys
+                     the exact same brake as a scheduled anchor. The day P&L comes
+                     from the COMPUTED source (pnl_source.magic_day_net), never the
+                     state['daily_pnl'] mirror; the rebuild is run BEFORE preflight
+                     so the governor knows the day's truth (the 07-09 defect was
+                     preflight clearing 4s before the rebuild landed). `--force-
+                     window` does NOT bypass this — it only skips rail 4.
 
 The trade IS real, so it counts toward the 30-trade validation; it is tagged in
 the journal with trigger_source='TESTFIRE' so it is auditable and distinguishable
@@ -65,11 +75,11 @@ def testfire_preflight(trader, now_utc=None, collision_min=None, force_window=Fa
 
     force_window (v3.3.1): bypasses ONLY rail 4 (the 30-min scheduled-anchor
     collision guard) so the owner can test off-schedule without waiting for the
-    window to clear. Rails 1/2/3/5 stay HARD and are unaffected — there is no
-    override for DEMO-ONLY, NO-FP, FLAT-BOOK, or ONE-AT-A-TIME. When the bypass
-    actually fires (a scheduled anchor is within the guard) the returned reason is
-    a LOUD warning naming how many minutes the nearest anchor is away; the bypass
-    is never silent."""
+    window to clear. Rails 1/2/3/5/6 stay HARD and are unaffected — there is no
+    override for DEMO-ONLY, NO-FP, FLAT-BOOK, ONE-AT-A-TIME, or the ANCHORS daily
+    BRAKE (E-23). When the bypass actually fires (a scheduled anchor is within the
+    guard) the returned reason is a LOUD warning naming how many minutes the
+    nearest anchor is away; the bypass is never silent."""
     cfg = trader.cfg
     sym = getattr(cfg, 'symbol', 'XAUUSD')
     try:
@@ -119,16 +129,51 @@ def testfire_preflight(trader, now_utc=None, collision_min=None, force_window=Fa
         return False, ("REFUSED [rail 5 ONE-AT-A-TIME]: a prior test-fire event is "
                        "still open. Wait for it to resolve before firing another.")
 
+    now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
+
+    # Rail 6 (E-23): obey the ANCHORS daily brake. A test-fire is NEW anchor risk, so it must
+    # refuse under the SAME conditions a scheduled anchor does. Evaluated BEFORE rail 4 so
+    # --force-window (which bypasses ONLY rail 4) can NEVER skip it -- the 07-09 defect fires
+    # off-schedule, which is exactly the --force-window path. TWO seams are checked (NOTE:
+    # _anchor_entries_blocked alone does NOT cover the daily stop -- it is only the Friday-
+    # window / engine-switch seam -- so the daystop is read explicitly):
+    #   (a) the anchors daily LOSS halt (hard) / PROFIT lock, via the PURE daystops.anchors_
+    #       daystop over the COMPUTED day P&L (_anchors_day_pnl_computed -> magic_day_net,
+    #       NEVER the state['daily_pnl'] mirror). PURE, not the LATCHING _anchors_daystop_
+    #       blocked -- a preflight must never latch the profit lock or fire its one-time alert.
+    #       This is the exact 07-09 defect: the anchors book was LOSS-HALTED at -$821 vs its
+    #       -$630 stop, yet testfire placed a real A2 straddle without consulting the governor.
+    #   (b) _anchor_entries_blocked(broker_date, now) -- the Friday weekend-hold window and the
+    #       anchors engine switch (OFF = manage-only): a test-fire is a NEW straddle.
+    # Evaluated AFTER the anchors day-P&L rebuild (run_testfire primes it before preflight).
+    # FAIL-CLOSED: the brake methods are called DIRECTLY (a missing/renamed method raises ->
+    # the except refuses), never guarded into a silent pass. NOT bypassable by --force-window.
+    try:
+        import daystops as _ds
+        broker_date = trader._broker_date(now)
+        dp = trader._anchors_day_pnl_computed()
+        daystop_blocked = bool(_ds.anchors_daystop(dp, trader.cfg, trader.state)[0])
+        entries_blocked = bool(trader._anchor_entries_blocked(broker_date, now))
+    except Exception as e:
+        return False, (f"REFUSED [rail 6 ANCHORS-BRAKE]: cannot evaluate the anchors daily "
+                       f"brake ({e!r}) — fail-closed. A test-fire never places while the "
+                       f"governor's state is unknown.")
+    if daystop_blocked or entries_blocked:
+        return False, ("REFUSED [rail 6 ANCHORS-BRAKE]: anchors entries blocked — daily loss "
+                       "halt / profit lock active (or the Friday weekend-hold window / anchors "
+                       "engine switched OFF). A test-fire is NEW anchor risk and obeys the same "
+                       "brake as a scheduled anchor. --force-window does NOT override this — it "
+                       "skips only rail 4 (the scheduled-anchor collision guard).")
+
     # Rail 4: never collide with a scheduled anchor (active or within N minutes).
     # This is the ONLY bypassable rail. With --force-window the owner can fire
-    # off-schedule even inside the guard; rails 1/2/3/5 above already ran and still
+    # off-schedule even inside the guard; rails 1/2/3/5/6 above already ran and still
     # refuse their cases. The bypass is LOUD (warning names minutes-away) and safe:
     # the scheduler is SUPPRESSED for the whole testfire session (_testfire_mode
     # gates _process_anchor_if_due), so the test event owns the book — the real
     # scheduled anchor will NOT also place alongside it while the test is live.
     n = int(collision_min if collision_min is not None
             else getattr(cfg, 'testfire_collision_min', 30))
-    now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
     near = minutes_to_nearest_anchor(cfg, now)
     if near is not None and near <= n:
         if force_window:
@@ -137,14 +182,15 @@ def testfire_preflight(trader, now_utc=None, collision_min=None, force_window=Fa
                           f"firing OFF-SCHEDULE anyway by owner override. The scheduler is "
                           f"SUPPRESSED for this testfire session, so the real anchor will "
                           f"NOT also fire while the test event is live (the test owns the "
-                          f"book). Rails 1/2/3 (DEMO-ONLY, NO-FP, FLAT-BOOK) stay HARD.")
+                          f"book). Rails 1/2/3/5/6 (DEMO-ONLY, NO-FP, FLAT-BOOK, ONE-AT-A-"
+                          f"TIME, ANCHORS-BRAKE) stay HARD.")
         return False, (f"REFUSED [rail 4 NO-COLLISION]: a scheduled anchor is "
                        f"{near:.0f} min away (<= {n} min guard). Never let a test-fire "
                        f"collide with a real anchor — wait until the window is clear, or "
-                       f"pass --force-window to fire off-schedule (rails 1/2/3 still apply).")
+                       f"pass --force-window to fire off-schedule (rails 1/2/3/5/6 still apply).")
 
-    return True, (f"CLEARED: demo account, STANDARD_5PCT profile, flat book, no "
-                  f"scheduled anchor within {n} min "
+    return True, (f"CLEARED: demo account, STANDARD_5PCT profile, flat book, anchors brake "
+                  f"clear, no scheduled anchor within {n} min "
                   f"(nearest {('%.0f min' % near) if near is not None else 'n/a'}).")
 
 
@@ -183,6 +229,27 @@ def arm_testfire(trader, label='A2', now_utc=None):
     return trader._deferred_anchor
 
 
+def _prime_anchors_daypnl(trader):
+    """E-23: rebuild the anchors realized day P&L from broker deal history BEFORE the
+    preflight so rail 6 evaluates the anchors daily brake against the day's real number.
+    The 07-09 defect was preflight clearing 4s BEFORE the rebuild landed, so the governor
+    did not yet know the day was -$821 against its -$630 stop and a real straddle placed.
+    READ-ONLY on the broker; idempotent; fully guarded (a failure leaves rail 6 to the live
+    computed source, which -- post E-22 -- already reads magic_day_net directly from history).
+    Also drops the per-tick computed-P&L cache so the first rail-6 read recomputes fresh."""
+    try:
+        import daystops as _ds
+        dp = _ds.rebuild_anchors_day_pnl(trader)
+        if dp is not None and isinstance(getattr(trader, 'state', None), dict):
+            trader.state['daily_pnl'] = float(dp)
+        _ds.invalidate_pnl_cache(trader)
+        log.info(f"TESTFIRE preflight priming: anchors day P&L rebuilt "
+                 f"${(dp if dp is not None else float('nan')):+.2f} (magic 20260522) "
+                 f"before rail-6 evaluation.")
+    except Exception as e:
+        log.warning(f"testfire day-pnl rebuild before preflight failed (non-fatal): {e!r}")
+
+
 def run_testfire(cfg, anchor='A2', force_window=False):
     """Build the live adapter + trader (same as run_live), run the fail-closed
     preflight, arm ONE manual entry, and hand off to the SAME live management loop.
@@ -200,6 +267,10 @@ def run_testfire(cfg, anchor='A2', force_window=False):
             expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))
         from live_trader import LiveTrader
         trader = LiveTrader(cfg, adapter, paper=False)
+
+        # E-23: establish the day's anchors P&L truth BEFORE preflight so rail 6 (the
+        # anchors daily-brake gate) sees the real number, not a cold un-rebuilt state.
+        _prime_anchors_daypnl(trader)
 
         ok, reason = testfire_preflight(trader, force_window=force_window)
         print(f"🧪🔥 TESTFIRE preflight: {reason}", flush=True)

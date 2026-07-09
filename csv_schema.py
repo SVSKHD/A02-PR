@@ -1,11 +1,14 @@
 """AUREON — CSV header/schema self-heal + one-shot migration (fixes R-8).
 
-R-8: the append-only CSV writers (rogue_patternlog, fetcher, boost_metrics) write the
-HEADER only when the file does not yet exist. When a column (e.g. `seed_source`) was
-APPENDED to a writer's column constant, every row immediately widened by one, but any file
-created BEFORE that change keeps its narrower header forever -- so csv.DictReader drops the
-extra trailing value into restkey and any reader keying that column reads garbage. The most
-visible casualty was run/rogue_trades.csv: a 9-column header over 10-column rows.
+R-8: the append-only CSV writers (rogue_patternlog, fetcher, boost_metrics, rescue_log,
+journal) write the HEADER only when the file does not yet exist. When a column (e.g.
+`seed_source`) was APPENDED to a writer's column constant, every row immediately widened by
+one, but any file created BEFORE that change keeps its narrower header forever -- so
+csv.DictReader drops the extra trailing value into restkey and any reader keying that column
+reads garbage. The most visible casualty was run/rogue_trades.csv: a 9-column header over
+10-column rows. Every append-only writer now calls ensure() before it appends, and
+migrate_run_dir() sweeps them all at boot (rescue_events.csv + the monthly journal files were
+added to the sweep when their writers were hardened).
 
 This module rewrites a stale header IN PLACE to match the writer's CURRENT column constant,
 backing the original up to `<file>.bak` first. It is:
@@ -128,6 +131,7 @@ def ensure(path, columns):
 # (pnl_ledger.csv is intentionally excluded -- pnl_report rewrites it whole each run, so its
 # header is never stale.) Resolved lazily so this module has no import-time dependency.
 def _known_files(run_dir):
+    import glob as _glob
     files = []
     try:
         import rogue_patternlog as _rpl
@@ -143,6 +147,19 @@ def _known_files(run_dir):
     try:
         import boost_metrics as _bm
         files.append((os.path.join(run_dir, "boost_ledger.csv"), list(_bm.LEDGER_COLUMNS)))
+    except Exception:
+        pass
+    try:
+        import rescue_log as _rl
+        files.append((os.path.join(run_dir, "rescue_events.csv"), list(_rl.RESCUE_CSV_HEADER)))
+    except Exception:
+        pass
+    try:
+        # the monthly anchors journal lives in run_dir/journal/trades_<YYYY-MM>.csv; sweep
+        # every month file present (a stale header self-heals on next append too).
+        import journal as _j
+        for jp in _glob.glob(os.path.join(run_dir, "journal", "trades_*.csv")):
+            files.append((jp, list(_j.JOURNAL_COLUMNS)))
     except Exception:
         pass
     return files

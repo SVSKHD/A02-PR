@@ -310,32 +310,64 @@ def _broker_day_range(trader):
 
 
 def render_status(anchors_pnl, rogue_pnl, fetcher_pnl, combined_pnl,
-                  day_start_equity, cfg, state):
+                  day_start_equity, cfg, state, engine_states=None):
     """PURE: the /daylock status lines -- each engine's realized day P&L vs BOTH thresholds
-    with its lock/halt state, plus the (disabled-by-default) account lock. Returns a list of
-    'label: value' pairs for the embed/text."""
-    ab, areason, akind = anchors_daystop(anchors_pnl, cfg, state)
+    with its switch + lock/halt state, plus the (disabled-by-default) account lock. Returns a
+    list of 'label: value' pairs for the embed/text.
+
+    R-10: `engine_states` = {engine: (switch_on: bool, lock_label: str)} from the caller's
+    SINGLE source (LiveTrader._engine_state -- the ONLY P&L/lock read; render_status no longer
+    recomputes the anchors daystop, so one number feeds each cell). When supplied, Rogue/Fetcher
+    render their real OFF / LOSS-HALTED / PROFIT-LOCK state (they were previously hardcoded
+    '🟢 live'); a switched-OFF engine renders '⚪ OFF' (with the hard loss-halt still surfaced
+    so 'off' vs 'off AND halted' stay distinguishable); an overridden profit lock renders
+    '🟢 live' (the override cleared the lock -- the day is trading again). Absent -> a per-engine
+    pure fallback (anchors from anchors_daystop; Rogue/Fetcher '🟢 live'), backward compatible."""
+    es = engine_states or {}
     acct_b, _ = account_daystop(combined_pnl, day_start_equity, cfg, state)
 
-    def _eng_line(name, pnl, profit_stop, loss_stop, blocked, kind, extra=''):
-        state_str = ('🔴 LOSS-HALT' if kind == 'loss'
-                     else ('🟡 PROFIT-LOCK' if kind == 'profit'
-                           else ('🟠 ' + kind.upper() if kind else '🟢 live')))
+    def _state_str(switch_on, lock_label):
+        hard = (lock_label == 'LOSS-HALTED')
+        if switch_on is False:
+            # a disabled engine reads OFF; a HARD loss-halt is still surfaced alongside it.
+            return '⚪ OFF · 🔴 LOSS-HALT' if hard else '⚪ OFF'
+        if hard:
+            return '🔴 LOSS-HALT'
+        if lock_label == 'PROFIT-LOCKED':
+            return '🟡 PROFIT-LOCK'
+        # 'override' == the profit lock was cleared for the day -> the engine is LIVE again.
+        return '🟢 live'
+
+    def _anchors_fallback():
+        # legacy caller (no engine_states): derive the anchors lock purely, as before.
+        _b, _r, ak = anchors_daystop(anchors_pnl, cfg, state)
+        lock = ('LOSS-HALTED' if ak == 'loss'
+                else 'PROFIT-LOCKED' if ak == 'profit'
+                else 'override' if state.get(K_ANCHORS_OVERRIDE) else 'active')
+        return True, lock
+
+    def _eng_line(name, engine, pnl, profit_stop, loss_stop, extra=''):
+        if engine in es:
+            sw, lock = es[engine]
+        elif engine == 'anchors':
+            sw, lock = _anchors_fallback()
+        else:
+            sw, lock = True, None
         return (f"{name}: ${float(pnl or 0.0):+.0f} "
-                f"(profit {profit_stop:g} / loss {loss_stop:g}) -> {state_str}{extra}")
+                f"(profit {profit_stop:g} / loss {loss_stop:g}) -> "
+                f"{_state_str(sw, lock)}{extra}")
 
     lines = [
-        _eng_line('Anchors', anchors_pnl,
+        _eng_line('Anchors', 'anchors', anchors_pnl,
                   float(getattr(cfg, 'anchors_daily_profit_stop', 0.0)),
                   float(getattr(cfg, 'anchors_daily_loss_stop', 0.0)),
-                  ab, akind,
                   extra=(' (overridden)' if state.get(K_ANCHORS_OVERRIDE) else '')),
-        _eng_line('Rogue', rogue_pnl,
+        _eng_line('Rogue', 'rogue', rogue_pnl,
                   float(getattr(cfg, 'rogue_daily_profit_stop', 0.0)),
-                  float(getattr(cfg, 'rogue_daily_loss_stop', 0.0)), False, ''),
-        _eng_line('Fetcher', fetcher_pnl,
+                  float(getattr(cfg, 'rogue_daily_loss_stop', 0.0))),
+        _eng_line('Fetcher', 'fetcher', fetcher_pnl,
                   float(getattr(cfg, 'fetcher_daily_profit_stop', 0.0)),
-                  float(getattr(cfg, 'fetcher_daily_loss_stop', 0.0)), False, ''),
+                  float(getattr(cfg, 'fetcher_daily_loss_stop', 0.0))),
     ]
     pct = float(getattr(cfg, 'account_daily_profit_stop_pct', 0.0) or 0.0)
     if pct <= 0.0:

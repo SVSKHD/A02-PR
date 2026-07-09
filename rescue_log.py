@@ -182,6 +182,15 @@ def _rescue_event_finalize(self, ev):
 
     path = _rescue_csv_path_for(self.run_dir)
     try:
+        # R-8 self-heal: a rescue_events.csv created before a column was appended to
+        # RESCUE_CSV_HEADER carries a stale narrower header; migrate it (rewrite header,
+        # back up to .bak) BEFORE appending so the header always matches the rows. No-op
+        # for a missing/current file. Guarded.
+        try:
+            import csv_schema
+            csv_schema.ensure(path, RESCUE_CSV_HEADER)
+        except Exception:
+            pass
         new = not os.path.exists(path)
         with open(path, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=RESCUE_CSV_HEADER)

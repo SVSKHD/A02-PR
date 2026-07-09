@@ -1,4 +1,4 @@
-"""AUREON — trade journal: _write_journal (19-col) + daily/today summaries.
+"""AUREON — trade journal: _write_journal (20-col) + daily/today summaries.
 
 Split out of live_trader.py in v3.0.0. These are the verbatim LiveTrader
 methods (bodies byte-identical, dedented one level); they take `self` and
@@ -20,6 +20,19 @@ from telemetry import telemetry_from_env, Severity
 from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
+
+# The journal (run/journal/trades_<YYYY-MM>.csv) column order -- the SINGLE source for both
+# the header row and every appended row, so header width can never drift from row width (R-8).
+# `trigger_source` (v3.2.9) was the last column appended; a file created before it self-heals
+# via csv_schema.ensure on the next write. This is the anchors realized-P&L record (magic
+# 20260522 only) -- Rogue/Fetcher are journaled by their own engine logs, never mixed in here.
+JOURNAL_COLUMNS = [
+    'date_ist', 'anchor', 'anchor_price', 'side', 'entry_time_ist',
+    'entry_price', 'lot', 'initial_sl', 'initial_tp', 'max_favorable',
+    'exit_time_ist', 'actual_exit_price', 'modeled_trail_exit',
+    'trail_slip', 'exit_reason', 'realized_pnl_usd', 'ticket',
+    'nohold_trail_exit', 'role', 'trigger_source',
+]
 
 
 # ============================================================================
@@ -180,15 +193,19 @@ def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, tick
         # this column makes it auditable, not excluded.
         shadow.get('trigger_source', 'SCHEDULED'),
     ]
+    # R-8 self-heal: migrate a journal file whose header predates a later-appended column
+    # (rewrite header, back up to .bak) BEFORE appending, so header width == row width. No-op
+    # for a missing/current file. Guarded — a migration failure never blocks the journal.
+    try:
+        import csv_schema as _cs
+        _cs.ensure(jpath, JOURNAL_COLUMNS)
+    except Exception:
+        pass
     new_file = not _os.path.exists(jpath)
     with open(jpath, "a", newline="") as f:
         w = csv.writer(f)
         if new_file:
-            w.writerow(['date_ist','anchor','anchor_price','side','entry_time_ist',
-                        'entry_price','lot','initial_sl','initial_tp','max_favorable',
-                        'exit_time_ist','actual_exit_price','modeled_trail_exit',
-                        'trail_slip','exit_reason','realized_pnl_usd','ticket',
-                        'nohold_trail_exit','role','trigger_source'])
+            w.writerow(JOURNAL_COLUMNS)
         w.writerow(row)
     log.info(f"journal: {shadow.get('anchor_label')} {side} {refined} "
              f"pnl=${pnl_usd:+.2f} trail_slip={trail_slip}")

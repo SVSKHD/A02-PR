@@ -1,10 +1,21 @@
 # AUREON — Known Errors Ledger
 
+**Status:** version `v3.8.3` · selftest `293` steps · base master `e059297`
+(pre-merge of the `claude/e23-and-ledger` branch) · last brought current
+`2026-07-09`. Engines: Anchors (magic `20260522`), Rogue (`20260626`), Fetcher
+(`20260707`). Realized-P&L truth = MT5 deal history via `pnl_source.magic_day_net`
+(see GROUND TRUTH RULE at the bottom).
+
 Tracked defects and their status. Rogue = the A1-anchored redesign engine
 (magic `20260626`); it never touches the anchor engine (magic `20260522`).
 
 Config **decisions** (not bugs) are date-stamped in the Decision Log at the
 bottom so the "why" survives the commit message.
+
+**Ledger was stale at E-3 (2026-07-01) for eight days across two silent safety
+failures (E-22, E-23) — this pass brings it current.** The consolidated
+DEVIATION LOG / OPEN / FIXED / WATCH summary directly below the detailed error
+entries is the fast index; the per-defect write-ups (E-3 … E-22) remain in full.
 
 ---
 
@@ -395,11 +406,180 @@ per lock event, not per tick, printing the compared value).
 
 ---
 
+## E-23 — testfire bypasses the anchors daily loss halt — **FIXED (this branch, v3.8.3)**
+
+**Status:** FIXED — 2026-07-09 — branch `claude/e23-and-ledger`. HIGH.
+
+**Evidence (live, 2026-07-09):** `python bot.py testfire` placed a real A2
+straddle while the anchors engine was LOSS-HALTED at −$821.10 against its −$630
+hard stop. Preflight CLEARED at 18:36:37; the anchors day-P&L rebuild landed at
+18:36:41 — preflight ran BEFORE the governor knew the day's truth. The BUY
+filled, floating drawdown pushed account equity $1.24 past the 3% line, and the
+account kill switch had to catch it. `testfire.py` had no reference to
+entries_blocked / loss_stop / daystop.
+
+**Root cause:** the testfire path (`arm_testfire` → the deferred-anchor
+completion) never consulted the anchors daily brake, and the preflight ran
+before the day-P&L rebuild, so even a check would have read a cold state.
+
+**Fix:** `testfire_preflight` gains **RAIL 6 (ANCHORS BRAKE)**, evaluated after
+`run_testfire` primes the anchors day-P&L rebuild. It refuses when
+`_anchors_daystop_blocked()` (the anchors LOSS halt / PROFIT lock / account lock,
+read from the COMPUTED `pnl_source.magic_day_net`, never the `state['daily_pnl']`
+mirror) **or** `_anchor_entries_blocked()` (Friday window / anchors engine OFF) is
+active. Fail-closed on any error. `--force-window` does NOT bypass rail 6 (it
+skips only rail 4, the collision guard). NOTE: `_anchor_entries_blocked` alone
+does NOT cover the daily stop — the daystop is read explicitly, so a test-fire
+obeys the exact brake a scheduled anchor does. **Files:** `testfire.py`
+(`testfire_preflight` rail 6, `_prime_anchors_daypnl`, `run_testfire`).
+**Self-test:** 288 (`e23 tf loss halt` — −$700 computed refuses, and refuses
+again with `force_window=True`), 289 (`e23 tf profit lock`), 290 (`e23 tf
+clean/off` — clean day clears all six rails; engine OFF refuses), 291 (`e23 tf
+ordering` — the rebuild runs BEFORE preflight, source + functional).
+
+---
+
+## R-8 — rogue_trades.csv header/row width mismatch — **FIXED (rogue core in PR #102; rescue/journal hardened this branch)**
+
+**Status:** FIXED — the rogue/fetcher/boost writers self-heal (`csv_schema.ensure`)
+and `migrate_run_dir` sweeps them at boot (PR #102). This branch AUDITED every
+writer and added the same self-heal + boot-sweep coverage to the two that lacked
+it: `rescue_events.csv` (`rescue_log.finalize`) and the monthly anchors journal
+`trades_<YYYY-MM>.csv` (`journal._write_journal`, now built from a single
+`JOURNAL_COLUMNS` constant so header width can never drift from row width).
+
+**Evidence (2026-07-09):** `run/rogue_trades.csv` carried a 9-column HEADER over
+10-column ROWS (`seed_source` appended to rows ~07-06 without rewriting the
+header); `csv.DictReader` dropped the 10th value into `restkey`.
+
+**Audit result:** rogue_trades ✓, rogue_patterns ✓, fetcher_trades ✓,
+boost_ledger ✓ (all self-heal on append + in the boot sweep); pnl_ledger ✓
+(whole-rewrite each run, structurally immune); rescue_events + journal ✗ → fixed
+here. journal's header/row were in lockstep (20 cols, not mismatched) — the
+docstring said "19-col" (stale, pre-`trigger_source`); corrected to 20. **Files:**
+`rescue_log.py`, `journal.py`, `csv_schema.py`. **Self-test:** 292 (`r8
+rescue+journal heal` — both writers self-heal, `migrate_run_dir` sweeps both);
+278 / 279 unchanged.
+
+---
+
+## R-10 — status surfaces disagree with the engine registry — **FIXED (this branch, v3.8.3)**
+
+**Status:** FIXED — 2026-07-09 — branch `claude/e23-and-ledger`.
+
+**Evidence (2026-07-09):** `run/state.json` showed `engines: {anchors, rogue}`
+(no fetcher) while `day_pnl_by_engine` carried a fetcher entry — mismatched key
+sets; and Rogue + Fetcher both rendered `lock: "active"` while switched OFF and
+`loss_stopped=True`.
+
+**Root cause:** the `engines` field in `_write_status` was hardcoded to
+`{anchors, rogue}` (fetcher literally omitted); and the per-engine lock label was
+derived per-surface without consulting the engine SWITCH, so a switched-OFF (or
+empty-gov) engine defaulted to `active`.
+
+**Fix:** one canonical engine set (`_ENGINE_KEYS`) + one source
+(`LiveTrader._engine_state` → registry `_engine_enabled` + computed governors,
+rendered through `_engine_display_state`). Every surface now derives from it:
+the `state.json` `engines` mirror lists all three; `day_pnl_by_engine` carries
+`switch`/`lock`/`state` per engine with a matching key set; `/daylock`
+(`daystops.render_status`, now passed `engine_states`) shows OFF / LOSS-HALTED
+for Rogue+Fetcher (was hardcoded "🟢 live"); the `/status` card (watchdog
+`_engine_state_row`) renders one engine switch+lock line. A DISABLED engine reads
+**OFF**, never `active`. `_engine_state` uses the PURE `anchors_daystop` (not the
+latching `_anchors_daystop`) so rendering a surface never latches the profit lock.
+pnl_report carries no engine switch/lock surface, so it needed no change (its P&L
+is already single-sourced by magic). **Files:** `live_trader.py`, `daystops.py`,
+`watchdog.py`. **Self-test:** 293 (`r10 engine surfaces` — disabled reads OFF,
+enabled+loss-stopped reads LOSS-HALTED, registry + day_pnl_by_engine key sets
+match, /status + /daylock agree with the payload).
+
+---
+
+## Status Ledger (2026-07-09) — DEVIATION / OPEN / FIXED index
+
+### DEVIATION LOG
+
+- **DEV-2 (07-07):** rogue confirm-5 believed deployed at 12:30 was never merged;
+  the bot ran confirm=10 all morning. Caught via the seed card reading "$10".
+  **Lesson: believed ≠ merged ≠ loaded. Verify the VALUE IN THE FILE at HEAD.**
+- **DEV-3 (07-07):** three restarts + two param changes + one new engine in one
+  session → 07-07 attribution is void.
+- **DEV-4 (07-08/09):** PRs #93–#101 (v3.7.0 → v3.8.0) landed across few restarts
+  with no single clean observation day. Bisect newest→oldest if a regression
+  needs attributing.
+
+### OPEN
+
+- **E-23** (07-09, HIGH): testfire bypassed the anchors loss halt; preflight ran
+  before the day-P&L rebuild. **FIXED-AT-HEAD by this branch** (see E-23 above) —
+  becomes closed on merge.
+- **R-8**: rogue_trades.csv 9-col header / 10-col rows. **FIXED** (rogue in
+  PR #102; rescue/journal hardened this branch — see R-8 above).
+- **R-9**: three P&L surfaces disagreed materially (07-08 ROGUE: report +$538.65
+  vs raw CSV +$7.00; FETCHER ~$170 offset both days). Root cause: trade CSVs were
+  summed as a P&L source. Superseded by the `magic_day_net` single source
+  (PR #103). **STILL TO VERIFY** with a reconcile pass over 07-01…07-09 (not run
+  in this branch — flagged as the outstanding action).
+- **R-10**: status surfaces vs engine registry. **FIXED-AT-HEAD by this branch**
+  (see R-10 above) — becomes closed on merge.
+- **G-1** (unchanged, still blocks funded): F-B bypasses the FP guard; worst
+  floating ≈ 4×($286+$260) = −$2,184 vs FPZERO −$500. 07-09 made this concrete —
+  the kill switch fired on FLOATING equity drawdown ($1,738.45 vs $1,737.21).
+  Verified in code this pass: `fills.py:651` fires `plan_trapped_late_rescue`
+  through its own call site and `continue`s BEFORE the break-and-hold gate and
+  the FP guard; gated only by `trapped_late_rescue_enabled`, not
+  `rescue_entry_enabled`.
+
+### FIXED (live-verified)
+
+- **E-20**: Rogue/Fetcher/anchors day governors rebuilt from broker deal history
+  on same-day restart (never zeroed). Fetcher first (PR #93), anchors in PR #103.
+- **E-21** (07-09): FIRST LIVE PROOF of per-engine loss-stop independence —
+  Fetcher LOSS-HALTED at −$536 while Rogue and Anchors continued trading
+  independently.
+- **E-22** (07-09, the most serious): `state['daily_pnl']` was accumulated ONLY at
+  `fills.py:401` (the reconcile loop). `risk._flatten_all()` closes positions
+  directly via the adapter, so kill-switch / EOD / Friday flattens never reached
+  the accumulator. On 07-09 it froze at +$140.00 while broker truth was −$821.10 —
+  so `anchors_daily_loss_stop` (−$630) NEVER FIRED on a −$821 day; the account
+  kill switch had to catch it. **FIX (PR #103, v3.8.2):** all decision read-sites
+  compute from `pnl_source.magic_day_net`; `state['daily_pnl']` is a mirror,
+  authoritative for nothing; the kill-switch + GATED logs print the COMPARED value
+  (equity drawdown), GATED throttled to once per lock. Selftests rewired to stub
+  `magic_day_net` so a governor reading the mirror now FAILS. **Lesson: 277 green
+  steps did not catch a −$821 day sailing past a −$630 stop, because the tests set
+  the accumulator directly.** (See the full E-22 entry above.)
+- **promote_on_boot override (07-09) — PARTIAL / DISCREPANCY.** The failure:
+  `rogue.py` / `fetcher.py` force-set `enabled=True` on demo, silently reverting
+  an explicit config `False`. **`rogue.promote_on_boot` IS fixed** (Optional[bool]
+  sentinel: None → auto-promote on demo, True/False → explicit owner override;
+  funded forced OFF first and unconditionally). **`fetcher.promote_on_boot` is
+  NOT** — it still auto-promotes to `True` on ANY demo account (`fetcher.py:95`),
+  so on a demo boot the D-28 "fetcher OFF" week is SILENTLY REVERTED to ON. Left
+  as-is (this is a documentation branch; behavior unchanged) and flagged as a
+  follow-up: fetcher needs the same sentinel to make its explicit `False`
+  authoritative on demo. The config comment on `fetcher_enabled` now states this.
+
+---
+
 ## Watch Ledger — patterns under observation (NOT confirmed bugs, NO lever pulled)
 
 ### W-2 — evidence append — 2026-07-02
 
 **A4 BUY:** no-hold shadow **+$36.75** vs actual **−$630** (held 33.9m).
+
+### W-11 — Rogue and Fetcher are CORRELATED, not complementary — **UPGRADED to structural (2026-07-09)**
+
+Same $5-chase logic, different SL widths. 07-09: both took losing trades in the
+same 4076–4086 band within minutes. Real offset comes from Anchors only. Genuine
+diversification requires a DIFFERENT instrument (XAGUSD), not a third gold
+chaser. (Feeds D-28: the anchors-only week.)
+
+### F-B is the biggest two-way swing factor and is UNGATED — evidence append (2026-07-09)
+
++$948.15 on 07-08 (A1), and the 07-09 A2 event (rescue SELL 4102.84, boosts at
+4113.05 / 4112.93) filled at the top. `rescue_entry_enabled` does NOT govern it
+(F-B rides `trapped_late_rescue_enabled` through its own call site — see G-1).
 
 ---
 
@@ -566,3 +746,113 @@ demo defaults (A5 skipped Friday, A4 not), the funded override
 
 **Restore path:** set `friday_flatten_enabled=False` and `a5_skip_friday=False`
 in `config.py` to fully restore pre-D-6 behavior (plain daily EOD only).
+
+### D-11 — `rogue_entry_confirm_redesign` 10 → 5 — LIVE 14:58 07-07
+
+The A1-anchored Rogue confirm distance dropped 10 → 5 (`config.py`,
+`rogue_entry_confirm_redesign = 5.0`, verified at HEAD). NOTE the chain
+displacement gate (`rogue_chain_min_displacement = 6.0`) now EXCEEDS the confirm
+by design — a chained entry needs $6 of fresh displacement even though the
+initial confirm is $5. (See DEV-2: a believed-but-unmerged confirm-5 ran as
+confirm-10 all morning of 07-07.)
+
+### D-13 — `rogue_init_sl` 5 → 10, PAIRED with `rogue_daily_loss_stop` −525 → −1050 (E-5 rule)
+
+**SUPERSEDED the same week** by the −$370 tight cap (D-16/17): at
+`rogue_daily_loss_stop = -370` the 3-fail pause is UNREACHABLE for Rogue at
+current defaults. The pause code is kept (it re-arms if the SL / stop values
+change). Current HEAD: `rogue_init_sl = 10.0`, `rogue_daily_loss_stop = -370.0`.
+
+### D-14 — FETCHER engine LIVE (PR #93, v3.7.0, magic 20260707)
+
+$5 trigger / +$5 TP / −$5 SL / no trail / re-anchor at close / cap 20 / 3-fail
+pause / funded force-off. **Review gate:** win rate vs the ~54% breakeven line.
+
+### D-15 — manual seeds `/rogueseed` `/fetchseed` LIVE
+
+`seed_source=MANUAL` rows are EXCLUDED from D-8 / D-12 evidence. Manual seeds =
+deliberate tests only.
+
+### D-16 / D-17 — per-engine daily profit locks + hard loss stops
+
+Profit locks **+$400 soft** (overridable once/day by reseed); hard loss stops
+**Rogue / Fetcher −$370**, **anchors −$630** (= exactly one full anchor SL).
+Losses hard, profits soft — the discipline line. Verified at HEAD:
+`rogue/fetcher_daily_profit_stop = 400`, `rogue/fetcher_daily_loss_stop = -370`,
+`anchors_daily_loss_stop = -630`.
+
+### D-18 — `anchors_daily_profit_stop` 400 → 800 for the anchors-only week
+
+Verified at HEAD: `anchors_daily_profit_stop = 800.0`.
+
+### D-24 — daily 2% target with the A4 decision gate — currently DISABLED
+
+80% minimum, skip A5 when secured post-A4, $200 give-back, no rollover.
+Currently **DISABLED** (`account_target_pct = 0.00` at HEAD) for the anchors-only
+week, so the +$800 engine lock (D-18) is the sole profit governor.
+(`account_target_min_pct = 0.80`, `account_target_giveback_dollars = 200`,
+`account_target_final_anchor = A4_1640_NYopen` remain configured for re-enable.)
+
+### D-26 / D-27 — $10-break seed anchor + earned trade budget (PR #101)
+
+- **D-26:** $10-break seed anchor — A1 is the REFERENCE, not the anchor; the
+  first break latches; no break → no trades. (`seed_break_dollars = 10.0`.)
+- **D-27:** earned trade budget — 2 free trades per anchor; a 3rd requires the
+  last two closes both WINS; exhaustion → 15m gap → fresh anchor at the tick.
+  (`engine_base_trades_per_anchor = 2`.) Both per-engine tunable; 0 disables.
+
+### D-28 — ANCHORS-ONLY EXPERIMENT, 07-09 → 07-16
+
+`rogue_enabled = False`, `fetcher_enabled = False`. **Rationale:** Rogue and
+Fetcher are correlated (W-11), both net-negative for July (~−$1,470 combined),
+took identical losing trades in the same chop band on 07-09, and their drawdown
+tripped the ACCOUNT kill switch — flattening a profitable anchors book. Anchors
+alone is the funded configuration (Rogue is force-off on funded regardless).
+**⚠️ Caveat (see FIXED / promote_on_boot discrepancy):** on a DEMO account
+`fetcher.promote_on_boot` still auto-promotes `fetcher_enabled` back to ON at
+boot — the D-28 fetcher-OFF intent is NOT authoritative on demo until fetcher
+gets the Optional[bool] sentinel. Verify `/fetcher status` reads OFF after boot,
+or `/fetcher off` manually, for the duration of the experiment.
+
+### D-29 — `rescue_entry_enabled` flipped True — 07-09 (concurrent with D-28)
+
+**ACKNOWLEDGED TWO-VARIABLE WEEK:** results are not attributable to either change
+alone. And per the F-B note (WATCH / G-1), `rescue_entry_enabled` does NOT govern
+the F-B path that motivated the flip — it governs the NORMAL rescue path only.
+
+---
+
+## FUNDED / AUG-15 GATE
+
+From the 26-day MT5 export (all engines, rescaled per-trade to each lot):
+
+| lot  | monthly       | worst day | worst 3-day streak |
+|------|---------------|-----------|--------------------|
+| 0.15 | +$2,383 (4.8%) | −$338     | −$844              |
+| 0.20 | +$3,178 (6.4%) | −$451     | −$1,126            |
+| 0.25 | +$3,972 (7.9%) | −$564     | −$1,407            |
+| 0.35 | +$5,561 (11.1%)| −$789     | −$1,970            |
+
+Worst streak in the whole sample = **3 days** (06-19 → 06-23), once.
+**Recommend 0.20** to start a $50k challenge: clears the target with ~45% of a
+~$2,500 trailing buffer unused. **NOTE** these blend in Rogue (force-off on
+funded) — recompute anchors-only before deciding.
+
+**GO / NO-GO criteria (pre-committed):**
+1. Anchors net positive for the window at the FUNDED lot (requires **G-1**
+   resolved first — it sets the lot).
+2. No single day breaches the funded daily limit with the brakes live.
+3. Trailing drawdown never threatened in any clustered-loss stretch.
+4. Rogue / Fetcher each judged on their own MTD, A3-style (cut, keep, tune).
+
+---
+
+## GROUND TRUTH RULE (strengthened)
+
+Realized-P&L truth = **MT5 deal history via `pnl_source.magic_day_net`, by
+magic.** `pnl_ledger.csv` is the MT5-rebuilt record. `rogue_trades.csv` /
+`fetcher_trades.csv` are **DECISION LOGS — NEVER sum their rows to produce a
+reported number** (their `outcome_dollars` is a live price delta, not an
+account-dollar realized P&L — the R-8/R-9 corruption). The journal
+(`trades_<YYYY-MM>.csv`) is anchors-only (magic 20260522) and EXCLUDES
+Rogue/Fetcher. **D-9: name the surface** whenever a P&L number is quoted.
