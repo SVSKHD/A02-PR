@@ -129,54 +129,31 @@ def testfire_preflight(trader, now_utc=None, collision_min=None, force_window=Fa
         return False, ("REFUSED [rail 5 ONE-AT-A-TIME]: a prior test-fire event is "
                        "still open. Wait for it to resolve before firing another.")
 
-    # Rail 4: never collide with a scheduled anchor (active or within N minutes).
-    # This is the ONLY bypassable rail. With --force-window the owner can fire
-    # off-schedule even inside the guard; rails 1/2/3/5 above already ran and still
-    # refuse their cases. The bypass is LOUD (warning names minutes-away) and safe:
-    # the scheduler is SUPPRESSED for the whole testfire session (_testfire_mode
-    # gates _process_anchor_if_due), so the test event owns the book — the real
-    # scheduled anchor will NOT also place alongside it while the test is live.
-    n = int(collision_min if collision_min is not None
-            else getattr(cfg, 'testfire_collision_min', 30))
     now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
-    near = minutes_to_nearest_anchor(cfg, now)
-    if near is not None and near <= n:
-        if force_window:
-            return True, (f"⚠️⚠️ CLEARED [rail 4 NO-COLLISION BYPASSED via --force-window]: "
-                          f"a scheduled anchor is {near:.0f} min away (<= {n} min guard) — "
-                          f"firing OFF-SCHEDULE anyway by owner override. The scheduler is "
-                          f"SUPPRESSED for this testfire session, so the real anchor will "
-                          f"NOT also fire while the test event is live (the test owns the "
-                          f"book). Rails 1/2/3 (DEMO-ONLY, NO-FP, FLAT-BOOK) stay HARD.")
-        return False, (f"REFUSED [rail 4 NO-COLLISION]: a scheduled anchor is "
-                       f"{near:.0f} min away (<= {n} min guard). Never let a test-fire "
-                       f"collide with a real anchor — wait until the window is clear, or "
-                       f"pass --force-window to fire off-schedule (rails 1/2/3 still apply).")
 
-    # Rail 6 (E-23): obey the ANCHORS daily brake. A test-fire is NEW anchor risk, so it
-    # must refuse under the SAME conditions a scheduled anchor does. TWO seams are checked
-    # (NOTE: _anchor_entries_blocked alone does NOT cover the daily stop -- it is only the
-    # Friday-window / engine-switch seam -- so the daystop is read explicitly):
-    #   (a) _anchors_daystop_blocked() -- the anchors daily LOSS halt (hard) / PROFIT lock /
-    #       account lock. Its P&L is the COMPUTED source (daystops.computed_anchors_day_pnl ->
-    #       pnl_source.magic_day_net), NEVER the state['daily_pnl'] mirror. This is the exact
-    #       07-09 defect: the anchors book was LOSS-HALTED at -$821 vs its -$630 stop, yet
-    #       testfire placed a real A2 straddle because preflight never consulted the governor.
-    #   (b) _anchor_entries_blocked(broker_date, now) -- the Friday weekend-hold window and
-    #       the anchors engine switch (OFF = manage-only): a test-fire is a NEW straddle.
-    # This rail is evaluated AFTER the anchors day-P&L rebuild (run_testfire primes it before
-    # preflight), so the governor knows the day's truth. FAIL-CLOSED on any error, and NOT
-    # bypassable by --force-window (that flag skips ONLY rail 4, the collision guard).
+    # Rail 6 (E-23): obey the ANCHORS daily brake. A test-fire is NEW anchor risk, so it must
+    # refuse under the SAME conditions a scheduled anchor does. Evaluated BEFORE rail 4 so
+    # --force-window (which bypasses ONLY rail 4) can NEVER skip it -- the 07-09 defect fires
+    # off-schedule, which is exactly the --force-window path. TWO seams are checked (NOTE:
+    # _anchor_entries_blocked alone does NOT cover the daily stop -- it is only the Friday-
+    # window / engine-switch seam -- so the daystop is read explicitly):
+    #   (a) the anchors daily LOSS halt (hard) / PROFIT lock, via the PURE daystops.anchors_
+    #       daystop over the COMPUTED day P&L (_anchors_day_pnl_computed -> magic_day_net,
+    #       NEVER the state['daily_pnl'] mirror). PURE, not the LATCHING _anchors_daystop_
+    #       blocked -- a preflight must never latch the profit lock or fire its one-time alert.
+    #       This is the exact 07-09 defect: the anchors book was LOSS-HALTED at -$821 vs its
+    #       -$630 stop, yet testfire placed a real A2 straddle without consulting the governor.
+    #   (b) _anchor_entries_blocked(broker_date, now) -- the Friday weekend-hold window and the
+    #       anchors engine switch (OFF = manage-only): a test-fire is a NEW straddle.
+    # Evaluated AFTER the anchors day-P&L rebuild (run_testfire primes it before preflight).
+    # FAIL-CLOSED: the brake methods are called DIRECTLY (a missing/renamed method raises ->
+    # the except refuses), never guarded into a silent pass. NOT bypassable by --force-window.
     try:
+        import daystops as _ds
         broker_date = trader._broker_date(now)
-        daystop_blocked = False
-        _dsb = getattr(trader, '_anchors_daystop_blocked', None)
-        if callable(_dsb):
-            daystop_blocked = bool(_dsb())
-        entries_blocked = False
-        _aeb = getattr(trader, '_anchor_entries_blocked', None)
-        if callable(_aeb):
-            entries_blocked = bool(_aeb(broker_date, now))
+        dp = trader._anchors_day_pnl_computed()
+        daystop_blocked = bool(_ds.anchors_daystop(dp, trader.cfg, trader.state)[0])
+        entries_blocked = bool(trader._anchor_entries_blocked(broker_date, now))
     except Exception as e:
         return False, (f"REFUSED [rail 6 ANCHORS-BRAKE]: cannot evaluate the anchors daily "
                        f"brake ({e!r}) — fail-closed. A test-fire never places while the "
@@ -187,6 +164,30 @@ def testfire_preflight(trader, now_utc=None, collision_min=None, force_window=Fa
                        "engine switched OFF). A test-fire is NEW anchor risk and obeys the same "
                        "brake as a scheduled anchor. --force-window does NOT override this — it "
                        "skips only rail 4 (the scheduled-anchor collision guard).")
+
+    # Rail 4: never collide with a scheduled anchor (active or within N minutes).
+    # This is the ONLY bypassable rail. With --force-window the owner can fire
+    # off-schedule even inside the guard; rails 1/2/3/5/6 above already ran and still
+    # refuse their cases. The bypass is LOUD (warning names minutes-away) and safe:
+    # the scheduler is SUPPRESSED for the whole testfire session (_testfire_mode
+    # gates _process_anchor_if_due), so the test event owns the book — the real
+    # scheduled anchor will NOT also place alongside it while the test is live.
+    n = int(collision_min if collision_min is not None
+            else getattr(cfg, 'testfire_collision_min', 30))
+    near = minutes_to_nearest_anchor(cfg, now)
+    if near is not None and near <= n:
+        if force_window:
+            return True, (f"⚠️⚠️ CLEARED [rail 4 NO-COLLISION BYPASSED via --force-window]: "
+                          f"a scheduled anchor is {near:.0f} min away (<= {n} min guard) — "
+                          f"firing OFF-SCHEDULE anyway by owner override. The scheduler is "
+                          f"SUPPRESSED for this testfire session, so the real anchor will "
+                          f"NOT also fire while the test event is live (the test owns the "
+                          f"book). Rails 1/2/3/5/6 (DEMO-ONLY, NO-FP, FLAT-BOOK, ONE-AT-A-"
+                          f"TIME, ANCHORS-BRAKE) stay HARD.")
+        return False, (f"REFUSED [rail 4 NO-COLLISION]: a scheduled anchor is "
+                       f"{near:.0f} min away (<= {n} min guard). Never let a test-fire "
+                       f"collide with a real anchor — wait until the window is clear, or "
+                       f"pass --force-window to fire off-schedule (rails 1/2/3/5/6 still apply).")
 
     return True, (f"CLEARED: demo account, STANDARD_5PCT profile, flat book, anchors brake "
                   f"clear, no scheduled anchor within {n} min "

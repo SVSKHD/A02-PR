@@ -3590,24 +3590,38 @@ class SelfTest:
     def _step_testfire_e23_loss_halt(self):
         # 288 E-23: anchors computed day P&L -$700 (<= -$630 hard loss stop) -> testfire
         # REFUSES at rail 6; and it refuses AGAIN with force_window=True (that flag skips
-        # ONLY rail 4). The P&L flows through the broker-history computed source
-        # (magic_day_net), not state['daily_pnl']. This is the exact 07-09 live incident.
+        # ONLY rail 4). CRITICAL: rail 6 runs BEFORE rail 4, so even WHEN a scheduled anchor
+        # is inside the collision window (the exact --force-window path), the loss halt still
+        # refuses -- a rail 6 placed AFTER rail 4's force-window bypass would fire off-schedule
+        # into a -$821 day (the live 07-09 incident). P&L flows through the computed
+        # magic_day_net source, not state['daily_pnl'].
         import testfire as _tf
         try:
             far = pd.Timestamp('2026-06-24T00:00:00Z')          # Wed, 7h from A2 -> rails 1-5 clear
+            near = pd.Timestamp('2026-06-24T07:00:00Z')         # AT A2 (10:00 broker) -> inside rail 4
             A = [('A2', 10, 0)]
             halted_ok, halted_r = _tf.testfire_preflight(
                 self._testfire_stub(anchors=A, anchors_day_pnl=-700.0), far)
             # --force-window must NOT bypass rail 6 (it only skips rail 4).
             forced_ok, forced_r = _tf.testfire_preflight(
                 self._testfire_stub(anchors=A, anchors_day_pnl=-700.0), far, force_window=True)
-            # -$100 (clean) at the SAME everything clears, proving rail 6 is the sole difference.
+            # THE REGRESSION GUARD: loss halt + a scheduled anchor INSIDE the window +
+            # force_window=True -> rail 6 fires BEFORE rail 4's bypass -> STILL REFUSED.
+            fw_near_ok, fw_near_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=-700.0), near, force_window=True)
+            # sanity: a CLEAN book at that same in-window instant WOULD clear via the bypass.
+            clean_near_ok, clean_near_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=-100.0), near, force_window=True)
+            # -$100 (clean) far from any anchor clears, proving rail 6 is the sole difference.
             clean_ok, _ = _tf.testfire_preflight(
                 self._testfire_stub(anchors=A, anchors_day_pnl=-100.0), far)
             ok = (halted_ok is False and forced_ok is False and clean_ok is True
+                  and fw_near_ok is False and 'rail 6' in fw_near_r
+                  and clean_near_ok is True and 'BYPASSED' in clean_near_r
                   and 'rail 6' in halted_r and 'rail 6' in forced_r)
             detail = (f"loss_halt_refused={not halted_ok} force_window_still_refused={not forced_ok} "
-                      f"clean_clears={clean_ok} reason={halted_r[:46]}")
+                      f"forcewin+in_window_still_refused={not fw_near_ok} "
+                      f"clean+in_window_bypasses={clean_near_ok} clean_far_clears={clean_ok}")
         except Exception as e:
             self._record(288, FAIL, f"raised: {e!r}"); return
         self._record(288, PASS if ok else FAIL, detail)
