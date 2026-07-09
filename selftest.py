@@ -8829,9 +8829,14 @@ class SelfTest:
         via self._set_anchors_day_pnl (broker deal history), NOT state['daily_pnl'] directly --
         the governors COMPUTE it from history (pnl_source.magic_day_net); _rogue/_fetcher hold
         each engine's governor day P&L."""
-        import types
+        import types, dataclasses
         import live_trader as _lt
-        cfg = cfg or self.cfg
+        # PIN the daily-stop threshold the MECHANISM tests exercise, so they are robust to
+        # owner config tuning of the production default (07-09: anchors_daily_profit_stop was
+        # retuned 400 -> 800). These tests verify the governor logic at a known threshold, not
+        # the deployment value. An explicit cfg (armed-lock tests) is respected as-is.
+        if cfg is None:
+            cfg = dataclasses.replace(self.cfg, anchors_daily_profit_stop=400.0)
         alerts = []
         t = types.SimpleNamespace(
             cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0},
@@ -9097,9 +9102,15 @@ class SelfTest:
         anchors; _rogue/_fetcher hold each engine governor's day P&L; shadow_positions tags
         open legs (so _post_a4_complete can see whether an A4 leg is still open). warn() alerts
         are captured for one-time-alert assertions."""
-        import types
+        import types, dataclasses
         import live_trader as _lt
-        cfg = cfg or self.cfg
+        # PIN the daily-target thresholds the MECHANISM tests exercise, so they are robust to
+        # owner config tuning of the production defaults (07-09: account_target_pct was retuned
+        # 0.02 -> 0.00, disabling the target in that deployment; anchors profit_stop 400 -> 800).
+        # These tests verify the target/lock logic at known values, not the deployment config.
+        if cfg is None:
+            cfg = dataclasses.replace(self.cfg, account_target_pct=0.02,
+                                      anchors_daily_profit_stop=400.0)
         alerts = []
         t = types.SimpleNamespace(
             cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0,
@@ -9125,10 +9136,13 @@ class SelfTest:
     def _step_target_levels(self):
         # 259 the daily target resolves off day-start equity: full = account_target_pct (2%),
         # min = account_target_min_pct (80%) x full. 50k -> 1000/800; 60k -> 1200/960.
-        import daystops as _ds
+        # Pinned to pct=0.02 so the resolver test is robust to the owner disabling the target
+        # in production (07-09: account_target_pct retuned 0.02 -> 0.00).
+        import daystops as _ds, dataclasses
         try:
-            f50, m50 = _ds.target_levels(50000, self.cfg)
-            f60, m60 = _ds.target_levels(60000, self.cfg)
+            cfg = dataclasses.replace(self.cfg, account_target_pct=0.02)
+            f50, m50 = _ds.target_levels(50000, cfg)
+            f60, m60 = _ds.target_levels(60000, cfg)
             ok = (abs(f50 - 1000) < 1e-6 and abs(m50 - 800) < 1e-6
                   and abs(f60 - 1200) < 1e-6 and abs(m60 - 960) < 1e-6)
             detail = f"50k->full {f50}/min {m50}  60k->full {f60}/min {m60}"

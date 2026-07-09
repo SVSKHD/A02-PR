@@ -2306,22 +2306,29 @@ class LiveTrader:
         # 5. Kill switch?
         if self._check_kill_switch() and not self.state['kill_switch_locked']:
             kill_base = self.state.get('day_start_equity') or self.cfg.starting_balance
-            # E-22: log the value the kill switch actually COMPARED (equity drawdown from
-            # day-open, or the computed realized loss in paper) vs its threshold -- NOT the
-            # state['daily_pnl'] mirror, which the flatten path had frozen at +$140 on the
-            # -$821 07-09 day. The mirror is still shown, labelled, for context.
+            # E-22 (07-09): the kill switch compares ACCOUNT EQUITY DRAWDOWN from day-open
+            # (incl. unrealized), NOT state['daily_pnl'] (anchors realized) -- the old line
+            # printed the mirror next to an equity limit, and on 07-09 the flatten path had
+            # frozen that mirror at +$140 on a -$821 day. Print what was actually COMPARED
+            # (drawdown vs threshold, via _kill_switch_drawdown, which falls back to the
+            # COMPUTED realized loss in paper); anchors realized is shown as context only.
             measured, kill_limit = self._kill_switch_drawdown()
+            _eq = self._live_equity()
+            _basis = ("account equity drawdown [incl. unrealized]" if _eq is not None
+                      else "computed realized loss [equity unavailable — paper/MT5 fallback]")
             log.warning(
-                f"KILL SWITCH TRIGGERED — equity drawdown ${measured:,.2f} >= "
-                f"limit ${kill_limit:,.2f} (base day_start_equity=${kill_base:,.2f}; "
-                f"anchors day P&L ${self._anchors_day_pnl_computed():+.2f}). "
+                f"KILL SWITCH TRIGGERED — {_basis} ${measured:,.2f} >= limit ${kill_limit:,.2f} "
+                f"({self.cfg.daily_loss_pct * 100:.1f}% of day_start_equity=${kill_base:,.2f}) "
+                f"[context: anchors realized day P&L ${self._anchors_day_pnl_computed():+.2f}]. "
                 f"Flattening; no new anchors today."
             )
             self.tele.critical(
                 f"🚨 *KILL SWITCH TRIGGERED*\n"
-                f"Equity drawdown: `${measured:,.2f}` "
-                f"(limit `${kill_limit:,.2f}`, from day-open `${kill_base:,.0f}`)\n"
-                f"Anchors day P&L: `${self._anchors_day_pnl_computed():+.2f}`\n"
+                f"{_basis.capitalize()}: `${measured:,.2f}` "
+                f"(limit `${kill_limit:,.2f}`, `{self.cfg.daily_loss_pct * 100:.1f}%` "
+                f"of day-open `${kill_base:,.0f}`)\n"
+                f"_Anchors realized today: `${self._anchors_day_pnl_computed():+.2f}` "
+                f"(context only — not the trigger)_\n"
                 f"Flattening everything, no more trades today."
             )
             self._flatten_all(reason="KillSwitch")
