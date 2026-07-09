@@ -352,6 +352,18 @@ STEP_NAMES = {
     264: "target override resume",    # /daylock off resumes incl A5, no same-day re-lock, loss stops hard
     265: "target day-roll+disable",   # day roll resets all target state; account_target_pct=0 disables
     266: "day-locked card",           # DAY SECURED / GIVE-BACK fires a DISTINCT 🔒 card (per-engine split + % of target)
+    # 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2), both engines
+    267: "break seed anchor up",       # A1=4000: 4009.99 no anchor/entry; 4010 -> anchor 4010, seed_source=A1_BREAK
+    268: "break seed downside+latch",  # 3990 first -> anchor 3990; first break latches (opposite never re-seeds)
+    269: "break never/disabled",       # never travels $10 -> no anchor/entries all day; seed_break_dollars=0 -> seed at A1
+    270: "budget gate pure",           # 2 free; 3rd blocked L,L/W,L/L,W; W,W->3rd; 3rd win->4th; 4th lose->no 5th
+    271: "budget exhaust+gap+fresh",   # fetcher: base spent w/o W,W -> gap blocks -> fresh anchor at tick, budget reset
+    272: "budget earned extension",    # fetcher: W,W across chain re-anchors unlocks a 3rd entry (budget not per-close)
+    273: "budget loss-stop terminal",  # loss stop during exhaustion/gap is terminal -- a fresh anchor never un-halts
+    274: "budget gap manage-only",     # an OPEN position during the gap still books its broker TP/SL close
+    275: "break+budget persist",       # latch + budget + win/loss window survive a same-day p1_state round-trip
+    276: "seed gap refuse/manual",     # /rogueseed+/fetchseed refused in the gap; MANUAL seed overrides the break
+    277: "break/budget anchors indep", # anchors engine (20260522) entries UNAFFECTED by both rules (independence)
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -470,6 +482,17 @@ class SelfTest:
     PING_DISTANCE = 50.0  # place test stops/markets this far from market
 
     def __init__(self, cfg, adapter, force: bool = False):
+        # The 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2) are
+        # DEFAULT-ON in production, but every drive-based Rogue/Fetcher test predates them and
+        # moves price by exactly the entry-confirm off A1 (which the break would withhold). So
+        # the harness base cfg runs both rules OFF -- existing steps exercise the underlying
+        # seed/entry/chain/governor mechanics byte-identically; steps 267-277 set these knobs
+        # EXPLICITLY (via _mk_break_cfg / cfg_over) to test the new rules at production values.
+        try:
+            import dataclasses as _dc
+            cfg = _dc.replace(cfg, seed_break_dollars=0.0, engine_base_trades_per_anchor=0)
+        except Exception:
+            pass
         self.cfg = cfg
         self.adapter = adapter
         self.force = force
@@ -7558,6 +7581,323 @@ class SelfTest:
                 env['deal'] = {'ticket': tk, 'pnl': close[0], 'price': close[1]}
         _f.drive(tr, allow_new_entries=allow_new_entries)
 
+    # --- 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2) ----------
+    def _mk_break_cfg(self, **over):
+        """A Fetcher cfg with the break/budget knobs set explicitly (isolate each rule)."""
+        import dataclasses
+        base = dict(fetcher_enabled=True, seed_break_dollars=10.0,
+                    engine_base_trades_per_anchor=2, engine_extend_requires_wins=2,
+                    engine_exhausted_gap_sec=900.0, fetcher_trigger_dollars=5.0,
+                    fetcher_daily_profit_stop=0.0)
+        base.update(over)
+        return dataclasses.replace(self.cfg, **base)
+
+    def _step_break_seed_up(self):
+        # 267 RULE 1: A1 is only the SEED REFERENCE. A1=4000 -> a $9.99 travel plants NO anchor
+        # and takes NO entry; the first $10 travel latches the anchor at the $10-point (4010),
+        # seed_source=A1_BREAK. Fetcher (the shared break core also drives Rogue, step 277).
+        import seed_budget as _sb
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(tr, env, 4009.99)                 # 9.99 < 10 -> no anchor
+            st = tr._fetcher or {}
+            under_ok = (st.get('anchor') is None and not env['orders']
+                        and not st.get('break_latched'))
+            self._fetch_tick(tr, env, 4010.0)                  # first $10 -> latch at 4010
+            st = tr._fetcher or {}
+            latch_ok = (abs(float(st.get('anchor') or 0) - 4010.0) < 1e-9
+                        and st.get('seed_source') == _sb.SEED_A1_BREAK
+                        and bool(st.get('break_latched'))
+                        and abs(float(st.get('break_a1_ref') or 0) - 4000.0) < 1e-9)
+            ok = under_ok and latch_ok
+            detail = (f"under(9.99)->no_anchor={under_ok} $10->anchor={st.get('anchor')} "
+                      f"src={st.get('seed_source')}")
+        except Exception as e:
+            self._record(267, FAIL, f"raised: {e!r}"); return
+        self._record(267, PASS if ok else FAIL, detail)
+
+    def _step_break_seed_downside(self):
+        # 268 RULE 1: the DOWNSIDE mirror -- price to 3990 FIRST latches the anchor at 3990;
+        # and the FIRST break LATCHES for the day -- once seeded, a later opposite-side move
+        # never re-seeds (chaining has taken over). seed_px is latched to the break point.
+        import seed_budget as _sb
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(tr, env, 3990.0)                  # -$10 -> anchor 3990
+            st = tr._fetcher or {}
+            down_ok = (abs(float(st.get('anchor') or 0) - 3990.0) < 1e-9
+                       and st.get('seed_source') == _sb.SEED_A1_BREAK
+                       and abs(float(st.get('seed_px') or 0) - 3990.0) < 1e-9)
+            # a later tick can NEVER re-seed: st['anchor'] is set, so the seed block is skipped
+            # and the latched seed_px stays 3990 (the +$10 side does not plant a new anchor).
+            self._fetch_tick(tr, env, 3991.0)                  # inside the band -> no entry/re-seed
+            st = tr._fetcher or {}
+            latch_ok = (abs(float(st.get('anchor') or 0) - 3990.0) < 1e-9
+                        and abs(float(st.get('seed_px') or 0) - 3990.0) < 1e-9)
+            ok = down_ok and latch_ok
+            detail = f"downside->anchor={st.get('anchor')} latched_no_reseed={latch_ok}"
+        except Exception as e:
+            self._record(268, FAIL, f"raised: {e!r}"); return
+        self._record(268, PASS if ok else FAIL, detail)
+
+    def _step_break_never_disabled(self):
+        # 269 RULE 1: if price NEVER travels the full break, NO anchor is planted and NEITHER
+        # engine trades all day (the filter working; no forced fallback). seed_break_dollars=0
+        # DISABLES the rule -> seed at A1 directly (today's behavior, seed_source=A1_ANCHOR).
+        import rogue as _r
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            for px in (4005.0, 3996.0, 4008.0, 3993.0, 4009.5):   # all < $10 from A1, all day
+                self._fetch_tick(tr, env, px)
+            st = tr._fetcher or {}
+            never_ok = (st.get('anchor') is None and not env['orders']
+                        and not st.get('break_latched'))
+            # disabled (=0): plant at A1 directly, seed_source A1_ANCHOR (regression to today).
+            trd, envd = self._fetch_mk(cfg=self._mk_break_cfg(seed_break_dollars=0.0),
+                                       anchors_on=True)
+            trd.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(trd, envd, 4000.0)
+            std = trd._fetcher or {}
+            disabled_ok = (abs(float(std.get('anchor') or 0) - 4000.0) < 1e-9
+                           and std.get('seed_source') == _r.SEED_A1_ANCHOR)
+            ok = never_ok and disabled_ok
+            detail = (f"never_travels->no_anchor={never_ok} disabled(0)->A1@{std.get('anchor')}"
+                      f"({std.get('seed_source')})")
+        except Exception as e:
+            self._record(269, FAIL, f"raised: {e!r}"); return
+        self._record(269, PASS if ok else FAIL, detail)
+
+    def _step_budget_gate_pure(self):
+        # 270 RULE 2 (pure core): 2 free attempts per anchor; a 3rd needs the last 2 closes to
+        # be BOTH wins. L,L / W,L / L,W all BLOCK the 3rd; W,W allows it; a win on the 3rd
+        # allows a 4th; a loss on the 4th blocks the 5th. base<=0 disables the whole rule.
+        import seed_budget as _sb
+        try:
+            cfg = self._mk_break_cfg()
+            free = (_sb.budget_can_trade({'trades': 0, 'wl': []}, cfg)[0]
+                    and _sb.budget_can_trade({'trades': 1, 'wl': [True]}, cfg)[0])
+            blocks = all(not _sb.budget_can_trade({'trades': 2, 'wl': list(w)}, cfg)[0]
+                         for w in ([False, False], [True, False], [False, True]))
+            ww = _sb.budget_can_trade({'trades': 2, 'wl': [True, True]}, cfg)[0]
+            fourth = _sb.budget_can_trade({'trades': 3, 'wl': [True, True, True]}, cfg)[0]
+            no_fifth = not _sb.budget_can_trade({'trades': 4, 'wl': [True, True, True, False]}, cfg)[0]
+            import dataclasses
+            off = _sb.budget_off(dataclasses.replace(cfg, engine_base_trades_per_anchor=0))
+            ok = free and blocks and ww and fourth and no_fifth and off
+            detail = (f"free={free} blocks(LL/WL/LW)={blocks} WW->3rd={ww} 3rd_win->4th={fourth} "
+                      f"4th_lose->no5th={no_fifth} base0_off={off}")
+        except Exception as e:
+            self._record(270, FAIL, f"raised: {e!r}"); return
+        self._record(270, PASS if ok else FAIL, detail)
+
+    def _step_budget_exhaust_gap_fresh(self):
+        # 271 RULE 2 end-to-end (Fetcher): 2 entries off an anchor, the 2nd a LOSS -> the anchor
+        # is EXHAUSTED (last two not both wins), a one-time ANCHOR EXHAUSTED alert fires, the gap
+        # BLOCKS a 3rd entry; once the gap elapses a FRESH anchor is planted at the current tick
+        # with a fresh budget. (break disabled here to isolate Rule 2.)
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(seed_break_dollars=0.0), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(tr, env, 4000.0)                  # seed anchor 4000
+            self._fetch_tick(tr, env, 4005.0)                  # entry #1 ($5 move)
+            self._fetch_tick(tr, env, 4005.0, close=(+50.0, 4005.0))   # close WIN, re-anchor 4005
+            self._fetch_tick(tr, env, 4010.0)                  # entry #2 ($5 move off 4005)
+            self._fetch_tick(tr, env, 4010.0, close=(-30.0, 4010.0))   # close LOSS -> re-anchor 4010
+            n_after_two = len(env['orders'])
+            b = (tr._fetcher or {}).get('budget') or {}
+            exhausted = (b.get('gap_until') is not None and int(b.get('trades', 0)) == 2)
+            alerted = any('ANCHOR EXHAUSTED' in str(m) for m in env['logs'])
+            # gap BLOCKS a 3rd entry
+            self._fetch_tick(tr, env, 4020.0)                  # would be a $10 move -> still blocked
+            blocked = (len(env['orders']) == n_after_two)
+            # elapse the gap (set the timer into the past) -> a fresh anchor is planted at the tick
+            (tr._fetcher['budget'])['gap_until'] = 1.0
+            self._fetch_tick(tr, env, 4055.0)
+            stf = tr._fetcher or {}
+            bf = stf.get('budget') or {}
+            fresh = (abs(float(stf.get('anchor') or 0) - 4055.0) < 1e-9
+                     and int(bf.get('trades', 0)) == 0 and bf.get('gap_until') is None
+                     and any('FRESH ANCHOR' in str(m) for m in env['logs']))
+            ok = (n_after_two == 2 and exhausted and alerted and blocked and fresh)
+            detail = (f"entries={n_after_two} exhausted={exhausted} alerted={alerted} "
+                      f"gap_blocked={blocked} fresh_anchor@{stf.get('anchor')}(reset={fresh})")
+        except Exception as e:
+            self._record(271, FAIL, f"raised: {e!r}"); return
+        self._record(271, PASS if ok else FAIL, detail)
+
+    def _step_budget_earned_extension(self):
+        # 272 RULE 2 (Fetcher): the budget SESSION spans an anchor's chain re-anchors (it does
+        # NOT reset per close). Two WINS in a row (W,W) EARN a 3rd entry off the same session;
+        # proving the budget counts across the re-anchor-at-close, which is the chop the
+        # evidence showed (4 chained re-entries in one band).
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(seed_break_dollars=0.0), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(tr, env, 4000.0)                  # seed
+            self._fetch_tick(tr, env, 4005.0)                  # entry #1
+            self._fetch_tick(tr, env, 4005.0, close=(+40.0, 4005.0))   # WIN, re-anchor 4005
+            self._fetch_tick(tr, env, 4010.0)                  # entry #2
+            self._fetch_tick(tr, env, 4010.0, close=(+40.0, 4010.0))   # WIN (W,W), re-anchor 4010
+            n_before = len(env['orders'])
+            self._fetch_tick(tr, env, 4015.0)                  # $5 move -> EARNED 3rd entry
+            b = (tr._fetcher or {}).get('budget') or {}
+            earned = (len(env['orders']) == n_before + 1 and int(b.get('trades', 0)) == 3
+                      and (b.get('gap_until') is None))
+            ok = (n_before == 2 and earned)
+            detail = (f"after_WW entries={n_before}->{len(env['orders'])} trades={b.get('trades')} "
+                      f"earned_3rd={earned}")
+        except Exception as e:
+            self._record(272, FAIL, f"raised: {e!r}"); return
+        self._record(272, PASS if ok else FAIL, detail)
+
+    def _step_budget_loss_terminal(self):
+        # 273 HIERARCHY: the daily loss stop is TERMINAL and OUTRANKS the budget -- can_enter
+        # (loss stop) is checked BEFORE the budget gate, so a loss-stopped day takes no fresh
+        # anchor and no earned extension, even with the exhaustion gap elapsed.
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(seed_break_dollars=0.0), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(tr, env, 4000.0)                  # seed anchor
+            n0 = len(env['orders'])
+            # force a loss-stopped gov + an elapsed exhaustion gap
+            tr._fetcher['gov']['loss_stopped'] = True
+            tr._fetcher['budget'] = {'trades': 2, 'wl': [False, False], 'gap_until': 1.0}
+            self._fetch_tick(tr, env, 4055.0)                  # gap ready, but loss stop ranks first
+            b = (tr._fetcher or {}).get('budget') or {}
+            terminal = (len(env['orders']) == n0                       # no entry
+                        and b.get('gap_until') == 1.0                  # NOT reset -> no fresh anchor
+                        and int(b.get('trades', 0)) == 2)
+            ok = terminal
+            detail = (f"loss_stopped: no_entry={len(env['orders']) == n0} "
+                      f"no_fresh_anchor(gap_kept={b.get('gap_until')})")
+        except Exception as e:
+            self._record(273, FAIL, f"raised: {e!r}"); return
+        self._record(273, PASS if ok else FAIL, detail)
+
+    def _step_budget_gap_manage_only(self):
+        # 274 HIERARCHY: MANAGE-ONLY during the gap -- an OPEN position still books its broker
+        # TP/SL close even while the exhaustion gap blocks NEW entries (the close is handled at
+        # the top of drive(), upstream of the budget gate).
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(seed_break_dollars=0.0), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(tr, env, 4000.0)                  # seed
+            self._fetch_tick(tr, env, 4005.0)                  # entry #1 -> open
+            open_tk = (tr._fetcher or {}).get('open', {}).get('ticket')
+            # engage a gap while the position is OPEN
+            tr._fetcher['budget'] = {'trades': 2, 'wl': [True, False], 'gap_until': 9e18}
+            dp_before = float(tr._fetcher['gov'].get('day_pnl', 0.0))
+            n_before = len(env['orders'])
+            self._fetch_tick(tr, env, 4005.0, close=(+25.0, 4005.0))   # broker close during the gap
+            booked = (abs(float(tr._fetcher['gov'].get('day_pnl', 0.0)) - (dp_before + 25.0)) < 1e-6
+                      and (tr._fetcher or {}).get('open') is None)
+            no_new = (len(env['orders']) == n_before)          # gap still blocks a fresh entry
+            ok = (open_tk is not None and booked and no_new)
+            detail = f"open_close_booked={booked} no_new_entry_in_gap={no_new}"
+        except Exception as e:
+            self._record(274, FAIL, f"raised: {e!r}"); return
+        self._record(274, PASS if ok else FAIL, detail)
+
+    def _step_break_budget_persist(self):
+        # 275 PERSISTENCE: the $10-break latch + the per-anchor budget (trades + win/loss window
+        # + gap) are runtime-only (NOT derivable from deal history) and survive a same-day
+        # p1_state snapshot -> json -> restore, for BOTH engines.
+        import p1_state as _p1, json, types
+        try:
+            tr = types.SimpleNamespace(
+                run_dir='.', paper=True, shadow_positions={},
+                state={'last_broker_date': '2026-07-09', 'processed_anchors_today': [],
+                       'daily_pnl': 0.0},
+                engines={'anchors': True, 'rogue': True, 'fetcher': True},
+                _rogue={'day': '2026-07-09', 'gov': __import__('rogue').new_day_state(),
+                        'anchor': 4010.0, 'leg_dir': 'BUY', 'a1_last_close': None, 'open': None,
+                        'seed_px': 4010.0, 'seed_source': 'A1_BREAK', 'break_latched': True,
+                        'break_anchor_px': 4010.0, 'break_a1_ref': 4000.0,
+                        'budget': {'trades': 2, 'wl': [True, False], 'gap_until': 1234.0}},
+                _fetcher={'day': '2026-07-09', 'gov': __import__('fetcher').new_day_state(),
+                          'anchor': 3990.0, 'leg_dir': 'SELL', 'open': None,
+                          'seed_px': 3990.0, 'seed_source': 'A1_BREAK', 'break_latched': True,
+                          'break_anchor_px': 3990.0, 'break_a1_ref': 4000.0,
+                          'budget': {'trades': 4, 'wl': [True, True, True, False],
+                                     'gap_until': None}})
+            snap = json.loads(json.dumps(_p1.snapshot(tr), default=str))
+            r, f = snap.get('rogue') or {}, snap.get('fetcher') or {}
+            r_ok = (r.get('break_latched') is True and float(r.get('break_anchor_px')) == 4010.0
+                    and (r.get('budget') or {}).get('trades') == 2
+                    and (r.get('budget') or {}).get('wl') == [True, False])
+            f_ok = (f.get('break_latched') is True and float(f.get('break_anchor_px')) == 3990.0
+                    and (f.get('budget') or {}).get('trades') == 4
+                    and (f.get('budget') or {}).get('wl') == [True, True, True, False])
+            ok = r_ok and f_ok
+            detail = f"rogue_persist={r_ok} fetcher_persist={f_ok}"
+        except Exception as e:
+            self._record(275, FAIL, f"raised: {e!r}"); return
+        self._record(275, PASS if ok else FAIL, detail)
+
+    def _step_seed_gap_refuse_manual(self):
+        # 276 HIERARCHY: /fetchseed (and /rogueseed) are REFUSED while the exhaustion gap runs;
+        # a MANUAL seed otherwise OVERRIDES the $10-break (plants at the tick directly) and
+        # starts a FRESH budget session.
+        import fetcher as _f, rogue as _r
+        try:
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            self._fetch_tick(tr, env, 4000.0)                  # (no break yet -> no anchor)
+            # engage a gap, then a manual reseed must be REFUSED
+            tr._fetcher = tr._fetcher or {'day': '2026-07-07', 'gov': _f.new_day_state(),
+                                          'anchor': None, 'leg_dir': None, 'open': None}
+            tr._fetcher['budget'] = {'trades': 2, 'wl': [False, False], 'gap_until': 9e18}
+            okm, reason, _px = _f.manual_seed(tr, 4050.0)
+            refused = (okm is False and reason == 'anchor_gap')
+            # clear the gap -> a manual seed plants at the tick (OVERRIDES the break) + fresh budget
+            tr._fetcher['budget']['gap_until'] = None
+            okm2, reason2, px2 = _f.manual_seed(tr, 4050.0)
+            b = (tr._fetcher or {}).get('budget') or {}
+            override_ok = (okm2 and abs(float(tr._fetcher.get('anchor') or 0) - 4050.0) < 1e-9
+                           and tr._fetcher.get('seed_source') == _r.SEED_MANUAL
+                           and int(b.get('trades', 0)) == 0 and not b.get('wl'))
+            ok = refused and override_ok
+            detail = (f"gap_refused={refused}({reason}) manual_overrides_break={override_ok} "
+                      f"anchor={tr._fetcher.get('anchor')}")
+        except Exception as e:
+            self._record(276, FAIL, f"raised: {e!r}"); return
+        self._record(276, PASS if ok else FAIL, detail)
+
+    def _step_break_budget_anchors_indep(self):
+        # 277 INDEPENDENCE: both rules live in Rogue/Fetcher only -- the ANCHORS engine
+        # (magic 20260522, state['daily_pnl']) is UNAFFECTED. Also a Rogue-side smoke: the
+        # SHARED break core latches the Rogue seed at A1_BREAK (proving both engines wire it).
+        import rogue as _r, seed_budget as _sb
+        try:
+            # (a) Fetcher break+budget cycles never touch the anchors day P&L / place an anchor.
+            tr, env = self._fetch_mk(cfg=self._mk_break_cfg(seed_break_dollars=0.0), anchors_on=True)
+            tr.state['a1_anchor_price'] = 4000.0
+            tr.state['daily_pnl'] = 111.0                      # anchors realized P&L (magic 20260522)
+            self._fetch_tick(tr, env, 4000.0)
+            self._fetch_tick(tr, env, 4005.0)
+            self._fetch_tick(tr, env, 4005.0, close=(+30.0, 4005.0))
+            anchors_untouched = (abs(float(tr.state.get('daily_pnl', 0.0)) - 111.0) < 1e-9)
+            # (b) Rogue-side: the shared break core latches the Rogue seed at A1_BREAK.
+            trr, envr, placed, _mod, _cl = self._mk_rogue_a1_trader(
+                a1_leg_px=4000.0, price=4009.0, seed_break_dollars=10.0)
+            _r.drive(trr)                                      # $9 travel -> no anchor, no entry
+            pre = (trr._rogue or {}).get('seed_source')
+            envr['price'] = 4010.0
+            _r.drive(trr)                                      # $10 -> latch A1_BREAK
+            strg = trr._rogue or {}
+            rogue_break = (pre != _sb.SEED_A1_BREAK and strg.get('seed_source') == _sb.SEED_A1_BREAK
+                           and abs(float(strg.get('seed_px') or 0) - 4010.0) < 1e-9
+                           and not placed)                     # latched anchor, no entry at the point
+            ok = anchors_untouched and rogue_break
+            detail = (f"anchors_daily_pnl_untouched={anchors_untouched} "
+                      f"rogue_break_latch={rogue_break}(src={strg.get('seed_source')})")
+        except Exception as e:
+            self._record(277, FAIL, f"raised: {e!r}"); return
+        self._record(277, PASS if ok else FAIL, detail)
+
     def _step_fetcher_seed_resolution(self):
         # 234 SEED: the shared resolver (rogue.resolve_seed, fallback_key=
         # 'fetcher_seed_fallback') gives the REAL A1 anchor when the anchor engine is ON,
@@ -10478,6 +10818,18 @@ class SelfTest:
             self._step_target_override()
             self._step_target_dayroll_disable()
             self._step_target_daylocked_card()
+            # 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2)
+            self._step_break_seed_up()
+            self._step_break_seed_downside()
+            self._step_break_never_disabled()
+            self._step_budget_gate_pure()
+            self._step_budget_exhaust_gap_fresh()
+            self._step_budget_earned_extension()
+            self._step_budget_loss_terminal()
+            self._step_budget_gap_manage_only()
+            self._step_break_budget_persist()
+            self._step_seed_gap_refuse_manual()
+            self._step_break_budget_anchors_indep()
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)

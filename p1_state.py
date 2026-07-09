@@ -115,6 +115,14 @@ def snapshot(trader):
                 'seed_recorded_px': r.get('seed_recorded_px'),
                 'a1_snap_px': r.get('a1_snap_px'),
                 'day_open_px': r.get('day_open_px'),
+                # 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2):
+                # runtime-only state (NOT derivable from broker deal history) -- a same-day
+                # restart must restore the latched break anchor + the per-anchor budget so the
+                # break never re-seeds and the budget/window never zeroes mid-session.
+                'break_latched': bool(r.get('break_latched', False)),
+                'break_anchor_px': r.get('break_anchor_px'),
+                'break_a1_ref': r.get('break_a1_ref'),
+                'budget': dict(r.get('budget') or {}),
                 'open': ({'ticket': o.get('ticket'), 'side': o.get('side'),
                           'entry': o.get('entry'), 'sl': o.get('sl'), 'peak': o.get('peak'),
                           'magic': o.get('magic'), 'leg_type': o.get('leg_type')}
@@ -152,6 +160,12 @@ def snapshot(trader):
                 'seed_recorded_px': fr.get('seed_recorded_px'),
                 'a1_snap_px': fr.get('a1_snap_px'),
                 'day_open_px': fr.get('day_open_px'),
+                # 2026-07-09 $10-break seed anchor + earned trade budget (mirror the Rogue
+                # block): runtime-only state restored from the snapshot on a same-day restart.
+                'break_latched': bool(fr.get('break_latched', False)),
+                'break_anchor_px': fr.get('break_anchor_px'),
+                'break_a1_ref': fr.get('break_a1_ref'),
+                'budget': dict(fr.get('budget') or {}),
                 'open': ({'ticket': fo.get('ticket'), 'side': fo.get('side'),
                           'entry': fo.get('entry'), 'tp': fo.get('tp'), 'sl': fo.get('sl'),
                           'magic': fo.get('magic'), 'leg_type': fo.get('leg_type')}
@@ -325,7 +339,13 @@ def recover_on_boot(trader):
                   'seed_source': r.get('seed_source'),
                   'seed_recorded_px': r.get('seed_recorded_px'),
                   'a1_snap_px': r.get('a1_snap_px'),
-                  'day_open_px': r.get('day_open_px')}
+                  'day_open_px': r.get('day_open_px'),
+                  # 2026-07-09 restore the $10-break latch + the per-anchor trade budget
+                  # (runtime-only; absent in an older file -> not-latched + a fresh budget).
+                  'break_latched': bool(r.get('break_latched', False)),
+                  'break_anchor_px': r.get('break_anchor_px'),
+                  'break_a1_ref': r.get('break_a1_ref'),
+                  'budget': dict(r.get('budget') or {})}
             o = r.get('open')
             if o and o.get('ticket') is not None and _position_open_at_broker(trader, o.get('ticket')):
                 # ADOPT the already-open Rogue position instead of ignoring it.
@@ -369,7 +389,13 @@ def recover_on_boot(trader):
                    'seed_px': fr.get('seed_px'), 'seed_source': fr.get('seed_source'),
                    'seed_recorded_px': fr.get('seed_recorded_px'),
                    'a1_snap_px': fr.get('a1_snap_px'),
-                   'day_open_px': fr.get('day_open_px')}
+                   'day_open_px': fr.get('day_open_px'),
+                   # 2026-07-09 restore the $10-break latch + the per-anchor trade budget
+                   # (runtime-only; mirror the Rogue block).
+                   'break_latched': bool(fr.get('break_latched', False)),
+                   'break_anchor_px': fr.get('break_anchor_px'),
+                   'break_a1_ref': fr.get('break_a1_ref'),
+                   'budget': dict(fr.get('budget') or {})}
             fo = fr.get('open')
             if fo and fo.get('ticket') is not None and _position_open_at_broker(trader, fo.get('ticket')):
                 # ADOPT the already-open Fetcher position instead of ignoring it.

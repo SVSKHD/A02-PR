@@ -608,6 +608,33 @@ class Config:
     # via fallback_key='fetcher_seed_fallback'): "a1_time_snapshot" (DEFAULT) or "market_open".
     fetcher_seed_fallback: str = "a1_time_snapshot"   # or "market_open"
 
+    # --- $10-BREAK SEED ANCHOR + EARNED TRADE BUDGET (Rogue + Fetcher; 2026-07-09) --------
+    # Evidence (07-08 -$168, 07-09 -$536): both engines seed at/near A1 and hunt INSIDE the
+    # noise band around it (Fetcher took 4 trades in a 4076-4086 range). Two shared brakes,
+    # both ANCHOR-PLACEMENT / trade-budget rules only -- NO entry-logic change, and the
+    # anchors engine (20260522) is COMPLETELY UNAFFECTED.
+    #
+    # RULE 1 -- $10-BREAK SEED ANCHOR: A1 is only the SEED REFERENCE, not the trading anchor.
+    # The FIRST time price travels seed_break_dollars from A1 in EITHER direction, THAT $-point
+    # (A1+10 or A1-10) becomes the day's anchor for BOTH engines (seed_source=A1_BREAK). The
+    # first break latches for the day; the opposite side never re-seeds (chaining has taken
+    # over). If price never travels the full break, NO anchor is planted and neither engine
+    # trades that day -- the filter working, no forced fallback. 0 disables (seed at A1
+    # directly, today's behavior). Manual /rogueseed /fetchseed override it (seed_source=MANUAL).
+    seed_break_dollars: float = 10.0
+    # RULE 2 -- EARNED TRADE BUDGET: each anchor starts with engine_base_trades_per_anchor free
+    # attempts. A 3rd (and each subsequent) entry from the SAME anchor is allowed ONLY IF the
+    # last engine_extend_requires_wins closed trades from this anchor were ALL WINS (W,W -> +1;
+    # any loss in the trailing window -> no more). An EXHAUSTED anchor (base spent without an
+    # earned extension, or an extension window broken by a loss) blocks NEW entries for
+    # engine_exhausted_gap_sec (broker wall-clock), then a FRESH anchor is planted at the
+    # current tick (NOT the stale close) with a fresh budget. SUBORDINATE to the daily loss
+    # stop (terminal) and the kill switch. Applies to rogue + fetcher; 0 disables each
+    # independently (engine_base_trades_per_anchor=0 -> no budget gating at all).
+    engine_base_trades_per_anchor: int = 2      # free attempts per anchor
+    engine_extend_requires_wins: int = 2        # last-N closes must ALL be wins to unlock +1
+    engine_exhausted_gap_sec: float = 900.0     # gap before a fresh anchor after exhaustion; TUNE
+
     # --- ANCHORS engine daily stops + the (inert) account-level lock (2026-07-08) --------
     # The ANCHORS engine (magic 20260522, incl. its boost / rescue / F-B legs) gets the same
     # per-engine daily brakes Rogue/Fetcher carry -- realized day P&L is state['daily_pnl']

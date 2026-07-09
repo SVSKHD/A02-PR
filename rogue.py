@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 
+import seed_budget   # SHARED $10-break seed anchor (Rule 1) + earned trade budget (Rule 2)
+
 log = logging.getLogger("AUREON")
 
 # --- tagging (distinct from the anchors) -----------------------------------------
@@ -595,7 +597,9 @@ def _record_seed(trader, st, seed_px, seed_source):
         # (master), but if the switch is later toggled off mid-day, resolve_seed
         # latches THIS price rather than re-seeding via the fallback.
         st['seed_recorded_px'] = round(float(seed_px), 2)
-        if seed_source in (SEED_A1_TIME_SNAPSHOT, SEED_MARKET_OPEN):
+        # A1_BREAK latches like the fallback sources: once the $10-break anchor is planted it
+        # is the day's fixed seed (resolve_seed reuses it; the opposite side never re-seeds).
+        if seed_source in (SEED_A1_TIME_SNAPSHOT, SEED_MARKET_OPEN, seed_budget.SEED_A1_BREAK):
             st['seed_px'] = round(float(seed_px), 2)
         if st.get('_seed_log_key') == key:
             return
@@ -605,6 +609,50 @@ def _record_seed(trader, st, seed_px, seed_source):
         log.info(msg)
         try:
             trader.tele.info(msg)
+        except Exception:
+            pass
+        _persist_state(trader)
+    except Exception:
+        pass
+
+
+def _plant_fresh_anchor_a1(trader, st, price):
+    """RULE 2: the exhaustion gap has elapsed -> plant a FRESH anchor at the current tick (NOT
+    the stale close that fed the chop) with a fresh trade budget. Mirrors manual_seed's core
+    (chain target = the tick; chain meta cleared so the first entry off it is unconstrained).
+    Guarded; never raises onto the driver."""
+    try:
+        px = round(float(price), 2)
+        st['a1_last_close'] = px
+        st['a1_reverted'] = False
+        st['chain_time'] = None
+        st['chain_anchor'] = None
+        seed_budget.budget_reset(st.setdefault('budget', seed_budget.new_budget()))
+        msg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} FRESH ANCHOR @ {px:.2f} — budget reset "
+               f"(hunting again after the exhaustion gap)")
+        log.warning(msg)
+        try:
+            trader.tele.info(msg)
+        except Exception:
+            pass
+        _persist_state(trader)
+    except Exception:
+        pass
+
+
+def _budget_exhausted_alert(trader, st, b, gap_sec):
+    """RULE 2: the anchor's trade budget is spent without an earned extension -> loud one-time
+    log + Discord (n trades, last two not both wins, gap length). Fires ONCE per exhaustion
+    episode (the gap latch guarantees single fire). Guarded; never raises."""
+    try:
+        n = int(b.get('trades', 0))
+        last2 = seed_budget.wl_tag(b, int(getattr(trader.cfg, 'engine_extend_requires_wins', 2) or 2))
+        mins = float(gap_sec) / 60.0
+        msg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ANCHOR EXHAUSTED ({n} trades, last two "
+               f"[{last2}] not both wins) — {mins:g}m gap, fresh anchor after")
+        log.warning(msg)
+        try:
+            trader.tele.warn(msg)
         except Exception:
             pass
         _persist_state(trader)
@@ -676,6 +724,27 @@ def _drive_a1(trader, st, allow_new_entries=True):
     # (A1-time snapshot / market open). Every seed logs its source once and stamps
     # st['seed_source'] for the ledger/pattern-log rows.
     seed_px, seed_source = resolve_seed(trader, st)
+    # RULE 1 ($10-break seed anchor): A1 is only the seed REFERENCE. The INITIAL seed is
+    # withheld until price first travels seed_break_dollars from A1 in either direction; the
+    # $-point (A1 +/- break) then latches as the day's anchor (seed_source=A1_BREAK). Chain
+    # re-anchors (a1_last_close set) and a manual/latched seed bypass it; seed_break_dollars
+    # <= 0 plants at A1 directly (today's behavior). No break yet -> no anchor, no trade.
+    brk = float(getattr(trader.cfg, 'seed_break_dollars', 0.0) or 0.0)
+    if (brk > 0.0 and st.get('a1_last_close') is None and st.get('seed_px') is None
+            and seed_source != SEED_MANUAL):
+        b_anchor, b_latched = seed_budget.break_seed_anchor(st, seed_px, price, brk)
+        if b_anchor is None:
+            return                              # price has not travelled $10 from A1 yet
+        seed_px, seed_source = b_anchor, seed_budget.SEED_A1_BREAK
+        if b_latched:
+            _bmsg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} SEED via {seed_budget.SEED_A1_BREAK} "
+                     f"@ {b_anchor:.2f} (A1 {float(st.get('break_a1_ref')):.2f}, "
+                     f"{'+' if b_anchor >= float(st.get('break_a1_ref')) else '-'}${brk:g} break)")
+            log.info(_bmsg)
+            try:
+                trader.tele.info(_bmsg)
+            except Exception:
+                pass
     anchor = a1_seed_anchor(st.get('a1_last_close'), seed_px)
     if anchor is None:
         return
@@ -697,6 +766,24 @@ def _drive_a1(trader, st, allow_new_entries=True):
     ok, _why = can_enter(st['gov'], trader.cfg)   # BRAKE: daily loss stop / cap / fail-pause
     if not ok:
         return
+    # RULE 2 (earned trade budget): SUBORDINATE to the loss stop above (can_enter ranks first;
+    # a loss-stopped day is terminal -- no fresh anchor resurrects it). During the exhaustion
+    # gap: manage-only (the open leg was already handled upstream). Gap elapsed: plant a FRESH
+    # anchor at the current tick with a fresh budget. Budget spent without an earned extension:
+    # latch the gap + one-time alert. Disabled (base<=0) -> byte-neutral.
+    if not seed_budget.budget_off(trader.cfg):
+        b = st.setdefault('budget', seed_budget.new_budget())
+        _now = _epoch()
+        if seed_budget.budget_in_gap(b, _now):
+            return
+        if seed_budget.budget_gap_ready(b, _now):
+            _plant_fresh_anchor_a1(trader, st, price)
+            return
+        ok_b, _why_b = seed_budget.budget_can_trade(b, trader.cfg)
+        if not ok_b:
+            _gap = seed_budget.budget_start_gap(b, trader.cfg, _now)
+            _budget_exhausted_alert(trader, st, b, _gap)
+            return
     enter, side, epx, sl = a1_entry_decision(anchor, price, trader.cfg)
     if not enter:
         # P3 GATE 1 (E-17): if this no-enter is a CHASE reject (|move| > cap), say so --
@@ -982,6 +1069,8 @@ def _mark_rogue_open(trader, st, entry_px, sl, tk, rc):
     st['open'] = {'ticket': tk, 'side': side, 'entry': entry_px, 'sl': sl,
                   'peak': entry_px, 'magic': ROGUE_MAGIC, 'leg_type': ROGUE_LEG_TYPE}
     record_entry(st['gov'])
+    # RULE 2: this entry consumes one of the anchor session's budget attempts.
+    seed_budget.budget_record_entry(st.setdefault('budget', seed_budget.new_budget()))
     try:
         import boost_metrics as _bm
         import pandas as _pd
@@ -1167,6 +1256,10 @@ def detect_close(trader, st):
     else:
         was_fail = float(pnl) <= 0.0     # a non-winning close = init-SL fake-out (winner resets)
         record_close(st['gov'], pnl, was_fail, trader.cfg)
+        # RULE 2: append this close's outcome to the anchor session's trailing win/loss
+        # window (a win = pnl > 0). Unresolved P&L (was_fail=None) leaves the window intact.
+        seed_budget.budget_record_close(
+            st.setdefault('budget', seed_budget.new_budget()), float(pnl) > 0.0)
     try:
         import boost_metrics as _bm
         import pandas as _pd
@@ -1418,6 +1511,19 @@ def manual_seed(trader, price):
             except Exception:
                 pass
             return False, 'loss_stop', None
+        # RULE 2: refuse a manual reseed while the exhaustion gap is still running -- the gap
+        # is a deliberate cool-off; a manual seed must wait it out (subordinate, like the loss
+        # stop). Read the LIVE budget from the pre-init state.
+        b_now = (st_now.get('budget') or {}) if isinstance(st_now, dict) else {}
+        if seed_budget.budget_in_gap(b_now, _epoch()):
+            log.warning(f"{ROGUE_ALERT_PREFIX} MANUAL SEED refused (anchor_gap): "
+                        f"exhaustion gap still running")
+            try:
+                trader.tele.warn(f"{ROGUE_ALERT_PREFIX} 🌱 manual seed refused — anchor "
+                                 f"exhaustion gap still running (wait it out)")
+            except Exception:
+                pass
+            return False, 'anchor_gap', None
         overrode = False
         profit_stop = float(getattr(trader.cfg, 'rogue_daily_profit_stop', 0.0))
         if (profit_stop > 0.0 and not gov.get('profit_override')
@@ -1448,6 +1554,9 @@ def manual_seed(trader, price):
         # gate on the first entry off it (same exemption as the A1 morning seed).
         st['chain_time'] = None
         st['chain_anchor'] = None
+        # RULE 1/2: a manual seed OVERRIDES the $10-break (plants at the tick directly, above)
+        # and starts a FRESH anchor session -- reset the trade budget (new anchor, not new day).
+        seed_budget.budget_reset(st.setdefault('budget', seed_budget.new_budget()))
         _persist_state(trader)             # Fix 5 (E-16): seed changed -> persist
         confirm = float(getattr(trader.cfg, 'rogue_entry_confirm_redesign', 10.0))
         if overrode:
