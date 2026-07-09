@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.5"  # explicit encoding='utf-8' on all repo file I/O (writers+readers); daily report em-dash round-trips regardless of ambient locale
+__version__ = "3.8.6"  # R-12: reconcile CLI never executed — MT5Adapter(cfg)+connect() -> MT5Adapter(symbol); construction path now driven in selftest
 CODENAME = "Astra Hawk"
 
 

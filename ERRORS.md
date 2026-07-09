@@ -532,6 +532,26 @@ match, /status + /daylock agree with the payload).
 
 ### FIXED (live-verified)
 
+- **R-12** (07-09): the reconcile CLI had NEVER executed. `pnl_reconcile.run_cli`
+  built its adapter as `MT5Adapter(cfg)` + `adapter.connect()` — the ctor takes the
+  SYMBOL STRING (connects in `__init__`) and there is NO `connect()` method, so
+  `python bot.py reconcile` raised `AttributeError` on every run. The tool whose
+  whole job is to prove the P&L surfaces agree was itself never verified against the
+  real adapter — selftests 281/282 passed against a PRE-BUILT stub trader
+  (`reconcile_day` directly), never exercising `run_cli`'s construction. THIRD
+  instance of the class this session (DEV-2 believed≠loaded; E-23 rail-6-behind-
+  rail-4). **FIX:** `MT5Adapter(getattr(cfg,'symbol','XAUUSD'))` (canonical idiom =
+  `pnl_report.run_dailyreport`); keep `adapter.shutdown()`. Audit of every
+  `MT5Adapter(` / `.connect()` call site: 5 sites, 4 already correct
+  (live_trader:2566, pnl_report:984, selftest, testfire — all pass a symbol string),
+  1 wrong (pnl_reconcile) — the only `.connect()` in the repo. **Self-test 295**
+  drives `run_cli`'s REAL construction path with a fake backend (asserts the ctor
+  gets a str, `.shutdown()` is called, and rc∈(0,1) — a broken ctor lands in the
+  except → rc=2) and guards the real MT5Adapter API contract (symbol-first ctor /
+  has shutdown / NO connect). Verified: reconcile on synthetic 07-09 data corrects
+  anchors ledger +$319 → −$821.10 authority, with the `live` column also −$821.10
+  (past-day rebuild from history via the CLI trader's adapter — meaningful, never a
+  silent 0.0). PR #107, v3.8.6.
 - **E-20**: Rogue/Fetcher/anchors day governors rebuilt from broker deal history
   on same-day restart (never zeroed). Fetcher first (PR #93), anchors in PR #103.
 - **E-21** (07-09): FIRST LIVE PROOF of per-engine loss-stop independence —
