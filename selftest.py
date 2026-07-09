@@ -396,6 +396,7 @@ STEP_NAMES = {
     292: "r8 rescue+journal heal",     # rescue_events + journal writers self-heal; migrate_run_dir sweeps both
     293: "r10 engine surfaces",        # disabled engine reads OFF; registry + day_pnl_by_engine key sets match across surfaces
     294: "utf-8 md round-trip",        # daily report em-dash round-trips via explicit utf-8; legacy cp1252 tolerated with errors='replace'
+    295: "r12 reconcile cli",          # run_cli builds MT5Adapter(symbol) (not cfg) + no .connect(); real construction path driven with a fake backend
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9458,6 +9459,70 @@ class SelfTest:
             shutil.rmtree(tmp, ignore_errors=True)
         self._record(294, PASS if ok else FAIL, detail)
 
+    def _step_r12_reconcile_cli(self):
+        # 295 R-12 (2026-07-09): pnl_reconcile.run_cli builds its OWN MT5 adapter, and that path
+        # was NEVER executed -- it passed MT5Adapter(cfg) + adapter.connect() (there is NO connect
+        # method), raising AttributeError on every real run, while tests 281/282 passed against a
+        # PRE-BUILT stub trader (reconcile_day directly). This step (a) guards the real MT5Adapter
+        # API contract (symbol-string ctor / shutdown exists / NO connect) and (b) drives run_cli's
+        # REAL construction path against a fake backend, so the ctor can never drift from the
+        # canonical pnl_report.run_dailyreport idiom again. A stub richer than the real object is
+        # exactly what let uncallable code test green -- so the fake here deliberately has NO
+        # connect(), and run_cli must get PAST construction (rc in (0,1)), not into its except (2).
+        import types, inspect, tempfile, os, shutil, io, contextlib
+        import mt5_adapter as _mt5a, pnl_reconcile as _rec
+        try:
+            RealA = _mt5a.MT5Adapter
+            # (a) the REAL adapter API contract that run_cli depends on.
+            params = list(inspect.signature(RealA.__init__).parameters)
+            ctor_symbol_first = (len(params) >= 2 and params[1] == 'symbol')
+            has_shutdown = callable(getattr(RealA, 'shutdown', None))   # run_cli teardown
+            no_connect = not hasattr(RealA, 'connect')                  # run_cli must NOT call this
+            # (b) drive run_cli's OWN construction with a fake backend (real-API SUBSET: the only
+            # methods it exposes -- shutdown + the mt5 history reader -- exist on the real class;
+            # it deliberately has NO connect()). Capture what the constructor actually received.
+            captured = {}
+
+            class _FakeAdapter:
+                def __init__(self, symbol='XAUUSD', expected_offset_hours=None):
+                    captured['symbol'] = symbol
+                    captured['symbol_is_str'] = isinstance(symbol, str)
+                    self.symbol = symbol
+                    self.mt5 = types.SimpleNamespace(history_deals_get=lambda *a, **k: [])
+
+                def shutdown(self):
+                    captured['shutdown'] = True
+                # NO connect() -- mirrors the real MT5Adapter; a run_cli that calls it AttributeErrors.
+
+            tmp = tempfile.mkdtemp(prefix='aureon_r12_')
+            _prev = os.environ.get('AUREON_RUN_DIR')
+            os.environ['AUREON_RUN_DIR'] = tmp
+            _mt5a.MT5Adapter = _FakeAdapter
+            try:
+                # run_cli prints the four-surface table; capture it so the gate output stays clean.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = _rec.run_cli(date_arg='2026-07-09')
+            finally:
+                _mt5a.MT5Adapter = RealA
+                if _prev is None:
+                    os.environ.pop('AUREON_RUN_DIR', None)
+                else:
+                    os.environ['AUREON_RUN_DIR'] = _prev
+                shutil.rmtree(tmp, ignore_errors=True)
+            # a FIXED run_cli gets past construction -> reconcile runs -> rc in (0,1). The broken
+            # version (MT5Adapter(cfg) / .connect()) hits run_cli's inner except -> rc == 2.
+            cli_constructs = (rc in (0, 1))
+            symbol_is_str = bool(captured.get('symbol_is_str'))
+            teardown_called = bool(captured.get('shutdown'))
+            ok = (ctor_symbol_first and has_shutdown and no_connect
+                  and cli_constructs and symbol_is_str and teardown_called)
+            detail = (f"ctor_symbol_first={ctor_symbol_first} real_has_shutdown={has_shutdown} "
+                      f"real_no_connect={no_connect} cli_rc={rc}(constructs={cli_constructs}) "
+                      f"ctor_got_str={symbol_is_str} shutdown_called={teardown_called}")
+        except Exception as e:
+            self._record(295, FAIL, f"raised: {e!r}"); return
+        self._record(295, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -11697,6 +11762,8 @@ class SelfTest:
             self._step_r10_engine_surfaces()
             # UTF-8 truth: daily report em-dash round-trips regardless of ambient locale
             self._step_encoding_md_roundtrip()
+            # R-12: the reconcile CLI builds its own MT5 adapter -- drive that construction path
+            self._step_r12_reconcile_cli()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

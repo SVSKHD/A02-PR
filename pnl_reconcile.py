@@ -310,8 +310,11 @@ def run_cli(date_arg=None):
         from mt5_adapter import MT5Adapter
         cfg = Config()
         try:
-            adapter = MT5Adapter(cfg)
-            adapter.connect()
+            # R-12 (2026-07-09): MT5Adapter takes the SYMBOL STRING and connects in __init__ --
+            # there is NO .connect() method. The prior `MT5Adapter(cfg)` + `adapter.connect()`
+            # raised AttributeError on every run, so this CLI (whose whole job is to prove the
+            # P&L surfaces agree) had NEVER executed. Canonical idiom: pnl_report.run_dailyreport.
+            adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'))
         except Exception as e:
             print(f"reconcile: could not connect MT5 adapter: {e!r}")
             return 2
@@ -321,6 +324,12 @@ def run_cli(date_arg=None):
             off = float(getattr(cfg, 'broker_tz_offset_hours', 0.0) or 0.0)
             date_str = str((_pd.Timestamp.now(tz='UTC') + _pd.Timedelta(hours=off)).date())
         import os
+        # The namespace carries adapter + cfg, which is ALL the `live` surface's past-day
+        # rebuilds need (rogue/fetcher rebuild_gov_from_history + daystops.rebuild_anchors_day_pnl
+        # + pnl_source.broker_day_range each read only trader.adapter.mt5.history_deals_get and
+        # trader.cfg). last_broker_date='' forces live_nets down the past-day HISTORY-rebuild path
+        # for every date (the CLI has no running bot's in-memory govs), so `live` == authority by
+        # construction and returns n/a (never a silent 0.0) only if the history query itself fails.
         trader = types.SimpleNamespace(
             adapter=adapter, cfg=cfg, run_dir=os.environ.get('AUREON_RUN_DIR', './run'),
             state={'last_broker_date': ''})
