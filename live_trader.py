@@ -618,9 +618,11 @@ class LiveTrader:
             "anchors_processed_today": self.state.get("processed_anchors_today", []),
             "kill_switch_locked": self.state.get("kill_switch_locked", False),
             "paused": self.paused,
-            # v3.6.0 engine switches (runtime state; config keys are boot defaults)
-            "engines": {"anchors": self._engine_enabled('anchors'),
-                        "rogue": self._engine_enabled('rogue')},
+            # v3.6.0 engine switches (runtime state; config keys are boot defaults).
+            # R-10: mirror the FULL canonical registry (all three engines), so this key set
+            # always matches day_pnl_by_engine below -- 07-09 dropped fetcher here while
+            # day_pnl_by_engine carried it, a surface disagreement.
+            "engines": {e: self._engine_enabled(e) for e in self._ENGINE_KEYS},
             # v3.7.4 per-engine realized day P&L + thresholds + lock state (display-only;
             # SAME source the daily stops read -- _engine_day_pnls / govs / daystops).
             "day_pnl_by_engine": self._day_pnl_by_engine_payload(),
@@ -1298,7 +1300,11 @@ class LiveTrader:
             a, r, f = self._engine_day_pnls_authoritative()
             dse = float((self.state or {}).get('day_start_equity')
                         or getattr(self.cfg, 'starting_balance', 0.0))
-            lines = _ds.render_status(a, r, f, a + r + f, dse, self.cfg, self.state)
+            # R-10: pass each engine's (switch_on, lock_label) from the SINGLE source so
+            # /daylock shows OFF / LOSS-HALTED for Rogue+Fetcher (was hardcoded '🟢 live').
+            eng_states = {e: self._engine_state(e) for e in self._ENGINE_KEYS}
+            lines = _ds.render_status(a, r, f, a + r + f, dse, self.cfg, self.state,
+                                      engine_states=eng_states)
             # v3.7.6 daily 2% target with the A4 gate (appended; [] when target disabled).
             try:
                 lines = lines + _ds.target_status_lines(
@@ -1323,6 +1329,51 @@ class LiveTrader:
             return 'PROFIT-LOCKED'
         return 'active'
 
+    # R-10: the canonical engine set -- every surface's engine key set derives from THIS one
+    # list so /status, /daylock and the state.json mirror can never disagree (07-09: the
+    # state.json `engines` field carried {anchors, rogue} while day_pnl_by_engine carried a
+    # fetcher entry, and switched-OFF / loss-stopped engines rendered 'active').
+    _ENGINE_KEYS = ('anchors', 'rogue', 'fetcher')
+
+    def _engine_state(self, engine: str):
+        """R-10 SINGLE SOURCE for one engine's (switch_on: bool, lock_label: str), read from
+        the ONE registry (_engine_enabled) + the computed governors -- the anchors daystop
+        (magic 20260522, computed from broker history) or the Rogue/Fetcher governor latches.
+        lock_label in ('active','PROFIT-LOCKED','LOSS-HALTED','override'). EVERY engine-state
+        surface renders from this, so they can't drift. DISPLAY-ONLY: uses the PURE
+        daystops.anchors_daystop (never the LATCHING _anchors_daystop) so rendering a status
+        surface never latches the profit lock or fires its one-time alert. Guarded -> (True,
+        'active')."""
+        try:
+            on = bool(self._engine_enabled(engine))
+            if engine == 'anchors':
+                import daystops as _ds
+                dp = self._anchors_day_pnl_computed()
+                _blk, _r, akind = _ds.anchors_daystop(dp, self.cfg, self.state)
+                if akind == 'loss':
+                    lock = 'LOSS-HALTED'
+                elif (self.state or {}).get('anchors_profit_override'):
+                    lock = 'override'
+                elif akind == 'profit':
+                    lock = 'PROFIT-LOCKED'
+                else:
+                    lock = 'active'
+            else:
+                gov = (getattr(self, '_' + engine, None) or {}).get('gov') or {}
+                lock = self._gov_lock_label(gov)
+            return on, lock
+        except Exception:
+            return True, 'active'
+
+    @staticmethod
+    def _engine_display_state(switch_on, lock_label):
+        """PURE: the ONE rendered engine-state token shared by every surface -- 'OFF' when the
+        switch is off (a DISABLED engine reads OFF, never 'active'), otherwise the lock label
+        ('active' shown as 'on'). Single-sourcing this is the R-10 fix."""
+        if not switch_on:
+            return 'OFF'
+        return 'on' if (lock_label in (None, '', 'active')) else str(lock_label)
+
     def _day_pnl_by_engine_payload(self):
         """DISPLAY-ONLY structured per-engine realized day P&L + thresholds + lock state for
         the /status card. SINGLE SOURCE OF TRUTH: per-engine P&L reads DIRECTLY from MT5 deal
@@ -1332,38 +1383,35 @@ class LiveTrader:
         try:
             a, r, f = self._engine_day_pnls_authoritative()
             cfg = self.cfg
-            # anchors lock state via the daystop reader (loss ranks first); override maps
-            # to 'override' since the reader reports NOT blocked once overridden.
-            _blk, _reason, akind = self._anchors_daystop()
-            if akind == 'loss':
-                anchors_lock = 'LOSS-HALTED'
-            elif (self.state or {}).get('anchors_profit_override'):
-                anchors_lock = 'override'
-            elif akind == 'profit':
-                anchors_lock = 'PROFIT-LOCKED'
-            else:
-                anchors_lock = 'active'
-            rgov = (getattr(self, '_rogue', None) or {}).get('gov') or {}
-            fgov = (getattr(self, '_fetcher', None) or {}).get('gov') or {}
+            # R-10: switch (on/off from the ONE registry) + lock label (computed governor) for
+            # each engine come from the SINGLE source _engine_state -- so a disabled / halted
+            # engine can never read 'active' here while another surface reads OFF.
+            a_on, a_lock = self._engine_state('anchors')
+            r_on, r_lock = self._engine_state('rogue')
+            f_on, f_lock = self._engine_state('fetcher')
+            pnls = {'anchors': a, 'rogue': r, 'fetcher': f}
+            profits = {'anchors': 'anchors_daily_profit_stop',
+                       'rogue': 'rogue_daily_profit_stop', 'fetcher': 'fetcher_daily_profit_stop'}
+            losses = {'anchors': 'anchors_daily_loss_stop',
+                      'rogue': 'rogue_daily_loss_stop', 'fetcher': 'fetcher_daily_loss_stop'}
+            states = {'anchors': (a_on, a_lock), 'rogue': (r_on, r_lock),
+                      'fetcher': (f_on, f_lock)}
             dse = float((self.state or {}).get('day_start_equity')
                         or getattr(cfg, 'starting_balance', 0.0))
             kill_th = round(float(getattr(cfg, 'daily_loss_pct', 0.0)) * dse, 2)
-            return {
-                'anchors': {'pnl': round(a, 2),
-                            'profit': float(getattr(cfg, 'anchors_daily_profit_stop', 0.0)),
-                            'loss': float(getattr(cfg, 'anchors_daily_loss_stop', 0.0)),
-                            'lock': anchors_lock},
-                'rogue': {'pnl': round(r, 2),
-                          'profit': float(getattr(cfg, 'rogue_daily_profit_stop', 0.0)),
-                          'loss': float(getattr(cfg, 'rogue_daily_loss_stop', 0.0)),
-                          'lock': self._gov_lock_label(rgov)},
-                'fetcher': {'pnl': round(f, 2),
-                            'profit': float(getattr(cfg, 'fetcher_daily_profit_stop', 0.0)),
-                            'loss': float(getattr(cfg, 'fetcher_daily_loss_stop', 0.0)),
-                            'lock': self._gov_lock_label(fgov)},
-                'account': {'pnl': round(a + r + f, 2), 'kill_threshold': kill_th,
-                            'kill_pct': round(float(getattr(cfg, 'daily_loss_pct', 0.0)) * 100.0, 1)},
-            }
+            # key set derives from the ONE canonical engine list (R-10: matches the state.json
+            # `engines` registry mirror exactly).
+            out = {}
+            for e in self._ENGINE_KEYS:
+                on, lock = states[e]
+                out[e] = {'pnl': round(float(pnls[e]), 2),
+                          'profit': float(getattr(cfg, profits[e], 0.0)),
+                          'loss': float(getattr(cfg, losses[e], 0.0)),
+                          'switch': 'on' if on else 'off', 'lock': lock,
+                          'state': self._engine_display_state(on, lock)}
+            out['account'] = {'pnl': round(a + r + f, 2), 'kill_threshold': kill_th,
+                              'kill_pct': round(float(getattr(cfg, 'daily_loss_pct', 0.0)) * 100.0, 1)}
+            return out
         except Exception:
             return {}
 

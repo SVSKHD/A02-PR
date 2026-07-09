@@ -310,32 +310,49 @@ def _broker_day_range(trader):
 
 
 def render_status(anchors_pnl, rogue_pnl, fetcher_pnl, combined_pnl,
-                  day_start_equity, cfg, state):
+                  day_start_equity, cfg, state, engine_states=None):
     """PURE: the /daylock status lines -- each engine's realized day P&L vs BOTH thresholds
-    with its lock/halt state, plus the (disabled-by-default) account lock. Returns a list of
-    'label: value' pairs for the embed/text."""
+    with its switch + lock/halt state, plus the (disabled-by-default) account lock. Returns a
+    list of 'label: value' pairs for the embed/text.
+
+    R-10: `engine_states` = {engine: (switch_on: bool, lock_label: str)} from the caller's
+    SINGLE source (LiveTrader._engine_state). When supplied, Rogue/Fetcher render their real
+    OFF / LOSS-HALTED / PROFIT-LOCK state (they were previously hardcoded '🟢 live'), and a
+    switched-OFF engine renders '⚪ OFF'. Absent -> legacy behavior (backward compatible)."""
+    es = engine_states or {}
     ab, areason, akind = anchors_daystop(anchors_pnl, cfg, state)
     acct_b, _ = account_daystop(combined_pnl, day_start_equity, cfg, state)
 
-    def _eng_line(name, pnl, profit_stop, loss_stop, blocked, kind, extra=''):
-        state_str = ('🔴 LOSS-HALT' if kind == 'loss'
-                     else ('🟡 PROFIT-LOCK' if kind == 'profit'
-                           else ('🟠 ' + kind.upper() if kind else '🟢 live')))
+    def _state_str(switch_on, kind, lock_label):
+        # switch OFF always wins the display (a disabled engine reads OFF, not 'live').
+        if switch_on is False:
+            return '⚪ OFF'
+        if kind == 'loss' or lock_label == 'LOSS-HALTED':
+            return '🔴 LOSS-HALT'
+        if kind == 'profit' or lock_label == 'PROFIT-LOCKED':
+            return '🟡 PROFIT-LOCK'
+        if lock_label == 'override' or (kind and kind not in ('', 'loss', 'profit')):
+            return '🟠 ' + (lock_label or kind).upper()
+        return '🟢 live'
+
+    def _eng_line(name, engine, pnl, profit_stop, loss_stop, kind='', extra=''):
+        sw, lock = es.get(engine, (True, None))
         return (f"{name}: ${float(pnl or 0.0):+.0f} "
-                f"(profit {profit_stop:g} / loss {loss_stop:g}) -> {state_str}{extra}")
+                f"(profit {profit_stop:g} / loss {loss_stop:g}) -> "
+                f"{_state_str(sw, kind, lock)}{extra}")
 
     lines = [
-        _eng_line('Anchors', anchors_pnl,
+        _eng_line('Anchors', 'anchors', anchors_pnl,
                   float(getattr(cfg, 'anchors_daily_profit_stop', 0.0)),
                   float(getattr(cfg, 'anchors_daily_loss_stop', 0.0)),
-                  ab, akind,
+                  kind=akind,
                   extra=(' (overridden)' if state.get(K_ANCHORS_OVERRIDE) else '')),
-        _eng_line('Rogue', rogue_pnl,
+        _eng_line('Rogue', 'rogue', rogue_pnl,
                   float(getattr(cfg, 'rogue_daily_profit_stop', 0.0)),
-                  float(getattr(cfg, 'rogue_daily_loss_stop', 0.0)), False, ''),
-        _eng_line('Fetcher', fetcher_pnl,
+                  float(getattr(cfg, 'rogue_daily_loss_stop', 0.0))),
+        _eng_line('Fetcher', 'fetcher', fetcher_pnl,
                   float(getattr(cfg, 'fetcher_daily_profit_stop', 0.0)),
-                  float(getattr(cfg, 'fetcher_daily_loss_stop', 0.0)), False, ''),
+                  float(getattr(cfg, 'fetcher_daily_loss_stop', 0.0))),
     ]
     pct = float(getattr(cfg, 'account_daily_profit_stop_pct', 0.0) or 0.0)
     if pct <= 0.0:

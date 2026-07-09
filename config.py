@@ -121,10 +121,15 @@ class Config:
     # ABOVE the bounce high), or on a SMOOTH down-move that break-and-hold CONFIRMS (SL
     # entry + $10), or SKIP if neither within the timeout (parent takes its SL alone).
     # SEPARATE keys / flag / call-site from rally (standing rule); shares ONLY the pure
-    # pullback_entry.step helper. DEFAULT OFF -> today's immediate bypass-fire preserved
-    # (byte-identical). Rescue SL stays $10 (boost_sl_dollars) and the cap stays -$700;
-    # the $10->$13 question is a SEPARATE month-end decision (it would move the cap).promote_on_boot
-    rescue_entry_enabled: bool = True  # v3.5.0 MASTER FLAG, DEFAULT OFF (freeze-safe).
+    # pullback_entry.step helper. Rescue SL stays $10 (boost_sl_dollars) and the cap stays
+    # -$700; the $10->$13 question is a SEPARATE month-end decision (it would move the cap).
+    # v3.5.0 MASTER FLAG. LIVE since 2026-07-09 (D-29; flipped concurrently with the D-28
+    # anchors-only week -- two-variable, results not attributable to this alone). SCOPE: it
+    # governs the NORMAL rescue path ONLY (rescue.py + the RESCUE branch in fills.py:744). It
+    # does NOT gate F-B: the trapped-late-rescue hedge fires through its OWN call site
+    # (fills.py:651), gated by `trapped_late_rescue_enabled`, and `continue`s BEFORE the
+    # break-and-hold gate and the FP guard (G-1) -- so this flag has no effect on F-B boosts.
+    rescue_entry_enabled: bool = True  # LIVE (was DEFAULT OFF pre-07-09); normal rescue path only.
     rescue_entry_bounce_dollars: float = 6.0  # bounce $ UP toward the parent fill that
     #   qualifies the retrace before the SELL entry on the rollover. Trial-tunable.
     rescue_entry_arm_timeout_candles: int = 4  # M5 candles before SKIP (no hedge).
@@ -166,16 +171,17 @@ class Config:
     # Rogue plants its OWN price-anchor where a strong move completes, then hunts the next
     # leg, reusing the rally/rescue/trail HELPERS from that anchor -- but ROGUE-tagged and
     # closed only against its own magic/label. rogue_enabled is the single master switch.
-    # v3.6.0 ENGINE SWITCH: the boot default is now True (the Rogue engine has been the
-    # live demo engine since the trial started; the old raw-False default only existed to
-    # be promoted anyway). The account-type gates are UNCHANGED and still authoritative on
-    # every boot: rogue.promote_on_boot sets this True on a demo (non-funded) account and
-    # FORCE-disables it on a funded one, and rogue.should_run refuses a funded account
-    # regardless of the flag (mandatory gate, un-proven Rogue never runs on real capital).
-    # This config default is the BOOT DEFAULT of the LiveTrader's runtime engine switch
-    # (live_trader.engines['rogue'], /rogue on|off) which ANDs with -- never replaces --
-    # rogue_a1_anchor_mode and the demo/funded promotion gate above.
-    rogue_enabled: bool = False      # MASTER SWITCH (v3.6.0 boot default ON; funded still forced OFF)
+    # v3.6.0 ENGINE SWITCH, interpreted by rogue.promote_on_boot as an Optional[bool] sentinel:
+    #   None       -> AUTO-PROMOTE: ON for a demo (non-funded) account (the legacy trial default);
+    #   True/False -> EXPLICIT owner override, honored as-is on a demo account;
+    #   FUNDED     -> ALWAYS forced OFF first, regardless of the value (mandatory gate; un-proven
+    #                 Rogue never runs on real capital -- rogue.should_run refuses it too).
+    # The DEFAULT here is an EXPLICIT False (D-28, 2026-07-09 anchors-only week: Rogue is switched
+    # OFF by owner choice, NOT auto-promoted). NOTE the field is typed `bool`, so the None /
+    # auto-promote branch is only reachable by a runtime override, not via this default.
+    # This is the BOOT DEFAULT of the LiveTrader runtime switch (live_trader.engines['rogue'],
+    # /rogue on|off) which ANDs with -- never replaces -- rogue_a1_anchor_mode + the funded gate.
+    rogue_enabled: bool = False      # EXPLICIT OFF (D-28 anchors-only week); funded forced OFF regardless
     rogue_daywatch: bool = True        # continuous M5 vision (only meaningful when rogue_enabled)
     rogue_max_reentries_per_day: int = 10   # HARD ceiling on NEW entries/day (the cap)
     rogue_min_candles: int = 4         # strong-move trigger: >= this many same-dir M5 closes
@@ -581,11 +587,17 @@ class Config:
     # software trail, NO breakeven, NO ladder. After ANY close, re-anchor at the CLOSE
     # PRICE and hunt the next $5 move both ways -- high re-entry count by design.
     # fetcher_enabled is the boot default of the runtime engine switch
-    # (live_trader.engines['fetcher'], /fetcher on|off), which ANDs with the demo/funded
-    # promotion gate: a FUNDED account force-disables it on every boot (un-proven engine
-    # never runs on real capital), identical to Rogue. NEVER reads/closes an anchor
-    # 20260522 or Rogue 20260626 ticket. Lot READS cfg.lot_size and never mutates it.
-    fetcher_enabled: bool = False        # MASTER SWITCH (boot default ON; funded forced OFF)
+    # (live_trader.engines['fetcher'], /fetcher on|off). FUNDED accounts are force-disabled on
+    # every boot (un-proven engine never runs on real capital; fetcher.should_run refuses them
+    # regardless). NEVER reads/closes an anchor 20260522 or Rogue 20260626 ticket; Lot READS
+    # cfg.lot_size and never mutates it.
+    # ⚠️ DISCREPANCY (2026-07-09): unlike rogue.promote_on_boot (Optional[bool] sentinel that
+    # honors an explicit True/False on demo), fetcher.promote_on_boot still AUTO-PROMOTES to
+    # True on ANY demo account -- it does NOT honor this explicit False. So on a demo boot the
+    # D-28 "fetcher OFF" week is SILENTLY REVERTED to ON by promote_on_boot. Left as-is here
+    # (documentation branch does not change behavior); tracked as a follow-up -- fetcher needs
+    # the same sentinel to make this default authoritative on demo.
+    fetcher_enabled: bool = False        # intended OFF (D-28); BUT demo boot re-promotes it ON (see above)
     fetcher_trigger_dollars: float = 5.0    # move ($) off the anchor (either dir) -> enter
     fetcher_tp_dollars: float = 5.0         # broker-side TP at entry +/- this (fixed, no trail)
     fetcher_sl_dollars: float = 5.0         # broker-side SL at entry -/+ this (fixed, no trail)

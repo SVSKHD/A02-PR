@@ -375,6 +375,12 @@ STEP_NAMES = {
     285: "e22 flatten 3 closes",       # _flatten_all closes 3 positions -> anchors day P&L reflects them within one tick (cache invalidated)
     286: "e22 loss over accum",        # anchors loss stop fires <=-630 computed even while the accumulator reads +140
     287: "e22 gated once",             # 'Anchor processing GATED' warns once per lock event, not per tick
+    288: "e23 tf loss halt",           # testfire refuses at rail 6 when anchors computed <= -630; force_window can't bypass
+    289: "e23 tf profit lock",         # testfire refuses at rail 6 when anchors profit-locked
+    290: "e23 tf clean/off",           # clean day clears all 6 rails; anchors engine OFF refuses at rail 6
+    291: "e23 tf ordering",            # run_testfire primes the day-P&L rebuild BEFORE preflight (source + functional)
+    292: "r8 rescue+journal heal",     # rescue_events + journal writers self-heal; migrate_run_dir sweeps both
+    293: "r10 engine surfaces",        # disabled engine reads OFF; registry + day_pnl_by_engine key sets match across surfaces
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -3369,22 +3375,52 @@ class SelfTest:
     # stubbed; placement is asserted by call-recording, not execution.
     # ------------------------------------------------------------------------
     def _testfire_stub(self, trade_mode=0, profile='STANDARD_5PCT', pos=(), pend=(),
-                       shadow=None, pending=None, evt_open=False, anchors=None):
+                       shadow=None, pending=None, evt_open=False, anchors=None,
+                       anchors_day_pnl=-100.0, anchors_engine=True):
+        # E-23: the stub now carries the rail-6 (anchors daily brake) surface so preflight can
+        # consult the REAL governor. `anchors_day_pnl` is served through the broker deal-history
+        # source (magic 20260522), so _anchors_daystop_blocked reads it via the COMPUTED path
+        # (daystops.computed_anchors_day_pnl -> pnl_source.magic_day_net), NEVER a raw mirror.
+        # Default -$100 = a clean day (rails 1-5 tests clear rail 6 unchanged). Pinned thresholds
+        # (loss -630 / profit 400) keep the mechanism test robust to owner config tuning.
         import types, dataclasses
-        cfg = dataclasses.replace(self.cfg, account_profile=profile)
+        import live_trader as _lt, daystops as _ds
+        cfg = dataclasses.replace(self.cfg, account_profile=profile,
+                                  anchors_daily_profit_stop=400.0, account_target_pct=0.0)
         if anchors is not None:
             cfg.anchors = anchors
         DEMO = 0
+
+        def _hist(*a, **k):
+            return [types.SimpleNamespace(entry=1, profit=float(anchors_day_pnl), swap=0.0,
+                                          commission=0.0, time=1, magic=_ds.ANCHORS_MAGIC)]
         mt5 = types.SimpleNamespace(
             ACCOUNT_TRADE_MODE_DEMO=DEMO,
             account_info=lambda: types.SimpleNamespace(trade_mode=trade_mode, balance=50000.0),
             positions_get=lambda symbol=None: list(pos),
             orders_get=lambda symbol=None: list(pend),
-            symbol_info_tick=lambda s: types.SimpleNamespace(bid=3995.0, ask=3995.2))
-        return types.SimpleNamespace(
+            symbol_info_tick=lambda s: types.SimpleNamespace(bid=3995.0, ask=3995.2),
+            history_deals_get=_hist)
+        t = types.SimpleNamespace(
             cfg=cfg, adapter=types.SimpleNamespace(mt5=mt5),
             shadow_positions=shadow or {}, shadow_pendings=pending or {},
-            _testfire_event_open=evt_open)
+            _testfire_event_open=evt_open,
+            state={'daily_pnl': 0.0, 'day_start_equity': 50000.0,
+                   'last_broker_date': '2026-06-24'},
+            engines={'anchors': bool(anchors_engine), 'rogue': False, 'fetcher': False},
+            _tick_counter=0, _rogue=None, _fetcher=None,
+            tele=types.SimpleNamespace(info=lambda *a, **k: None, send=lambda *a, **k: None,
+                                       warn=lambda *a, **k: None, success=lambda *a, **k: None,
+                                       error=lambda *a, **k: None))
+        import utils as _u
+        t._anchor_datetime_utc = _u.anchor_datetime_utc
+        for m in ('_broker_date', '_anchor_entries_blocked', '_friday_entries_blocked',
+                  '_friday_flatten_reached', '_engine_enabled', '_anchors_daystop_blocked',
+                  '_anchors_daystop', '_anchors_day_pnl_computed', '_account_locked',
+                  '_account_target', '_post_a4_complete', '_engine_day_pnls',
+                  '_anchors_profit_alert', '_account_target_alert'):
+            setattr(t, m, getattr(_lt.LiveTrader, m).__get__(t))
+        return t
 
     def _step_testfire_demo_only(self):
         # 84: rail 1 DEMO-ONLY — testfire REFUSES on a non-demo account (no --force
@@ -3546,6 +3582,102 @@ class SelfTest:
         except Exception as e:
             self._record(88, FAIL, f"raised: {e!r}"); return
         self._record(88, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
+    # E-23 (07-09): testfire rail 6 — obey the anchors daily brake (loss halt /
+    # profit lock), read from the COMPUTED source, un-bypassable by --force-window.
+    # ------------------------------------------------------------------------
+    def _step_testfire_e23_loss_halt(self):
+        # 288 E-23: anchors computed day P&L -$700 (<= -$630 hard loss stop) -> testfire
+        # REFUSES at rail 6; and it refuses AGAIN with force_window=True (that flag skips
+        # ONLY rail 4). The P&L flows through the broker-history computed source
+        # (magic_day_net), not state['daily_pnl']. This is the exact 07-09 live incident.
+        import testfire as _tf
+        try:
+            far = pd.Timestamp('2026-06-24T00:00:00Z')          # Wed, 7h from A2 -> rails 1-5 clear
+            A = [('A2', 10, 0)]
+            halted_ok, halted_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=-700.0), far)
+            # --force-window must NOT bypass rail 6 (it only skips rail 4).
+            forced_ok, forced_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=-700.0), far, force_window=True)
+            # -$100 (clean) at the SAME everything clears, proving rail 6 is the sole difference.
+            clean_ok, _ = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=-100.0), far)
+            ok = (halted_ok is False and forced_ok is False and clean_ok is True
+                  and 'rail 6' in halted_r and 'rail 6' in forced_r)
+            detail = (f"loss_halt_refused={not halted_ok} force_window_still_refused={not forced_ok} "
+                      f"clean_clears={clean_ok} reason={halted_r[:46]}")
+        except Exception as e:
+            self._record(288, FAIL, f"raised: {e!r}"); return
+        self._record(288, PASS if ok else FAIL, detail)
+
+    def _step_testfire_e23_profit_lock(self):
+        # 289 E-23: anchors PROFIT-locked (computed +$850 >= +$400 pinned profit stop) ->
+        # testfire REFUSES at rail 6 (a test-fire is NEW anchor risk; the soft profit lock
+        # stops new straddles exactly as it does for a scheduled anchor).
+        import testfire as _tf
+        try:
+            far = pd.Timestamp('2026-06-24T00:00:00Z')
+            A = [('A2', 10, 0)]
+            locked_ok, locked_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=850.0), far)
+            ok = (locked_ok is False and 'rail 6' in locked_r)
+            detail = f"profit_locked_refused={not locked_ok} reason={locked_r[:52]}"
+        except Exception as e:
+            self._record(289, FAIL, f"raised: {e!r}"); return
+        self._record(289, PASS if ok else FAIL, detail)
+
+    def _step_testfire_e23_clean_and_engine_off(self):
+        # 290 E-23 regression: a CLEAN anchors day (-$100) CLEARS all six rails (rails 1-5
+        # unchanged); and the anchors engine switched OFF also refuses at rail 6 (a test-fire
+        # is a NEW straddle, blocked at the same seam /anchors off uses).
+        import testfire as _tf
+        try:
+            far = pd.Timestamp('2026-06-24T00:00:00Z')
+            A = [('A2', 10, 0)]
+            clean_ok, clean_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=-100.0), far)
+            off_ok, off_r = _tf.testfire_preflight(
+                self._testfire_stub(anchors=A, anchors_day_pnl=-100.0, anchors_engine=False), far)
+            ok = (clean_ok is True and 'CLEARED' in clean_r and 'anchors brake clear' in clean_r
+                  and off_ok is False and 'rail 6' in off_r)
+            detail = (f"clean_clears={clean_ok} engine_off_refused={not off_ok} "
+                      f"clean_reason={clean_r[:46]}")
+        except Exception as e:
+            self._record(290, FAIL, f"raised: {e!r}"); return
+        self._record(290, PASS if ok else FAIL, detail)
+
+    def _step_testfire_e23_ordering(self):
+        # 291 E-23 ordering (the ACTUAL defect): run_testfire primes the anchors day-P&L
+        # rebuild BEFORE preflight, so rail 6 sees the day's truth. Asserted two ways:
+        #  (a) SOURCE ORDER: in run_testfire, the _prime_anchors_daypnl(trader) call precedes
+        #      the testfire_preflight( call (07-09: preflight ran 4s BEFORE the rebuild).
+        #  (b) FUNCTIONAL: _prime_anchors_daypnl rebuilds state['daily_pnl'] from broker deal
+        #      history (magic 20260522) and drops the computed cache, so the next rail-6 read
+        #      recomputes fresh.
+        import inspect, testfire as _tf, daystops as _ds
+        try:
+            src = inspect.getsource(_tf.run_testfire)
+            i_prime = src.find('_prime_anchors_daypnl(trader)')
+            i_pre = src.find('testfire_preflight(')
+            source_order_ok = (0 <= i_prime < i_pre)
+            # functional: priming rebuilds the mirror from history and invalidates the cache.
+            tr = self._testfire_stub(anchors=[('A2', 10, 0)], anchors_day_pnl=-712.0)
+            tr.state['daily_pnl'] = 0.0
+            tr._anchors_pnl_cache_tick = tr._tick_counter          # pre-seed a stale cache
+            tr._anchors_pnl_cache_value = 999.0
+            _tf._prime_anchors_daypnl(tr)
+            mirror_rebuilt = abs(tr.state['daily_pnl'] - (-712.0)) < 1e-6
+            cache_dropped = getattr(tr, '_anchors_pnl_cache_tick', 'x') is None
+            # and the governor now reads the rebuilt truth (blocked at <= -630).
+            blocked = tr._anchors_daystop_blocked()
+            ok = source_order_ok and mirror_rebuilt and cache_dropped and blocked is True
+            detail = (f"source_order(prime<preflight)={source_order_ok} mirror_rebuilt={mirror_rebuilt} "
+                      f"cache_dropped={cache_dropped} governor_blocked={blocked}")
+        except Exception as e:
+            self._record(291, FAIL, f"raised: {e!r}"); return
+        self._record(291, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # v3.3.0 — rally RIDES (peak-gap trail, not a flat lock) + no sub-floor clip
@@ -8052,6 +8184,75 @@ class SelfTest:
             shutil.rmtree(tmp, ignore_errors=True)
         self._record(279, PASS if ok else FAIL, detail)
 
+    def _step_r8_rescue_journal(self):
+        # 292 R-8 EXTENDED: the rescue_events + journal writers (audited by this branch) also
+        # self-heal. (a) the real journal writer emits header width == row width == JOURNAL_COLUMNS
+        # (header[-1]='trigger_source'); (b) a legacy NARROW journal / rescue_events header migrates
+        # to the full header (rows preserved, .bak written, idempotent); (c) migrate_run_dir now
+        # sweeps BOTH rescue_events.csv and the monthly journal files.
+        import os, csv, tempfile, types
+        import csv_schema as _cs, journal as _j, rescue_log as _rl
+        tmp = tempfile.mkdtemp(prefix='aureon_r8x_')
+        try:
+            def _hdr_row(path):
+                with open(path, newline='') as fh:
+                    rows = list(csv.reader(fh))
+                return rows[0], (rows[1] if len(rows) > 1 else [])
+            # (a) the REAL journal writer: header == row == JOURNAL_COLUMNS.
+            stub = types.SimpleNamespace(run_dir=tmp, cfg=self.cfg)
+            shadow = {'side': 'BUY', 'entry_price': 4000.0, 'max_fav': 4008.0,
+                      'anchor_label': 'A1', 'anchor_price': 4000.0, 'entry_time': None,
+                      'lot': 0.35, 'role': 'normal', 'trigger_source': 'SCHEDULED'}
+            _j._write_journal(stub, shadow, None, 4005.0, 'TP', 12.0, 101)
+            import pandas as _pd
+            jdir = os.path.join(tmp, 'journal')
+            jfile = os.path.join(jdir, os.listdir(jdir)[0])
+            h, r = _hdr_row(jfile)
+            journal_ok = (len(h) == len(r) == len(_j.JOURNAL_COLUMNS)
+                          and h == _j.JOURNAL_COLUMNS and h[-1] == 'trigger_source')
+            # (b) legacy NARROW journal header (pre-trigger_source) self-heals via ensure().
+            legacy_j = list(_j.JOURNAL_COLUMNS[:-1])            # drop trigger_source (19 cols)
+            pj = os.path.join(tmp, 'legacy_journal.csv')
+            with open(pj, 'w', newline='') as f:
+                w = csv.writer(f); w.writerow(legacy_j)
+                w.writerow(['2026-07-09', 'A1', '4000', 'BUY', '', '4000', '0.35', '3982',
+                            '4030', '8', '', '4005', '', '', 'TP', '12.0', '7', '', 'normal',
+                            'SCHEDULED'])                       # a 20-col row already appended
+            res_j = _cs.migrate(pj, _j.JOURNAL_COLUMNS)
+            hj, _ = _cs.inspect(pj)
+            jrows = list(csv.DictReader(open(pj)))
+            journal_heal = (res_j['migrated'] and len(hj) == len(_j.JOURNAL_COLUMNS)
+                            and hj[-1] == 'trigger_source' and os.path.exists(pj + '.bak')
+                            and jrows[0]['trigger_source'] == 'SCHEDULED' and None not in jrows[0])
+            # (c) legacy NARROW rescue_events header self-heals + idempotent.
+            legacy_r = list(_rl.RESCUE_CSV_HEADER[:-1])         # drop the last column
+            pr = os.path.join(tmp, 'rescue_events.csv')
+            with open(pr, 'w', newline='') as f:
+                csv.writer(f).writerow(legacy_r)
+            _cs.ensure(pr, _rl.RESCUE_CSV_HEADER)
+            hr, _ = _cs.inspect(pr)
+            rescue_heal = (len(hr) == len(_rl.RESCUE_CSV_HEADER)
+                           and hr[-1] == _rl.RESCUE_CSV_HEADER[-1])
+            idem = (_cs.migrate(pr, _rl.RESCUE_CSV_HEADER)['reason'] == 'already-current')
+            # (d) migrate_run_dir sweeps BOTH new writers.
+            os.makedirs(os.path.join(tmp, 'journal'), exist_ok=True)
+            with open(os.path.join(tmp, 'journal', 'trades_2026-06.csv'), 'w', newline='') as f:
+                csv.writer(f).writerow(legacy_j)               # stale journal month file
+            with open(pr, 'w', newline='') as f:
+                csv.writer(f).writerow(legacy_r)               # re-stale rescue for the sweep
+            swept = {m['file'] for m in _cs.migrate_run_dir(tmp)}
+            sweep_ok = ('rescue_events.csv' in swept and 'trades_2026-06.csv' in swept)
+            ok = journal_ok and journal_heal and rescue_heal and idem and sweep_ok
+            detail = (f"journal_hdr==row=={len(_j.JOURNAL_COLUMNS)}({journal_ok}) "
+                      f"journal_heal={journal_heal} rescue_heal={rescue_heal} idem={idem} "
+                      f"migrate_run_dir_sweeps_both={sweep_ok}")
+        except Exception as e:
+            self._record(292, FAIL, f"raised: {e!r}"); return
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._record(292, PASS if ok else FAIL, detail)
+
     def _step_pnl_source_truth(self):
         # 280 SINGLE SOURCE OF TRUTH: magic_day_net sums profit+swap+commission over CLOSING
         # deals (entry==1) by magic; engine_day_nets splits anchors/rogue/fetcher + account;
@@ -8841,13 +9042,17 @@ class SelfTest:
         t = types.SimpleNamespace(
             cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0},
             _rogue=None, _fetcher=None, _anchor_deals_pnl=None, _save_state=lambda: None,
+            engines={'anchors': True, 'rogue': True, 'fetcher': True},
             tele=types.SimpleNamespace(info=lambda *a, **k: None, send=lambda *a, **k: None,
                                        warn=lambda m='', **k: alerts.append(str(m))))
         # E-22: broker deal-history source so the day stops read the COMPUTED anchors P&L.
         t.adapter = types.SimpleNamespace(
             mt5=types.SimpleNamespace(history_deals_get=lambda *a, **k: self._pnl_stub_deals(t)))
+        t._ENGINE_KEYS = _lt.LiveTrader._ENGINE_KEYS                    # R-10 canonical set
+        t._engine_display_state = _lt.LiveTrader._engine_display_state  # @staticmethod (no __get__)
+        t._gov_lock_label = _lt.LiveTrader._gov_lock_label             # @staticmethod (no __get__)
         for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_anchors_day_pnl_computed',
-                  '_anchors_daystop', '_anchors_daystop_blocked',
+                  '_anchors_daystop', '_anchors_daystop_blocked', '_engine_enabled', '_engine_state',
                   '_anchors_profit_alert', '_account_locked', '_anchors_daystop_skip',
                   '_daylock_override', '_daylock_lines', '_post_daylock_status'):
             setattr(t, m, getattr(_lt.LiveTrader, m).__get__(t))
@@ -9040,6 +9245,7 @@ class SelfTest:
 
             wd = types.SimpleNamespace()
             wd._day_pnl_by_engine_rows = _wd.Watchdog._day_pnl_by_engine_rows.__get__(wd)
+            wd._engine_state_row = _wd.Watchdog._engine_state_row.__get__(wd)   # R-10
             wd._heartbeat_age = lambda: 5.0
             wd._format_status = _wd.Watchdog._format_status.__get__(wd)
 
@@ -9093,6 +9299,54 @@ class SelfTest:
             self._record(258, FAIL, f"raised: {e!r}"); return
         self._record(258, PASS if ok else FAIL, detail)
 
+    def _step_r10_engine_surfaces(self):
+        # 293 R-10: every engine-state surface renders from ONE registry + the computed
+        # governors. 07-09 showed state.json engines={anchors,rogue} (fetcher dropped) while
+        # day_pnl_by_engine carried fetcher, and Rogue/Fetcher rendered 'active' while OFF +
+        # loss_stopped. Assert: (a) a DISABLED engine reads OFF (not 'active'); (b) an ENABLED
+        # loss-stopped engine reads LOSS-HALTED; (c) the registry mirror + day_pnl_by_engine key
+        # sets MATCH; (d) /status (watchdog) + /daylock (render_status) agree with the payload.
+        import types
+        import live_trader as _lt, watchdog as _wd, rogue as _r, fetcher as _f
+        try:
+            tr, _ = self._daylock_mk()
+            tr._day_pnl_by_engine_payload = _lt.LiveTrader._day_pnl_by_engine_payload.__get__(tr)
+            self._set_anchors_day_pnl(tr, -100.0)                      # anchors clean, ON
+            tr.engines = {'anchors': True, 'rogue': False, 'fetcher': False}   # both switched OFF
+            tr._rogue = {'gov': dict(_r.new_day_state(), day_pnl=-200.0, loss_stopped=True)}
+            tr._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=50.0)}
+            payload = tr._day_pnl_by_engine_payload()
+            # (a) disabled engine reads OFF regardless of gov lock; anchors (ON, clean) reads 'on'.
+            off_ok = (payload['rogue']['switch'] == 'off' and payload['rogue']['state'] == 'OFF'
+                      and payload['fetcher']['switch'] == 'off' and payload['fetcher']['state'] == 'OFF'
+                      and payload['anchors']['switch'] == 'on' and payload['anchors']['state'] == 'on')
+            # (b) an ENABLED loss-stopped engine reads LOSS-HALTED (distinct from OFF).
+            tr.engines['rogue'] = True
+            payload2 = tr._day_pnl_by_engine_payload()
+            halted_ok = (payload2['rogue']['switch'] == 'on'
+                         and payload2['rogue']['state'] == 'LOSS-HALTED')
+            # (c) registry mirror key set == day_pnl_by_engine engine key set == canonical set.
+            registry = {e: tr._engine_enabled(e) for e in tr._ENGINE_KEYS}
+            payload_engines = {k for k in payload if k != 'account'}
+            keysets_match = (set(registry) == payload_engines == set(tr._ENGINE_KEYS))
+            # (d1) /daylock (render_status) shows OFF for the switched-off engines.
+            tr.engines = {'anchors': True, 'rogue': False, 'fetcher': False}
+            dl = " ".join(tr._daylock_lines())
+            daylock_ok = ('Rogue' in dl and 'Fetcher' in dl and dl.count('OFF') >= 2)
+            # (d2) /status (watchdog) engine row renders OFF for the switched-off engines,
+            #      from the SAME payload — one source, agreeing surfaces.
+            wd = types.SimpleNamespace()
+            wd._engine_state_row = _wd.Watchdog._engine_state_row.__get__(wd)
+            row = wd._engine_state_row({'day_pnl_by_engine': tr._day_pnl_by_engine_payload()})
+            status_ok = ('Rogue: OFF' in row and 'Fetcher: OFF' in row and 'Anchors: on' in row)
+            ok = off_ok and halted_ok and keysets_match and daylock_ok and status_ok
+            detail = (f"disabled_reads_OFF={off_ok} enabled_lossstop_reads_HALTED={halted_ok} "
+                      f"keysets_match={keysets_match} daylock_OFF={daylock_ok} "
+                      f"status_row_OFF={status_ok} row='{row}'")
+        except Exception as e:
+            self._record(293, FAIL, f"raised: {e!r}"); return
+        self._record(293, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -9116,6 +9370,7 @@ class SelfTest:
             cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0,
                             'processed_anchors_today': []},
             _rogue=None, _fetcher=None, _anchor_deals_pnl=None, shadow_positions={},
+            engines={'anchors': True, 'rogue': True, 'fetcher': True},
             _save_state=lambda: None, paper=True, run_dir='./run',
             tele=types.SimpleNamespace(info=lambda *a, **k: None,
                                        send=lambda m='', *a, **k: alerts.append(str(m)),
@@ -9124,8 +9379,11 @@ class SelfTest:
         # anchors day P&L (set via self._set_anchors_day_pnl), not the state['daily_pnl'] mirror.
         t.adapter = types.SimpleNamespace(
             mt5=types.SimpleNamespace(history_deals_get=lambda *a, **k: self._pnl_stub_deals(t)))
+        t._ENGINE_KEYS = _lt.LiveTrader._ENGINE_KEYS                    # R-10 canonical set
+        t._engine_display_state = _lt.LiveTrader._engine_display_state  # @staticmethod (no __get__)
+        t._gov_lock_label = _lt.LiveTrader._gov_lock_label             # @staticmethod (no __get__)
         for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_anchors_day_pnl_computed',
-                  '_account_locked',
+                  '_account_locked', '_engine_enabled', '_engine_state',
                   '_account_target', '_post_a4_complete',
                   '_account_target_alert', '_anchors_daystop', '_anchors_daystop_blocked',
                   '_anchors_daystop_skip', '_daylock_override', '_post_daylock_status',
@@ -11160,6 +11418,11 @@ class SelfTest:
             self._step_testfire_flat_inflight()
             self._step_testfire_anchor_window()
             self._step_testfire_same_placement()
+            # E-23 (07-09): testfire rail 6 — anchors daily brake (loss halt / profit lock)
+            self._step_testfire_e23_loss_halt()
+            self._step_testfire_e23_profit_lock()
+            self._step_testfire_e23_clean_and_engine_off()
+            self._step_testfire_e23_ordering()
             # v3.3.0 — rally rides not bails + no sub-floor clip (PTRACE defect fix)
             self._step_rally_rides_not_bails()
             self._step_rally_no_subfloor_clip()
@@ -11311,6 +11574,8 @@ class SelfTest:
             self._step_daylock_day_roll_reset()
             # v3.7.4 /status per-engine day P&L display
             self._step_status_per_engine_pnl()
+            # R-10 (07-09): engine-state surfaces render from ONE registry + computed governors
+            self._step_r10_engine_surfaces()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()
@@ -11341,6 +11606,7 @@ class SelfTest:
             # 2026-07-09 P&L pipeline reconciliation (R-8 fix + single source + reconcile audit)
             self._step_csv_writers_schema()
             self._step_r8_migration()
+            self._step_r8_rescue_journal()
             self._step_pnl_source_truth()
             self._step_reconcile_agree()
             self._step_reconcile_mismatch()

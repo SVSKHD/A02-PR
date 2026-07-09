@@ -399,6 +399,33 @@ class Watchdog:
         except Exception:
             return []
 
+    def _engine_state_row(self, status: dict):
+        """R-10: a single compact 'engine switch + lock' line for /status, rendered from the
+        bot-written day_pnl_by_engine payload (the SAME single source /daylock + state.json use)
+        -- switch OFF shows OFF, a governor lock shows LOSS-HALTED/PROFIT-LOCKED/override, else
+        'on'. Returns '' when the payload is absent (older bot). Guarded."""
+        try:
+            dpe = status.get("day_pnl_by_engine") or {}
+            if not dpe:
+                return ""
+            glyph = {'anchors': '⚓', 'rogue': '🦏', 'fetcher': '🪣'}
+            parts = []
+            for e in ('anchors', 'rogue', 'fetcher'):
+                cell = dpe.get(e)
+                if not isinstance(cell, dict):
+                    continue
+                # prefer the precomputed display token; fall back to switch/lock, then legacy.
+                token = cell.get('state')
+                if token is None:
+                    sw = cell.get('switch')
+                    lk = cell.get('lock')
+                    token = ('OFF' if sw == 'off'
+                             else ('on' if lk in (None, '', 'active') else str(lk)))
+                parts.append(f"{glyph.get(e, '')} {e.capitalize()}: {token}")
+            return "  ·  ".join(parts)
+        except Exception:
+            return ""
+
     def _status_card(self, status: dict):
         """v3.1.2: /status as a clean field-grid card (account · P&L · positions).
         v3.7.4: + a 'Realized P&L by engine (today)' section -- ADDITIVE, every existing
@@ -436,6 +463,10 @@ class Watchdog:
         snap["Kill switch"] = (("🔴 LOCKED" if locked else "🟢 OK")
                                + (f" (-${kill_th:,.0f})" if kill_th else ""))
         snap["Heartbeat"] = f"{hb_age:.0f}s ago" if hb_age is not None else "none yet"
+        # R-10: one engine switch + lock line (OFF / LOSS-HALTED / …) from the single payload.
+        _es = self._engine_state_row(status)
+        if _es:
+            snap["Engines"] = _es
         # v3.7.4 Realized P&L by engine (today) -- ADDITIVE section: signed per-magic realized
         # day P&L (Non-OCO/Rogue/Fetcher) + Total, from the SAME source the daystops read.
         _rows = self._day_pnl_by_engine_rows(status)
@@ -487,6 +518,10 @@ class Watchdog:
             f"   {', '.join(anchors) if anchors else '(none yet)'}",
             f"💓 Heartbeat: {hb_str}",
         ]
+        # R-10: one engine switch + lock line from the single day_pnl_by_engine payload.
+        _es = self._engine_state_row(status)
+        if _es:
+            lines.append(f"⚙️ Engines: {_es}")
         # v3.7.4 Realized P&L by engine (today) -- ADDITIVE section (signed per-magic + Total).
         _rows = self._day_pnl_by_engine_rows(status)
         if _rows:
