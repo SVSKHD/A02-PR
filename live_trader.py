@@ -227,6 +227,9 @@ class LiveTrader:
         # Bar-close tracking
         self._last_managed_minute: Optional[pd.Timestamp] = None
         self._tick_counter = 0
+        # E-22: the "Anchor processing GATED" warning fires ONCE per kill-switch lock event
+        # (was ~10/min). Reset at the broker day roll (the only place the lock clears).
+        self._kill_gate_warned = False
         # Hot polling window: for 30s after firing an anchor we tick at 0.2s
         # to catch fills fast. After that, back to normal 1.0s cadence.
         self._hot_poll_until: Optional[pd.Timestamp] = None
@@ -394,6 +397,13 @@ class LiveTrader:
                                           self.state.get('daily_pnl', 0.0))
             self.tele.info(f"📅 New broker day: {broker_date}")
             self.state['daily_pnl'] = 0.0
+            # E-22: drop the computed-P&L cache + re-arm the GATED warning for the new day.
+            try:
+                import daystops as _ds
+                _ds.invalidate_pnl_cache(self)
+            except Exception:
+                pass
+            self._kill_gate_warned = False
             self.state['last_broker_date'] = str(broker_date)
             self.state['processed_anchors_today'] = []
             self.state['missed_anchors_today'] = []   # v3.0.5: reset late-window give-ups
@@ -599,6 +609,9 @@ class LiveTrader:
         status = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "broker_date": str(broker_date),
+            # DISPLAY-ONLY anchors mirror (E-22: state['daily_pnl'] tracks the computed truth
+            # but is authoritative for nothing). The reconciled per-engine DECISION source is
+            # day_pnl_by_engine below (_engine_day_pnls_authoritative -> pnl_source).
             "daily_pnl_realized": self.state.get("daily_pnl", 0.0),
             "open_positions": len(self.shadow_positions),
             "pending_orders": len(self.shadow_pendings),
@@ -1006,14 +1019,46 @@ class LiveTrader:
     # ------------------------------------------------------------------------
     # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
     # ------------------------------------------------------------------------
+    def _anchors_day_pnl_computed(self):
+        """E-22 SINGLE TRUTH: the COMPUTED anchors realized day P&L (magic 20260522) from broker
+        deal history -- what the day stops, the kill-switch paper fallback and the account-target
+        combined net all read. NOT state['daily_pnl'] (that accumulator is bypassed by
+        risk._flatten_all's direct closes, which is why it froze at +$140 on the -$821 07-09
+        day). Mirrors the value back into state['daily_pnl']; per-tick cached. Guarded ->
+        state['daily_pnl'] fallback when history is unavailable (paper / query failure)."""
+        try:
+            import daystops as _ds
+            return _ds.computed_anchors_day_pnl(self)
+        except Exception:
+            return float((self.state or {}).get('daily_pnl', 0.0) or 0.0)
+
+    def _log_kill_gated_once(self):
+        """E-22: emit the 'Anchor processing GATED' warning ONCE per kill-switch lock event --
+        it was firing every STATUS_EVERY_TICKS ticks (~10/min on the 07-09 lock). Prints the
+        COMPARED value (equity drawdown vs threshold), not the state['daily_pnl'] mirror.
+        Returns True iff it logged this call; re-armed at the broker day roll (where the lock
+        clears). Guarded."""
+        try:
+            if self._kill_gate_warned:
+                return False
+            self._kill_gate_warned = True
+            measured, kill_limit = self._kill_switch_drawdown()
+            log.warning(
+                "Anchor processing GATED: kill switch locked for the day "
+                f"(equity drawdown ${measured:,.2f} vs limit ${kill_limit:,.2f}). "
+                f"Resets next broker day."
+            )
+            return True
+        except Exception:
+            return False
+
     def _engine_day_pnls(self):
         """(anchors, rogue, fetcher) realized day P&L -- the LIVE, per-tick source the daily
-        STOPS act on: anchors = state['daily_pnl'] (magic 20260522, already EXCLUDES Rogue/
-        Fetcher); Rogue/Fetcher from their governors. All three are seeded from the SINGLE
-        SOURCE (pnl_source.magic_day_net, via the E-20 rebuilds) and accumulated live by
-        record_close. Guarded -- a missing piece reads $0."""
-        st = getattr(self, 'state', {}) or {}
-        anchors = float(st.get('daily_pnl', 0.0) or 0.0)
+        STOPS act on: anchors = the COMPUTED broker-history truth (E-22: magic 20260522, already
+        EXCLUDES Rogue/Fetcher -- NOT the state['daily_pnl'] accumulator the flatten path
+        bypasses); Rogue/Fetcher from their governors. All three trace to the SINGLE SOURCE
+        (pnl_source.magic_day_net). Guarded -- a missing piece reads $0."""
+        anchors = self._anchors_day_pnl_computed()
         rogue = float(((getattr(self, '_rogue', None) or {}).get('gov') or {}).get('day_pnl', 0.0) or 0.0)
         fetcher = float(((getattr(self, '_fetcher', None) or {}).get('gov') or {}).get('day_pnl', 0.0) or 0.0)
         return anchors, rogue, fetcher
@@ -1041,7 +1086,7 @@ class LiveTrader:
         one-time alert when it first engages. Guarded -> (False,'ok','')."""
         try:
             import daystops as _ds
-            dp = float((self.state or {}).get('daily_pnl', 0.0) or 0.0)
+            dp = self._anchors_day_pnl_computed()   # E-22: computed broker truth, not the accumulator
             if _ds.latch_profit(dp, self.cfg, self.state):
                 self._anchors_profit_alert(dp)
             return _ds.anchors_daystop(dp, self.cfg, self.state)
@@ -2261,18 +2306,22 @@ class LiveTrader:
         # 5. Kill switch?
         if self._check_kill_switch() and not self.state['kill_switch_locked']:
             kill_base = self.state.get('day_start_equity') or self.cfg.starting_balance
-            kill_limit = self.cfg.daily_loss_pct * kill_base
-            # v2.5.4: persist to file log, not just Telegram, so any future gating
-            # of anchors is always reconstructable on disk.
+            # E-22: log the value the kill switch actually COMPARED (equity drawdown from
+            # day-open, or the computed realized loss in paper) vs its threshold -- NOT the
+            # state['daily_pnl'] mirror, which the flatten path had frozen at +$140 on the
+            # -$821 07-09 day. The mirror is still shown, labelled, for context.
+            measured, kill_limit = self._kill_switch_drawdown()
             log.warning(
-                f"KILL SWITCH TRIGGERED — daily_pnl=${self.state['daily_pnl']:.2f} "
-                f"limit=-${kill_limit:.0f} (base day_start_equity=${kill_base:,.2f}). "
+                f"KILL SWITCH TRIGGERED — equity drawdown ${measured:,.2f} >= "
+                f"limit ${kill_limit:,.2f} (base day_start_equity=${kill_base:,.2f}; "
+                f"anchors day P&L ${self._anchors_day_pnl_computed():+.2f}). "
                 f"Flattening; no new anchors today."
             )
             self.tele.critical(
                 f"🚨 *KILL SWITCH TRIGGERED*\n"
-                f"Daily P&L: `${self.state['daily_pnl']:.2f}` "
-                f"(limit `-${kill_limit:.0f}`, from day-open `${kill_base:,.0f}`)\n"
+                f"Equity drawdown: `${measured:,.2f}` "
+                f"(limit `${kill_limit:,.2f}`, from day-open `${kill_base:,.0f}`)\n"
+                f"Anchors day P&L: `${self._anchors_day_pnl_computed():+.2f}`\n"
                 f"Flattening everything, no more trades today."
             )
             self._flatten_all(reason="KillSwitch")
@@ -2280,13 +2329,11 @@ class LiveTrader:
             self._save_state()
 
         if self.state['kill_switch_locked']:
-            # v2.5.4: leave a periodic on-disk record of WHY anchors are gated,
-            # so a silent "no trades today" is never a mystery in the log again.
+            # v2.5.4 / E-22: leave an on-disk record of WHY anchors are gated so a silent
+            # "no trades today" is never a mystery -- but ONCE per lock event (was every
+            # STATUS_EVERY_TICKS ticks, ~10/min). The status.json write stays periodic.
+            self._log_kill_gated_once()
             if self._tick_counter % self.STATUS_EVERY_TICKS == 0:
-                log.warning(
-                    "Anchor processing GATED: kill switch locked for the day "
-                    f"(daily_pnl=${self.state['daily_pnl']:.2f}). Resets next broker day."
-                )
                 self._write_status(broker_date)
             return
 
@@ -2512,6 +2559,7 @@ LiveTrader._acquire_pid_lock        = _state_mod._acquire_pid_lock
 LiveTrader._release_pid_lock        = _state_mod._release_pid_lock
 LiveTrader._compute_safe_lot        = _risk_mod._compute_safe_lot
 LiveTrader._check_kill_switch       = _risk_mod._check_kill_switch
+LiveTrader._kill_switch_drawdown    = _risk_mod._kill_switch_drawdown
 LiveTrader._ensure_day_start_equity = _risk_mod._ensure_day_start_equity
 LiveTrader._flatten_all             = _risk_mod._flatten_all
 LiveTrader._process_anchor_if_due   = _anchors_mod._process_anchor_if_due

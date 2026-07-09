@@ -371,6 +371,10 @@ STEP_NAMES = {
     281: "reconcile 4 surfaces agree", # synthetic history -> authority==ledger==report==live per engine + account
     282: "reconcile mismatch fails",   # injected discrepancy -> ok=False, named surface+delta, non-zero; corrections table
     283: "no csv-sum pnl path",        # trade CSVs are decision logs: no code sums their rows for reported P&L
+    284: "e22 flatten truth",          # computed anchors P&L == magic_day_net incl flatten closes; mirror corrected, accum diverges
+    285: "e22 flatten 3 closes",       # _flatten_all closes 3 positions -> anchors day P&L reflects them within one tick (cache invalidated)
+    286: "e22 loss over accum",        # anchors loss stop fires <=-630 computed even while the accumulator reads +140
+    287: "e22 gated once",             # 'Anchor processing GATED' warns once per lock event, not per tick
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -7938,6 +7942,8 @@ class SelfTest:
         tr = types.SimpleNamespace(adapter=adapter, cfg=cfg, run_dir=tmp,
                                    state={'last_broker_date': date})
         tr._engine_day_pnls = _lt.LiveTrader._engine_day_pnls.__get__(tr)
+        # E-22: _engine_day_pnls' anchors leg is now the COMPUTED broker-history value.
+        tr._anchors_day_pnl_computed = _lt.LiveTrader._anchors_day_pnl_computed.__get__(tr)
         df, dt = _ps.broker_day_range(tr, day=date)
         tr._rogue = {'gov': _rg.rebuild_gov_from_history(tr, df, dt)}
         tr._fetcher = {'gov': _ft.rebuild_gov_from_history(tr, df, dt)}
@@ -8783,21 +8789,60 @@ class SelfTest:
     # =====================================================================
     # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
     # =====================================================================
+    @staticmethod
+    def _pnl_stub_deals(t):
+        """E-22 test helper: synthesize the broker OUT-deal list that computed_anchors_day_pnl /
+        engine_day_nets read -- one deal per engine magic. Anchors comes from t._anchor_deals_pnl
+        when set (DECOUPLED from the state['daily_pnl'] mirror, so a governor that still read the
+        raw accumulator would get the wrong answer and FAIL), else the mirror; Rogue/Fetcher from
+        their govs so the authoritative DISPLAY source stays consistent with _engine_day_pnls."""
+        import types, daystops as _ds, rogue as _r, fetcher as _f
+        def _out(pnl, magic):
+            return types.SimpleNamespace(entry=1, profit=float(pnl), swap=0.0,
+                                         commission=0.0, time=1, magic=magic)
+        deals = []
+        ap = getattr(t, '_anchor_deals_pnl', None)
+        if ap is None:
+            ap = float((getattr(t, 'state', {}) or {}).get('daily_pnl', 0.0) or 0.0)
+        deals.append(_out(ap, _ds.ANCHORS_MAGIC))
+        rp = ((getattr(t, '_rogue', None) or {}).get('gov') or {}).get('day_pnl')
+        if rp is not None:
+            deals.append(_out(rp, _r.ROGUE_MAGIC))
+        fp = ((getattr(t, '_fetcher', None) or {}).get('gov') or {}).get('day_pnl')
+        if fp is not None:
+            deals.append(_out(fp, _f.FETCHER_MAGIC))
+        return deals
+
+    def _set_anchors_day_pnl(self, t, value):
+        """E-22 test helper: set the stub's ANCHORS realized day P&L via broker DEAL HISTORY
+        (what the COMPUTED governor reads), while zeroing the state['daily_pnl'] accumulator so a
+        governor that still read the raw mirror would get the WRONG answer and FAIL. Drops the
+        per-tick cache. (The mirror is re-synced to `value` on the next governor read.)"""
+        import daystops as _ds
+        t._anchor_deals_pnl = float(value)
+        t.state['daily_pnl'] = 0.0
+        _ds.invalidate_pnl_cache(t)
+
     def _daylock_mk(self, cfg=None):
         """A stub LiveTrader carrying the anchors/account day-stop methods bound onto it +
-        an alerts list, for headless daily-stop tests. state['daily_pnl'] is the anchors
-        realized day P&L; _rogue/_fetcher hold each engine's governor day P&L."""
+        an alerts list, for headless daily-stop tests. E-22: the anchors realized day P&L is set
+        via self._set_anchors_day_pnl (broker deal history), NOT state['daily_pnl'] directly --
+        the governors COMPUTE it from history (pnl_source.magic_day_net); _rogue/_fetcher hold
+        each engine's governor day P&L."""
         import types
         import live_trader as _lt
         cfg = cfg or self.cfg
         alerts = []
         t = types.SimpleNamespace(
             cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0},
-            _rogue=None, _fetcher=None, _save_state=lambda: None,
+            _rogue=None, _fetcher=None, _anchor_deals_pnl=None, _save_state=lambda: None,
             tele=types.SimpleNamespace(info=lambda *a, **k: None, send=lambda *a, **k: None,
                                        warn=lambda m='', **k: alerts.append(str(m))))
-        for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_anchors_daystop',
-                  '_anchors_daystop_blocked',
+        # E-22: broker deal-history source so the day stops read the COMPUTED anchors P&L.
+        t.adapter = types.SimpleNamespace(
+            mt5=types.SimpleNamespace(history_deals_get=lambda *a, **k: self._pnl_stub_deals(t)))
+        for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_anchors_day_pnl_computed',
+                  '_anchors_daystop', '_anchors_daystop_blocked',
                   '_anchors_profit_alert', '_account_locked', '_anchors_daystop_skip',
                   '_daylock_override', '_daylock_lines', '_post_daylock_status'):
             setattr(t, m, getattr(_lt.LiveTrader, m).__get__(t))
@@ -8830,7 +8875,7 @@ class SelfTest:
         import rogue as _r, fetcher as _f
         try:
             tr, alerts = self._daylock_mk()
-            tr.state['daily_pnl'] = 420.0                            # anchors +$420 -> lock
+            self._set_anchors_day_pnl(tr, 420.0)                     # anchors +$420 (history) -> lock
             tr._rogue = {'gov': _r.new_day_state()}                  # rogue flat
             tr._fetcher = {'gov': _f.new_day_state()}                # fetcher flat
             blocked1 = tr._anchors_daystop_blocked()
@@ -8856,10 +8901,10 @@ class SelfTest:
                         * float(self.cfg.contract_size))              # -$630
             same = abs(full_sl - float(self.cfg.anchors_daily_loss_stop)) < 1e-6
             tr, _ = self._daylock_mk()
-            tr.state['daily_pnl'] = full_sl
+            self._set_anchors_day_pnl(tr, full_sl)                    # -$630 via broker history
             halt_at_630 = tr._anchors_daystop_blocked()
             tr2, _ = self._daylock_mk()
-            tr2.state['daily_pnl'] = full_sl + 1.0                    # -$629
+            self._set_anchors_day_pnl(tr2, full_sl + 1.0)             # -$629
             no_halt_629 = tr2._anchors_daystop_blocked()
             # loss override refused (stays blocked)
             tr._daylock_override('anchors')
@@ -8880,7 +8925,7 @@ class SelfTest:
         import pandas as _pd
         try:
             tr, alerts = self._daylock_mk()
-            tr.state['daily_pnl'] = 500.0                            # profit-locked
+            self._set_anchors_day_pnl(tr, 500.0)                     # profit-locked (history)
             tr.state['missed_anchors_today'] = []
             now = _pd.Timestamp('2026-07-08T06:00:00Z')
             tr._anchors_daystop_skip('A4', now, now)                 # DUE while locked -> skip
@@ -8910,14 +8955,14 @@ class SelfTest:
         import dataclasses
         try:
             tr, _ = self._daylock_mk()
-            tr.state['daily_pnl'] = 5000.0
+            self._set_anchors_day_pnl(tr, 5000.0)
             tr._rogue = {'gov': {'day_pnl': 5000.0}}
             tr._fetcher = {'gov': {'day_pnl': 5000.0}}               # combined $15k
             inert = tr._account_locked() is False                   # pct=0 -> never locks
             # arm at 2% of $50k = $1,000; combined $15k >= -> locks
             armed_cfg = dataclasses.replace(self.cfg, account_daily_profit_stop_pct=0.02)
             tr2, _ = self._daylock_mk(cfg=armed_cfg)
-            tr2.state['daily_pnl'] = 600.0
+            self._set_anchors_day_pnl(tr2, 600.0)
             tr2._rogue = {'gov': {'day_pnl': 300.0}}
             tr2._fetcher = {'gov': {'day_pnl': 200.0}}               # combined $1,100 >= $1,000
             armed_locks = tr2._account_locked() is True
@@ -8945,7 +8990,7 @@ class SelfTest:
             # a fresh day (day_pnl 0, flags cleared) -> anchors NOT blocked, enters clean.
             tr, _ = self._daylock_mk()
             tr.state.update(st)
-            tr.state['daily_pnl'] = 0.0
+            self._set_anchors_day_pnl(tr, 0.0)
             clean_next_day = tr._anchors_daystop_blocked() is False
             ok = all_cleared and clean_next_day
             detail = f"all_flags_cleared={all_cleared} clean_next_day={clean_next_day}"
@@ -8965,7 +9010,7 @@ class SelfTest:
         import live_trader as _lt, watchdog as _wd, rogue as _r, fetcher as _f
         try:
             tr, _ = self._daylock_mk()
-            tr.state['daily_pnl'] = 250.0                            # anchors +$250 (active)
+            self._set_anchors_day_pnl(tr, 250.0)                     # anchors +$250 (active, history)
             tr._rogue = {'gov': dict(_r.new_day_state(), day_pnl=420.0, profit_locked=True)}
             tr._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=-390.0, loss_stopped=True)}
             tr._day_pnl_by_engine_payload = _lt.LiveTrader._day_pnl_by_engine_payload.__get__(tr)
@@ -9059,12 +9104,17 @@ class SelfTest:
         t = types.SimpleNamespace(
             cfg=cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0,
                             'processed_anchors_today': []},
-            _rogue=None, _fetcher=None, shadow_positions={}, _save_state=lambda: None,
-            paper=True, run_dir='./run',
+            _rogue=None, _fetcher=None, _anchor_deals_pnl=None, shadow_positions={},
+            _save_state=lambda: None, paper=True, run_dir='./run',
             tele=types.SimpleNamespace(info=lambda *a, **k: None,
                                        send=lambda m='', *a, **k: alerts.append(str(m)),
                                        warn=lambda m='', **k: alerts.append(str(m))))
-        for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_account_locked',
+        # E-22: broker deal-history source so the combined-net DECISION reads the COMPUTED
+        # anchors day P&L (set via self._set_anchors_day_pnl), not the state['daily_pnl'] mirror.
+        t.adapter = types.SimpleNamespace(
+            mt5=types.SimpleNamespace(history_deals_get=lambda *a, **k: self._pnl_stub_deals(t)))
+        for m in ('_engine_day_pnls', '_engine_day_pnls_authoritative', '_anchors_day_pnl_computed',
+                  '_account_locked',
                   '_account_target', '_post_a4_complete',
                   '_account_target_alert', '_anchors_daystop', '_anchors_daystop_blocked',
                   '_anchors_daystop_skip', '_daylock_override', '_post_daylock_status',
@@ -9093,7 +9143,7 @@ class SelfTest:
         import rogue as _r, fetcher as _f
         try:
             t, _ = self._target_mk()
-            t.state['daily_pnl'] = 250.0
+            self._set_anchors_day_pnl(t, 250.0)
             t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=400.0)}
             t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=200.0)}   # net = 850 (>=800)
             t.state['processed_anchors_today'] = ['A1_02h_Asia', 'A2_10h_London']  # A4 NOT fired
@@ -9117,7 +9167,7 @@ class SelfTest:
         import rogue as _r, fetcher as _f
         try:
             t, alerts = self._target_mk()
-            t.state['daily_pnl'] = -390.0                       # anchors LOSER (not re-seeded)
+            self._set_anchors_day_pnl(t, -390.0)                # anchors LOSER (not re-seeded)
             t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=800.0)}
             t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=440.0)}   # net = 850
             t.state['processed_anchors_today'] = ['A1_02h_Asia', 'A4_1640_NYopen']
@@ -9149,7 +9199,7 @@ class SelfTest:
         import rogue as _r, fetcher as _f
         try:
             t, alerts = self._target_mk()
-            t.state['daily_pnl'] = 300.0
+            self._set_anchors_day_pnl(t, 300.0)
             t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=250.0)}
             t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=150.0)}   # net = 700 (<800)
             t.state['processed_anchors_today'] = ['A4_1640_NYopen']
@@ -9172,10 +9222,10 @@ class SelfTest:
         # unaffected (the lock is manage-only -- it mutates no position).
         try:
             t, alerts = self._target_mk()
-            t.state['daily_pnl'] = 1000.0                       # peak (pre-A4, not secured)
+            self._set_anchors_day_pnl(t, 1000.0)                # peak (pre-A4, not secured)
             at_peak = t._account_locked()                       # updates peak; net==peak -> no lock
             peak_hi = float(t.state.get('account_target_peak_net', 0.0))
-            t.state['daily_pnl'] = 780.0                        # retreat $220 from peak
+            self._set_anchors_day_pnl(t, 780.0)                 # retreat $220 from peak
             locked = t._account_locked()                        # give-back engages (pre-A4 ok)
             gblock = bool(t.state.get('account_target_giveback_locked'))
             t._account_locked()                                 # idempotent -- no second alert
@@ -9194,17 +9244,17 @@ class SelfTest:
         # HARD -- the account override never clears it.
         try:
             t, _ = self._target_mk()
-            t.state['daily_pnl'] = 850.0
+            self._set_anchors_day_pnl(t, 850.0)
             t.state['processed_anchors_today'] = ['A4_1640_NYopen']
             secured_first = t._account_locked()                 # secured
             t._daylock_override('account')                      # /daylock off
             resumed = t._account_locked() is False
             a5_ok = t._anchors_daystop_blocked() is False
             override = bool(t.state.get('account_target_override'))
-            t.state['daily_pnl'] = 1000.0                       # full target -> still no re-lock
+            self._set_anchors_day_pnl(t, 1000.0)                # full target -> still no re-lock
             no_relock = t._account_locked() is False
             # anchors LOSS halt is un-overridable by the account/target override.
-            t.state['daily_pnl'] = -700.0                       # <= anchors_daily_loss_stop (-630)
+            self._set_anchors_day_pnl(t, -700.0)               # <= anchors_daily_loss_stop (-630)
             loss_hard = t._anchors_daystop_blocked() is True
             ok = (secured_first and resumed and a5_ok and override and no_relock and loss_hard)
             detail = (f"secured_first={secured_first} resumed={resumed} a5_ok={a5_ok} "
@@ -9274,7 +9324,7 @@ class SelfTest:
                      and "105% of" in gflat)
             # (c) wiring — the alert path fires the card ONCE and only once (latched by the caller).
             t, alerts = self._target_mk()
-            t.state['daily_pnl'] = -390.0
+            self._set_anchors_day_pnl(t, -390.0)
             import rogue as _r, fetcher as _f
             t._rogue = {'gov': dict(_r.new_day_state(), day_pnl=800.0)}
             t._fetcher = {'gov': dict(_f.new_day_state(), day_pnl=440.0)}     # net 850
@@ -9292,6 +9342,166 @@ class SelfTest:
         except Exception as e:
             self._record(266, FAIL, f"raised: {e!r}"); return
         self._record(266, PASS if ok else FAIL, detail)
+
+    # =====================================================================
+    # E-22 (07-09) anchors day-P&L single source: the DECISION path computes from broker deal
+    # history, not the state['daily_pnl'] accumulator that risk._flatten_all bypasses.
+    # =====================================================================
+    def _step_e22_flatten_truth(self):
+        # 284 E-22 REGRESSION FOR 07-09: the anchors DECISION-path day P&L is COMPUTED from
+        # broker deal history (pnl_source.magic_day_net, magic 20260522), NOT the
+        # state['daily_pnl'] accumulator that risk._flatten_all bypasses. Synthetic 07-09
+        # history: A1 +$140 (the fill-loop close) + 4 FLATTEN-path closes taking the day to
+        # -$821.10, while the accumulator stayed frozen at +$140. The GOVERNOR must read
+        # -$821.10 (== magic_day_net) and the state mirror must be CORRECTED to it.
+        import types, daystops as _ds, pnl_source as _ps
+        try:
+            def _out(pnl, magic=_ds.ANCHORS_MAGIC):
+                return types.SimpleNamespace(entry=1, profit=pnl, swap=0.0,
+                                             commission=0.0, time=1, magic=magic)
+            # A1 booked via the fill loop (+140); the rest closed by the kill-switch flatten.
+            deals = [_out(140.00), _out(-300.10), _out(-260.00), _out(-201.00), _out(-200.00),
+                     _out(-99.0, magic=_ds and 20260626)]      # a Rogue close: excluded by magic
+            expect = _ps.magic_day_net(deals, _ds.ANCHORS_MAGIC)   # 140-300.1-260-201-200
+            tr, _ = self._daylock_mk()
+            tr.state['daily_pnl'] = 140.00                         # accumulator FROZEN at A1's close
+            tr.adapter.mt5.history_deals_get = lambda *a, **k: deals
+            _ds.invalidate_pnl_cache(tr)
+            computed = tr._anchors_day_pnl_computed()
+            # the accumulator (+140) diverges hugely from the computed truth (-821.10) ...
+            diverged = abs(140.00 - expect) > 600.0
+            # ... yet the GOVERNOR reads the computed value == magic_day_net ...
+            governor_reads_truth = abs(computed - expect) < 1e-6 and abs(computed + 821.10) < 1e-6
+            # ... and the state['daily_pnl'] MIRROR is overwritten to broker truth.
+            mirror_corrected = abs(tr.state['daily_pnl'] - expect) < 1e-6
+            ok = (abs(expect + 821.10) < 1e-6 and diverged and governor_reads_truth
+                  and mirror_corrected)
+            detail = (f"magic_day_net={expect} computed={computed} accum_was=140.00"
+                      f"(diverged={diverged}) mirror_now={tr.state['daily_pnl']}")
+        except Exception as e:
+            self._record(284, FAIL, f"raised: {e!r}"); return
+        self._record(284, PASS if ok else FAIL, detail)
+
+    def _step_e22_flatten_reflects(self):
+        # 285 E-22 the EXACT 07-09 bug: risk._flatten_all() closes 3 anchor positions DIRECTLY
+        # via the adapter (never through the fills reconcile loop), yet the anchors day P&L
+        # reflects all 3 within ONE tick -- the governor recomputes from broker deal history and
+        # the flatten INVALIDATES the per-tick computed-P&L cache. The pre-flatten read caches $0
+        # at the same tick, so only cache invalidation lets the post-flatten read see -$821.10.
+        import types, daystops as _ds, live_trader as _lt
+        try:
+            tr, _alerts = self._daylock_mk()
+            tr.paper = True
+            tr.shadow_positions = {201: {'side': 'BUY'}, 202: {'side': 'SELL'}, 203: {'side': 'BUY'}}
+            tr.shadow_pendings = {}
+            tr._deferred_anchor = None
+            tr._tick_counter = 5
+            closed = {}
+            pnls = {201: -300.00, 202: -260.00, 203: -261.10}    # sums to -821.10
+            def _close(ticket, dry_run=False):
+                closed[ticket] = pnls[ticket]
+                return True
+            tr.adapter = types.SimpleNamespace(
+                close_position=_close,
+                mt5=types.SimpleNamespace(
+                    positions_get=lambda **k: [],
+                    history_deals_get=lambda *a, **k: [
+                        types.SimpleNamespace(entry=1, profit=p, swap=0.0, commission=0.0,
+                                              time=1, magic=_ds.ANCHORS_MAGIC)
+                        for p in closed.values()]))
+            for m in ('_flatten_all',):
+                setattr(tr, m, getattr(_lt.LiveTrader, m).__get__(tr))
+            # BEFORE: positions still open -> no closes in history -> governor sees $0 (cached@t5).
+            before = tr._anchors_day_pnl_computed()
+            # ONE tick: the kill-switch flatten closes all three directly via the adapter.
+            tr._flatten_all(reason="KillSwitch")
+            flat = (not tr.shadow_positions)
+            # SAME tick: the governor now reflects all three closes (cache invalidated on flatten).
+            after = tr._anchors_day_pnl_computed()
+            blocked, _r, kind = _ds.anchors_daystop(after, tr.cfg, tr.state)
+            ok = (abs(before) < 1e-6 and flat and abs(after + 821.10) < 1e-6
+                  and blocked is True and kind == 'loss')
+            detail = (f"before=${before:.2f} flat={flat} after=${after:.2f} "
+                      f"loss_halt={blocked}/{kind}")
+        except Exception as e:
+            self._record(285, FAIL, f"raised: {e!r}"); return
+        self._record(285, PASS if ok else FAIL, detail)
+
+    def _step_e22_loss_over_accum(self):
+        # 286 E-22 the risk-control failure itself: the anchors LOSS stop fires at <= -$630
+        # COMPUTED even though the state['daily_pnl'] accumulator reads +$140 (A1's frozen close).
+        # A governor that still read the raw accumulator would see +$140, stay live and never
+        # brake -- the exact -$821 day the account kill switch had to catch.
+        import daystops as _ds
+        try:
+            tr, _ = self._daylock_mk()
+            self._set_anchors_day_pnl(tr, -821.10)              # computed anchors day P&L (history)
+            tr.state['daily_pnl'] = 140.00                      # the pre-fix frozen accumulator
+            blocked = tr._anchors_daystop_blocked()
+            _b2, _r2, kind = tr._anchors_daystop()
+            # the raw accumulator (+140), had the governor read it, would NOT trip (>-630).
+            accum_would_not_trip = _ds.anchors_daystop(140.00, tr.cfg, tr.state)[0] is False
+            computed = tr._anchors_day_pnl_computed()
+            ok = (blocked is True and kind == 'loss' and accum_would_not_trip
+                  and abs(computed + 821.10) < 1e-6)
+            detail = (f"loss_halt={blocked}/{kind} computed=${computed:.2f} "
+                      f"accum(+140)_would_trip={not accum_would_not_trip}")
+        except Exception as e:
+            self._record(286, FAIL, f"raised: {e!r}"); return
+        self._record(286, PASS if ok else FAIL, detail)
+
+    def _step_e22_gated_once(self):
+        # 287 E-22: the "Anchor processing GATED" warning fires exactly ONCE per kill-switch
+        # lock event, not every STATUS_EVERY_TICKS ticks (~10/min on 07-09). It re-arms only at
+        # the broker day roll. 20 locked ticks -> one warning; a day-roll re-arm -> one more.
+        import types, logging as _lg
+        import live_trader as _lt
+        try:
+            warns = []
+            t = types.SimpleNamespace(
+                cfg=self.cfg, state={'daily_pnl': 0.0, 'day_start_equity': 50000.0,
+                                     'kill_switch_locked': True},
+                paper=True, _kill_gate_warned=False,
+                adapter=types.SimpleNamespace(
+                    mt5=types.SimpleNamespace(history_deals_get=lambda *a, **k: [])),
+                _live_equity=lambda: None, _save_state=lambda: None,
+                tele=types.SimpleNamespace(info=lambda *a, **k: None))
+            for m in ('_log_kill_gated_once', '_kill_switch_drawdown', '_ensure_day_start_equity',
+                      '_anchors_day_pnl_computed'):
+                setattr(t, m, getattr(_lt.LiveTrader, m).__get__(t))
+            _log = _lg.getLogger("AUREON")
+
+            class _Cap(_lg.Handler):
+                def emit(self, r):
+                    warns.append(r.getMessage())
+            h = _Cap()
+            # capture warnings regardless of the ambient logger config / any global disable().
+            _prev_disable = _lg.root.manager.disable
+            _prev_level = _log.level
+            _lg.disable(_lg.NOTSET)
+            _log.setLevel(_lg.WARNING)
+            _log.addHandler(h)
+            try:
+                fired = [t._log_kill_gated_once() for _ in range(20)]   # 20 locked ticks
+                gated_1 = [w for w in warns if 'Anchor processing GATED' in w]
+                # the ONE emitted warning prints the COMPARED value, not state['daily_pnl'].
+                msg_ok = len(gated_1) == 1 and 'drawdown' in gated_1[0] and 'vs limit' in gated_1[0]
+                one_per_lock = sum(1 for f in fired if f) == 1 and msg_ok
+                # broker day roll re-arms -> the next lock event logs exactly once more.
+                t._kill_gate_warned = False
+                again = t._log_kill_gated_once()
+                gated_2 = [w for w in warns if 'Anchor processing GATED' in w]
+                rearm_ok = again is True and len(gated_2) == 2
+            finally:
+                _log.removeHandler(h)
+                _log.setLevel(_prev_level)
+                _lg.disable(_prev_disable)
+            ok = one_per_lock and rearm_ok
+            detail = (f"fired_true={sum(1 for f in fired if f)}/20 gated_logs={len(gated_1)} "
+                      f"msg_prints_compared={msg_ok} rearm_logs_twice_total={rearm_ok}")
+        except Exception as e:
+            self._record(287, FAIL, f"raised: {e!r}"); return
+        self._record(287, PASS if ok else FAIL, detail)
 
     def _step_fix4_rogue_a1(self):
         # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
@@ -11096,6 +11306,12 @@ class SelfTest:
             self._step_target_override()
             self._step_target_dayroll_disable()
             self._step_target_daylocked_card()
+            # E-22 (2026-07-09) anchors day-P&L single source: DECISION path computes from broker
+            # deal history, not the state['daily_pnl'] accumulator risk._flatten_all bypasses.
+            self._step_e22_flatten_truth()
+            self._step_e22_flatten_reflects()
+            self._step_e22_loss_over_accum()
+            self._step_e22_gated_once()
             # 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2)
             self._step_break_seed_up()
             self._step_break_seed_downside()

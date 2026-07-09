@@ -398,7 +398,17 @@ def _reconcile_with_broker(self):
             close_deal = next((d for d in deals if d.entry == 1), None)
             if close_deal:
                 pnl_usd = float(close_deal.profit) + float(close_deal.swap) + float(close_deal.commission)
+                # E-22: OPTIMISTIC increment of the state['daily_pnl'] MIRROR (fast, so the
+                # close alert below shows a moved number immediately). It is authoritative for
+                # nothing -- the next governor read recomputes from broker deal history and
+                # overwrites this. Invalidate the computed-P&L cache so that recompute now
+                # includes this close.
                 self.state['daily_pnl'] += pnl_usd
+                try:
+                    import daystops as _ds
+                    _ds.invalidate_pnl_cache(self)
+                except Exception:
+                    pass
                 # v3.7.3: this anchor-leg close just moved the anchors realized day P&L --
                 # latch the profit lock + fire its one-time alert if it now crosses the
                 # target (guarded; never affects the close path).
