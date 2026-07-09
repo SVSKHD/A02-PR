@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.3"  # E-23 testfire loss-halt rail 6 + R-8 rescue/journal self-heal + R-10 engine-surface unification + comment/ERRORS.md truth
+__version__ = "3.8.4"  # selftest truth: config-drift tests assert behavior-vs-cfg (not values), utf-8 on every open(), emoji-safe stdout under redirect
 CODENAME = "Astra Hawk"
 
 

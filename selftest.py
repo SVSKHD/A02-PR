@@ -26,6 +26,7 @@ SAFETY (hard rules)
 """
 import logging
 import os
+import sys
 import time
 from typing import List, Optional, Tuple
 
@@ -35,6 +36,19 @@ from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
 from telemetry import telemetry_from_env, Severity
 
 log = logging.getLogger("AUREON")
+
+# Windows / Task-Scheduler safety: this harness prints emoji (🧪 ✅ …). When stdout/stderr is
+# REDIRECTED (a scheduled run, `> log.txt`, a pipe) the ambient console codec is often cp1252,
+# and the first emoji `print` then raises UnicodeEncodeError -- which kills the gate SILENTLY
+# from a scheduled run (the exact failure this guards). Force utf-8 with a NON-raising error
+# handler so a harness print can never crash the run regardless of the redirect/console codec.
+# Idempotent and guarded (a stream without .reconfigure, e.g. a StringIO, is left untouched).
+for _stream_name in ('stdout', 'stderr'):
+    _stream = getattr(sys, _stream_name, None)
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+    except Exception:
+        pass
 
 PASS, FAIL, WARN, SKIP = "PASS", "FAIL", "WARN", "SKIP"
 
@@ -967,7 +981,7 @@ class SelfTest:
             run_event(3000, [-18, 20, 6, 2])       # net  +10 -> SCRATCH
 
             path = _os.path.join(tmp, "rescue_events.csv")
-            with open(path) as f:
+            with open(path, encoding='utf-8') as f:
                 rows = list(_csv.DictReader(f))
             branches = [r['branch'] for r in rows]
             tally = _rl.rescue_tally(path)
@@ -1462,7 +1476,7 @@ class SelfTest:
             lone_event(3000, rescue_pnl=5.0,   b1=10.0,    b2=-5.0)      # SCRATCH (chop)
 
             path = _os.path.join(tmp, "rescue_events.csv")
-            with open(path) as f:
+            with open(path, encoding='utf-8') as f:
                 rows = list(_csv.DictReader(f))
             by = {r['event_id'].split('_')[-1]: r for r in rows}
             trend, whip, scr = by['1000'], by['2000'], by['3000']
@@ -1604,7 +1618,7 @@ class SelfTest:
             no_orphan = (len(bot2._rescue_events) == 0)        # finalized, none left
 
             path = _os.path.join(tmp, "rescue_events.csv")
-            rows = list(_csv.DictReader(open(path))) if _os.path.exists(path) else []
+            rows = list(_csv.DictReader(open(path, encoding='utf-8'))) if _os.path.exists(path) else []
             wrote = (len(rows) == 1)
             r = rows[0] if rows else {}
             fields_ok = (wrote and r.get('event_type') == 'LONE_RESCUE'
@@ -3148,6 +3162,12 @@ class SelfTest:
                     'boost_cross_streak': 2}}   # hold_ticks-1 -> ONE tick confirms
                 s.fires = []
                 s._break_and_hold_ok = lambda shadow, plan: bh_ok
+                # v3.5.0 RESCUE adaptive-entry seam: when rescue_entry_enabled is ON (now the
+                # live default), a bypass-break-and-hold RESCUE routes through _rescue_entry_ok
+                # instead of free-firing. Stub it PASS so this test isolates the v3.2.7
+                # break-and-hold split (RALLY gated / RESCUE bypasses) from the adaptive gate --
+                # the assertions then hold regardless of rescue_entry_enabled's configured value.
+                s._rescue_entry_ok = lambda shadow, plan: True
                 s._fp_guard_ok = lambda shadow, n: fp_ok
                 s._fire_boost_event = lambda t, sh, pl: s.fires.append(pl.kind)
                 s._enforce_boost_cap = lambda mid_: None
@@ -4367,7 +4387,7 @@ class SelfTest:
             _pr.upsert_ledger_rows(csv_path, '2026-07-02', rows_d2_v1)
             _pr.upsert_ledger_rows(csv_path, '2026-07-02', rows_d2_v1)  # re-run, same data
             _pr.upsert_ledger_rows(csv_path, '2026-07-02', rows_d2_v2)  # re-run, CHANGED data
-            with open(csv_path, newline='') as f:
+            with open(csv_path, newline='', encoding='utf-8') as f:
                 final = list(_csv.DictReader(f))
             d1_rows = [r for r in final if r['date'] == '2026-07-01']
             d2_rows = [r for r in final if r['date'] == '2026-07-02']
@@ -4575,7 +4595,7 @@ class SelfTest:
 
             # (a) explicit date_str is honored even though "now" would differ.
             month_csv = _os.path.join(tmp, "trades_2026-07.csv")
-            with open(month_csv, 'w', newline='') as f:
+            with open(month_csv, 'w', newline='', encoding='utf-8') as f:
                 w = _csv.writer(f)
                 w.writerow(['date_ist', 'anchor', 'realized_pnl_usd'])
                 w.writerow(['2026-07-02', 'A1', '100.00'])   # requested day
@@ -4586,14 +4606,14 @@ class SelfTest:
                 cfg=_types.SimpleNamespace(util_daily_report=True),
                 _journal_dir=lambda: tmp, shadow_positions={})
             out_path = _bm.run_daily_report(trader, date_str='2026-07-02')
-            with open(out_path) as f:
+            with open(out_path, encoding='utf-8') as f:
                 md = f.read()
             explicit_date_honored = ('$+100.00' in md and '999.00' not in md
                                      and out_path.endswith('daily_report_2026-07-02.md'))
 
             # (b) IST midnight bucketing on load_rogue_closes.
             ledger_csv = _os.path.join(tmp, "boost_ledger.csv")
-            with open(ledger_csv, 'w', newline='') as f:
+            with open(ledger_csv, 'w', newline='', encoding='utf-8') as f:
                 w = _csv.writer(f)
                 w.writerow(_bm.LEDGER_COLUMNS)
                 # 18:45 UTC on 07-03 = 00:15 IST on 07-04 -- belongs to the NEXT IST day.
@@ -4674,7 +4694,7 @@ class SelfTest:
             fb_log = any(k == 'info' and 'F-B TRAPPED RESCUE FIRED' in m
                         and 'parent 777' in m and 'SELL' in m for k, m in logged)
             ledger_path = _os.path.join(tmp, 'boost_ledger.csv')
-            with open(ledger_path) as f:
+            with open(ledger_path, encoding='utf-8') as f:
                 rows = list(_csv.DictReader(f))
             ledger_ok = (len(rows) == 1 and rows[0]['kind'] == 'FB'
                         and rows[0]['event'] == 'enter' and bool(rows[0]['ts']))
@@ -4991,9 +5011,10 @@ class SelfTest:
         return tr, env, placed, modified, closed
 
     def _step_engine_defaults_wired(self):
-        # 223 v3.6.0 boot defaults + validator wiring + seed_source schema:
-        # (a) non_oco_enabled / rogue_enabled default True, rogue_seed_fallback
-        # defaults 'a1_time_snapshot'; (b) the validator carries the new flags +
+        # 223 v3.6.0 boot flags PRESENT + validator wiring + seed_source schema:
+        # (a) non_oco_enabled / rogue_enabled are present bool flags + rogue_seed_fallback is a
+        # valid non-empty mode (value is owner-tuned, not asserted); (b) the validator carries
+        # the new flags +
         # the seed-mode validity check + the three new LiveTrader seams, all
         # passing on the real cfg; (c) a typo'd seed mode is a WIRING FAILURE
         # (DO-NOT-START); (d) seed_source is the LAST column of the boost ledger
@@ -5001,10 +5022,15 @@ class SelfTest:
         import aureon_validator as _v, dataclasses
         import boost_metrics as _bm, rogue_patternlog as _pl, fetcher as _fetch
         try:
-            defaults_ok = (getattr(self.cfg, 'non_oco_enabled', None) is True
-                           and getattr(self.cfg, 'rogue_enabled', None) is True
-                           and getattr(self.cfg, 'rogue_seed_fallback', None)
-                           == 'a1_time_snapshot')
+            # STRUCTURAL wiring, not owner-tuned values: the engine-switch flags are PRESENT and
+            # correctly typed (bool), and rogue_seed_fallback is a non-empty VALID mode. Their
+            # on/off VALUE is an owner toggle (D-28 set rogue_enabled False) -- asserting it here
+            # would make a config change a test failure (E-22 lesson). Validity of the actual
+            # value is proved by the validator's rogue:seed_fallback_valid check below.
+            defaults_ok = (isinstance(getattr(self.cfg, 'non_oco_enabled', None), bool)
+                           and isinstance(getattr(self.cfg, 'rogue_enabled', None), bool)
+                           and isinstance(getattr(self.cfg, 'rogue_seed_fallback', None), str)
+                           and bool(getattr(self.cfg, 'rogue_seed_fallback', '')))
             rep = _v.validate(self.cfg)
             names_ok = {c['name'] for c in rep['wiring_ok']}
             wired = ({'flag:non_oco_enabled', 'flag:rogue_seed_fallback',
@@ -5023,7 +5049,7 @@ class SelfTest:
                          and _fetch.TRADE_COLUMNS[-1] == 'seed_source'   # v3.7.0 fetcher CSV
                          and _bm.ledger_row({'ts': 't'})[-1] == '')
             ok = defaults_ok and wired and typo_blocks and schema_ok
-            detail = (f"defaults_on={defaults_ok} validator_wired={wired} "
+            detail = (f"flags_present_typed={defaults_ok} validator_wired={wired} "
                       f"typo_mode_do_not_start={typo_blocks} "
                       f"seed_source_schema={schema_ok}")
         except Exception as e:
@@ -5205,7 +5231,7 @@ class SelfTest:
 
             t1, _logs1 = mk('2026-07-06')
             _lt.LiveTrader._set_engine(t1, 'anchors', False, source='selftest')
-            with open(os.path.join(tmp, 'state.json')) as f:
+            with open(os.path.join(tmp, 'state.json'), encoding='utf-8') as f:
                 snap = json.load(f)
             persisted = (snap.get('engines') == {'anchors': False, 'rogue': True,
                                                  'fetcher': True}
@@ -5285,7 +5311,7 @@ class SelfTest:
                 _r.drive(tr)
                 chain_ran = (len(placed) == 2
                              and abs(tr._rogue['gov']['day_pnl'] - 4.9) < 1e-9)
-                with open(os.path.join(tmp, 'boost_ledger.csv')) as f:
+                with open(os.path.join(tmp, 'boost_ledger.csv'), encoding='utf-8') as f:
                     rows = [r for r in csv.DictReader(f) if r.get('kind') == 'ROGUE']
                 ledger_tagged = (len(rows) >= 2 and all(
                     r.get('seed_source') == 'A1_TIME_SNAPSHOT' for r in rows))
@@ -6258,22 +6284,23 @@ class SelfTest:
         self._record(114, PASS if ok else FAIL, detail)
 
     def _step_v35_rescue_freeze(self):
-        # 115 FREEZE — RESCUE: rescue_entry_enabled=False (default) -> the scan's rescue
-        # branch is NOT gated (today's immediate bypass-fire preserved). Proven by the
-        # gating boolean (kind=='RESCUE' AND flag) being False on the default cfg, plus
-        # the rescue plan SL $10 / cap -$700 unchanged.
+        # 115 FREEZE — RESCUE: the scan's rescue gating boolean (kind=='RESCUE' AND
+        # rescue_entry_enabled) tracks the FLAG, not a hardcoded default. Asserted as a
+        # BEHAVIOR over BOTH constructed cfgs (OFF -> not gated / bypass-fire preserved;
+        # ON -> gated through the adaptive gate), so flipping the live default can never
+        # break this test. Plus the rescue plan SL $10 / cap -$700 are unchanged.
         import boosts as _boosts, dataclasses
         try:
-            flag_off = (bool(getattr(self.cfg, 'rescue_entry_enabled', False)) is False)
-            # the exact scan gating condition for a RESCUE plan:
-            gated_off = not (True and bool(getattr(self.cfg, 'rescue_entry_enabled', False)))
+            # the exact scan gating condition for a RESCUE plan, over BOTH flag states.
+            cfg_off = dataclasses.replace(self.cfg, rescue_entry_enabled=False)
             cfg_on = dataclasses.replace(self.cfg, rescue_entry_enabled=True)
+            gated_off = not (True and bool(getattr(cfg_off, 'rescue_entry_enabled', False)))
             gated_on = (True and bool(getattr(cfg_on, 'rescue_entry_enabled', False)))
             rescue_plan = _boosts.plan_boost_event('BUY', 4000.0, 4000.0 - 10.0, self.cfg)
             sl_ok = abs(rescue_plan.sl_dollars - 10.0) < 1e-9
             cap_ok = abs(_boosts.boost_whipsaw_cap(self.cfg, 'RESCUE') - 700.0) < 1e-6
-            ok = flag_off and gated_off and gated_on and sl_ok and cap_ok
-            detail = (f"flag_off={flag_off} bypass_when_off={gated_off} gated_when_on={gated_on} "
+            ok = gated_off and gated_on and sl_ok and cap_ok
+            detail = (f"bypass_when_off={gated_off} gated_when_on={gated_on} "
                       f"rescue_SL$10={sl_ok} cap-$700={cap_ok}")
         except Exception as e:
             self._record(115, FAIL, f"raised: {e!r}"); return
@@ -6547,22 +6574,25 @@ class SelfTest:
 
     # --- ROGUE: self-anchoring monster-rider --------------------------------
     def _step_rogue_freeze_gate(self):
-        # 132 GATE (v3.6.0): rogue_enabled boot default is now TRUE (the engine-switch
-        # boot default; the old raw-False only existed to be demo-promoted anyway) ->
-        # should_run True on a non-funded account. The MANDATORY account gates are
-        # unchanged: a FUNDED account force-disables rogue even with the flag ON, and
-        # an EXPLICIT rogue_enabled=False still kills the whole mechanism (should_run
-        # False -> no watch/anchor/entry).
+        # 132 GATE (v3.6.0): should_run on a non-funded account TRACKS the configured
+        # rogue_enabled (whatever the owner set it to); an EXPLICIT rogue_enabled=True runs
+        # and =False kills the whole mechanism; a FUNDED account force-disables it even with
+        # the flag ON. Asserted as BEHAVIOR over constructed cfgs, so the live default value
+        # can drift (D-28 set it False) without breaking this test.
         import rogue as _rogue, dataclasses
         try:
-            on_default = (bool(getattr(self.cfg, 'rogue_enabled', False)) is True
-                          and _rogue.should_run(self.cfg, is_funded=False) is True)
+            cfg_on = dataclasses.replace(self.cfg, rogue_enabled=True)
             cfg_off = dataclasses.replace(self.cfg, rogue_enabled=False)
+            # non-funded should_run == the configured flag (True->run, False->kill).
+            on_runs = (_rogue.should_run(cfg_on, is_funded=False) is True)
             off_kills = (_rogue.should_run(cfg_off, is_funded=False) is False)
-            funded_gate = (_rogue.should_run(self.cfg, is_funded=True) is False)
-            ok = on_default and off_kills and funded_gate
-            detail = (f"boot_default_on={on_default} explicit_off_kills={off_kills} "
-                      f"funded_force_off={funded_gate}")
+            tracks_cfg = (bool(_rogue.should_run(self.cfg, is_funded=False))
+                          == bool(getattr(self.cfg, 'rogue_enabled', False)))
+            # funded force-OFF is unconditional -- even with the flag explicitly ON.
+            funded_gate = (_rogue.should_run(cfg_on, is_funded=True) is False)
+            ok = on_runs and off_kills and tracks_cfg and funded_gate
+            detail = (f"explicit_on_runs={on_runs} explicit_off_kills={off_kills} "
+                      f"nonfunded_tracks_cfg={tracks_cfg} funded_force_off={funded_gate}")
         except Exception as e:
             self._record(132, FAIL, f"raised: {e!r}"); return
         self._record(132, PASS if ok else FAIL, detail)
@@ -6901,9 +6931,12 @@ class SelfTest:
                 def run(self):
                     return None
 
-            def _drive(paper, is_demo):
-                # throwaway cfg so the shared self.cfg is never mutated.
-                cfg = _types.SimpleNamespace(symbol='XAUUSD', rogue_enabled=False,
+            def _drive(paper, is_demo, initial=None):
+                # throwaway cfg so the shared self.cfg is never mutated. rogue_enabled starts at
+                # the AUTO-PROMOTE sentinel (None) so this test exercises the promotion MECHANISM
+                # rather than any hardcoded live default: promote_on_boot converts None->True on a
+                # demo, ->False on funded, and paper never runs it so None is left untouched.
+                cfg = _types.SimpleNamespace(symbol='XAUUSD', rogue_enabled=initial,
                                              EXPECTED_BROKER_OFFSET_HOURS=None)
                 adapter = _mk_adapter(is_demo)
                 orig_LT, orig_AD = _lt.LiveTrader, _mt5a.MT5Adapter
@@ -6915,9 +6948,9 @@ class SelfTest:
                     _lt.LiveTrader, _mt5a.MT5Adapter = orig_LT, orig_AD
                 return cfg.rogue_enabled
 
-            live_demo_on = (_drive(paper=False, is_demo=True) is True)    # LIVE+demo -> ON
-            live_funded_off = (_drive(paper=False, is_demo=False) is False)  # LIVE+funded -> OFF
-            paper_never = (_drive(paper=True, is_demo=True) is False)     # PAPER -> never promotes
+            live_demo_on = (_drive(paper=False, is_demo=True) is True)    # LIVE+demo -> promotes ON
+            live_funded_off = (_drive(paper=False, is_demo=False) is False)  # LIVE+funded -> forced OFF
+            paper_never = (_drive(paper=True, is_demo=True) is None)      # PAPER -> promotion never ran
             ok = live_demo_on and live_funded_off and paper_never
             detail = (f"live_demo_promotes={live_demo_on} "
                       f"live_funded_forced_off={live_funded_off} "
@@ -6982,7 +7015,7 @@ class SelfTest:
                 p = os.path.join(run_dir, "rogue_patterns.csv")
                 if not os.path.exists(p):
                     return []
-                with open(p) as f:
+                with open(p, encoding='utf-8') as f:
                     return list(csv.DictReader(f))
 
             # (d) untrained model -> 1.0
@@ -7133,7 +7166,7 @@ class SelfTest:
                               {'max_fav': 35.0, 'trail_path_summary': '4075.0->4040.0->4050.0',
                                'exit_price': 4050.0, 'held_minutes': 42.0,
                                'outcome_dollars': 25.0})
-            with open(os.path.join(run_x, "rogue_patterns.csv")) as f:
+            with open(os.path.join(run_x, "rogue_patterns.csv"), encoding='utf-8') as f:
                 xrow = list(csv.DictReader(f))[0]
             exit_captured = all(str(xrow.get(c, '')) != '' for c in
                                 ('entry_price', 'max_fav', 'trail_path_summary',
@@ -7150,7 +7183,7 @@ class SelfTest:
                               {'max_fav': 1.0, 'trail_path_summary': '4000->4001->3995',
                                'exit_price': 3995.0, 'held_minutes': 5.0,
                                'outcome_dollars': -5.0}, decision=_pl.FAKEOUT)
-            with open(os.path.join(run_x, "rogue_patterns.csv")) as f:
+            with open(os.path.join(run_x, "rogue_patterns.csv"), encoding='utf-8') as f:
                 rows_x = list(csv.DictReader(f))
             fakeout_relabel = any(r['decision'] == 'FAKEOUT'
                                   and str(r['outcome_dollars']) == '-5.0' for r in rows_x)
@@ -8107,7 +8140,7 @@ class SelfTest:
             os.makedirs(os.path.join(tmp, 'reports'), exist_ok=True)
 
             def _hdr_row(path):
-                with open(path, newline='') as fh:
+                with open(path, newline='', encoding='utf-8') as fh:
                     rows = list(csv.reader(fh))
                 return rows[0], (rows[1] if len(rows) > 1 else [])
             checks = {}
@@ -8167,14 +8200,14 @@ class SelfTest:
             p = os.path.join(tmp, _rpl.TRADES_CSV)
             legacy = ['ts', 'event', 'direction', 'entry', 'exit', 'sl', 'outcome_dollars',
                       'ticket', 'magic']                     # 9 cols (pre-seed_source)
-            with open(p, 'w', newline='') as f:
+            with open(p, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f); w.writerow(legacy)
                 w.writerow(['t1', 'close', 'BUY', '4000', '4010', '3990', '7.0', '11', '20260626'])
                 w.writerow(['t2', 'close', 'SELL', '4010', '4005', '4015', '-5.0', '22',
                             '20260626', 'A1_BREAK'])       # a 10-col row already appended
             res = _cs.migrate(p, _rpl.TRADE_COLUMNS)
             hf, _ = _cs.inspect(p)
-            rows = list(csv.DictReader(open(p)))
+            rows = list(csv.DictReader(open(p, encoding='utf-8')))
             migrated_ok = (res['migrated'] and len(hf) == 10 and hf[-1] == 'seed_source'
                            and os.path.exists(p + '.bak') and len(rows) == 2
                            and rows[0]['outcome_dollars'] == '7.0'
@@ -8184,7 +8217,7 @@ class SelfTest:
             idem = (res2['migrated'] is False and res2['reason'] == 'already-current')
             # self-heal: appending via the real writer to a STALE file fixes the header first
             p2 = os.path.join(tmp, 'rt2.csv')
-            with open(p2, 'w', newline='') as f:
+            with open(p2, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(legacy)             # 9-col header only
             _cs.ensure(p2, _rpl.TRADE_COLUMNS)
             hf2, _ = _cs.inspect(p2)
@@ -8209,7 +8242,7 @@ class SelfTest:
         tmp = tempfile.mkdtemp(prefix='aureon_r8x_')
         try:
             def _hdr_row(path):
-                with open(path, newline='') as fh:
+                with open(path, newline='', encoding='utf-8') as fh:
                     rows = list(csv.reader(fh))
                 return rows[0], (rows[1] if len(rows) > 1 else [])
             # (a) the REAL journal writer: header == row == JOURNAL_COLUMNS.
@@ -8227,21 +8260,21 @@ class SelfTest:
             # (b) legacy NARROW journal header (pre-trigger_source) self-heals via ensure().
             legacy_j = list(_j.JOURNAL_COLUMNS[:-1])            # drop trigger_source (19 cols)
             pj = os.path.join(tmp, 'legacy_journal.csv')
-            with open(pj, 'w', newline='') as f:
+            with open(pj, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f); w.writerow(legacy_j)
                 w.writerow(['2026-07-09', 'A1', '4000', 'BUY', '', '4000', '0.35', '3982',
                             '4030', '8', '', '4005', '', '', 'TP', '12.0', '7', '', 'normal',
                             'SCHEDULED'])                       # a 20-col row already appended
             res_j = _cs.migrate(pj, _j.JOURNAL_COLUMNS)
             hj, _ = _cs.inspect(pj)
-            jrows = list(csv.DictReader(open(pj)))
+            jrows = list(csv.DictReader(open(pj, encoding='utf-8')))
             journal_heal = (res_j['migrated'] and len(hj) == len(_j.JOURNAL_COLUMNS)
                             and hj[-1] == 'trigger_source' and os.path.exists(pj + '.bak')
                             and jrows[0]['trigger_source'] == 'SCHEDULED' and None not in jrows[0])
             # (c) legacy NARROW rescue_events header self-heals + idempotent.
             legacy_r = list(_rl.RESCUE_CSV_HEADER[:-1])         # drop the last column
             pr = os.path.join(tmp, 'rescue_events.csv')
-            with open(pr, 'w', newline='') as f:
+            with open(pr, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(legacy_r)
             _cs.ensure(pr, _rl.RESCUE_CSV_HEADER)
             hr, _ = _cs.inspect(pr)
@@ -8250,9 +8283,9 @@ class SelfTest:
             idem = (_cs.migrate(pr, _rl.RESCUE_CSV_HEADER)['reason'] == 'already-current')
             # (d) migrate_run_dir sweeps BOTH new writers.
             os.makedirs(os.path.join(tmp, 'journal'), exist_ok=True)
-            with open(os.path.join(tmp, 'journal', 'trades_2026-06.csv'), 'w', newline='') as f:
+            with open(os.path.join(tmp, 'journal', 'trades_2026-06.csv'), 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(legacy_j)               # stale journal month file
-            with open(pr, 'w', newline='') as f:
+            with open(pr, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(legacy_r)               # re-stale rescue for the sweep
             swept = {m['file'] for m in _cs.migrate_run_dir(tmp)}
             sweep_ok = ('rescue_events.csv' in swept and 'trades_2026-06.csv' in swept)
@@ -8341,11 +8374,11 @@ class SelfTest:
             _pr.write_report_files(rep, run_dir=tmp)
             # inject: corrupt the ledger's ROGUE day P&L
             lp = os.path.join(tmp, 'reports', 'pnl_ledger.csv')
-            rows = list(csv.DictReader(open(lp)))
+            rows = list(csv.DictReader(open(lp, encoding='utf-8')))
             for r in rows:
                 if r['scope'] == 'ROGUE':
                     r['rogue_day_pnl'] = '999.99'
-            with open(lp, 'w', newline='') as f:
+            with open(lp, 'w', newline='', encoding='utf-8') as f:
                 w = csv.DictWriter(f, fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
             res = _rec.reconcile_day(tr, date)
             named = any(m['surface'] == 'ledger' and m['engine'] == 'rogue'
@@ -8376,7 +8409,7 @@ class SelfTest:
             root = os.path.dirname(os.path.abspath(__file__))
 
             def _src(name):
-                with open(os.path.join(root, name)) as f:
+                with open(os.path.join(root, name), encoding='utf-8') as f:
                     return f.read()
             pr_src = _src('pnl_report.py')
             rc_src = _src('pnl_reconcile.py')
@@ -8620,7 +8653,7 @@ class SelfTest:
                           exit_px='', tp=4010.0, sl=4000.0, ticket=700001,
                           seed_source='A1_TIME_SNAPSHOT')
             path = os.path.join(tmp, _f.TRADES_CSV)
-            with open(path, newline='') as fh:
+            with open(path, newline='', encoding='utf-8') as fh:
                 rows = list(csv.DictReader(fh))
             header_ok = (rows and list(rows[0].keys())[-1] == 'seed_source'
                          and rows[0]['seed_source'] == 'A1_TIME_SNAPSHOT')
@@ -8685,7 +8718,7 @@ class SelfTest:
                              and trf._fetcher['seed_source'] == 'MANUAL')
             self._fetch_tick(trf, envf, 4005.0)          # +$5 -> BUY enters, writes a row
             path = os.path.join(tmp, _f.TRADES_CSV)
-            rows = list(csv.DictReader(open(path))) if os.path.exists(path) else []
+            rows = list(csv.DictReader(open(path, encoding='utf-8'))) if os.path.exists(path) else []
             csv_manual = (len(rows) >= 1 and all(rw.get('seed_source') == 'MANUAL' for rw in rows))
             ok = rogue_ok and fetch_seed_ok and csv_manual
             detail = (f"rogue_manual@{r_px}(src={tr._rogue['seed_source']}) "
@@ -8767,7 +8800,7 @@ class SelfTest:
             reanchor = (tr._fetcher.get('open') is None
                         and abs(tr._fetcher['anchor'] - exit_px) < 1e-9
                         and tr._fetcher['seed_source'] == 'MANUAL')
-            rows = list(csv.DictReader(open(os.path.join(tmp, _f.TRADES_CSV))))
+            rows = list(csv.DictReader(open(os.path.join(tmp, _f.TRADES_CSV), encoding='utf-8')))
             all_manual = (len(rows) >= 2 and all(rw.get('seed_source') == 'MANUAL' for rw in rows))
             ok = no_entry and entered and reanchor and all_manual
             detail = (f"no_entry@under={no_entry} entered@trigger={entered} "
@@ -9996,7 +10029,7 @@ class SelfTest:
 
             # JOB 1: a forced write-ERROR is caught NON-FATALLY (returns False, never raises).
             blocker = os.path.join(tmp, 'blocker')
-            with open(blocker, 'w') as f:
+            with open(blocker, 'w', encoding='utf-8') as f:
                 f.write('x')                          # a FILE where a dir is needed
             bad_path = os.path.join(blocker, 'sub', 'selftest_report.md')
             write_failed_safely = (_st.write_selftest_report(md, bad_path) is False)
@@ -10108,7 +10141,7 @@ class SelfTest:
             os.environ['AUREON_RUN_DIR'] = tmp
             try:
                 rc = _r.enqueue_seed_command(tr.cfg)
-                with open(os.path.join(tmp, 'commands.json')) as f:
+                with open(os.path.join(tmp, 'commands.json'), encoding='utf-8') as f:
                     cmds = json.load(f)
             finally:
                 if _prev is None:
@@ -10161,7 +10194,7 @@ class SelfTest:
                 cfg = dataclasses.replace(self.cfg, rogue_enabled=True,
                                           rogue_a1_anchor_mode=True)
                 cpath = os.path.join(tmp, f"commands_{'demo' if demo else 'funded'}.json")
-                json.dump([{"cmd": "rogueseed"}], open(cpath, "w"))   # launcher queued it
+                json.dump([{"cmd": "rogueseed"}], open(cpath, "w", encoding='utf-8'))   # launcher queued it
                 stub = types.SimpleNamespace(
                     commands_path=cpath, adapter=ad, cfg=cfg, paper=True, _rogue=None,
                     state={'last_broker_date': '2026-06-29'},
@@ -10181,7 +10214,7 @@ class SelfTest:
             tr._handle_commands()                                   # (a) the per-tick poll
             planted = (tr._rogue is not None
                        and abs(tr._rogue.get('a1_last_close', 0) - 4100.0) < 1e-9)
-            cleared = (json.load(open(cpath)) == [])                # (b) command removed
+            cleared = (json.load(open(cpath, encoding='utf-8')) == [])                # (b) command removed
             # (c) idempotent: a second loop must NOT replant (file already empty)
             tr._rogue['a1_last_close'] = None
             tr._handle_commands()
@@ -11171,42 +11204,45 @@ class SelfTest:
 
     # --- v3.5.0 all-16: freeze / independence / routing / flag table --------
     def _step_strat_full_freeze(self):
-        # 142 FREEZE: with ALL strategy flags FALSE (the defaults) behavior == master.
-        # The rally override fires IMMEDIATELY (override_entry OFF) and every strategy
-        # extra defaults OFF (12/13/14) so order logic is byte-identical to v3.5.0 core.
-        import rally as _rally
+        # 142 FREEZE: with ALL strategy flags FALSE, behavior == v3.5.0 master core -- the
+        # rally override fires IMMEDIATELY (override_entry OFF) and the ptrace event is the
+        # legacy shape (no entry_mode). Asserted over a CONSTRUCTED all-flags-off cfg, not the
+        # live cfg's happening-to-be-off values, so flipping a live default (e.g.
+        # rescue_entry_enabled) can never break this freeze proof.
+        import rally as _rally, dataclasses
         try:
-            strat_off = (getattr(self.cfg, 'override_entry_enabled') is False
-                         and getattr(self.cfg, 'rescue_entry_enabled') is False
-                         and getattr(self.cfg, 'entry_confirm_candle') is False
-                         and getattr(self.cfg, 'entry_adaptive_depth') is False
-                         and getattr(self.cfg, 'rescue_sl_wide') is False)
+            cfg_off = dataclasses.replace(
+                self.cfg, override_entry_enabled=False, rescue_entry_enabled=False,
+                entry_confirm_candle=False, entry_adaptive_depth=False, rescue_sl_wide=False)
             bars = self._case2_bars()
             tr, sh, pl = self._break_gate_stub(lambda s, n: bars, side='SELL',
-                                               parent_side='SELL', parent_max_fav=25.0)
+                                               parent_side='SELL', parent_max_fav=25.0,
+                                               cfg=cfg_off)
             immediate = (_rally.break_and_hold_ok(tr, sh, pl) is True)
             ev = [e for e in self._gate_ptrace if e[0] == 'break_override_parent_established']
             legacy = (len(ev) == 1 and 'entry_mode' not in ev[0][1])
-            ok = strat_off and immediate and legacy
-            detail = f"all_strategy_flags_off={strat_off} immediate_override_fire={immediate} legacy={legacy}"
+            ok = immediate and legacy
+            detail = f"all_flags_off_cfg -> immediate_override_fire={immediate} legacy_event={legacy}"
         except Exception as e:
             self._record(158, FAIL, f"raised: {e!r}"); return
         self._record(158, PASS if ok else FAIL, detail)
 
     def _step_per_flag_indep(self):
-        # 143: each strategy flag toggles INDEPENDENTLY -- flipping one leaves the others
-        # at their defaults (no cross-wiring).
+        # 143: each strategy flag toggles INDEPENDENTLY -- flipping one leaves EVERY other flag
+        # at its BASELINE value (no cross-wiring). Compared against the baseline cfg, not a
+        # hardcoded default, so an owner-tuned default (e.g. rescue_entry_enabled=True) does not
+        # break the independence proof.
         import dataclasses
         try:
+            keys = ('override_entry_enabled', 'rescue_entry_enabled',
+                    'entry_confirm_candle', 'entry_adaptive_depth', 'rescue_sl_wide')
+            base = self.cfg
             checks = []
-            for key in ('override_entry_enabled', 'rescue_entry_enabled',
-                        'entry_confirm_candle', 'entry_adaptive_depth', 'rescue_sl_wide'):
-                c = dataclasses.replace(self.cfg, **{key: True})
-                others = [k for k in ('override_entry_enabled', 'rescue_entry_enabled',
-                                      'entry_confirm_candle', 'entry_adaptive_depth',
-                                      'rescue_sl_wide') if k != key]
-                only_this = (getattr(c, key) is True
-                             and all(getattr(c, o) is False for o in others))
+            for key in keys:
+                flipped = not bool(getattr(base, key))
+                c = dataclasses.replace(base, **{key: flipped})
+                only_this = (bool(getattr(c, key)) == flipped
+                             and all(getattr(c, o) == getattr(base, o) for o in keys if o != key))
                 checks.append(only_this)
             ok = all(checks)
             detail = f"each_flag_independent={ok} ({sum(checks)}/{len(checks)})"
@@ -11237,9 +11273,12 @@ class SelfTest:
         self._record(160, PASS if ok else FAIL, detail)
 
     def _step_flag_table_check(self):
-        # 145: all 16 features have their flag/param on Config with the directive defaults
-        # (the flag-reference table, asserted in code).
+        # 145: all 16 features have their flag/param PRESENT on Config with the right TYPE
+        # (the flag-reference table). The SPEC value fixes only the expected TYPE, never the
+        # value -- these are owner-tunable knobs, and a config change must not break this
+        # structural check (E-22 lesson). A behaviour that mis-wires a flag's type still fails.
         try:
+            # each entry's value fixes the expected TYPE only (bool / int / float / str).
             spec = {
                 'override_entry_enabled': False, 'rescue_entry_enabled': False,
                 'override_entry_smooth_confirm': True, 'rescue_entry_smooth_confirm': True,
@@ -11253,10 +11292,12 @@ class SelfTest:
                 'fix_boost_telemetry': True, 'fix_a1_offset': True,
             }
             missing = [k for k in spec if not hasattr(self.cfg, k)]
-            wrong = [k for k, v in spec.items()
-                     if hasattr(self.cfg, k) and getattr(self.cfg, k) != v]
-            ok = (not missing and not wrong)
-            detail = f"all_flags_present={not missing} defaults_correct={not wrong} missing={missing} wrong={wrong}"
+            # bool is a subtype of int, but type() identity distinguishes them exactly.
+            wrong_type = [k for k, v in spec.items()
+                          if hasattr(self.cfg, k) and type(getattr(self.cfg, k)) is not type(v)]
+            ok = (not missing and not wrong_type)
+            detail = (f"all_flags_present={not missing} all_types_correct={not wrong_type} "
+                      f"missing={missing} wrong_type={wrong_type}")
         except Exception as e:
             self._record(161, FAIL, f"raised: {e!r}"); return
         self._record(161, PASS if ok else FAIL, detail)
