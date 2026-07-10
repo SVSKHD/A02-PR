@@ -9,15 +9,19 @@ is built, what is **blocked on data**, and exactly what is needed to finish.
 ## TL;DR
 
 - **Part 1A (tick cache) — BUILT & TESTED** (`python bot.py fetchticks --from … --to …`).
-- **Part 1B/1C (the simulator + reports), THE GATE, Part 2 (boost redesign),
-  Part 3 (variant runs) — BLOCKED.** They require real 2026-07 XAUUSD **ticks**,
-  the **200-position deal export** (the MT5 truth), and **`AUREON_boost_redesign_spec.md`**
-  — none of which exist in this sandbox (no MT5; empty `backtest/ticks/`; the spec
-  file and deal export are not in the repo).
-- Per the task's own rule — *"if the baseline does not reproduce the MT5 truth,
-  the simulator is wrong and every downstream number is fiction … do not tune the
-  sim to match … stop here and report"* — I did **not** fabricate a gate pass or
-  build Parts 2–3 on synthetic data.
+- **Part 1B/1C (the simulator + reports) — BUILT, UNVALIDATED** (`python bot.py
+  simulate --from … --to …`). The REAL `LiveTrader._tick()` loop drives a fake
+  broker offline (no strategy fork); every artifact carries the mandatory
+  **GATE-NOT-RUN** header.
+- **THE GATE — CANNOT PASS YET.** It needs real 2026-07 ticks + the 200-position
+  deal export. Neither is in the sandbox, so the gate is wired and run but reports
+  **NOT PASSED** on synthetic data — never a fabricated pass, never tuned to match.
+- **Part 2 (boost redesign) — NOT STARTED, by instruction** ("do not implement
+  `boost_spec_v2` until the gate passes on real ticks"). `AUREON_boost_redesign_spec.md`
+  is also not yet in the repo.
+- Per the task's rule — *"if the baseline does not reproduce the MT5 truth, every
+  downstream number is fiction … do not tune the sim to match … stop and report"*
+  — Parts 2–3 are held until the gate passes on the committed real-tick cache.
 
 ---
 
@@ -101,16 +105,35 @@ Needs: **(a)** real ticks for 2026-07-01..07-10 — run `python bot.py fetchtick
 export** (comment-labelled) that produced the MT5 truth table, so the sim's
 per-anchor / rogue / fetcher output can be diffed against it to a stated tolerance.
 
-### Part 1B — the simulator (design, not yet built)
-The correct design (no strategy fork) is a **fake adapter behind the real
-`LiveTrader._tick()` loop** driven by cached ticks — `LiveTrader` already has a
-`paper` mode; the seam is `self.adapter` (`symbol_info_tick`, `place_market_order`,
-`positions_get`, `history_deals_get`, `account_info`). The fake broker fills at
-tick+spread, fires SL/TP on tick touch, stamps **real magics + `AUR_*` comments**
-(so `pnl_report`'s classifier and `magic_day_net` work unchanged), and computes
-equity incl. unrealized so `risk._check_kill_switch` and every `daystops` governor
-fire exactly as live. This is a **large integration** and — critically — is
-**unvalidatable without the real ticks above**, so it was not built blind.
+### Part 1B/1C — the simulator + reports (BUILT, unvalidated)
+`backtest/sim_broker.py` (fake broker) + `backtest/simulator.py` (driver) +
+`backtest/sim_report.py` (reports) + `backtest/sim_gate.py` (the gate). Run:
+`python bot.py simulate --from 2026-07-01 --to 2026-07-10`.
+
+- **No strategy fork.** A `FakeMT5` handle simulates the broker at TICK
+  resolution; the **real `mt5_adapter.MT5Adapter`** is wrapped around it (its
+  order/reconcile/price logic reused verbatim). `LiveTrader` is constructed
+  `paper=False` (paper mode disables the fill-reconcile + boost engine), so the
+  **real** order path, fills reconcile, trails, rogue, fetcher, boost family,
+  every `daystops` governor, the 3% kill switch (`risk._check_kill_switch`, on
+  equity **incl. unrealized**), and the EOD/Friday flatten all run against the
+  fake broker. Verified in-sim: anchor stops fill on tick touch, positions close
+  at TP/SL, OUT deals carry **real magics + `AUR_*` comments** (so
+  `pnl_report.classify_comment` + `pnl_source.magic_day_net` work unchanged), and
+  the anchors day-profit-stop governor fires.
+- **Clock:** `pandas.Timestamp.now` is monkeypatched to the sim tick time for the
+  run (the tick loop reads wall-clock `now()`, not the tick); the fake adapter's
+  `server_time_utc()` returns the same sim time.
+- **Isolation:** all engine-state writes go to a scratch dir via `AUREON_RUN_DIR`;
+  **nothing** is written under the live `run/` (asserted by selftest 298, which
+  snapshots `run/` before/after). Reports go to `sim/reports/<run-id>/`.
+- **Every artifact** (daily `.md`, `pnl_ledger.csv`, `summary.md`, `GATE.txt`,
+  console) carries the two-line **GATE-NOT-RUN** header. Removed only when the
+  gate passes.
+- **What it still cannot model / caveats:** intrabar order on any non-`tick` day
+  (M1/synthetic) is unknown — the manifest flags it and the gate refuses to pass;
+  spread/slippage are configurable approximations (defaults 0.20 / 0.0); the sim
+  has not been validated against real July prices (synthetic ticks only here).
 
 ### Part 2 — boost redesign (`boost_spec_v2`, default OFF)
 Gated on the GATE passing **and** on `AUREON_boost_redesign_spec.md` (not in repo).
@@ -127,10 +150,14 @@ outlier). Blocked until 1B runs on real ticks.
 
 ## Recommended next step
 
-Run on the VPS:
+The machinery is built. To make it MEAN anything, on the VPS:
 ```
-python bot.py fetchticks --from 2026-07-01 --to 2026-07-10
+python bot.py fetchticks --from 2026-07-01 --to 2026-07-10   # real ticks
+git add backtest/ticks && git commit                          # commit the cache
+# commit the 200-position deal export CSV under backtest/ (name it deal_export*.csv)
+python bot.py simulate  --from 2026-07-01 --to 2026-07-10     # run the gate for real
 ```
-commit `backtest/ticks/` (parquet + manifest), and provide the deal export + the
-boost-redesign spec. Then Part 1B/1C are built against real ticks, the gate is run
-honestly, and — only if it passes — Parts 2–3 follow.
+Then the gate compares sim buckets to the deal-export truth on all-tick data. If
+it PASSES to tolerance, the GATE-NOT-RUN header is removed and Part 2
+(`boost_spec_v2`) begins. If it does not, the gap is REPORTED and explained —
+never tuned away.

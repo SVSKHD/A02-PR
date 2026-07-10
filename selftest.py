@@ -402,6 +402,8 @@ STEP_NAMES = {
     296: "r14 report==authority",       # OUT-only counted, IN-only not lost, partials summed once, report_net==magic_day_net, reconcile ok
     # 2026-07-10 offline simulator Part 1A: per-day tick cache + manifest (resolution tag).
     297: "sim tick cache",              # per-day parquet/csv split, idempotent, manifest records tick/M1/unavailable, writes only under backtest/ticks
+    # 2026-07-10 offline simulator Part 1B/1C: real LiveTrader tick loop behind a fake broker.
+    298: "sim engine drives",           # fake broker + REAL _tick(): anchor fills, real AUR_* comments, magic_day_net works, GATE-NOT-RUN header on every artifact, nothing writes to run/
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9688,6 +9690,90 @@ class SelfTest:
             self._record(297, FAIL, f"raised: {e!r}"); return
         self._record(297, PASS if ok else FAIL, detail)
 
+    def _step_sim_engine_drives(self):
+        # 298 Part 1B/1C offline simulator: the REAL LiveTrader._tick() loop runs against a FAKE
+        # broker over a synthetic tick day (MT5 disconnected, no strategy fork). Asserts: an
+        # anchor stop fills and the position closes -> OUT deals carry the REAL AUR_* comment and
+        # magic (so pnl_report.classify_comment + pnl_source.magic_day_net work UNCHANGED); the
+        # per-engine reports carry the mandatory GATE-NOT-RUN header on EVERY artifact; the gate
+        # runs and reports NOT-passed on synthetic (never a fabricated pass); and NOTHING is
+        # written under the live run/ tree (the sim state goes to a scratch dir).
+        import importlib.util as _ilu, os, tempfile, glob, shutil
+        import pandas as pd
+        try:
+            bt = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest')
+            def _load(name):
+                p = os.path.join(bt, name + '.py')
+                s = _ilu.spec_from_file_location('aureon_' + name + '_st', p)
+                m = _ilu.module_from_spec(s); s.loader.exec_module(m); return m
+            sim = _load('simulator'); srep = _load('sim_report'); sgate = _load('sim_gate')
+            import config as _cfgmod
+            cfg = _cfgmod.Config(); cfg.util_daily_pnl_report = False
+            off = int(cfg.broker_tz_offset_hours)
+            # a compact A2 day (broker ~09:30..11:30) that breaks UP past TP so a leg closes fast
+            date = '2026-07-02'; day0 = pd.Timestamp(date + ' 00:00:00', tz='UTC')
+            rows = []; start = day0 + pd.Timedelta(hours=9 - off); n = int(2.5 * 3600 / 5); base = 4000.0
+            for i in range(n):
+                t = start + pd.Timedelta(seconds=5 * i)
+                bh = (t + pd.Timedelta(hours=off)).hour + (t + pd.Timedelta(hours=off)).minute / 60.0
+                mid = base + (40.0 * min(1.0, (bh - 10.08) / 0.4) if bh >= 10.08 else 0.0)
+                rows.append((t, round(mid - 0.10, 2), round(mid + 0.10, 2)))
+            df = pd.DataFrame(rows, columns=['time', 'bid', 'ask'])
+            tmp = tempfile.mkdtemp(prefix='aureon_simst_')
+            run_before = _run_snapshot = None
+            try:
+                # snapshot the live run/ dir so we can prove it is untouched
+                run_dir = os.path.join(os.path.dirname(bt), 'run')
+                def _snap():
+                    out = {}
+                    for r, _d, fs in os.walk(run_dir):
+                        for fn in fs:
+                            fp = os.path.join(r, fn)
+                            try: out[fp] = os.path.getmtime(fp)
+                            except OSError: pass
+                    return out
+                run_before = _snap() if os.path.isdir(run_dir) else {}
+                os.environ['AUREON_SIM_DIR'] = os.path.join(tmp, 'sim')
+                res = sim.simulate(cfg, [(date, df)], scratch_dir=os.path.join(tmp, 'st'),
+                                   tick_cadence_s=4.0)
+                deals = res.get('deals', [])
+                import pnl_source as _ps, pnl_report as _pr
+                closed = res.get('closed_positions', 0)
+                out_deals = [d for d in deals if getattr(d, 'entry', None) == 1]
+                real_comments = all(str(getattr(d, 'comment', '')).startswith('AUR_') for d in out_deals) and bool(out_deals)
+                anet = _ps.magic_day_net(deals, _ps.ANCHORS_MAGIC)
+                pa = _pr.per_anchor_stats(_pr.build_trades(deals))
+                classifies = any(k in ('A1','A2','A3','A4','A5') for k in pa)
+                fills_and_closes = (closed >= 1 and abs(anet) > 0.0)
+                # reports carry the GATE header on EVERY artifact
+                out_dir, _reports, summ = srep.write_reports('ST', deals, cfg, [date])
+                arts = glob.glob(os.path.join(out_dir, '*'))
+                hdr_all = bool(arts) and all('GATE-NOT-RUN' in open(p, encoding='utf-8').read() for p in arts)
+                # the gate runs and does NOT fabricate a pass on synthetic data
+                gate = sgate.run_gate(deals, resolution_all_tick=False)
+                gate_honest = (gate['passed'] is False)
+                # the run/ guard refuses run/ paths
+                guard_ok = False
+                try:
+                    srep.sc.assert_not_run_dir(os.path.join(run_dir, 'x')); guard_ok = False
+                except AssertionError:
+                    guard_ok = True
+                # the LIVE run/ tree is byte-for-byte untouched
+                run_after = _snap() if os.path.isdir(run_dir) else {}
+                run_untouched = (run_before == run_after)
+                ok = (fills_and_closes and real_comments and classifies and hdr_all
+                      and gate_honest and guard_ok and run_untouched)
+                detail = (f"closed={closed} anchors_net={anet} real_AUR_comments={real_comments} "
+                          f"classifies={classifies} gate_header_on_all={hdr_all} "
+                          f"gate_not_passed={gate_honest} guard={guard_ok} run_untouched={run_untouched}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+                os.environ.pop('AUREON_SIM_DIR', None)
+        except Exception as e:
+            import traceback
+            self._record(298, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(298, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -11934,6 +12020,8 @@ class SelfTest:
             self._step_r14_report_truth()
             # Part 1A (07-10): offline-simulator per-day tick cache + resolution manifest.
             self._step_sim_tick_cache()
+            # Part 1B/1C (07-10): the REAL LiveTrader tick loop drives a fake broker offline.
+            self._step_sim_engine_drives()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

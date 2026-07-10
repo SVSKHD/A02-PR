@@ -71,6 +71,8 @@ backtest/results/*.csv
 !backtest/results/
 !backtest/ticks/.gitkeep
 !backtest/results/.gitkeep
+# Offline-simulator RUN OUTPUT (sim/reports/<run-id>/...) is local, like run/ — never committed.
+sim/
 # Part 1A offline-simulator PER-DAY cache (XAUUSD_YYYY-MM-DD.parquet) + manifest are
 # INTENTIONALLY committable: the gate must be reproducible from the committed cache
 # (run `fetchticks` on the VPS, then commit backtest/ticks/*.parquet + manifest.json).

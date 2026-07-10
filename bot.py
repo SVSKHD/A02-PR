@@ -60,7 +60,8 @@ def main():
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
                                          'testfire', 'verifyfb', 'rescuestats',
                                          'bescratchscan', 'rogueseed', 'fetchseed',
-                                         'dailyreport', 'reconcile', 'fetchticks'])
+                                         'dailyreport', 'reconcile', 'fetchticks',
+                                         'simulate'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -230,6 +231,20 @@ def main():
         sys.exit(_tc.run_cli(args.date_from, args.date_to, symbol=cfg.symbol,
                              broker_tz_offset_hours=cfg.broker_tz_offset_hours,
                              force=args.force))
+
+    elif args.mode == 'simulate':
+        # OFFLINE SIMULATOR (Part 1B): replay the cached ticks in [--from, --to]
+        # through the REAL LiveTrader tick loop behind a fake broker (MT5
+        # disconnected). Writes sim/reports/<run-id>/ and runs THE GATE vs the MT5
+        # deal-export truth. Every artifact carries the GATE-NOT-RUN header; the
+        # gate cannot pass on synthetic/M1 data. Writes ONLY under sim/, never run/.
+        import importlib.util as _ilu
+        _sm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'backtest', 'simulator.py')
+        _spec = _ilu.spec_from_file_location('aureon_simulator', _sm_path)
+        _sm = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_sm)
+        sys.exit(_sm.run_cli(args.date_from, args.date_to))
 
     elif args.mode == 'rogueseed':
         # Manual Rogue A1-mode seed: enqueue a 'rogueseed' command onto the RUNNING bot's
