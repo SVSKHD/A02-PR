@@ -100,6 +100,24 @@ from mt5_adapter import _MT5_RETCODE_MAP
 log = logging.getLogger("AUREON")
 
 
+def _bs_mode(cfg):
+    """D-31: 'SPEC_V2' / 'F-B' boost mode (guarded)."""
+    try:
+        import boost_spec as _bspec
+        return _bspec.boost_mode(cfg)
+    except Exception:
+        return 'F-B'
+
+
+def _bs_mode_line(cfg, suppressed_today=0):
+    """D-31: the /status boost-mode line (guarded)."""
+    try:
+        import boost_spec as _bspec
+        return _bspec.boost_mode_line(cfg, suppressed_today)
+    except Exception:
+        return "Boost mode: F-B (trapped-leg hedge at $10 adverse)"
+
+
 # ============================================================================
 # LiveTrader
 # ============================================================================
@@ -227,6 +245,8 @@ class LiveTrader:
         # Bar-close tracking
         self._last_managed_minute: Optional[pd.Timestamp] = None
         self._tick_counter = 0
+        # D-31: BOOST_SUPPRESSED_IN_BAND count for THIS broker day (boost_spec_v2).
+        self._spec_suppressed_today = 0
         # E-22: the "Anchor processing GATED" warning fires ONCE per kill-switch lock event
         # (was ~10/min). Reset at the broker day roll (the only place the lock clears).
         self._kill_gate_warned = False
@@ -404,6 +424,10 @@ class LiveTrader:
             except Exception:
                 pass
             self._kill_gate_warned = False
+            # D-31: reset the boost_spec_v2 per-day suppressed count + the once-per-day
+            # "armed" log gate (the band state itself is transient per straddle).
+            self._spec_suppressed_today = 0
+            self._spec_armed_logged = set()
             self.state['last_broker_date'] = str(broker_date)
             self.state['processed_anchors_today'] = []
             self.state['missed_anchors_today'] = []   # v3.0.5: reset late-window give-ups
@@ -628,6 +652,11 @@ class LiveTrader:
             "day_pnl_by_engine": self._day_pnl_by_engine_payload(),
             # v3.7.6 daily 2% target with the A4 gate (display-only; [] when disabled).
             "target_lines": self._target_status_lines_payload(),
+            # D-31 visibility: boost mode + today's suppressed-in-band count (SPEC_V2)
+            # so /status renders "Boost mode: SPEC_V2 · suppressed-in-band today: N".
+            "boost_mode": _bs_mode(self.cfg),
+            "boost_suppressed_in_band_today": int(getattr(self, '_spec_suppressed_today', 0)),
+            "boost_mode_line": _bs_mode_line(self.cfg, getattr(self, '_spec_suppressed_today', 0)),
             "mode": "paper" if self.paper else "live",
             "lot_size": self.cfg.lot_size,
             "starting_balance": self.cfg.starting_balance,
@@ -1523,6 +1552,14 @@ class LiveTrader:
                 "Seed fallback": str(getattr(self.cfg, 'rogue_seed_fallback',
                                              'a1_time_snapshot')),
             }
+            # D-31: boost mode + today's suppressed-in-band count (the whole point of R1).
+            try:
+                import boost_spec as _bspec
+                snap["Boost mode"] = _bspec.boost_mode_line(
+                    self.cfg, getattr(self, '_spec_suppressed_today', 0)
+                ).split(': ', 1)[1]
+            except Exception:
+                pass
             # v3.7.3: fold the per-engine day-lock states into the engines embed.
             try:
                 for _ln in self._daylock_lines():
@@ -2157,6 +2194,7 @@ class LiveTrader:
                         else "\nFP\\_ZERO\\_MAX\\_LOT: `None` (Pepperstone demo — no cap)")
         _mode = 'PAPER' if self.paper else 'LIVE'
         _alerts_val = f"Discord cards · heartbeat {_hb}m"
+        import boost_spec as _boost_spec
         self.tele.send(
             f"🚀 *AUREON v{AUREON_VERSION} {_mode} starting*\n"
             f"Lot: `{self.cfg.lot_size}` ({auto_lot_label})\n"
@@ -2164,6 +2202,7 @@ class LiveTrader:
             f"Hold: `{self.cfg.freeze_minutes}m` | TSTOP: `fav<${getattr(self.cfg, 'tstop_fav', 0):.2f}` | NoOCO: `{getattr(self.cfg, 'no_oco', False)}`\n"
             f"Ladder: `5>BE | 6>+4 | 10>peak-2` | Trail: `gap ${self.cfg.trail_gap:.2f}, arm ${self.cfg.be_trigger:.2f}`\n"
             f"SL/TP: `${self.cfg.sl_dist:.0f}/${self.cfg.tp_dist:.0f}` | Roles: `normal + RESCUE 2nd legs`\n"
+            f"{_boost_spec.startup_card_line(self.cfg)}\n"
             f"Boost RALLY: `{_boost_n}x SL ${_rally_sl:.0f}` | trail `${_rally_gap:.2f}` | cap `-${_rally_cap:.0f}` · RESCUE: `SL ${_boost_sl:.0f}` | gap `${_boost_gap:.2f}` | cap `-${_whip_cap:.0f}` | isolated\n"
             f"{_alert_line}\n"
             f"Defer waits: A1/A3=15s, A2/A4/A5=30s | rc=-1 retries: {self.MAX_PLACEMENT_RETRIES} (15s, 30s)\n"
@@ -2180,6 +2219,19 @@ class LiveTrader:
                 f"RALLY ${_rally_sl:.0f}/cap-${_rally_cap:.0f} · RESCUE ${_boost_sl:.0f}/cap-${_whip_cap:.0f} (isolated)",
                 _alerts_val),
         )
+        # D-31: LOUD one-time boost_spec_v2 ACTIVE block at boot -- INFO log + a single
+        # Discord post -- so an operator can tell at a glance the new boost logic is live.
+        # Flag OFF -> active_block_lines is empty -> prints nothing (byte-identical).
+        _spec_block = _boost_spec.active_block_lines(self.cfg)
+        if _spec_block:
+            for _ln in _spec_block:
+                log.info(_ln)
+            try:
+                self.tele.send("\n".join(_spec_block), Severity.WARN, important=True,
+                               event_key="boost-spec-v2-active")
+            except Exception:
+                pass
+
         # v3.1.0: start the Discord heartbeat (no-op if Discord disabled).
         self._start_discord_heartbeat()
 

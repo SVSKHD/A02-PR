@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.8"  # D-31: boost_spec_v2 (flag-gated, DEFAULT OFF) — boosts JOIN the winning side outside the band + one-way ratchet (never negative); F-B gated off when ON; freeze=0 (R8) + tstop_after_min. UNVALIDATED on ticks.
+__version__ = "3.8.9"  # D-31 visibility: dynamic preflight flag list (every Config bool), boot ACTIVE block + startup "Boost mode" line, /status + /engines boost mode + suppressed-in-band count, state-machine armed/BAND_ESTABLISHED logs. Display-only; flag OFF byte-identical.
 CODENAME = "Astra Hawk"
 
 

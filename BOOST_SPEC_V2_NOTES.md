@@ -75,6 +75,25 @@ no boost at 4127.x, SELL boosts on the downside, four-leg total **+$1.05 vs the
 fires once at 45m, never at t=0). **Total: 302 steps, 301 PASS, 0 FAIL** (1 env
 WARN = Discord unconfigured).
 
+## Visibility (v3.8.9 — display only, flag OFF byte-identical)
+
+The flag was live but invisible on the boot banner. Fixed:
+1. **Preflight flag list is now DYNAMIC** — `boost_metrics.all_bool_flags(cfg)`
+   iterates every bool field on `Config`, so `boost_spec_v2` (and any future flag)
+   appears in the ON/OFF banner automatically. No more stale hardcoded list.
+2. **Loud boot block** when ON (`[BOOST-SPEC-V2] ACTIVE — …` + the R1/R2/R3/R5/F-B/
+   freeze/tstop summary, all read from cfg): logged at INFO and posted once to
+   Discord. Empty when OFF (byte-identical boot).
+3. **Startup card** gains a `Boost mode: SPEC_V2` / `F-B` line where Ladder/Trail/
+   SL-TP print.
+4. **/status + /engines** show `Boost mode: SPEC_V2 · suppressed-in-band today: N`,
+   where N counts `BOOST_SUPPRESSED_IN_BAND` events this broker day (reset at the
+   day roll) — how many boosts the old F-B would have fired into the band.
+5. **State-machine visibility**: `[BOOST-SPEC-V2] armed for A2 — awaiting fills`
+   once per anchor when its straddle is pending, and `[BOOST-SPEC-V2]
+   BAND_ESTABLISHED A2 lo=… hi=…` when the band forms — so a no-fill day is not
+   silent. Selftest **303** covers all of the above; total **303 steps**.
+
 ## WHAT REMAINS UNPROVEN
 
 **This spec has never been validated against real tick data.** The simulator's
