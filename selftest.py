@@ -400,6 +400,12 @@ STEP_NAMES = {
     # 2026-07-10 R-14 pnl_report <-> MT5 authority: report anchor net == magic_day_net,
     # never dropping a straddling / partial / unattributable realized close.
     296: "r14 report==authority",       # OUT-only counted, IN-only not lost, partials summed once, report_net==magic_day_net, reconcile ok
+    # 2026-07-10 offline simulator Part 1A: per-day tick cache + manifest (resolution tag).
+    297: "sim tick cache",              # per-day parquet/csv split, idempotent, manifest records tick/M1/unavailable, writes only under backtest/ticks
+    # 2026-07-10 offline simulator Part 1B/1C: real LiveTrader tick loop behind a fake broker.
+    298: "sim engine drives",           # fake broker + REAL _tick(): anchor fills, real AUR_* comments, magic_day_net works, GATE-NOT-RUN header on every artifact, nothing writes to run/
+    # 2026-07-10 offline simulator baseline = July AS TRADED: per-day config from the D-series.
+    299: "sim config as-traded",         # per-day config reconstruction: D-5/D-11/D-13/D-14/D-16-17/D-26-27/D-28/D-29 resolve to the right values per day incl the 07-07 14:58 intra-day rogue flip
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9620,6 +9626,245 @@ class SelfTest:
             self._record(296, FAIL, f"raised: {e!r}"); return
         self._record(296, PASS if ok else FAIL, detail)
 
+    def _step_sim_tick_cache(self):
+        # 297 Part 1A offline simulator TICK CACHE: backtest/tick_cache.fetch_range caches each
+        # calendar day to its OWN file with a manifest recording the resolution ACTUALLY obtained
+        # (tick vs M1 vs unavailable). Asserts: per-day split, idempotency (a day on disk is not
+        # refetched; its resolution is preserved, not downgraded to 'cache'), an M1 day is flagged
+        # (intrabar order unknown), an unavailable day writes NO file, and NOTHING is written
+        # outside the ticks dir (never run/). Drives the PURE plumbing with an injected synthetic
+        # day-fetch, so it proves the cache logic with no MT5.
+        import importlib.util as _ilu, tempfile, os, shutil
+        import pandas as pd
+        try:
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest', 'tick_cache.py')
+            _spec = _ilu.spec_from_file_location('aureon_tick_cache_test', _p)
+            tc = _ilu.module_from_spec(_spec); _spec.loader.exec_module(tc)
+            tmp = tempfile.mkdtemp(prefix='aureon_ticks_')
+            try:
+                def fake(sym, day, off):
+                    if day == '2026-07-01':
+                        t = pd.date_range('2026-07-01', periods=50, freq='s', tz='UTC')
+                        return (pd.DataFrame({'time': t, 'bid': 4000.0, 'ask': 4000.2}),
+                                tc.RES_TICK, 'mt5-ticks')
+                    if day == '2026-07-02':
+                        t = pd.date_range('2026-07-02', periods=5, freq='min', tz='UTC')
+                        return (pd.DataFrame({'time': t, 'open': 4000.0, 'high': 4001.0,
+                                              'low': 3999.0, 'close': 4000.5}),
+                                tc.RES_M1, 'mt5-m1-fallback')
+                    return None, tc.RES_UNAVAILABLE, 'no-data'
+                r1 = tc.fetch_range('XAUUSD', '2026-07-01', '2026-07-03', tmp,
+                                    day_fetch_fn=fake, now_iso='2026-07-10T00:00:00Z')
+                split = (r1['summary'][tc.RES_TICK] == 1 and r1['summary'][tc.RES_M1] == 1
+                         and r1['summary'][tc.RES_UNAVAILABLE] == 1)
+                files = set(os.listdir(tmp))
+                # tick + M1 each wrote ONE day file; the unavailable day wrote NONE.
+                has_files = (any('2026-07-01' in f for f in files)
+                             and any('2026-07-02' in f for f in files)
+                             and not any('2026-07-03' in f for f in files))
+                m1_flagged = (r1['days']['2026-07-02']['resolution'] == tc.RES_M1)
+                unavail_no_path = (r1['days']['2026-07-03']['path'] is None)
+                # idempotency: a 2nd run refetches ONLY the unavailable day; cached days keep res.
+                seen = []
+                def spy(sym, day, off):
+                    seen.append(day); return fake(sym, day, off)
+                r2 = tc.fetch_range('XAUUSD', '2026-07-01', '2026-07-03', tmp,
+                                    day_fetch_fn=spy, now_iso='2026-07-10T01:00:00Z')
+                idem = (seen == ['2026-07-03'] and r2['summary'][tc.RES_CACHE] == 2
+                        and r2['days']['2026-07-01']['resolution'] == tc.RES_TICK
+                        and r2['days']['2026-07-02']['resolution'] == tc.RES_M1)
+                # round-trip load is tz-aware UTC
+                d = tc.load_day(tmp, 'XAUUSD', '2026-07-01')
+                roundtrip = (d is not None and len(d) == 50 and str(d['time'].dt.tz) == 'UTC')
+                # nothing escaped the ticks dir (manifest + day files only)
+                only_ticks_dir = all(f == 'manifest.json' or f.startswith('XAUUSD_') for f in files)
+                # the real MT5 fetch degrades to 'unavailable' with no MT5 (never raises/fabricates)
+                _df, _res, _src = tc.mt5_day_fetch('XAUUSD', '2026-07-01')
+                mt5_degrades = (_df is None and _res == tc.RES_UNAVAILABLE)
+                ok = (split and has_files and m1_flagged and unavail_no_path and idem
+                      and roundtrip and only_ticks_dir and mt5_degrades)
+                detail = (f"split={split} files={has_files} m1_flag={m1_flagged} "
+                          f"idempotent={idem} roundtrip={roundtrip} scoped={only_ticks_dir} "
+                          f"mt5_degrades={mt5_degrades}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        except Exception as e:
+            self._record(297, FAIL, f"raised: {e!r}"); return
+        self._record(297, PASS if ok else FAIL, detail)
+
+    def _step_sim_engine_drives(self):
+        # 298 Part 1B/1C offline simulator: the REAL LiveTrader._tick() loop runs against a FAKE
+        # broker over a synthetic tick day (MT5 disconnected, no strategy fork). Asserts: an
+        # anchor stop fills and the position closes -> OUT deals carry the REAL AUR_* comment and
+        # magic (so pnl_report.classify_comment + pnl_source.magic_day_net work UNCHANGED); the
+        # per-engine reports carry the mandatory GATE-NOT-RUN header on EVERY artifact; the gate
+        # runs and reports NOT-passed on synthetic (never a fabricated pass); and NOTHING is
+        # written under the live run/ tree (the sim state goes to a scratch dir).
+        import importlib.util as _ilu, os, tempfile, glob, shutil
+        import pandas as pd
+        try:
+            bt = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest')
+            def _load(name):
+                p = os.path.join(bt, name + '.py')
+                s = _ilu.spec_from_file_location('aureon_' + name + '_st', p)
+                m = _ilu.module_from_spec(s); s.loader.exec_module(m); return m
+            sim = _load('simulator'); srep = _load('sim_report'); sgate = _load('sim_gate')
+            import config as _cfgmod
+            cfg = _cfgmod.Config(); cfg.util_daily_pnl_report = False
+            off = int(cfg.broker_tz_offset_hours)
+            # a compact A2 day (broker ~09:30..11:30) that breaks UP past TP so a leg closes fast
+            date = '2026-07-02'; day0 = pd.Timestamp(date + ' 00:00:00', tz='UTC')
+            rows = []; start = day0 + pd.Timedelta(hours=9 - off); n = int(2.5 * 3600 / 5); base = 4000.0
+            for i in range(n):
+                t = start + pd.Timedelta(seconds=5 * i)
+                bh = (t + pd.Timedelta(hours=off)).hour + (t + pd.Timedelta(hours=off)).minute / 60.0
+                mid = base + (40.0 * min(1.0, (bh - 10.08) / 0.4) if bh >= 10.08 else 0.0)
+                rows.append((t, round(mid - 0.10, 2), round(mid + 0.10, 2)))
+            df = pd.DataFrame(rows, columns=['time', 'bid', 'ask'])
+            # a SECOND day supplied as an M1 BAR frame (open/high/low/close, no
+            # bid/ask) -- the simulator must REFUSE it, never interpolate it.
+            m1rows = []
+            for i in range(30):
+                t = pd.Timestamp('2026-07-03 07:00:00', tz='UTC') + pd.Timedelta(minutes=i)
+                m1rows.append((t, 4000.0, 4001.0, 3999.0, 4000.5))
+            m1df = pd.DataFrame(m1rows, columns=['time', 'open', 'high', 'low', 'close'])
+            tmp = tempfile.mkdtemp(prefix='aureon_simst_')
+            run_before = _run_snapshot = None
+            try:
+                # snapshot the live run/ dir so we can prove it is untouched
+                run_dir = os.path.join(os.path.dirname(bt), 'run')
+                def _snap():
+                    out = {}
+                    for r, _d, fs in os.walk(run_dir):
+                        for fn in fs:
+                            fp = os.path.join(r, fn)
+                            try: out[fp] = os.path.getmtime(fp)
+                            except OSError: pass
+                    return out
+                run_before = _snap() if os.path.isdir(run_dir) else {}
+                os.environ['AUREON_SIM_DIR'] = os.path.join(tmp, 'sim')
+                res = sim.simulate(cfg, [(date, df), ('2026-07-03', m1df)],
+                                   scratch_dir=os.path.join(tmp, 'st'), tick_cadence_s=4.0)
+                deals = res.get('deals', [])
+                import pnl_source as _ps, pnl_report as _pr
+                closed = res.get('closed_positions', 0)
+                out_deals = [d for d in deals if getattr(d, 'entry', None) == 1]
+                real_comments = all(str(getattr(d, 'comment', '')).startswith('AUR_') for d in out_deals) and bool(out_deals)
+                anet = _ps.magic_day_net(deals, _ps.ANCHORS_MAGIC)
+                pa = _pr.per_anchor_stats(_pr.build_trades(deals))
+                classifies = any(k in ('A1','A2','A3','A4','A5') for k in pa)
+                fills_and_closes = (closed >= 1 and abs(anet) > 0.0)
+                # confirm-1: the M1 day was REFUSED, never interpolated/run.
+                m1_refused = ('2026-07-03' in res.get('refused_days', [])
+                              and '2026-07-03' not in res.get('days', []))
+                # §3: every emitted comment classifies (no phantom '??'/'ext' legs).
+                no_build_errors = (res.get('build_errors') == [])
+                # confirm-2: the broker-day roll used the INJECTED clock (sim date),
+                # NOT the wall clock (which is 2026-07-10 today). If it used wall
+                # time, last_broker_date would be today and every governor reset
+                # would fire on the wrong day.
+                dayroll_sim_clock = (res.get('last_broker_date') == '2026-07-02')
+                # reports carry the GATE header on EVERY artifact
+                out_dir, _reports, summ = srep.write_reports('ST', deals, cfg, res.get('days', [date]))
+                arts = glob.glob(os.path.join(out_dir, '*'))
+                hdr_all = bool(arts) and all('GATE-NOT-RUN' in open(p, encoding='utf-8').read() for p in arts)
+                # §4: the gate HARD-REFUSES on synthetic/non-tick data (not a soft warn).
+                gate = sgate.run_gate(deals, resolution_all_tick=False,
+                                      refused_days=res.get('refused_days'),
+                                      build_errors=res.get('build_errors'))
+                gate_honest = (gate['passed'] is False and gate.get('refused') is True)
+                # the run/ guard refuses run/ paths
+                guard_ok = False
+                try:
+                    srep.sc.assert_not_run_dir(os.path.join(run_dir, 'x')); guard_ok = False
+                except AssertionError:
+                    guard_ok = True
+                # the LIVE run/ tree is byte-for-byte untouched
+                run_after = _snap() if os.path.isdir(run_dir) else {}
+                run_untouched = (run_before == run_after)
+                ok = (fills_and_closes and real_comments and classifies and hdr_all
+                      and gate_honest and guard_ok and run_untouched and m1_refused
+                      and no_build_errors and dayroll_sim_clock)
+                detail = (f"closed={closed} anchors_net={anet} real_AUR_comments={real_comments} "
+                          f"classifies={classifies} gate_header_on_all={hdr_all} "
+                          f"gate_hard_refused={gate_honest} guard={guard_ok} run_untouched={run_untouched} "
+                          f"m1_refused={m1_refused} no_build_errors={no_build_errors} "
+                          f"dayroll_sim_clock={dayroll_sim_clock}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+                os.environ.pop('AUREON_SIM_DIR', None)
+        except Exception as e:
+            import traceback
+            self._record(298, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(298, PASS if ok else FAIL, detail)
+
+    def _step_sim_config_as_traded(self):
+        # 299 BASELINE = July AS TRADED: the simulator reconstructs each day's config from
+        # ERRORS.md's D-series (sim_config), NOT today's config -- a run with today's config
+        # cannot reproduce July's trades. Asserts the timeline resolves the right values per day,
+        # incl. the 07-07 14:58 INTRA-DAY rogue flip (confirm 10->5, init_sl 5->10) to the minute,
+        # the whole-run disable of D-26/D-27 (seed_break / base_trades = 0), fetcher not existing
+        # before 07-07, and D-28 anchors-only (rogue+fetcher off) from 07-09. apply_to_trader
+        # mutates a trader stub's cfg + engines.
+        import importlib.util as _ilu, os, types
+        import pandas as pd
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest', 'sim_config.py')
+            s = _ilu.spec_from_file_location('aureon_sim_config_st', p)
+            scfg = _ilu.module_from_spec(s); s.loader.exec_module(scfg)
+
+            def at(broker_local):
+                ts = pd.Timestamp(broker_local, tz='UTC') - pd.Timedelta(hours=3)
+                return scfg.active_config(ts)
+
+            c2, e2, _ = at('2026-07-02 10:00')     # early window
+            c7a, e7a, _ = at('2026-07-07 12:00')   # 07-07 BEFORE the 14:58 flip
+            c7b, e7b, _ = at('2026-07-07 15:00')   # 07-07 AFTER the flip
+            c8, e8, _ = at('2026-07-08 10:00')     # loss-stop cut
+            c9, e9, _ = at('2026-07-09 10:00')     # anchors-only
+            checks = {
+                # early: confirm 10 / init_sl 5 / loss -525 / F-B off / rescue off / rogue on / fetcher off
+                'early': (c2['rogue_entry_confirm_redesign'] == 10.0 and c2['rogue_init_sl'] == 5.0
+                          and c2['rogue_daily_loss_stop'] == -525.0
+                          and c2['trapped_late_rescue_enabled'] is False
+                          and c2['rescue_entry_enabled'] is False
+                          and e2['rogue'] is True and e2['fetcher'] is False),
+                # D-26/D-27 disabled the WHOLE run
+                'seed_budget_off': (c2['seed_break_dollars'] == 0.0 and c2['engine_base_trades_per_anchor'] == 0
+                                    and c9['seed_break_dollars'] == 0.0),
+                # D-14 fetcher exists from 07-07 (present pre-flip time, absent on 07-02)
+                'fetcher_birth': (e7a['fetcher'] is True and e2['fetcher'] is False),
+                # 07-07 INTRA-DAY flip to the minute (D-11/D-13): pre != post
+                'intraday_flip': (c7a['rogue_entry_confirm_redesign'] == 10.0 and c7a['rogue_init_sl'] == 5.0
+                                  and c7b['rogue_entry_confirm_redesign'] == 5.0 and c7b['rogue_init_sl'] == 10.0),
+                # D-16/17 loss stops -> -370 on 07-08
+                'loss_stop_cut': (c8['rogue_daily_loss_stop'] == -370.0 and c8['fetcher_daily_loss_stop'] == -370.0
+                                  and c7b['rogue_daily_loss_stop'] == -525.0),
+                # D-5 F-B live 07-03 (off on 07-02, on by 07-07)
+                'fb_live': (c2['trapped_late_rescue_enabled'] is False and c7a['trapped_late_rescue_enabled'] is True),
+                # D-28 anchors-only + D-29 rescue on, from 07-09
+                'anchors_only': (e9['rogue'] is False and e9['fetcher'] is False and e9['anchors'] is True
+                                 and c9['rescue_entry_enabled'] is True),
+            }
+            # apply_to_trader mutates a trader stub
+            tr = types.SimpleNamespace(cfg=types.SimpleNamespace(
+                rogue_entry_confirm_redesign=5.0, rogue_init_sl=10.0, rogue_daily_loss_stop=-370.0,
+                fetcher_daily_loss_stop=-370.0, seed_break_dollars=10.0, engine_base_trades_per_anchor=2,
+                trapped_late_rescue_enabled=True, rescue_entry_enabled=True, rogue_enabled=True,
+                fetcher_enabled=True, non_oco_enabled=True),
+                engines={'anchors': True, 'rogue': True, 'fetcher': True})
+            ts2 = pd.Timestamp('2026-07-02 10:00', tz='UTC') - pd.Timedelta(hours=3)
+            scfg.apply_to_trader(tr, ts2)
+            applied = (tr.cfg.rogue_entry_confirm_redesign == 10.0 and tr.cfg.rogue_init_sl == 5.0
+                       and tr.cfg.seed_break_dollars == 0.0 and tr.engines['fetcher'] is False
+                       and tr.engines['rogue'] is True)
+            checks['apply_mutates_trader'] = applied
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+        except Exception as e:
+            self._record(299, FAIL, f"raised: {e!r}"); return
+        self._record(299, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -11864,6 +12109,12 @@ class SelfTest:
             # R-14 (07-10): the report's anchor net == pnl_source.magic_day_net over the SAME
             # broker-day window -- straddling / partial / unattributable closes are never dropped.
             self._step_r14_report_truth()
+            # Part 1A (07-10): offline-simulator per-day tick cache + resolution manifest.
+            self._step_sim_tick_cache()
+            # Part 1B/1C (07-10): the REAL LiveTrader tick loop drives a fake broker offline.
+            self._step_sim_engine_drives()
+            # Baseline = July AS TRADED (07-10): per-day config reconstructed from the D-series.
+            self._step_sim_config_as_traded()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()
