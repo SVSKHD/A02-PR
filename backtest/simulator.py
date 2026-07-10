@@ -142,13 +142,15 @@ def unclassified_comments(deals):
 # the run
 # --------------------------------------------------------------------------- #
 def simulate(cfg, day_frames, *, scratch_dir, tick_cadence_s=1.0, spread=0.20,
-             slippage=0.0, starting_balance=None, progress=None):
+             slippage=0.0, starting_balance=None, progress=None,
+             apply_config_timeline=False):
     """Drive the real LiveTrader over `day_frames` (ordered list of (date_str,
     DataFrame)). Returns {'deals': [...], 'closed_positions': int, 'days': [...],
     'run_dir': scratch_dir, 'account': {...}}. Writes engine state ONLY under
     scratch_dir (never the live run/). MT5 disconnected."""
     import importlib
     import live_trader as lt
+    import sim_config as _scfg
 
     _saved_env = {k: os.environ.get(k) for k in
                   ('AUREON_RUN_DIR', 'DISCORD_BOT_TOKEN', 'DISCORD_CHANNEL_ID')}
@@ -180,6 +182,20 @@ def simulate(cfg, day_frames, *, scratch_dir, tick_cadence_s=1.0, spread=0.20,
                 'account': {}, 'empty': True}
     clock = SimClock(first_ts)
 
+    # Baseline = July AS TRADED: reconstruct the config live at the run's first
+    # instant BEFORE construction, so self.engines boots to that day's engine set
+    # (rogue on / fetcher off before 07-07, etc.). See sim_config.
+    if apply_config_timeline:
+        _cfg_over, _eng_over, _ = _scfg.active_config(first_ts)
+        for _k, _v in _cfg_over.items():
+            if hasattr(cfg, _k):
+                setattr(cfg, _k, _v)
+        for _e, _on in _eng_over.items():
+            if hasattr(cfg, _e + '_enabled'):
+                setattr(cfg, _e + '_enabled', bool(_on))
+        if hasattr(cfg, 'non_oco_enabled'):
+            cfg.non_oco_enabled = bool(_eng_over.get('anchors', True))
+
     _orig_factory = lt.telemetry_from_env
     lt.telemetry_from_env = lambda *a, **k: NoOpTele()
     try:
@@ -187,6 +203,10 @@ def simulate(cfg, day_frames, *, scratch_dir, tick_cadence_s=1.0, spread=0.20,
             broker.advance(first_tick)   # seed the broker's current tick
             trader = lt.LiveTrader(cfg, adapter, paper=False)
             trader.tele = NoOpTele()
+            _cp_idx = None
+            if apply_config_timeline:
+                _scfg.apply_to_trader(trader, first_ts)
+                _cp_idx = _scfg.active_index(first_ts)
             # The run() startup path validates the broker time-offset (a LIVE feed-
             # detection step). The simulator's offset is KNOWN and fixed (set on the
             # fake adapter), so it is validated by construction -- flip the gate the
@@ -215,6 +235,15 @@ def simulate(cfg, day_frames, *, scratch_dir, tick_cadence_s=1.0, spread=0.20,
                     tsec = tick.time_utc.timestamp()
                     if last_tick_call is None or (tsec - last_tick_call) >= tick_cadence_s:
                         last_tick_call = tsec
+                        # apply the per-day config timeline when a change-point (incl.
+                        # the 07-07 14:58 rogue flip) advances -- baseline = as traded.
+                        if apply_config_timeline:
+                            _i = _scfg.active_index(tick.time_utc)
+                            if _i != _cp_idx:
+                                _cp_idx = _i
+                                _, _, _cites = _scfg.apply_to_trader(trader, tick.time_utc)
+                                if progress:
+                                    progress(f"config change-point @ {tick.time_utc}: {_cites}")
                         try:
                             trader._tick()               # the REAL per-tick engine
                         except Exception as e:
@@ -319,8 +348,10 @@ def run_cli(d_from, d_to, *, run_id=None, ticks_dir=None, tick_cadence_s=1.0):
 
     scratch = tempfile.mkdtemp(prefix='aureon_sim_state_')
     day_frames = [(d, df) for d, df, _ in frames]
+    # BASELINE = July AS TRADED: reconstruct each day's config from the D-series
+    # (sim_config). Without this the sim runs today's config and cannot match July.
     res = simulate(cfg, day_frames, scratch_dir=os.path.join(scratch, 'st'),
-                   tick_cadence_s=tick_cadence_s)
+                   tick_cadence_s=tick_cadence_s, apply_config_timeline=True)
     deals = res.get('deals', [])
     day_list = [d for d, _, _ in frames]
 

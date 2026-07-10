@@ -404,6 +404,8 @@ STEP_NAMES = {
     297: "sim tick cache",              # per-day parquet/csv split, idempotent, manifest records tick/M1/unavailable, writes only under backtest/ticks
     # 2026-07-10 offline simulator Part 1B/1C: real LiveTrader tick loop behind a fake broker.
     298: "sim engine drives",           # fake broker + REAL _tick(): anchor fills, real AUR_* comments, magic_day_net works, GATE-NOT-RUN header on every artifact, nothing writes to run/
+    # 2026-07-10 offline simulator baseline = July AS TRADED: per-day config from the D-series.
+    299: "sim config as-traded",         # per-day config reconstruction: D-5/D-11/D-13/D-14/D-16-17/D-26-27/D-28/D-29 resolve to the right values per day incl the 07-07 14:58 intra-day rogue flip
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9796,6 +9798,73 @@ class SelfTest:
             self._record(298, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
         self._record(298, PASS if ok else FAIL, detail)
 
+    def _step_sim_config_as_traded(self):
+        # 299 BASELINE = July AS TRADED: the simulator reconstructs each day's config from
+        # ERRORS.md's D-series (sim_config), NOT today's config -- a run with today's config
+        # cannot reproduce July's trades. Asserts the timeline resolves the right values per day,
+        # incl. the 07-07 14:58 INTRA-DAY rogue flip (confirm 10->5, init_sl 5->10) to the minute,
+        # the whole-run disable of D-26/D-27 (seed_break / base_trades = 0), fetcher not existing
+        # before 07-07, and D-28 anchors-only (rogue+fetcher off) from 07-09. apply_to_trader
+        # mutates a trader stub's cfg + engines.
+        import importlib.util as _ilu, os, types
+        import pandas as pd
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest', 'sim_config.py')
+            s = _ilu.spec_from_file_location('aureon_sim_config_st', p)
+            scfg = _ilu.module_from_spec(s); s.loader.exec_module(scfg)
+
+            def at(broker_local):
+                ts = pd.Timestamp(broker_local, tz='UTC') - pd.Timedelta(hours=3)
+                return scfg.active_config(ts)
+
+            c2, e2, _ = at('2026-07-02 10:00')     # early window
+            c7a, e7a, _ = at('2026-07-07 12:00')   # 07-07 BEFORE the 14:58 flip
+            c7b, e7b, _ = at('2026-07-07 15:00')   # 07-07 AFTER the flip
+            c8, e8, _ = at('2026-07-08 10:00')     # loss-stop cut
+            c9, e9, _ = at('2026-07-09 10:00')     # anchors-only
+            checks = {
+                # early: confirm 10 / init_sl 5 / loss -525 / F-B off / rescue off / rogue on / fetcher off
+                'early': (c2['rogue_entry_confirm_redesign'] == 10.0 and c2['rogue_init_sl'] == 5.0
+                          and c2['rogue_daily_loss_stop'] == -525.0
+                          and c2['trapped_late_rescue_enabled'] is False
+                          and c2['rescue_entry_enabled'] is False
+                          and e2['rogue'] is True and e2['fetcher'] is False),
+                # D-26/D-27 disabled the WHOLE run
+                'seed_budget_off': (c2['seed_break_dollars'] == 0.0 and c2['engine_base_trades_per_anchor'] == 0
+                                    and c9['seed_break_dollars'] == 0.0),
+                # D-14 fetcher exists from 07-07 (present pre-flip time, absent on 07-02)
+                'fetcher_birth': (e7a['fetcher'] is True and e2['fetcher'] is False),
+                # 07-07 INTRA-DAY flip to the minute (D-11/D-13): pre != post
+                'intraday_flip': (c7a['rogue_entry_confirm_redesign'] == 10.0 and c7a['rogue_init_sl'] == 5.0
+                                  and c7b['rogue_entry_confirm_redesign'] == 5.0 and c7b['rogue_init_sl'] == 10.0),
+                # D-16/17 loss stops -> -370 on 07-08
+                'loss_stop_cut': (c8['rogue_daily_loss_stop'] == -370.0 and c8['fetcher_daily_loss_stop'] == -370.0
+                                  and c7b['rogue_daily_loss_stop'] == -525.0),
+                # D-5 F-B live 07-03 (off on 07-02, on by 07-07)
+                'fb_live': (c2['trapped_late_rescue_enabled'] is False and c7a['trapped_late_rescue_enabled'] is True),
+                # D-28 anchors-only + D-29 rescue on, from 07-09
+                'anchors_only': (e9['rogue'] is False and e9['fetcher'] is False and e9['anchors'] is True
+                                 and c9['rescue_entry_enabled'] is True),
+            }
+            # apply_to_trader mutates a trader stub
+            tr = types.SimpleNamespace(cfg=types.SimpleNamespace(
+                rogue_entry_confirm_redesign=5.0, rogue_init_sl=10.0, rogue_daily_loss_stop=-370.0,
+                fetcher_daily_loss_stop=-370.0, seed_break_dollars=10.0, engine_base_trades_per_anchor=2,
+                trapped_late_rescue_enabled=True, rescue_entry_enabled=True, rogue_enabled=True,
+                fetcher_enabled=True, non_oco_enabled=True),
+                engines={'anchors': True, 'rogue': True, 'fetcher': True})
+            ts2 = pd.Timestamp('2026-07-02 10:00', tz='UTC') - pd.Timedelta(hours=3)
+            scfg.apply_to_trader(tr, ts2)
+            applied = (tr.cfg.rogue_entry_confirm_redesign == 10.0 and tr.cfg.rogue_init_sl == 5.0
+                       and tr.cfg.seed_break_dollars == 0.0 and tr.engines['fetcher'] is False
+                       and tr.engines['rogue'] is True)
+            checks['apply_mutates_trader'] = applied
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+        except Exception as e:
+            self._record(299, FAIL, f"raised: {e!r}"); return
+        self._record(299, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -12044,6 +12113,8 @@ class SelfTest:
             self._step_sim_tick_cache()
             # Part 1B/1C (07-10): the REAL LiveTrader tick loop drives a fake broker offline.
             self._step_sim_engine_drives()
+            # Baseline = July AS TRADED (07-10): per-day config reconstructed from the D-series.
+            self._step_sim_config_as_traded()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

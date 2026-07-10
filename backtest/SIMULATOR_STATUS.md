@@ -134,6 +134,19 @@ per-anchor / rogue / fetcher output can be diffed against it to a stated toleran
   (M1/synthetic) is unknown — the manifest flags it and the gate **hard-refuses**;
   spread/slippage are configurable approximations (defaults 0.20 / 0.0); the sim
   has not been validated against real July prices (synthetic ticks only here).
+- **Baseline = July AS TRADED (per-day config, `sim_config.py`):** the sim replays
+  each day with the config that was LIVE that day, reconstructed from ERRORS.md's
+  D-series — not today's config (which would place trades July never saw). A
+  change-point timeline (broker-local) is applied to the running trader when it
+  advances, so the **07-07 14:58** intra-day rogue flip lands to the minute:
+  D-5 F-B live 07-03; D-14 fetcher born 07-07; D-11/D-13 `rogue_entry_confirm_redesign`
+  10→5 + `rogue_init_sl` 5→10 at 07-07 14:58; D-16/17 loss-stops →−370 on 07-08;
+  D-28 anchors-only (rogue+fetcher off) + D-29 `rescue_entry_enabled`→on from 07-09;
+  and D-26/D-27 (`seed_break_dollars`, `engine_base_trades_per_anchor`) **disabled
+  (=0) for the whole run** per owner (not in the running bot during the window).
+  Documented simplification: D-13's transient `rogue_daily_loss_stop`=−1050 blip on
+  07-07 is folded (−525 until 07-08, then −370) per the owner spec. Asserted by
+  selftest 299.
 - **Hardening (07-10, owner spec §3/§4 + confirms; see `BOOST_REDESIGN_TZ_NOTES.md`):**
   (a) the sim replays the **cached ticks verbatim** and **REFUSES M1 days** — it
   never interpolates invented intrabar prices; (b) every emitted leg's comment
