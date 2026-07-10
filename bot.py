@@ -60,7 +60,7 @@ def main():
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
                                          'testfire', 'verifyfb', 'rescuestats',
                                          'bescratchscan', 'rogueseed', 'fetchseed',
-                                         'dailyreport', 'reconcile'])
+                                         'dailyreport', 'reconcile', 'fetchticks'])
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -96,6 +96,11 @@ def main():
     parser.add_argument('--date', default=None, metavar='YYYY-MM-DD|YYYY-MM',
                         help="dailyreport: the day (or whole month) to report on; "
                              "reconcile: the broker day to audit. Default: today.")
+    parser.add_argument('--from', dest='date_from', default=None, metavar='YYYY-MM-DD',
+                        help="fetchticks: first calendar day of the tick-cache range")
+    parser.add_argument('--to', dest='date_to', default=None, metavar='YYYY-MM-DD',
+                        help="fetchticks: last calendar day of the tick-cache range "
+                             "(--force refetches days already on disk)")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
 
@@ -205,6 +210,26 @@ def main():
         # HISTORY reads only -- never touches the order book.
         from pnl_reconcile import run_cli
         sys.exit(run_cli(date_arg=args.date))
+
+    elif args.mode == 'fetchticks':
+        # Offline-simulator TICK CACHE (Part 1A): cache each calendar day in
+        # [--from, --to] to backtest/ticks/<symbol>_<date>.parquet + a manifest
+        # recording the resolution ACTUALLY obtained per day (tick vs M1). Reads
+        # MT5 for HISTORY ticks only (never the order book); writes ONLY under
+        # backtest/ticks/, never run/. Needs a live MT5 terminal (VPS) for real
+        # ticks; off-VPS it reports 'unavailable' honestly and writes nothing.
+        # Load backtest/tick_cache.py by ABSOLUTE FILE PATH: the repo root has both
+        # backtest.py (module) and backtest/ (dir), so `import backtest.tick_cache`
+        # is ambiguous -- mirror back_main.py's file-path load.
+        import importlib.util as _ilu
+        _tc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'backtest', 'tick_cache.py')
+        _spec = _ilu.spec_from_file_location('aureon_tick_cache', _tc_path)
+        _tc = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_tc)
+        sys.exit(_tc.run_cli(args.date_from, args.date_to, symbol=cfg.symbol,
+                             broker_tz_offset_hours=cfg.broker_tz_offset_hours,
+                             force=args.force))
 
     elif args.mode == 'rogueseed':
         # Manual Rogue A1-mode seed: enqueue a 'rogueseed' command onto the RUNNING bot's

@@ -400,6 +400,8 @@ STEP_NAMES = {
     # 2026-07-10 R-14 pnl_report <-> MT5 authority: report anchor net == magic_day_net,
     # never dropping a straddling / partial / unattributable realized close.
     296: "r14 report==authority",       # OUT-only counted, IN-only not lost, partials summed once, report_net==magic_day_net, reconcile ok
+    # 2026-07-10 offline simulator Part 1A: per-day tick cache + manifest (resolution tag).
+    297: "sim tick cache",              # per-day parquet/csv split, idempotent, manifest records tick/M1/unavailable, writes only under backtest/ticks
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9620,6 +9622,72 @@ class SelfTest:
             self._record(296, FAIL, f"raised: {e!r}"); return
         self._record(296, PASS if ok else FAIL, detail)
 
+    def _step_sim_tick_cache(self):
+        # 297 Part 1A offline simulator TICK CACHE: backtest/tick_cache.fetch_range caches each
+        # calendar day to its OWN file with a manifest recording the resolution ACTUALLY obtained
+        # (tick vs M1 vs unavailable). Asserts: per-day split, idempotency (a day on disk is not
+        # refetched; its resolution is preserved, not downgraded to 'cache'), an M1 day is flagged
+        # (intrabar order unknown), an unavailable day writes NO file, and NOTHING is written
+        # outside the ticks dir (never run/). Drives the PURE plumbing with an injected synthetic
+        # day-fetch, so it proves the cache logic with no MT5.
+        import importlib.util as _ilu, tempfile, os, shutil
+        import pandas as pd
+        try:
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest', 'tick_cache.py')
+            _spec = _ilu.spec_from_file_location('aureon_tick_cache_test', _p)
+            tc = _ilu.module_from_spec(_spec); _spec.loader.exec_module(tc)
+            tmp = tempfile.mkdtemp(prefix='aureon_ticks_')
+            try:
+                def fake(sym, day, off):
+                    if day == '2026-07-01':
+                        t = pd.date_range('2026-07-01', periods=50, freq='s', tz='UTC')
+                        return (pd.DataFrame({'time': t, 'bid': 4000.0, 'ask': 4000.2}),
+                                tc.RES_TICK, 'mt5-ticks')
+                    if day == '2026-07-02':
+                        t = pd.date_range('2026-07-02', periods=5, freq='min', tz='UTC')
+                        return (pd.DataFrame({'time': t, 'open': 4000.0, 'high': 4001.0,
+                                              'low': 3999.0, 'close': 4000.5}),
+                                tc.RES_M1, 'mt5-m1-fallback')
+                    return None, tc.RES_UNAVAILABLE, 'no-data'
+                r1 = tc.fetch_range('XAUUSD', '2026-07-01', '2026-07-03', tmp,
+                                    day_fetch_fn=fake, now_iso='2026-07-10T00:00:00Z')
+                split = (r1['summary'][tc.RES_TICK] == 1 and r1['summary'][tc.RES_M1] == 1
+                         and r1['summary'][tc.RES_UNAVAILABLE] == 1)
+                files = set(os.listdir(tmp))
+                # tick + M1 each wrote ONE day file; the unavailable day wrote NONE.
+                has_files = (any('2026-07-01' in f for f in files)
+                             and any('2026-07-02' in f for f in files)
+                             and not any('2026-07-03' in f for f in files))
+                m1_flagged = (r1['days']['2026-07-02']['resolution'] == tc.RES_M1)
+                unavail_no_path = (r1['days']['2026-07-03']['path'] is None)
+                # idempotency: a 2nd run refetches ONLY the unavailable day; cached days keep res.
+                seen = []
+                def spy(sym, day, off):
+                    seen.append(day); return fake(sym, day, off)
+                r2 = tc.fetch_range('XAUUSD', '2026-07-01', '2026-07-03', tmp,
+                                    day_fetch_fn=spy, now_iso='2026-07-10T01:00:00Z')
+                idem = (seen == ['2026-07-03'] and r2['summary'][tc.RES_CACHE] == 2
+                        and r2['days']['2026-07-01']['resolution'] == tc.RES_TICK
+                        and r2['days']['2026-07-02']['resolution'] == tc.RES_M1)
+                # round-trip load is tz-aware UTC
+                d = tc.load_day(tmp, 'XAUUSD', '2026-07-01')
+                roundtrip = (d is not None and len(d) == 50 and str(d['time'].dt.tz) == 'UTC')
+                # nothing escaped the ticks dir (manifest + day files only)
+                only_ticks_dir = all(f == 'manifest.json' or f.startswith('XAUUSD_') for f in files)
+                # the real MT5 fetch degrades to 'unavailable' with no MT5 (never raises/fabricates)
+                _df, _res, _src = tc.mt5_day_fetch('XAUUSD', '2026-07-01')
+                mt5_degrades = (_df is None and _res == tc.RES_UNAVAILABLE)
+                ok = (split and has_files and m1_flagged and unavail_no_path and idem
+                      and roundtrip and only_ticks_dir and mt5_degrades)
+                detail = (f"split={split} files={has_files} m1_flag={m1_flagged} "
+                          f"idempotent={idem} roundtrip={roundtrip} scoped={only_ticks_dir} "
+                          f"mt5_degrades={mt5_degrades}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        except Exception as e:
+            self._record(297, FAIL, f"raised: {e!r}"); return
+        self._record(297, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -11864,6 +11932,8 @@ class SelfTest:
             # R-14 (07-10): the report's anchor net == pnl_source.magic_day_net over the SAME
             # broker-day window -- straddling / partial / unattributable closes are never dropped.
             self._step_r14_report_truth()
+            # Part 1A (07-10): offline-simulator per-day tick cache + resolution manifest.
+            self._step_sim_tick_cache()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

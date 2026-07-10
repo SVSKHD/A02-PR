@@ -61,9 +61,9 @@ data/
 results/
 monthly_output/
 
-# Tick-resolution monthly backtester (backtest/) — cached ticks + results
-backtest/ticks/*.parquet
-backtest/ticks/*.csv
+# Tick-resolution monthly backtester (backtest/) — legacy MONTHLY cache stays local.
+backtest/ticks/ticks_*.parquet
+backtest/ticks/ticks_*.csv
 backtest/results/*.csv
 # ...but keep the directory placeholders tracked (the bare `results/` rule above
 # would otherwise swallow backtest/results/.gitkeep).
@@ -71,3 +71,7 @@ backtest/results/*.csv
 !backtest/results/
 !backtest/ticks/.gitkeep
 !backtest/results/.gitkeep
+# Part 1A offline-simulator PER-DAY cache (XAUUSD_YYYY-MM-DD.parquet) + manifest are
+# INTENTIONALLY committable: the gate must be reproducible from the committed cache
+# (run `fetchticks` on the VPS, then commit backtest/ticks/*.parquet + manifest.json).
+# If a month of ticks is too large for git, switch these paths to git-lfs.
