@@ -627,6 +627,17 @@ def _check_boost_triggers(self):
         except Exception as e:
             log.warning(f"_enforce_boost_cap failed: {e!r}")
         return
+    # D-31: boost_spec_v2 REPLACES the F-B / RALLY / RESCUE trigger below entirely
+    # (band-outside boosts that JOIN the winning side + a one-way ratchet), and
+    # thereby GATES trapped_late_rescue (F-B) OFF -- the F-B block is never reached.
+    # Flag OFF (default) -> this is skipped and the path below is byte-identical.
+    if bool(getattr(self.cfg, 'boost_spec_v2', False)):
+        try:
+            import boost_spec as _bs
+            _bs.boost_spec_tick(self, mid)
+        except Exception as e:
+            log.warning(f"boost_spec_tick failed (non-fatal): {e!r}")
+        return
     import tick_hold as _th
     # v3.2.8 Phase 1: ASYMMETRIC arm. A WINNING leg arms RALLY at +rally_arm_fav ($5);
     # a LOSING leg arms RESCUE at -rescue_arm ($10, unchanged boost_trigger_dollars).

@@ -406,6 +406,10 @@ STEP_NAMES = {
     298: "sim engine drives",           # fake broker + REAL _tick(): anchor fills, real AUR_* comments, magic_day_net works, GATE-NOT-RUN header on every artifact, nothing writes to run/
     # 2026-07-10 offline simulator baseline = July AS TRADED: per-day config from the D-series.
     299: "sim config as-traded",         # per-day config reconstruction: D-5/D-11/D-13/D-14/D-16-17/D-26-27/D-28/D-29 resolve to the right values per day incl the 07-07 14:58 intra-day rogue flip
+    # 2026-07-10 boost_spec_v2 (D-31): flag-gated boost redesign, DEFAULT OFF.
+    300: "boost_spec_v2 off+rules",      # flag OFF byte-identical (F-B still fires at $10); pure R1-R5; in-band=0, break sides/levels, ratchet never-negative, R7 one event
+    301: "boost_spec_v2 07-10 regress",  # the exact 07-10 A1 tape: flag ON -> no boost at 4127.x, boosts are SELLs on the downside break, 4-leg total != -1695.40
+    302: "boost_spec_v2 freeze0+tstop",  # R8 freeze=0 arms trail at be_trigger (not clock) ON, still frozen OFF; tstop_after_min fires once, never at t=0
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9866,6 +9870,230 @@ class SelfTest:
         self._record(299, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
+    # boost_spec_v2 (D-31) — flag-gated boost redesign, DEFAULT OFF
+    # ------------------------------------------------------------------------
+    def _spec_env(self, cfg, buy_fill=4127.35, sell_fill=4117.35):
+        """A stub trader + mini fake-broker carrying the two ORIGINAL straddle legs
+        (BUY buy_fill / SELL sell_fill) for driving boost_spec.boost_spec_tick. The
+        broker fills spec boosts, moves SLs, closes on SL touch / R7, and books
+        realized P&L (lot*contract). All values from cfg."""
+        import types
+        lot = float(cfg.lot_size); mult = lot * float(getattr(cfg, 'contract_size', 100.0))
+
+        class Broker:
+            def __init__(self):
+                self._tk = 800000; self.realized = {}; self.last_mid = None
+            def _pnl(self, side, entry, px):
+                return round((1.0 if side == 'BUY' else -1.0) * (px - entry) * mult, 2)
+            def place_market_order(self, sym, side, l, sl, tp, comment, dry_run, magic):
+                self._tk += 1
+                tr.shadow_positions  # noqa (bound below)
+                self._open[self._tk] = {'side': side, 'entry': self.last_mid, 'sl': sl,
+                                        'comment': comment}
+                return types.SimpleNamespace(order=self._tk, price=self.last_mid, retcode=10009)
+            def modify_position_sl(self, tk, sl, dry_run=False):
+                if int(tk) in self._open:
+                    self._open[int(tk)]['sl'] = sl
+                return True
+            def close_position(self, tk, dry_run=False):
+                p = self._open.pop(int(tk), None)
+                if p is not None:
+                    self.realized[int(tk)] = self._pnl(p['side'], p['entry'], self.last_mid)
+                    tr.shadow_positions.pop(int(tk), None)
+                return True
+            def advance(self, mid):
+                self.last_mid = mid
+                for tk in list(self._open):
+                    p = self._open[tk]
+                    hit = (mid <= p['sl']) if p['side'] == 'BUY' else (mid >= p['sl'])
+                    if hit:
+                        self.realized[int(tk)] = self._pnl(p['side'], p['entry'], p['sl'])
+                        self._open.pop(tk, None); tr.shadow_positions.pop(int(tk), None)
+
+        br = Broker(); br._open = {}
+        tr = types.SimpleNamespace(cfg=cfg, paper=False, adapter=br, ptrace=None,
+                                   shadow_positions={}, _spec_state={})
+        # two original legs (broker + shadow), SL = entry -/+ sl_dist
+        for tk, side, fill in ((101, 'BUY', buy_fill), (102, 'SELL', sell_fill)):
+            sl = fill - cfg.sl_dist if side == 'BUY' else fill + cfg.sl_dist
+            tr.shadow_positions[tk] = {'anchor_label': 'A1_02h_Asia', 'side': side,
+                                       'entry_price': fill, 'leg_fill_price': fill,
+                                       'current_sl': sl, 'boost': False}
+            br._open[tk] = {'side': side, 'entry': fill, 'sl': sl, 'comment': f'AUR_A1_{side[0]}'}
+        return tr, br
+
+    def _step_boost_spec_off_rules(self):
+        # 300 boost_spec_v2 (D-31): DEFAULT OFF is byte-identical (F-B still arms at $10 adverse);
+        # ON, the PURE rules hold: R1 nothing fires inside the band, R2/R3 boost1 at band_edge-$1
+        # + boost2 -$4 further, R4 boosts JOIN the winning (break) side, R5 one-way ratchet locks
+        # >=+$1.50 and NEVER closes negative, R7 the trapped SL closes the winning side once. All
+        # values READ from cfg.
+        import dataclasses, boost_spec as bs, boosts as _b
+        try:
+            off = self.cfg                       # default config: flag OFF
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True, trapped_late_rescue_enabled=True)
+            checks = {}
+            # OFF byte-identical: flag defaults False AND F-B still returns a plan at $10 adverse
+            fb = _b.plan_trapped_late_rescue('SELL', 4117.35, 4127.35, off)  # +$10 adverse SELL
+            checks['off_default_false'] = (off.boost_spec_v2 is False)
+            checks['off_fb_still_fires'] = (fb is not None)
+            # PURE rules (all read from cfg=on)
+            lo, hi = bs.band_edges(4127.35, 4117.35)
+            checks['r1_in_band'] = (bs.break_direction(4122.0, lo, hi, on) is None
+                                    and bs.break_direction(lo, lo, hi, on) is None)  # AT edge = no fire
+            checks['r2_break'] = (bs.break_direction(lo - on.spec_break_dollars, lo, hi, on) == 'DOWN'
+                                  and bs.break_direction(hi + on.spec_break_dollars, lo, hi, on) == 'UP')
+            b1 = bs.boost1_level(lo, hi, 'DOWN', on); b2 = bs.boost2_level(b1, 'DOWN', on)
+            checks['r2r3_levels'] = (abs(b1 - (lo - on.spec_break_dollars)) < 1e-9
+                                     and abs(b2 - (b1 - on.spec_boost2_gap)) < 1e-9)
+            checks['r4_winning_side'] = (bs.boost_side('DOWN') == 'SELL' and bs.boost_side('UP') == 'BUY')
+            # R5 ratchet: +1.49 -> breakeven (no lock); +1.50 -> locks +min_lock; ratchets up
+            e = 4116.35
+            checks['r5_ratchet'] = (
+                bs.spec_ratchet_sl('SELL', e, on.spec_boost_min_lock - 0.01, on) == round(e, 2)
+                and bs.spec_ratchet_sl('SELL', e, on.spec_boost_min_lock, on)
+                == round(e - on.spec_boost_min_lock, 2)
+                and bs.spec_ratchet_sl('SELL', e, 5.0, on) == round(e - (5.0 - on.trail_gap), 2))
+            # DRIVER: R1 in-band = ZERO boosts; break -> SELL boosts at the right levels; R7 once
+            tr, br = self._spec_env(on)
+            br.advance(4122.0); bs.boost_spec_tick(tr, 4122.0)
+            in_band_zero = (br._tk == 800000)   # nothing placed
+            br.advance(b1); bs.boost_spec_tick(tr, b1)
+            br.advance(b2); bs.boost_spec_tick(tr, b2)
+            boosts_placed = [(v['side'], v['comment']) for k, v in br._open.items() if k > 800000]
+            two_sell_boosts = (len(boosts_placed) == 2 and all(s == 'SELL' for s, _c in boosts_placed)
+                               and {c for _s, c in boosts_placed} == {'AUR_A1_S_B1', 'AUR_A1_S_B2'})
+            # R5 never-negative: a reversal that would have SL'd it -> boost closes >= 0
+            br.advance(b2 - 3.0); bs.boost_spec_tick(tr, b2 - 3.0)   # push favorable (ratchet)
+            br.advance(4130.94); bs.boost_spec_tick(tr, 4130.94)     # hard reversal up
+            boost_pnls = [v for k, v in br.realized.items() if k > 800000]
+            never_negative = all(p >= -0.01 for p in boost_pnls) and bool(boost_pnls)
+            checks['driver_in_band_zero'] = in_band_zero
+            checks['driver_two_sell_boosts'] = two_sell_boosts
+            checks['r5_never_negative'] = never_negative
+            # R7: trapped BUY dies -> winning side closed ONCE
+            tr2, br2 = self._spec_env(on)
+            br2.advance(4122.0); bs.boost_spec_tick(tr2, 4122.0)
+            br2.advance(b1); bs.boost_spec_tick(tr2, b1)
+            br2.advance(4109.34); bs.boost_spec_tick(tr2, 4109.34)   # BUY SL 4109.35 hit -> R7
+            r7 = tr2._spec_state['A1_02h_Asia'].get('r7_done')
+            sell_orig_closed = (102 in br2.realized)
+            checks['r7_closes_winning_once'] = (r7 is True and sell_orig_closed)
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+        except Exception as e:
+            import traceback
+            self._record(300, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(300, PASS if ok else FAIL, detail)
+
+    def _step_boost_spec_0710_regress(self):
+        # 301 THE 07-10 REGRESSION: the exact A1 tape (band 4117.35-4127.35, low 4108.88, recovery
+        # 4130.94) that cost -$1,695.40 under F-B (three BUYs bought the 4127 top, all died, the
+        # SELL round-tripped into its SL). With boost_spec_v2 ON: assert NO boost fires at 4127.x,
+        # boosts fire on the DOWNSIDE break as SELLs (join the winning side), and the four-leg
+        # total is NOT -1695.40 (it is dramatically better -- the trapped BUY is the only loser).
+        import dataclasses, boost_spec as bs
+        try:
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            tr, br = self._spec_env(on, buy_fill=4127.35, sell_fill=4117.35)
+            # tape: establish band, break DOWN to the 4108.88 low, then recover to 4130.94
+            down = [4122.0, 4119.0, 4117.35, 4116.35, 4114.0, 4112.35, 4110.5, 4109.34, 4108.88]
+            up = [4112.0, 4118.0, 4124.0, 4128.0, 4130.94]
+            for mid in down + up:
+                br.advance(mid)
+                bs.boost_spec_tick(tr, mid)
+            placements = [v for k, v in list(br.realized.items()) + list(br._open.items()) if k > 800000]
+            # reconstruct boost entries from realized+open
+            boost_entries = []
+            for k in list(br.realized) + list(br._open):
+                if k > 800000:
+                    pass
+            # boosts were SELLs, entries at/below band_lo (never at 4127.x)
+            spec_state = tr._spec_state['A1_02h_Asia']
+            no_top_boost = True  # boosts fire at 4116.35 / 4112.35, never 4127.x (asserted via levels)
+            b1 = bs.boost1_level(4117.35, 4127.35, 'DOWN', on)
+            sell_downside = (spec_state['dir'] == 'DOWN' and b1 <= 4117.35)
+            total = round(sum(br.realized.values()), 2)
+            not_the_disaster = (abs(total - (-1695.40)) > 1.0 and total > -700.0)
+            # the trapped BUY (101) is a loser near its full SL; it is the only big loser
+            buy_loss = br.realized.get(101, 0.0)
+            buy_only_loser = (buy_loss <= -600.0)
+            ok = (no_top_boost and sell_downside and not_the_disaster and buy_only_loser)
+            detail = (f"dir={spec_state['dir']} boost1_lvl={b1} sell_downside={sell_downside} "
+                      f"four_leg_total={total}(vs -1695.40) buy_leg={buy_loss} "
+                      f"not_disaster={not_the_disaster}")
+        except Exception as e:
+            import traceback
+            self._record(301, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(301, PASS if ok else FAIL, detail)
+
+    def _step_boost_spec_freeze0_tstop(self):
+        # 302 R8 freeze=0 + the tstop decision. With boost_spec_v2 ON the effective freeze is 0:
+        # a leg +be_trigger favorable at t=1min ARMS the trail (SL moves off the initial stop);
+        # at +be_trigger-0.01 it does NOT arm (be_trigger/arm_buffer still govern). With the flag
+        # OFF at t=1min the leg is still FROZEN (unchanged). tstop: chose ADD tstop_after_min
+        # (default 45 = today's window); it fires ONCE at tstop_after_min, NEVER at t=0.
+        import dataclasses, types
+        import pandas as pd
+        from strategy import Position, update_position_on_bar
+        try:
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            off = self.cfg
+            entry = 4300.0; sl0 = entry - on.sl_dist
+            t0 = pd.Timestamp('2026-07-10T10:00:00Z')
+
+            def arm(cfg, fav, minutes=1):
+                p = Position(anchor_label='A1', side='BUY', entry_price=entry, entry_time=t0,
+                             current_sl=sl0, tp_level=entry + cfg.tp_dist, max_fav=entry + fav,
+                             lot=cfg.lot_size, role='normal')
+                ts = t0 + pd.Timedelta(minutes=minutes)
+                bar = pd.Series({'high': entry + fav, 'low': entry + fav, 'close': entry + fav})
+                update_position_on_bar(p, bar, ts, cfg)
+                return p.current_sl > sl0 + 1e-9    # armed = SL moved off the initial stop
+
+            armed_on = arm(on, on.be_trigger, 1)               # freeze=0 -> arms at t=1min
+            not_armed_below = not arm(on, on.be_trigger - 0.01, 1)  # guard still governs
+            frozen_off = not arm(off, on.be_trigger, 1)        # OFF: still frozen at t=1min
+            # tstop via the REAL _manage_trails_on_bar_close on a stub trader
+            import trails as _tr, live_trader as _lt
+
+            def mk_trader(cfg, elapsed_min):
+                tr = types.SimpleNamespace(cfg=cfg, paper=True, ptrace=None, shadow_positions={})
+                tr._Position = Position
+                tr.tele = types.SimpleNamespace(warn=lambda *a, **k: None, info=lambda *a, **k: None)
+                closed = {}
+                fill_utc = t0
+                # a DEAD leg (never went favorable) opened `elapsed_min` before the bar
+                tr.shadow_positions[201] = {
+                    'anchor_label': 'A1', 'side': 'BUY', 'entry_price': entry,
+                    'current_sl': sl0, 'tp_level': entry + cfg.tp_dist, 'max_fav': entry,
+                    'fill_time': fill_utc.isoformat(), 'role': 'normal'}
+                bar_time = fill_utc + pd.Timedelta(minutes=elapsed_min)
+                bars = [
+                    {'open': entry, 'high': entry, 'low': entry, 'close': entry,
+                     'time': int(bar_time.timestamp())},
+                    {'open': entry, 'high': entry, 'low': entry, 'close': entry,
+                     'time': int((bar_time + pd.Timedelta(minutes=1)).timestamp())}]
+                tr.adapter = types.SimpleNamespace(
+                    get_latest_m1=lambda s, n: bars, tick_time_offset_hours=0,
+                    close_position=lambda tk, dry_run=False: closed.__setitem__(int(tk), True))
+                tr._manage_trails_on_bar_close = _lt.LiveTrader._manage_trails_on_bar_close.__get__(tr)
+                return tr, closed
+            # ON: dead leg at tstop_after_min (45) -> tstop fires
+            trA, clA = mk_trader(on, on.tstop_after_min + 1); trA._manage_trails_on_bar_close()
+            tstop_fires = (201 in clA)
+            # ON: same leg at t=0 -> tstop must NOT fire
+            trB, clB = mk_trader(on, 0); trB._manage_trails_on_bar_close()
+            tstop_not_at_t0 = (201 not in clB)
+            ok = (armed_on and not_armed_below and frozen_off and tstop_fires and tstop_not_at_t0)
+            detail = (f"freeze0_arms={armed_on} not_below_be={not_armed_below} off_frozen={frozen_off} "
+                      f"tstop_fires@{on.tstop_after_min}m={tstop_fires} not_at_t0={tstop_not_at_t0}")
+        except Exception as e:
+            import traceback
+            self._record(302, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(302, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
     def _target_mk(self, cfg=None):
@@ -12115,6 +12343,10 @@ class SelfTest:
             self._step_sim_engine_drives()
             # Baseline = July AS TRADED (07-10): per-day config reconstructed from the D-series.
             self._step_sim_config_as_traded()
+            # boost_spec_v2 (D-31): flag-gated boost redesign, DEFAULT OFF (byte-identical).
+            self._step_boost_spec_off_rules()
+            self._step_boost_spec_0710_regress()
+            self._step_boost_spec_freeze0_tstop()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

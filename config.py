@@ -384,6 +384,18 @@ class Config:
     trapped_late_rescue_enabled: bool = True    # F-B master flag (D-5: LIVE 2026-07-03)
     trapped_rescue_arm_dollars: float = 10.0    # $ adverse from fill before the hedge arms
     trapped_rescue_sl_dollars: float = 13.0     # the late hedge's OWN hard SL ($/leg)
+
+    # ── boost_spec_v2 (D-31, 2026-07-10) ─────────────────────────────────────
+    # MASTER FLAG, DEFAULT OFF -> today's behavior is byte-identical (selftest asserts).
+    # ON inverts the boost family: instead of F-B hedging the trapped leg at $10 adverse
+    # (which structurally buys tops / sells bottoms -- the 2026-07-10 A1 -$1,695 case),
+    # boosts JOIN THE WINNING (break) side, fired only OUTSIDE the straddle band, and
+    # ride a one-way ratchet that can never close negative. When ON, trapped_late_rescue
+    # (F-B) is GATED OFF (its code is kept intact; D-5 stays in history). See boost_spec.py.
+    boost_spec_v2: bool = False           # master flag; OFF = today, byte-identical
+    spec_break_dollars: float = 1.00      # boost 1 fires this far PAST the band edge (R2)
+    spec_boost2_gap: float = 4.00         # boost 2 fires this far after boost 1, same dir (R3)
+    spec_boost_min_lock: float = 1.50     # one-way ratchet floor per boost, once reached (R5)
     boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
     # armed from the instant the boost fills, alongside the $10 hard SL backstop
     # (both live; whichever hits first closes the boost). One-way ratchet; once a
@@ -466,6 +478,13 @@ class Config:
     # leg whose best favorable excursion never reached this ($1). Grid verdict: +$2.0k
     # funded net, 6 fewer full SLs, identical maxDD (-$2,520), best half-balance of all
     # 72 combos. fav<$2 or <$3 tested WORSE -- only truly dead legs get cut. 0 disables.
+    # D-31: with boost_spec_v2 ON, freeze_minutes = 0, so "hold expiry" no longer exists.
+    # tstop_after_min is the EXPLICIT time from ENTRY at which the tstop_fav loser cut
+    # fires (default 45 = today's freeze window, so today's tstop timing is preserved).
+    # It NEVER fires at t=0 (a leg is only cut after tstop_after_min elapsed). When the
+    # freeze is active (flag OFF) the trail loop uses hold-expiry as before; this bound
+    # governs ONLY the freeze=0 path. 0 disables the time bound on that path.
+    tstop_after_min: int = 45
     # Auto-sizing: read balance from MT5 at startup, compute the largest safe lot
     auto_lot: bool = False  # if True, override lot_size from live balance
     lot_conservatism: float = 0.99  # was 0.92 — produces lot 0.54 at $50k (1.94% per trade, safe buffer to 4% daily rule)

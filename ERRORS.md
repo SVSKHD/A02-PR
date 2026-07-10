@@ -895,6 +895,23 @@ or `/fetcher off` manually, for the duration of the experiment.
 alone. And per the F-B note (WATCH / G-1), `rescue_entry_enabled` does NOT govern
 the F-B path that motivated the flip — it governs the NORMAL rescue path only.
 
+### D-31 — `boost_spec_v2` boost redesign — FLAG-GATED, DEFAULT OFF (2026-07-10)
+
+Motivated by the 07-10 A1 −$1,695.40 (three BUYs at the 4127 top hedging the
+trapped SELL via F-B, all died on the $18 fall, the SELL round-tripped into its SL
+with a frozen trail). Two mechanisms fired at structurally wrong moments: F-B arms
+on **adverse distance** ($10 — frequently where the adverse move exhausts, so it
+buys tops / sells bottoms), and `freeze_minutes=45` disabled the trail through the
+favorable excursion. `boost_spec_v2` (default OFF) inverts it: boosts fire only
+**outside the band**, **join the winning (break) side**, ride a one-way ratchet
+that never closes negative (R1–R8, see `boost_spec.py` / `BOOST_SPEC_V2_NOTES.md`).
+ON gates F-B OFF (code kept). `freeze_minutes→0` (R8) with `be_trigger`/`arm_buffer`
+as the sole guards; `tstop_after_min` (default 45) replaces the vanished hold
+expiry. **UNPROVEN on real ticks** — the sim gate has not passed; selftest 301 is a
+hand-built tape proving the mechanism inverts (four-leg total +$1.05 vs −$1,695.40),
+not that it is +EV. Do not flip live until the gate passes and R7's real fire-rate
+is measured (in the crude sim R7 never fired once). Selftests 300–302; v3.8.8.
+
 ---
 
 ## FUNDED / AUG-15 GATE
