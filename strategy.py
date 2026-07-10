@@ -330,7 +330,11 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
     # Initial $18 SL stays as the broker-side stop. When freeze expires, normal
     # trail logic engages and will snap to (peak − trail_gap) automatically.
     in_freeze = False
-    if cfg.freeze_minutes > 0 and pos.entry_time is not None:
+    # D-31 (R8): boost_spec_v2 sets the effective freeze to 0 -- the trail arms on
+    # PROFIT (the `fav >= be_trigger` gate below, guarded by arm_buffer / trail_gap /
+    # max_tick_jump), never on a clock. Flag OFF -> unchanged, byte-identical.
+    if (cfg.freeze_minutes > 0 and pos.entry_time is not None
+            and not bool(getattr(cfg, 'boost_spec_v2', False))):
         try:
             elapsed = (ts - pos.entry_time).total_seconds() / 60.0
             in_freeze = elapsed < cfg.freeze_minutes

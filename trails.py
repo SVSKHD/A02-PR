@@ -173,21 +173,28 @@ def _manage_trails_on_bar_close(self):
         # fake-out; close at market (~ -$5..-$12) instead of riding to the full SL.
         # One-shot by construction: max_fav is monotonic, so once fav >= threshold
         # at expiry this can never fire later.
+        # D-31: with boost_spec_v2 ON the effective freeze is 0, so "hold expiry" no
+        # longer exists; the loser time-stop instead fires at tstop_after_min (default
+        # 45 = today's window, so today's timing is preserved). NEVER at t=0 (bound > 0
+        # required; 0 disables). Flag OFF -> the freeze_minutes hold-expiry path, unchanged.
+        _tstop_bound = (float(getattr(self.cfg, 'tstop_after_min', 45))
+                        if bool(getattr(self.cfg, 'boost_spec_v2', False))
+                        else float(self.cfg.freeze_minutes))
         if (getattr(self.cfg, 'tstop_fav', 0.0) > 0
-                and self.cfg.freeze_minutes > 0
+                and _tstop_bound > 0
                 and entry_time_for_pos is not None):
             try:
                 _elapsed = (bar_time - entry_time_for_pos).total_seconds() / 60.0
             except Exception:
                 _elapsed = None
-            if _elapsed is not None and _elapsed >= self.cfg.freeze_minutes:
+            if _elapsed is not None and _elapsed >= _tstop_bound:
                 _fav = (pos.max_fav - pos.entry_price) if shadow['side'] == 'BUY' \
                     else (pos.entry_price - pos.max_fav)
                 if _fav < self.cfg.tstop_fav:
                     self.tele.warn(
                         f"\u23f1 TSTOP: {shadow['anchor_label']} {shadow['side']} "
                         f"never reached +${self.cfg.tstop_fav:.2f} fav in "
-                        f"{self.cfg.freeze_minutes}m (peak +${max(_fav, 0):.2f}) -- "
+                        f"{_tstop_bound:.0f}m (peak +${max(_fav, 0):.2f}) -- "
                         f"closing at market instead of riding to SL."
                     )
                     shadow['tstop'] = True

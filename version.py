@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.7"  # R-14: pnl_report drifted from MT5 authority — report anchor net now == pnl_source.magic_day_net over the SAME broker-day window; no straddling/partial/unattributable realized close is dropped
+__version__ = "3.8.8"  # D-31: boost_spec_v2 (flag-gated, DEFAULT OFF) — boosts JOIN the winning side outside the band + one-way ratchet (never negative); F-B gated off when ON; freeze=0 (R8) + tstop_after_min. UNVALIDATED on ticks.
 CODENAME = "Astra Hawk"
 
 
