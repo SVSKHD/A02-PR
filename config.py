@@ -396,6 +396,11 @@ class Config:
     spec_break_dollars: float = 1.00      # boost 1 fires this far PAST the band edge (R2)
     spec_boost2_gap: float = 4.00         # boost 2 fires this far after boost 1, same dir (R3)
     spec_boost_min_lock: float = 1.50     # one-way ratchet floor per boost, once reached (R5)
+    spec_boost_sl_dollars: float = 10.0   # OPENING backstop per boost ($ beyond entry) -- a REAL
+    # broker-legal stop at fill, NOT the +spec_boost_min_lock ratchet (which is a TRAILING lock
+    # applied on the tick loop once the boost is +spec_boost_min_lock favorable). Defaults to the
+    # rescue backstop (boost_sl_dollars $10). It is validated against symbol_info.trade_stops_level
+    # before the order is sent and widened to the broker minimum if it would land inside it (R5/R6).
     boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
     # armed from the instant the boost fills, alongside the $10 hard SL backstop
     # (both live; whichever hits first closes the boost). One-way ratchet; once a

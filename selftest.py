@@ -414,6 +414,8 @@ STEP_NAMES = {
     303: "sim gate reproducible",        # ST (testfire) excluded; ROGUE/FETCH legs OPENED >= 07-07 14:34 server excluded by ENTRY timestamp (opened-before/closed-after KEPT); excluded total stated; reproducible buckets reconciled to the cent; no-export hard-refuses
     # 2026-07-10 boost_spec_v2 VISIBILITY: dynamic preflight flags + boot/ status banners.
     304: "boost_spec_v2 visibility",     # preflight lists the flag (ON when True/OFF when False); ACTIVE block only when True; suppressed-in-band count renders on /status; OFF byte-identical
+    # 2026-07-10 boost order geometry: the 07-10 INVALID_STOPS reject (breakeven-at-mid SL + entry+$1000 TP).
+    305: "boost_spec_v2 order stops",     # opening boost SL is a REAL backstop >= trade_stops_level from entry (not breakeven-at-mid); no placeholder TP; ratchet lock arms on the tick loop at +$1.50 fav, not at fill; a mock order_send that rejects INVALID_STOPS accepts the new geometry, rejects the old
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -10266,6 +10268,107 @@ class SelfTest:
             self._record(304, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
         self._record(304, PASS if ok else FAIL, detail)
 
+    def _step_boost_spec_order_stops(self):
+        # 305 boost ORDER GEOMETRY (the 2026-07-10 INVALID_STOPS reject). boost_spec_v2 ON.
+        # The 07-10 boost-1 sent SL=breakeven-at-mid ($0.24 from a 4114.76 BUY entry, INSIDE
+        # trade_stops_level) + TP=entry+$1000 (a placeholder) -> retcode 10016 rejected. Asserts:
+        # (1) the OPENING boost SL is a REAL backstop >= trade_stops_level from entry (= entry -
+        #     spec_boost_sl_dollars), NOT breakeven-at-mid; (2) NO placeholder TP is sent (tp=0.0);
+        # (3) a mock order_send that rejects INVALID_STOPS ACCEPTS the new geometry and REJECTS the
+        #     old; (4) the +spec_boost_min_lock ratchet lock arms on the TICK LOOP at +$1.50 fav,
+        #     NOT at fill. All values READ from cfg.
+        import dataclasses, types, boost_spec as bs
+        try:
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            STOPS_PTS = 30; POINT = 0.01; MIN_DIST = STOPS_PTS * POINT   # $0.30 broker minimum
+            sent = []            # every (side, sl, tp, rc) the broker was asked to place
+
+            class Broker:
+                def __init__(self):
+                    self._tk = 900000; self.last_mid = None; self._open = {}; self.realized = {}
+                    self.mt5 = types.SimpleNamespace(
+                        symbol_info=lambda s=None: types.SimpleNamespace(
+                            point=POINT, trade_stops_level=STOPS_PTS))
+                def _rejects(self, entry, sl):
+                    # broker INVALID_STOPS: a stop inside trade_stops_level from the fill price
+                    return abs(float(entry) - float(sl)) < MIN_DIST - 1e-9
+                def place_market_order(self, sym, side, l, sl, tp, comment, dry_run, magic):
+                    entry = self.last_mid
+                    if self._rejects(entry, sl):
+                        sent.append((side, sl, tp, 10016))
+                        return types.SimpleNamespace(order=None, price=entry, retcode=10016,
+                                                     comment='INVALID_STOPS')
+                    self._tk += 1
+                    self._open[self._tk] = {'side': side, 'entry': entry, 'sl': sl}
+                    sent.append((side, sl, tp, 10009))
+                    return types.SimpleNamespace(order=self._tk, price=entry, retcode=10009)
+                def modify_position_sl(self, tk, sl, dry_run=False):
+                    if int(tk) in self._open:
+                        self._open[int(tk)]['sl'] = sl
+                    return types.SimpleNamespace(retcode=10009)
+                def close_position(self, tk, dry_run=False):
+                    self._open.pop(int(tk), None); tr.shadow_positions.pop(int(tk), None)
+                    return True
+                def advance(self, mid):
+                    self.last_mid = mid
+                    for tk in list(self._open):
+                        p = self._open[tk]
+                        hit = (mid <= p['sl']) if p['side'] == 'BUY' else (mid >= p['sl'])
+                        if hit:
+                            self._open.pop(tk, None); tr.shadow_positions.pop(int(tk), None)
+
+            br = Broker()
+            tr = types.SimpleNamespace(cfg=on, paper=False, adapter=br, ptrace=None,
+                                       shadow_positions={}, _spec_state={})
+            # band [4100.0, 4113.76]; UP break at hi + spec_break_dollars = 4114.76 -> BUY boost
+            buy_fill, sell_fill = 4113.76, 4100.0
+            for tk, side, fill in ((101, 'BUY', buy_fill), (102, 'SELL', sell_fill)):
+                sl = fill - on.sl_dist if side == 'BUY' else fill + on.sl_dist
+                tr.shadow_positions[tk] = {'anchor_label': 'A2_B_Asia', 'side': side,
+                                           'entry_price': fill, 'leg_fill_price': fill,
+                                           'current_sl': sl, 'boost': False}
+                br._open[tk] = {'side': side, 'entry': fill, 'sl': sl}
+
+            entry_px = round(buy_fill + on.spec_break_dollars, 2)   # 4114.76
+            # 1) establish band (inside, no break); 2) UP break -> boost1 BUY at 4114.76
+            br.advance(4108.0); bs.boost_spec_tick(tr, 4108.0)
+            br.advance(entry_px); bs.boost_spec_tick(tr, entry_px)
+
+            checks = {}
+            boost_tks = [k for k in tr.shadow_positions if k > 900000]
+            checks['boost_placed'] = (len(boost_tks) == 1)
+            accepted = [s for s in sent if s[3] == 10009]
+            checks['one_accept'] = (len(accepted) == 1)
+            a_side, a_sl, a_tp, _rc = accepted[0] if accepted else (None, 0.0, 0.0, None)
+            backstop = round(entry_px - on.spec_boost_sl_dollars, 2)     # 4104.76
+            checks['sl_is_backstop'] = (a_side == 'BUY' and abs(a_sl - backstop) < 1e-9)
+            checks['sl_clears_stops'] = (abs(entry_px - a_sl) >= MIN_DIST - 1e-9)
+            checks['sl_not_breakeven'] = (abs(a_sl - entry_px) > 1.0)   # not the ~4114.52 reject
+            checks['no_placeholder_tp'] = (abs(a_tp) < 1e-9)            # tp=0.0, not entry+$1000
+            # the OLD geometry (breakeven-at-mid) would be REJECTED by the same broker; new accepts
+            checks['old_geometry_rejects'] = br._rejects(entry_px, round(entry_px, 2))
+            checks['new_geometry_accepts'] = (not br._rejects(entry_px, a_sl))
+            # RATCHET: not armed at fill; the shadow stop sits at the backstop, not entry+lock
+            bsh = tr.shadow_positions[boost_tks[0]] if boost_tks else {}
+            checks['not_armed_at_fill'] = (not bsh.get('spec_ratchet_armed')
+                                           and abs(float(bsh.get('current_sl', 0)) - backstop) < 1e-9)
+            # advance +spec_boost_min_lock favorable -> the ratchet lock ARMS on the tick loop
+            lk = round(entry_px + on.spec_boost_min_lock, 2)            # 4116.26
+            br.advance(lk); bs.boost_spec_tick(tr, lk)
+            armed_stop = float(bsh.get('current_sl', 0))
+            checks['armed_on_tickloop'] = (bool(bsh.get('spec_ratchet_armed'))
+                                           and armed_stop > backstop + 1e-9
+                                           and armed_stop >= entry_px - 1e-9)
+            # the armed stop is still broker-legal (cleared trade_stops_level vs the live mid)
+            checks['armed_stop_legal'] = (lk - armed_stop >= MIN_DIST - 1e-9)
+            ok = all(checks.values())
+            detail = (" ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+                      + f" | entry={entry_px} sl={a_sl} tp={a_tp} armed_stop={round(armed_stop, 2)}")
+        except Exception as e:
+            import traceback
+            self._record(305, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(305, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -12523,6 +12626,7 @@ class SelfTest:
             # Gate reconciles the REPRODUCIBLE SUBSET (excludes testfire + manual seeds).
             self._step_sim_gate_reproducible()
             self._step_boost_spec_visibility()
+            self._step_boost_spec_order_stops()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()
