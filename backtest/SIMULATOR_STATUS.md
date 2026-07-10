@@ -96,6 +96,54 @@ Selftest total: **297 steps** (was 296; +1 = step 297 "sim tick cache").
 
 ---
 
+## Gate first-run defects — mechanism + fix (2026-07-10)
+
+The gate ran on real ticks and failed on four defects. Mechanism for each:
+
+1. **A3 / A4 never placed.** Two causes. **A3** is CUT from `cfg.anchors` at HEAD
+   (D-1, 07-02) but TRADED on 07-01 — the config timeline now carries A3 in the
+   07-01 anchor list and drops it from 07-02 (`sim_config._ANCHORS_WITH_A3`).
+   **A4/A5** were suppressed by the **anchors daystop**: `daystops.anchors_daystop`
+   locks anchor entries once realized day P&L ≥ `anchors_daily_profit_stop` (800)
+   or ≤ the loss stop (−630); a single A1/A2 full-TP (+$1050) trips +800 and locks
+   the rest of the day before A4 (16:40) / A5 (19:30). But the daystops did not
+   exist before **07-08** (D-16/17 rollout). The sim applied today's values to
+   every day → every decisive morning locked out A4/A5 (the A4 +0.00-vs-+682.15
+   defect). Fix: the timeline disables the daystops (0) before 07-08, turns them on
+   at 07-08 (profit 400 / loss −630), and raises anchors profit 400→800 the
+   **EVENING of 07-09** (D-18) — NOT at 07-09 00:00; the 07-09 morning still runs
+   400. The exact evening minute is immaterial: 07-09 closed at −$821, and a profit
+   lock cannot bind on a losing day, so 400-vs-800 changes no 07-09 outcome (it
+   governs 07-10 onward). Account governors (`account_target_pct`,
+   `account_daily_profit_stop_pct`) are pinned 0 for the whole run (D-24 disabled).
+   Reproduced: with the daystop off, a big A1 win on 07-01 no longer blocks A4/A5.
+2. **FETCH off.** Boundary check confirmed: fetcher is OFF before 07-07 (D-14
+   birth) and OFF on 07-09/07-10 (D-28 anchors-only) in the running sim
+   (`trader.engines['fetcher']` toggled by the timeline). Residual magnitude was
+   the 07-07 manual-seed contamination — see (3).
+3. **ROGUE / ST — unreproducible events, EXCLUDED (owner decision).** On 07-07 the
+   owner fired `/rogueseed` + `/fetchseed` (14:34 server, again ~14:58 after a
+   restart, seed_source=MANUAL); both engines re-anchored at the current tick, and
+   the sim (auto-seeded from A1) diverges from that instant. ST = 34 testfire legs
+   fired by hand (`python bot.py testfire`). Decision: **exclude, do not absorb into
+   a tolerance.** The gate reconciles the **reproducible subset** — it excludes the
+   `ST` bucket and every ROGUE/FETCH leg **OPENED at/after 2026-07-07 14:34:00
+   server**, keyed by **ENTRY timestamp, not by day**. Rogue & Fetcher traded
+   cleanly all morning from the A1 seed, so the pre-14:34 morning STAYS IN (excluding
+   the whole day discarded ~5h of reproducible trades for no reason); a leg opened
+   before 14:34 is kept even if it closes after. Entry time is paired from the IN
+   leg via `position_id` on both the sim and the export. The reproducible truth is
+   computed FROM the export with the same carve. The gate STATES the excluded total
+   (ST + manual-seed) on every run. The 14:34 boundary is the owner's live seed time
+   (run/rogue_trades.csv / fetcher_trades.csv, seed_source==MANUAL); those CSVs are
+   gitignored (VPS-only), so it lives in `sim_gate.MANUAL_SEED_CUTOFF_BROKER` as a
+   documented constant — verify against the MANUAL rows on the VPS before a run.
+4. **A1 / A5** were downstream of (1) — they re-settle once A3/A4 place (the
+   daystop + A3 fixes change which A1/A5 legs survive). Re-grade on the next run.
+
+The gate stays CLOSED until sim == export to the cent on the reproducible buckets
+on all-tick data. No Part 2.
+
 ## BLOCKED — and exactly what unblocks each
 
 ### THE GATE (Part 1B/1C validation)
@@ -141,9 +189,13 @@ per-anchor / rogue / fetcher output can be diffed against it to a stated toleran
   advances, so the **07-07 14:58** intra-day rogue flip lands to the minute:
   D-5 F-B live 07-03; D-14 fetcher born 07-07; D-11/D-13 `rogue_entry_confirm_redesign`
   10→5 + `rogue_init_sl` 5→10 at 07-07 14:58; D-16/17 loss-stops →−370 on 07-08;
-  D-28 anchors-only (rogue+fetcher off) + D-29 `rescue_entry_enabled`→on from 07-09;
-  and D-26/D-27 (`seed_break_dollars`, `engine_base_trades_per_anchor`) **disabled
-  (=0) for the whole run** per owner (not in the running bot during the window).
+  D-16/17 anchors daystop LIVE 07-08 (profit 400 / loss −630) — **no anchors daystop
+  existed at all before 07-08**; D-18 anchors profit 400→800 the **evening of 07-09**
+  (morning stays 400); `account_target_pct` / `account_daily_profit_stop_pct` = 0
+  the whole run (D-24 disabled); D-28 anchors-only (rogue+fetcher off) + D-29
+  `rescue_entry_enabled`→on from 07-09; and D-26/D-27 (`seed_break_dollars`,
+  `engine_base_trades_per_anchor`) **disabled (=0) for the whole run** per owner
+  (not in the running bot during the window).
   Documented simplification: D-13's transient `rogue_daily_loss_stop`=−1050 blip on
   07-07 is folded (−525 until 07-08, then −370) per the owner spec. Asserted by
   selftest 299.
