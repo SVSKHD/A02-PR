@@ -91,6 +91,27 @@ ROGUE_MAGIC_DEFAULT = 20260626
 FETCHER_ENGINE = "FETCHER"
 FETCHER_LEG = "FETCHER"
 FETCHER_MAGIC_DEFAULT = 20260707
+ANCHORS_MAGIC_DEFAULT = 20260522
+
+# R-14: the report's day-window convention. It MUST match the authority
+# (pnl_source.magic_day_net over pnl_source.broker_day_range) or the reconcile
+# audit can never agree with MT5 -- the two would count different deal sets.
+# Every operational surface in this codebase (the live day-P&L accumulator, the
+# daystops, the E-20 governor rebuilds, the 23:00 `eod_broker_hour` flatten) is
+# keyed on the BROKER trading day (UTC + broker_tz_offset_hours). The report used
+# to cut at IST midnight (ist_day_window_utc, UTC+5:30) -- a 2.5h-shifted window
+# that put every boundary-straddling close on a different day than the authority.
+# The report + ledger now use the SAME broker-day window as the authority, so the
+# two are comparable by construction. DEFAULT_BROKER_TZ_OFFSET_HOURS mirrors
+# config.broker_tz_offset_hours (Pepperstone = UTC+3); real callers pass the live
+# cfg value, so a deployment that changes the offset stays correct.
+DEFAULT_BROKER_TZ_OFFSET_HOURS = 3.0
+
+# R-14: explicit bucket for a realized close whose OPEN leg is outside the window
+# (opened before it, or its position_id / comment can't attribute it to a named
+# anchor). Its P&L is ALWAYS counted in the anchor total; attribution is best-
+# effort. Keyed with a non-anchor label so it can never collide with 'A1'..'A5'.
+CLOSED_OUTSIDE_BUCKET = "ext"
 
 _ANCHOR_ORIG_RE = re.compile(r'^AUR_([A-Z0-9]{2})_(BUY|SELL)(?:_(G|RCV|CFM))?(?:_R\d+)?$')
 _ANCHOR_BOOST_RE = re.compile(r'^AUR_([A-Z0-9]{2})_([BS])_B(\d+)$')
@@ -160,64 +181,94 @@ def _dget(d, name, default=None):
 
 def group_deals_by_position(deals):
     """PURE: group raw deal records by `position_id`. Returns
-    {position_id: {'in': deal|None, 'out': deal|None}}. `entry` semantics
-    follow the MT5 convention already used elsewhere in this repo (rogue.py
-    `_rogue_close_pnl`): 0 = IN (open), 1 = OUT (close). A position with more
-    than one OUT deal (partial closes) collapses to its LAST out deal -- a
-    documented simplification (full partial-close reconstruction is out of
-    scope for a daily P&L report; the FINAL close still nets to the broker's
-    own realized total across all partials, so no P&L is lost, only the
-    open/close TIMESTAMP granularity for a partially-closed position)."""
+    {position_id: {'in': deal|None, 'out': last_out|None, 'outs': [all outs]}}.
+    `entry` semantics follow the MT5 convention already used elsewhere in this
+    repo (rogue.py `_rogue_close_pnl`): 0 = IN (open), 1 = OUT (close).
+
+    R-14 fix: EVERY OUT deal is retained in `outs` so a partially-closed
+    position (multiple OUT tranches) sums to the broker's full realized total --
+    matching pnl_source.magic_day_net, which sums ALL out deals. `out` (the last
+    tranche) is kept only for the close TIMESTAMP; realized P&L is built from
+    `outs`, never from a single tranche's `profit`."""
     groups = {}
     for d in (deals or []):
         pid = _dget(d, 'position_id')
         if pid is None:
             continue
-        g = groups.setdefault(int(pid), {'in': None, 'out': None})
+        g = groups.setdefault(int(pid), {'in': None, 'out': None, 'outs': []})
         entry = _dget(d, 'entry')
         if entry == 0 and g['in'] is None:
             g['in'] = d
         elif entry == 1:
-            g['out'] = d
+            g['out'] = d           # last tranche (timestamp only)
+            g['outs'].append(d)    # ALL tranches (realized P&L)
     return groups
 
 
-def build_trade(position_id, group, rescue_event_index, rogue_magic=ROGUE_MAGIC_DEFAULT):
-    """PURE: one completed-trade dict from a {'in':deal,'out':deal} group, or
-    None if the position isn't fully closed within the window (no 'in' or no
-    'out' deal present -- a still-open or straddling-the-window position is
-    excluded from THIS day's completed-trade count, matching "trades closed
-    today" as the report's unit, not "trades touched today")."""
+def _deal_realized(d):
+    """PURE: one deal's realized $ = profit + swap + commission (guarded -> 0).
+    Identical rule to pnl_source.deal_pnl -- the report must book the SAME cents."""
+    return (float(_dget(d, 'profit', 0.0) or 0.0)
+            + float(_dget(d, 'swap', 0.0) or 0.0)
+            + float(_dget(d, 'commission', 0.0) or 0.0))
+
+
+def build_trade(position_id, group, rescue_event_index, rogue_magic=ROGUE_MAGIC_DEFAULT,
+                anchors_magic=ANCHORS_MAGIC_DEFAULT, fetcher_magic=FETCHER_MAGIC_DEFAULT):
+    """PURE: one completed-trade dict from a grouped position, or None ONLY when
+    the position has NO closing deal in the window (still-open / opened-inside-
+    closed-later -- it carries no realized P&L for this day; its realized close
+    is booked in the LATER window that actually contains its OUT deal).
+
+    R-14 fix (never drop a realized close): a position WITH an OUT deal is ALWAYS
+    built, even when its IN deal is outside the window (opened before it). The
+    realized P&L is sum(realized) over ALL OUT tranches (partial-close-safe), so
+    the report's total matches pnl_source.magic_day_net to the cent. When the IN
+    deal is absent the OUT deal's own (comment, magic) drive classification --
+    best-effort; an anchor-magic close that can't be attributed to a named anchor
+    still counts as ANCHOR engine (anchor2=None -> the '??'/ext bucket), never a
+    silent drop."""
     din, dout = group.get('in'), group.get('out')
-    if din is None or dout is None:
+    outs = group.get('outs') or ([dout] if dout is not None else [])
+    if not outs:
         return None
+    opened_before_window = din is None
     comment = _dget(din, 'comment') or _dget(dout, 'comment')
     magic = _dget(din, 'magic', _dget(dout, 'magic'))
-    cls = classify_comment(comment, magic, rogue_magic=rogue_magic)
+    cls = classify_comment(comment, magic, rogue_magic=rogue_magic,
+                           fetcher_magic=fetcher_magic)
+    engine, anchor2 = cls['engine'], cls['anchor2']
     leg_class = cls['leg_class']
+    # Magic-first anchor fallback: a magic-20260522 close whose comment doesn't
+    # match any AUR_* pattern (e.g. a broker SL/TP close-deal comment on a leg
+    # opened before the window) is STILL an anchor realized close -- book it as
+    # ANCHOR engine so per_anchor_stats counts it, rather than dropping to a
+    # non-anchor UNKNOWN that the anchor total would miss.
+    if engine is None and magic == anchors_magic:
+        engine, leg_class = ANCHOR_ENGINE, UNKNOWN
     ticket = int(position_id)
     if leg_class == BOOST_UNCLASSIFIED:
         leg_class = resolve_boost_leg_class(ticket, rescue_event_index)
-    pnl = round(float(_dget(dout, 'profit', 0.0) or 0.0)
-                + float(_dget(dout, 'swap', 0.0) or 0.0)
-                + float(_dget(dout, 'commission', 0.0) or 0.0), 2)
+    pnl = round(sum(_deal_realized(o) for o in outs), 2)
     return {
-        'ticket': ticket, 'symbol': _dget(din, 'symbol'), 'comment': comment,
-        'magic': magic, 'engine': cls['engine'], 'anchor2': cls['anchor2'],
+        'ticket': ticket, 'symbol': _dget(din, 'symbol') or _dget(dout, 'symbol'),
+        'comment': comment, 'magic': magic, 'engine': engine, 'anchor2': anchor2,
         'side': cls['side'], 'leg_class': leg_class,
         'open_time': _dget(din, 'time'), 'close_time': _dget(dout, 'time'),
         'open_price': float(_dget(din, 'price', 0.0) or 0.0),
         'close_price': float(_dget(dout, 'price', 0.0) or 0.0),
-        'pnl': pnl,
+        'pnl': pnl, 'opened_before_window': opened_before_window,
     }
 
 
-def build_trades(deals, rescue_event_index=None, rogue_magic=ROGUE_MAGIC_DEFAULT):
+def build_trades(deals, rescue_event_index=None, rogue_magic=ROGUE_MAGIC_DEFAULT,
+                 anchors_magic=ANCHORS_MAGIC_DEFAULT, fetcher_magic=FETCHER_MAGIC_DEFAULT):
     """PURE: raw deals -> list of completed-trade dicts (see build_trade)."""
     rescue_event_index = rescue_event_index or {}
     out = []
     for pid, g in group_deals_by_position(deals).items():
-        t = build_trade(pid, g, rescue_event_index, rogue_magic=rogue_magic)
+        t = build_trade(pid, g, rescue_event_index, rogue_magic=rogue_magic,
+                        anchors_magic=anchors_magic, fetcher_magic=fetcher_magic)
         if t is not None:
             out.append(t)
     return out
@@ -263,11 +314,16 @@ def detect_whipsaws(trades):
 _RAW_ANCHOR_KEYS = ('trades', 'orig_trades', 'net', 'gross_win', 'gross_loss',
                     'wins', 'losses', 'orig_pnl', 'rally_pnl',
                     'rescue_boost_pnl', 'fb_pnl', 'unclassified_pnl',
-                    'unclassified_n', 'whipsaw_count')
+                    'unclassified_n', 'whipsaw_count',
+                    # R-14: realized closes whose OPEN leg fell outside the window
+                    # (opened before it). Attributed to this anchor, COUNTED in net,
+                    # and surfaced separately so the day's report shows how much of
+                    # the total came from boundary-straddling legs.
+                    'outside_pnl', 'outside_n')
 
 
 _FLOAT_KEYS = {'net', 'gross_win', 'gross_loss', 'orig_pnl', 'rally_pnl',
-              'rescue_boost_pnl', 'fb_pnl', 'unclassified_pnl'}
+              'rescue_boost_pnl', 'fb_pnl', 'unclassified_pnl', 'outside_pnl'}
 
 
 def _blank_anchor_stats():
@@ -283,7 +339,7 @@ def _finalize_ratios(acc):
     decisive = acc['wins'] + acc['losses']
     acc['win_pct'] = round(100.0 * acc['wins'] / decisive, 1) if decisive else 0.0
     for k in ('net', 'orig_pnl', 'rally_pnl', 'rescue_boost_pnl', 'fb_pnl',
-              'unclassified_pnl', 'gross_win', 'gross_loss'):
+              'unclassified_pnl', 'outside_pnl', 'gross_win', 'gross_loss'):
         acc[k] = round(acc[k], 2)
     return acc
 
@@ -304,6 +360,9 @@ def per_anchor_stats(trades, whipsaw_counts=None):
         s['trades'] += 1
         pnl = t['pnl']
         s['net'] += pnl
+        if t.get('opened_before_window'):
+            s['outside_pnl'] += pnl
+            s['outside_n'] += 1
         if t['leg_class'] == ORIGINAL:
             s['orig_pnl'] += pnl
             s['orig_trades'] += 1
@@ -653,20 +712,32 @@ def render_markdown(date_str, per_anchor, rogue, whipsaw_counts=None,
 # Impure readers -- MT5 history sweep, rescue_events.csv join, journal join,
 # log file read. Each degrades to empty/None on any error; never raises.
 # ---------------------------------------------------------------------------
-def ist_day_window_utc(date_str):
-    """(dt_from, dt_to) UTC datetimes spanning ONE IST calendar day [00:00,
-    24:00) -- matches journal.py's `date_ist` convention (the existing
-    per-trade day-key everywhere else in this codebase), so a dailyreport for
-    date_str lines up with the SAME day's rows in trades_<month>.csv. MT5
-    deal.time is always a true UTC epoch second (a different, more reliable
-    convention than the tick-timestamp broker-offset ambiguity documented
-    elsewhere in this repo -- deals are historical broker-server records, not
-    live ticks)."""
+def day_window_utc(date_str, broker_tz_offset_hours=DEFAULT_BROKER_TZ_OFFSET_HOURS):
+    """(dt_from, dt_to) UTC datetimes spanning ONE BROKER trading day for
+    `date_str` = [date 00:00 broker, date+1 00:00 broker), expressed in UTC.
+
+    R-14: this is the day-window the report + ledger now use. It is IDENTICAL,
+    to the second, to pnl_source.broker_day_range(trader, day=date_str) for the
+    same offset (broker midnight = date 00:00 UTC minus the offset), so the
+    report's magic_day_net and the reconcile authority's magic_day_net count the
+    EXACT same deal set -- comparable by construction. MT5 deal.time is a true
+    UTC epoch second, so the window is exact. Every operational surface (live
+    day-P&L, daystops, E-20 rebuilds, the 23:00 EOD flatten) already uses this
+    broker day; the report now joins them instead of cutting at IST midnight."""
+    off = timedelta(hours=float(broker_tz_offset_hours or 0.0))
     d = datetime.strptime(date_str, '%Y-%m-%d')
-    ist_offset = timedelta(hours=5, minutes=30)
-    dt_from = (d - ist_offset).replace(tzinfo=timezone.utc)
-    dt_to = (d + timedelta(days=1) - ist_offset).replace(tzinfo=timezone.utc)
+    dt_from = (d - off).replace(tzinfo=timezone.utc)
+    dt_to = (d + timedelta(days=1) - off).replace(tzinfo=timezone.utc)
     return dt_from, dt_to
+
+
+def ist_day_window_utc(date_str):
+    """DEPRECATED (R-14): the IST calendar-day window [00:00, 24:00) IST (UTC+5:30)
+    the report USED to cut on. Retained only so any external caller / older test
+    that imports it keeps working. The report itself now uses day_window_utc (the
+    broker trading day) so it reconciles with the MT5 authority; using this IST
+    window instead reintroduces the 2.5h boundary drift R-14 fixed."""
+    return day_window_utc(date_str, broker_tz_offset_hours=5.5)
 
 
 def fetch_deals_for_range(adapter, dt_from, dt_to):
@@ -781,29 +852,84 @@ def run_dir_default():
 
 
 # ---------------------------------------------------------------------------
+# R-14: anchor total <- magic_day_net (the ONE authority), attribution best-effort
+# ---------------------------------------------------------------------------
+def reconcile_anchor_total(per_anchor, deals, anchors_magic=ANCHORS_MAGIC_DEFAULT):
+    """PURE: force sum(per_anchor net) to EQUAL pnl_source.magic_day_net(deals,
+    anchors_magic) to the cent, by adding an explicit CLOSED_OUTSIDE_BUCKET
+    ('ext') row for any residual the per-anchor attribution could not place.
+
+    With the build_trade fix, every anchor-magic OUT deal is normally attributed
+    to a named anchor (or the '??' anchor), so the residual is $0 and NO bucket
+    is added. The bucket is the belt-and-suspenders guarantee for the last
+    pathological deals that reach magic_day_net but not per_anchor_stats -- e.g.
+    a close with position_id=None (dropped by grouping) -- so a realized close is
+    COUNTED even when it can't be ATTRIBUTED. Mutates and returns per_anchor."""
+    import pnl_source as _ps
+    authoritative = _ps.magic_day_net(deals, anchors_magic)
+    attributed = round(sum(float(s.get('net', 0.0) or 0.0)
+                           for s in per_anchor.values()), 2)
+    residual = round(authoritative - attributed, 2)
+    if abs(residual) >= 0.01:
+        b = _blank_anchor_stats()
+        b['net'] = residual
+        b['unclassified_pnl'] = residual
+        b['unclassified_n'] = 1
+        b['trades'] = 1
+        if residual > 0:
+            b['gross_win'] = residual
+            b['wins'] = 1
+        else:
+            b['gross_loss'] = -residual
+            b['losses'] = 1
+        _finalize_ratios(b)
+        per_anchor[CLOSED_OUTSIDE_BUCKET] = b
+    return per_anchor
+
+
+# ---------------------------------------------------------------------------
 # Orchestration for one day
 # ---------------------------------------------------------------------------
 def build_day_report(adapter, date_str, run_dir=None, logs_dir=None,
-                     rogue_magic=ROGUE_MAGIC_DEFAULT):
-    """Impure orchestrator: pull MT5 history for `date_str` (IST calendar
-    day), join rescue_events.csv + the journal CSV + the day's log file, and
-    return {'trades', 'per_anchor', 'whipsaw_counts', 'rogue', 'w2',
-    'unclassified'} -- everything render_markdown/ledger_rows need. Never
-    raises (every reader below degrades independently)."""
+                     rogue_magic=ROGUE_MAGIC_DEFAULT,
+                     broker_tz_offset_hours=DEFAULT_BROKER_TZ_OFFSET_HOURS,
+                     fetcher_magic=FETCHER_MAGIC_DEFAULT,
+                     anchors_magic=ANCHORS_MAGIC_DEFAULT):
+    """Impure orchestrator: pull MT5 history for `date_str` over the BROKER
+    trading day (day_window_utc, single-sourced with pnl_source.broker_day_range
+    -- see R-14), join rescue_events.csv + the journal CSV + the day's log file,
+    and return {'trades', 'per_anchor', 'whipsaw_counts', 'rogue', 'fetcher',
+    'w2', 'unclassified'}. Never raises (every reader below degrades
+    independently).
+
+    R-14: each engine's reported day total is now SOURCED FROM the single
+    authority pnl_source.magic_day_net over the same window -- the anchor total
+    via reconcile_anchor_total (per-anchor attribution kept best-effort), rogue
+    and fetcher day_pnl overwritten with their magic's net. So report == MT5
+    authority to the cent, and no straddling / partial / unattributable realized
+    close is ever dropped."""
+    import pnl_source as _ps
     run_dir = run_dir or run_dir_default()
     logs_dir = logs_dir or _logs_dir()
-    dt_from, dt_to = ist_day_window_utc(date_str)
+    dt_from, dt_to = day_window_utc(date_str, broker_tz_offset_hours)
     deals = fetch_deals_for_range(adapter, dt_from, dt_to)
     rescue_idx = load_rescue_event_index(run_dir)
-    trades = build_trades(deals, rescue_idx, rogue_magic=rogue_magic)
+    trades = build_trades(deals, rescue_idx, rogue_magic=rogue_magic,
+                          anchors_magic=anchors_magic, fetcher_magic=fetcher_magic)
     whipsaw_counts = detect_whipsaws(trades)
     per_anchor = per_anchor_stats(trades, whipsaw_counts)
+    per_anchor = reconcile_anchor_total(per_anchor, deals, anchors_magic=anchors_magic)
     journal_idx = load_journal_index(run_dir, date_str)
     w2 = w2_no_hold_delta(trades, journal_idx)
     log_lines = read_log_lines_for_date(logs_dir, date_str)
     log_counts = count_rogue_log_events(log_lines)
     rogue = rogue_stats(trades, log_counts)
     fetcher = fetcher_stats(trades, count_fetcher_log_events(log_lines))
+    # R-14: authority-source the two isolated-engine totals too (rogue/fetcher
+    # day_pnl were summed from `trades` and shared the same drop bug -- they only
+    # looked clean because those engines rarely straddle the day boundary).
+    rogue['day_pnl'] = _ps.magic_day_net(deals, rogue_magic)
+    fetcher['day_pnl'] = _ps.magic_day_net(deals, fetcher_magic)
     unclassified = [t for t in trades if t['leg_class'] in (UNKNOWN, BOOST_UNCLASSIFIED)]
     return {'date': date_str, 'trades': trades, 'per_anchor': per_anchor,
             'whipsaw_counts': whipsaw_counts, 'rogue': rogue, 'fetcher': fetcher,
@@ -917,10 +1043,14 @@ def run_eod_report(self, broker_date):
         if not bool(getattr(self.cfg, 'util_daily_pnl_report', True)):
             return None
         date_str = str(broker_date)
-        rep = build_day_report(self.adapter, date_str, run_dir=self.run_dir)
+        off = float(getattr(self.cfg, 'broker_tz_offset_hours',
+                            DEFAULT_BROKER_TZ_OFFSET_HOURS) or 0.0)
+        rep = build_day_report(self.adapter, date_str, run_dir=self.run_dir,
+                               broker_tz_offset_hours=off)
         month_stats = None
         try:
-            month_stats = month_to_date_rollup(self.adapter, date_str, run_dir=self.run_dir)
+            month_stats = month_to_date_rollup(self.adapter, date_str, run_dir=self.run_dir,
+                                               broker_tz_offset_hours=off)
         except Exception as e:
             log.warning(f"pnl_report: month rollup failed (day report unaffected): {e!r}")
         md_path, csv_path = write_report_files(rep, run_dir=self.run_dir,
@@ -940,7 +1070,8 @@ def run_eod_report(self, broker_date):
         return None
 
 
-def month_to_date_rollup(adapter, date_str, run_dir=None):
+def month_to_date_rollup(adapter, date_str, run_dir=None,
+                         broker_tz_offset_hours=DEFAULT_BROKER_TZ_OFFSET_HOURS):
     """Build the month-to-date per-anchor roll-up (1st of the month through
     date_str inclusive) by running build_day_report for each day and summing
     via rollup_period. Bounded to <=31 iterations; a day with no deals just
@@ -952,7 +1083,8 @@ def month_to_date_rollup(adapter, date_str, run_dir=None):
     cur = first
     while cur <= d:
         cur_str = cur.strftime('%Y-%m-%d')
-        rep = build_day_report(adapter, cur_str, run_dir=run_dir)
+        rep = build_day_report(adapter, cur_str, run_dir=run_dir,
+                               broker_tz_offset_hours=broker_tz_offset_hours)
         day_stats.append(rep['per_anchor'])
         cur += timedelta(days=1)
     return rollup_period(day_stats)
@@ -981,14 +1113,19 @@ def run_dailyreport(date_arg=None):
     try:
         from mt5_adapter import MT5Adapter
         from config import Config
-        adapter = MT5Adapter(Config().symbol)
+        _cfg = Config()
+        adapter = MT5Adapter(_cfg.symbol)
+        off = float(getattr(_cfg, 'broker_tz_offset_hours',
+                            DEFAULT_BROKER_TZ_OFFSET_HOURS) or 0.0)
     except Exception as e:
         print(f"dailyreport: could not connect to MT5: {e!r}")
         return 1
     try:
         if is_day:
-            rep = build_day_report(adapter, date_arg, run_dir=run_dir)
-            month_stats = month_to_date_rollup(adapter, date_arg, run_dir=run_dir)
+            rep = build_day_report(adapter, date_arg, run_dir=run_dir,
+                                   broker_tz_offset_hours=off)
+            month_stats = month_to_date_rollup(adapter, date_arg, run_dir=run_dir,
+                                               broker_tz_offset_hours=off)
             md_path, csv_path = write_report_files(
                 rep, run_dir=run_dir, month_rollup_stats=month_stats,
                 month_str=date_arg[:7])
@@ -1006,7 +1143,8 @@ def run_dailyreport(date_arg=None):
             last_rep = None
             while cur <= end:
                 cur_str = cur.strftime('%Y-%m-%d')
-                rep = build_day_report(adapter, cur_str, run_dir=run_dir)
+                rep = build_day_report(adapter, cur_str, run_dir=run_dir,
+                                       broker_tz_offset_hours=off)
                 per_day_anchor_stats.append(rep['per_anchor'])
                 write_report_files(rep, run_dir=run_dir)
                 _print_day_summary(rep)

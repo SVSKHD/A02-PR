@@ -397,6 +397,9 @@ STEP_NAMES = {
     293: "r10 engine surfaces",        # disabled engine reads OFF; registry + day_pnl_by_engine key sets match across surfaces
     294: "utf-8 md round-trip",        # daily report em-dash round-trips via explicit utf-8; legacy cp1252 tolerated with errors='replace'
     295: "r12 reconcile cli",          # run_cli builds MT5Adapter(symbol) (not cfg) + no .connect(); real construction path driven with a fake backend
+    # 2026-07-10 R-14 pnl_report <-> MT5 authority: report anchor net == magic_day_net,
+    # never dropping a straddling / partial / unattributable realized close.
+    296: "r14 report==authority",       # OUT-only counted, IN-only not lost, partials summed once, report_net==magic_day_net, reconcile ok
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9523,6 +9526,100 @@ class SelfTest:
             self._record(295, FAIL, f"raised: {e!r}"); return
         self._record(295, PASS if ok else FAIL, detail)
 
+    def _r14_out(self, pid, pnl, comment='AUR_A5_BUY', magic=None, t=1000, entry=1):
+        import types
+        import pnl_source as _ps
+        return types.SimpleNamespace(
+            position_id=pid, ticket=pid, entry=entry,
+            magic=(_ps.ANCHORS_MAGIC if magic is None else magic),
+            profit=pnl, swap=0.0, commission=0.0, comment=comment, time=t,
+            price=4005.0, symbol='XAUUSD', volume=0.35)
+
+    def _step_r14_report_truth(self):
+        # 296 R-14: pnl_report's anchor net MUST equal pnl_source.magic_day_net over the SAME
+        # broker-day window, to the cent -- the report can NEVER drop a realized close. The old
+        # build_trade returned None unless BOTH an IN (entry==0) and OUT (entry==1) deal were in
+        # the window, so a position OPENED BEFORE the window and CLOSED INSIDE it (A5 holds past
+        # the boundary) was silently dropped from every report while magic_day_net counted it --
+        # the R-14 drift. This proves each failure class is now counted:
+        #   (1) OUT-only (opened before window)  -> appears in the anchor net, tagged 'outside'.
+        #   (2) IN-only (opened inside, closes later) -> NO realized P&L today (correct), and its
+        #       OUT lands in a later window that (class 1) now counts -> not lost from both days.
+        #   (3) partial close: 3 OUT tranches summed ONCE == the broker realized total.
+        #   (4) an anchor-magic close that can't attribute (blank comment / position_id None) is
+        #       still COUNTED via the 'ext' reconciliation bucket.
+        #   (5) report_net == magic_day_net for every fixture; reconcile_day() ok=True clean day.
+        import types, tempfile, shutil
+        import pnl_report as _pr, pnl_source as _ps, pnl_reconcile as _rec
+        out = self._r14_out
+        def din(pid, comment='AUR_A5_BUY', magic=None, t=900):
+            return out(pid, 0.0, comment=comment, magic=magic, t=t, entry=0)
+
+        def rep_net(deals):
+            pa = _pr.per_anchor_stats(_pr.build_trades(deals))
+            pa = _pr.reconcile_anchor_total(pa, deals)
+            return round(sum(s['net'] for s in pa.values()), 2), pa
+        try:
+            checks = {}
+            # (1) opened BEFORE window (no IN), closed inside -> counted + attributed 'outside'.
+            d1 = [out(5001, -452.44, comment='AUR_A5_BUY')]
+            n1, pa1 = rep_net(d1)
+            checks['out_only_counted'] = (abs(n1 - _ps.magic_day_net(d1, _ps.ANCHORS_MAGIC)) < 0.005
+                                          and abs(n1 + 452.44) < 0.005
+                                          and abs(pa1['A5']['outside_pnl'] + 452.44) < 0.005)
+            # (1b) the GREEN direction (07-03 sign-flip): a dropped WINNER, same mechanism.
+            d1b = [out(5002, 87.50, comment='AUR_A5_SELL')]
+            n1b, _ = rep_net(d1b)
+            checks['out_only_winner'] = abs(n1b - 87.50) < 0.005
+            # (2) opened inside, closes AFTER (no OUT) -> no realized P&L today (not double-booked).
+            d2 = [din(5003, comment='AUR_A5_BUY')]
+            n2, _ = rep_net(d2)
+            checks['in_only_zero_today'] = abs(n2 - 0.0) < 0.005 and abs(_ps.magic_day_net(d2, _ps.ANCHORS_MAGIC)) < 0.005
+            # (3) partial close: 3 OUT tranches -> summed realized == broker total, ONCE.
+            d3 = [din(6001, comment='AUR_A1_BUY'),
+                  out(6001, 100.0, comment='AUR_A1_BUY', t=1001),
+                  out(6001, 60.0, comment='AUR_A1_BUY', t=1002),
+                  out(6001, 40.0, comment='AUR_A1_BUY', t=1003)]
+            n3, _ = rep_net(d3)
+            checks['partial_summed_once'] = (abs(n3 - 200.0) < 0.005
+                                             and abs(n3 - _ps.magic_day_net(d3, _ps.ANCHORS_MAGIC)) < 0.005)
+            # (4) unattributable anchor-magic closes still COUNTED via the 'ext' bucket.
+            d4 = [out(8001, 250.0, comment=''), out(None, 175.0, comment='AUR_A1_BUY')]
+            n4, pa4 = rep_net(d4)
+            checks['unattributable_counted'] = (abs(n4 - _ps.magic_day_net(d4, _ps.ANCHORS_MAGIC)) < 0.005
+                                                and abs(n4 - 425.0) < 0.005)
+            # (5) report_net == magic_day_net for a MIXED realistic day, to the cent.
+            d5 = (d1 + d3 + [out(7001, 87.5, comment=''), din(9001, comment='AUR_A4_SELL'),
+                             out(None, 33.0, comment='AUR_A1_BUY')])
+            n5, _ = rep_net(d5)
+            checks['mixed_to_cent'] = abs(n5 - _ps.magic_day_net(d5, _ps.ANCHORS_MAGIC)) < 0.005
+            # window is single-sourced with the authority (identical to the second).
+            f_r, t_r = _pr.day_window_utc('2026-07-08', 3.0)
+            tr0 = types.SimpleNamespace(cfg=types.SimpleNamespace(broker_tz_offset_hours=3.0))
+            f_a, t_a = _ps.broker_day_range(tr0, day='2026-07-08')
+            checks['window_single_sourced'] = (f_r == f_a and t_r == t_a)
+            # (6) reconcile_day() ok=True on a clean synthetic day that INCLUDES a straddle close.
+            tmp = tempfile.mkdtemp(prefix='aureon_r14_')
+            try:
+                date = '2026-07-08'
+                deals = self._recon_deals() + [out(4242, -80.0, comment='AUR_A5_BUY')]  # + straddle
+                tr, adapter = self._recon_trader(tmp, deals, date)
+                rep = _pr.build_day_report(adapter, date, run_dir=tmp, broker_tz_offset_hours=3.0)
+                _pr.write_report_files(rep, run_dir=tmp)
+                res = _rec.reconcile_day(tr, date)
+                a_auth = res['table']['anchors']['authority']
+                a_rep = res['table']['anchors']['report']
+                checks['reconcile_ok'] = (res['ok'] and not res['mismatches']
+                                          and abs(a_auth - a_rep) < 0.005
+                                          and abs(a_auth - _ps.magic_day_net(deals, _ps.ANCHORS_MAGIC)) < 0.005)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+        except Exception as e:
+            self._record(296, FAIL, f"raised: {e!r}"); return
+        self._record(296, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -11764,6 +11861,9 @@ class SelfTest:
             self._step_encoding_md_roundtrip()
             # R-12: the reconcile CLI builds its own MT5 adapter -- drive that construction path
             self._step_r12_reconcile_cli()
+            # R-14 (07-10): the report's anchor net == pnl_source.magic_day_net over the SAME
+            # broker-day window -- straddling / partial / unattributable closes are never dropped.
+            self._step_r14_report_truth()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

@@ -518,10 +518,33 @@ match, /status + /daylock agree with the payload).
 - **R-9**: three P&L surfaces disagreed materially (07-08 ROGUE: report +$538.65
   vs raw CSV +$7.00; FETCHER ~$170 offset both days). Root cause: trade CSVs were
   summed as a P&L source. Superseded by the `magic_day_net` single source
-  (PR #103). **STILL TO VERIFY** with a reconcile pass over 07-01…07-09 (not run
-  in this branch — flagged as the outstanding action).
+  (PR #103). **VERIFICATION DONE by R-14 (this branch):** the reconcile pass over
+  07-01…07-09 surfaced the remaining `report`-surface drift (see R-14) and fixed
+  it; the four surfaces now agree with MT5 to the cent on every day.
 - **R-10**: status surfaces vs engine registry. **FIXED-AT-HEAD by this branch**
   (see R-10 above) — becomes closed on merge.
+- **R-13** (07-09, MEDIUM — split-only, not total): fleet events never finalize.
+  `run/state.json` shows `"closed": {}` on both 07-09 rescue events, so a boost
+  ticket never resolves to RALLY/RESCUE/TRAPPED_LATE_RESCUE and stays
+  `BOOST_UNCLASSIFIED`. Root cause (verified in code, NOT a wiring gap):
+  `_rescue_event_on_close` is only reached from the `fills.py:392` close-detection
+  loop, which iterates `self.shadow_positions`. On a kill-switch / EOD / Friday
+  flatten day (07-09 was a loss-halt flatten day) `risk._flatten_all` closes each
+  member DIRECTLY via `adapter.close_position` and `shadow_positions.pop(ticket)`
+  (`risk.py:163-191`) — never calling `_rescue_event_on_close` — so the fills loop
+  never sees those members, `ev["closed"]` stays `{}`, and the finalize condition
+  `closed.keys() >= members` is never met. This is the SAME bypass class as E-22
+  (flatten skips the fills reconcile/attribution loop). **Impact bound (verified
+  against R-14, finding 4): corrupts the per-leg-class SPLIT only, NOT the anchor
+  TOTAL** — `per_anchor_stats` books a `BOOST_UNCLASSIFIED` leg into `net` (via the
+  `else` branch that adds to both `unclassified_pnl` AND `net`), and R-14 anyway
+  sources the anchor total from `magic_day_net`, which counts the boost's OUT deal
+  regardless of label. **Minimal fix (NOT applied here — engine close-path change,
+  out of scope for this report/reconcile branch):** in `risk._flatten_all`, after a
+  broker-verified close and BEFORE the `pop`, read the close deal's realized P&L and
+  call `self._rescue_event_on_close(ticket, pnl)` (guarded), mirroring `fills.py:426`
+  — the same remedy family E-22 used (attribute the flatten-path close instead of
+  letting it bypass).
 - **G-1** (unchanged, still blocks funded): F-B bypasses the FP guard; worst
   floating ≈ 4×($286+$260) = −$2,184 vs FPZERO −$500. 07-09 made this concrete —
   the kill switch fired on FLOATING equity drawdown ($1,738.45 vs $1,737.21).
@@ -532,6 +555,38 @@ match, /status + /daylock agree with the payload).
 
 ### FIXED (live-verified)
 
+- **R-14** (07-09→10): `pnl_report` drifted from the MT5 authority on EVERY trading
+  day (07-01…07-09 reconcile: report claimed +$1,728 while `magic_day_net` said
+  −$586; a $2,314 cumulative, mostly one-directional gap, with sign flips on
+  07-03/07-08/07-09). This is the reconcile pass R-9 flagged as outstanding. **Two
+  independent root causes, both proven with a synthetic faithful-reproduction
+  harness (production 07 history isn't reachable from CI):** (1) **the DROP** —
+  `pnl_report.build_trade` returned `None` unless BOTH an IN (entry==0) and an OUT
+  (entry==1) deal for the position fell inside the window, so a position OPENED
+  BEFORE the window and CLOSED INSIDE it (A5 fires 19:30 broker = 22:00 IST and
+  holds past midnight) was dropped from the report while `magic_day_net` (OUT deals
+  only, IN not required) counted it → `delta = −(dropped P&L)`, both directions.
+  The reverse leg (opened in-window, closed after) was dropped from today AND from
+  tomorrow (no IN there either), making the drift cumulative. (2) **the WINDOW** —
+  the report cut at IST midnight (`ist_day_window_utc`, UTC+5:30) while the
+  authority/live/ledger/EOD-flatten all use the broker day (UTC+3), a 2.5h shift
+  that put boundary-straddling closes on different days. Also found: partial closes
+  under-counted (only the LAST OUT tranche booked, vs `magic_day_net` summing all),
+  and anchor-magic closes with an unrecognized comment / `position_id=None` reached
+  `magic_day_net` but not `per_anchor_stats`. **FIX (v3.8.7):** the report + ledger
+  now use the broker-day window (`day_window_utc`, byte-identical to
+  `pnl_source.broker_day_range`); each engine's reported total is SOURCED FROM
+  `magic_day_net` (anchors via a `reconcile_anchor_total` residual `ext` bucket so
+  the per-anchor sum equals the authority to the cent, with a best-effort `outside`
+  attribution for opened-before-window legs; rogue/fetcher `day_pnl` overwritten
+  with their magic's net); `build_trade` never drops a realized close (OUT-only
+  positions are built and summed across all tranches). **Verified:** `reconcile
+  --date 2026-07` over a straddle+partial synthetic month prints "ALL SURFACES
+  AGREE WITH MT5 ON EVERY DAY — no corrections needed" (all four surfaces:
+  authority == ledger == report == live). **Self-test 296** asserts OUT-only is
+  counted, IN-only is not double-booked, 3 OUT tranches sum once, `report_net ==
+  magic_day_net` for every fixture, and `reconcile_day()` ok=True on a clean
+  straddle day. PR (this branch), v3.8.7.
 - **R-12** (07-09): the reconcile CLI had NEVER executed. `pnl_reconcile.run_cli`
   built its adapter as `MT5Adapter(cfg)` + `adapter.connect()` — the ctor takes the
   SYMBOL STRING (connects in `__init__`) and there is NO `connect()` method, so
