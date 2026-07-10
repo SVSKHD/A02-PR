@@ -29,7 +29,41 @@ the F-B code is kept intact, D-5 stays in history):
 
 Config (all new, default preserves today): `boost_spec_v2=False`,
 `spec_break_dollars=1.00`, `spec_boost2_gap=4.00`, `spec_boost_min_lock=1.50`,
-`tstop_after_min=45`.
+`spec_boost_sl_dollars=10.00`, `tstop_after_min=45`.
+
+## Boost order geometry — the 2026-07-10 INVALID_STOPS fix (v3.9.0)
+
+The first live spec boost (`AUR_A2_B_B1`, BUY @ 4114.76) was **rejected**
+(`retcode=10016 INVALID_STOPS`) because the order was malformed two ways:
+
+- **Opening SL was breakeven-at-mid** (`round(last_mid, 2)` ≈ 4114.52, only $0.24
+  below a 4114.76 BUY entry) — inside the broker's minimum stop distance. The
+  ratchet floor is a *trailing* lock, never the opening stop.
+- **TP was `entry + $1000`** (5114.52) — a placeholder that was actually *sent* to
+  the broker as the order's TP.
+
+Fix (`boost_spec.py`, flag ON only):
+
+- **Opening SL is now a REAL backstop**, `spec_boost_sl_dollars` ($10, defaults to
+  the rescue backstop `boost_sl_dollars`) beyond entry, **validated against
+  `symbol_info(symbol).trade_stops_level * point`** and widened to the broker
+  minimum (with a log line) if it would land inside it. New pure helpers
+  `spec_boost_sl` / `stops_min_dist` / `clear_stops_level` reuse the same
+  `trade_stops_level` clamp the anchor/rogue/trails paths use — no reinvention.
+- **No placeholder TP** — the broker order carries `tp=0.0` (no TP; the exit is
+  governed by the ratchet / R7). The shadow keeps a wide *structural* `tp_level`
+  only so the bar-close trail manager never reads it as a hit.
+- **The +$1.50 ratchet is confirmed SEPARATE from the opening order.**
+  `_ratchet_boost` now no-ops until the boost is `+spec_boost_min_lock` favorable
+  (the opening backstop holds until then), and every stop it moves is likewise
+  clamped to clear `trade_stops_level`. R5's "never close negative" is realized
+  once the lock arms; the opening backstop is the capped worst case before that.
+
+Selftest **305** (`boost_spec_v2 order stops`): drives the 07-10 BUY boost at
+~4114.76 through a mock `order_send` that rejects INVALID_STOPS — asserts the new
+SL is a valid `$10` backstop (not 4114.52), no TP is sent, the old geometry is
+rejected while the new one is accepted, and the ratchet lock arms on the tick loop
+at +$1.50 favorable (not at fill). **Total: 305 steps.**
 
 ## The tstop decision + rationale
 
@@ -92,7 +126,8 @@ The flag was live but invisible on the boot banner. Fixed:
 5. **State-machine visibility**: `[BOOST-SPEC-V2] armed for A2 — awaiting fills`
    once per anchor when its straddle is pending, and `[BOOST-SPEC-V2]
    BAND_ESTABLISHED A2 lo=… hi=…` when the band forms — so a no-fill day is not
-   silent. Selftest **304** covers all of the above; total **304 steps**.
+   silent. Selftest **304** covers all of the above (total was **304 steps**; the
+   order-geometry fix below adds **305**, current total **305 steps**).
 
 ## WHAT REMAINS UNPROVEN
 

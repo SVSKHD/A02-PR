@@ -10,8 +10,11 @@ fell $18 and killed all three). boost_spec_v2 instead:
   R2  Boost 1 fires spec_break_dollars ($1) PAST the band edge, break direction.
   R3  Boost 2 fires spec_boost2_gap ($4) after boost 1, same direction.
   R4  Boosts JOIN THE WINNING (break) side -- they do NOT hedge the trapped leg.
-  R5  Each boost trails from ENTRY, one-way ratchet, locks spec_boost_min_lock
-      ($1.50) minimum once reached. A boost can NEVER close negative.
+  R5  Each boost opens with a REAL backstop (spec_boost_sl_dollars $10, validated
+      to clear trade_stops_level) and NO TP, then trails a one-way ratchet that
+      engages on the tick loop once +spec_boost_min_lock ($1.50) favorable and locks
+      that minimum. Once locked a boost can NEVER close negative (the opening
+      backstop is the capped worst case before the lock arms).
   R6  The trapped original dies at its SL, capped -- the ONLY permitted loser.
   R7  When the trapped leg hits its SL, close the entire winning side near it.
   R8  freeze_minutes = 0 -- the trail arms on PROFIT (be_trigger 2.50 / arm_buffer
@@ -71,12 +74,15 @@ def active_block_lines(cfg):
     brk = float(getattr(cfg, 'spec_break_dollars', 1.0))
     gap = float(getattr(cfg, 'spec_boost2_gap', 4.0))
     lock = float(getattr(cfg, 'spec_boost_min_lock', 1.5))
+    back = float(getattr(cfg, 'spec_boost_sl_dollars',
+                         getattr(cfg, 'boost_sl_dollars', 10.0)))
     tstop = int(getattr(cfg, 'tstop_after_min', 45))
     return [
         "[BOOST-SPEC-V2] ACTIVE — boosts join the winning side outside the band.",
         "  band gate: no boost inside the straddle band (R1)",
         f"  boost 1: band edge ±${brk:.2f} · boost 2: +${gap:.2f} after (R2/R3)",
-        f"  ratchet: +${lock:.2f} min lock, one-way, can never close negative (R5)",
+        f"  opening SL: ${back:.2f} backstop (clears trade_stops_level), no TP (R5/R6)",
+        f"  ratchet: +${lock:.2f} min lock, one-way, trailing floor from +${lock:.2f} fav (R5)",
         "  F-B (trapped_late_rescue): GATED OFF",
         f"  freeze_minutes: 0 · tstop_after_min: {tstop}",
     ]
@@ -143,6 +149,52 @@ def spec_ratchet_sl(side, entry, max_fav, cfg):
     return round(float(entry) + sgn * lock, 2)
 
 
+def spec_boost_sl(side, entry, cfg):
+    """The OPENING backstop stop PRICE for a spec boost: a REAL protective stop
+    spec_boost_sl_dollars beyond entry (below a BUY, above a SELL). This is the boost's
+    capped worst case at fill -- NOT the +spec_boost_min_lock ratchet, which is a TRAILING
+    floor engaged on the tick loop only once the boost is +spec_boost_min_lock favorable
+    (R5/R6). The distance is READ from cfg (default = boost_sl_dollars $10, the rescue
+    backstop). Pure; shared with the selftest so live and test can never drift."""
+    sgn = 1.0 if side == 'BUY' else -1.0
+    dist = float(getattr(cfg, 'spec_boost_sl_dollars',
+                         getattr(cfg, 'boost_sl_dollars', 10.0)))
+    return round(float(entry) - sgn * dist, 2)
+
+
+def stops_min_dist(info):
+    """The broker's minimum LEGAL stop distance in price $ from a symbol_info object:
+    trade_stops_level * point -- the SAME source the anchor straddle / rogue / trails paths
+    validate against (mt5_adapter routes 10016 INVALID_STOPS through a recompute-vs-stops_level
+    resend; this is that computation, factored so the boost path reuses it, not reinvents it).
+    0.0 when unknown/unavailable. Pure."""
+    try:
+        point = float(getattr(info, 'point', 0.01)) or 0.01
+        pts = float(getattr(info, 'trade_stops_level', 0) or 0)
+        return max(0.0, pts * point)
+    except Exception:
+        return 0.0
+
+
+def clear_stops_level(side, ref_price, sl, min_dist):
+    """Ensure a stop `sl` sits at least `min_dist` from `ref_price` on the protective side
+    (below a BUY, above a SELL). Returns (sl, widened): a stop INSIDE the broker minimum is
+    widened OUT to exactly the minimum (never pulled closer). This is the same clamp trails.py
+    applies to the anchor legs' stops -- reused here so a spec boost order can never be sent
+    with an INVALID_STOPS geometry (the 2026-07-10 boost-1 reject). Pure."""
+    if min_dist <= 0.0:
+        return round(float(sl), 2), False
+    if side == 'BUY':
+        max_legal = round(float(ref_price) - min_dist, 2)   # SL must be <= this (below market)
+        if float(sl) > max_legal:
+            return max_legal, True
+    else:
+        min_legal = round(float(ref_price) + min_dist, 2)   # SL must be >= this (above market)
+        if float(sl) < min_legal:
+            return min_legal, True
+    return round(float(sl), 2), False
+
+
 def favorable(side, entry, price):
     """Favorable excursion in price $ for a leg (>=0 good)."""
     return (price - entry) if side == 'BUY' else (entry - price)
@@ -195,30 +247,62 @@ def _anchor_originals(trader, anchor):
     return out
 
 
+def _live_min_dist(trader):
+    """Live broker minimum LEGAL stop distance ($) for the traded symbol. Best-effort;
+    0.0 when the adapter/mt5/symbol_info is unavailable (paper stubs, test brokers)."""
+    try:
+        info = trader.adapter.mt5.symbol_info(trader.cfg.symbol)
+    except Exception:
+        info = None
+    return stops_min_dist(info)
+
+
 def _place_spec_boost(trader, anchor, side, seq, band_state):
-    """Place ONE spec boost at market on `side`, breakeven stop, no TP (rides the
-    ratchet / R7). Registers a shadow with spec markers. Returns ticket or None."""
+    """Place ONE spec boost at market on `side`. The OPENING stop is a REAL backstop
+    (spec_boost_sl_dollars beyond the reference price), VALIDATED to clear the broker's
+    trade_stops_level -- NOT the +spec_boost_min_lock ratchet (that is a TRAILING lock the
+    tick loop engages once the boost is +spec_boost_min_lock favorable; see _ratchet_boost).
+    NO take-profit is sent to the broker (tp=0.0): the exit is governed by the ratchet / R7,
+    never a placeholder target. The shadow keeps a WIDE STRUCTURAL tp_level only so the
+    bar-close trail manager never reads it as a hit. Registers a shadow with spec markers.
+    Returns ticket or None."""
     a2 = str(anchor)[:2]
     sgn = 1.0 if side == 'BUY' else -1.0
     comment = f"AUR_{a2}_{_SIDE_CHAR[side]}_B{seq}"
-    # far TP so only the ratchet / R7 close the boost; breakeven SL at the current
-    # mid (corrected to the real fill by the first ratchet pass).
     mid = float(band_state['last_mid'])
-    far_tp = round(mid + sgn * 1000.0, 2)
+    # OPENING backstop, clamped to the broker's minimum legal stop distance (reuse the same
+    # trade_stops_level validation the anchor/rogue/trails paths use). The 2026-07-10 reject
+    # was a breakeven-at-mid stop ($0.24 from a BUY entry) landing inside trade_stops_level.
+    min_dist = _live_min_dist(trader)
+    sl0 = spec_boost_sl(side, mid, trader.cfg)
+    sl0, widened = clear_stops_level(side, mid, sl0, min_dist)
+    if widened:
+        log.warning(f"boost_spec: {side} B{seq} opening SL inside trade_stops_level "
+                    f"(min ${min_dist:.2f} from {mid}) -- widened to {sl0}")
+    # WIDE STRUCTURAL TP for the local shadow ONLY (keeps the bar-close trail's TP check
+    # inert); the broker order carries NO TP (tp=0.0), not the old entry+$1000 placeholder.
+    structural_tp = round(mid + sgn * 1000.0, 2)
     try:
         res = trader.adapter.place_market_order(
-            trader.cfg.symbol, side, trader.cfg.lot_size, sl=round(mid, 2), tp=far_tp,
+            trader.cfg.symbol, side, trader.cfg.lot_size, sl=sl0, tp=0.0,
             comment=comment, dry_run=trader.paper, magic=ANCHORS_MAGIC)
     except Exception as e:
         log.warning(f"boost_spec: place {side} B{seq} failed: {e!r}")
         return None
     tk = getattr(res, 'order', None) or getattr(res, 'deal', None)
+    rc = getattr(res, 'retcode', None)
     fill = float(getattr(res, 'price', mid) or mid)
-    if not tk:
+    if not tk or (rc is not None and rc != 10009):
+        log.error(f"boost_spec: {side} B{seq} not filled (rc={rc}) -- no shadow registered")
         return None
+    # re-derive the backstop from the ACTUAL fill so the shadow's stop matches what protects
+    # the live position (validated the same way).
+    sl_fill = spec_boost_sl(side, fill, trader.cfg)
+    sl_fill, _w = clear_stops_level(side, fill, sl_fill, min_dist)
     trader.shadow_positions[int(tk)] = {
         'anchor_label': anchor, 'side': side, 'entry_price': fill,
-        'current_sl': round(fill, 2), 'tp_level': far_tp, 'max_fav': fill,
+        'current_sl': sl_fill, 'tp_level': structural_tp, 'max_fav': fill,
+        'spec_open_sl': sl_fill,
         'leg_fill_price': fill, 'role': 'rescue', 'boost': True, 'spec_boost': True,
         'spec_seq': seq, 'spec_anchor': anchor, 'boost_eligible': False,
         'boost_fired': True, 'boost_rally_only': False,
@@ -227,16 +311,25 @@ def _place_spec_boost(trader, anchor, side, seq, band_state):
 
 
 def _ratchet_boost(trader, tk, sh, mid):
-    """R5: advance the boost's one-way ratchet stop from its peak favorable
-    excursion; emit RATCHET_ARMED the first time it locks. The broker SL is moved
-    via modify_position_sl (live) / the shadow current_sl (paper)."""
+    """R5: the boost's one-way TRAILING ratchet. It ENGAGES only once the boost is
+    +spec_boost_min_lock favorable -- until then the OPENING backstop set at placement
+    stands (the ratchet is NOT the opening SL: that was the 2026-07-10 defect). Once armed
+    it locks >= +spec_boost_min_lock and only ever advances further favorable, emitting
+    RATCHET_ARMED the first time. Every stop it sends is clamped to clear trade_stops_level
+    so a lock near market can never reject. The broker SL is moved via modify_position_sl
+    (live) / the shadow current_sl (paper)."""
     side = sh['side']; entry = float(sh['entry_price'])
     fav = favorable(side, entry, mid)
     peak = max(float(sh.get('spec_max_fav', 0.0)), fav)
     sh['spec_max_fav'] = peak
+    # NOT yet +spec_boost_min_lock favorable -> the opening backstop holds; the ratchet
+    # (the +$1.50 lock) is a TRAILING floor engaged on the tick loop, never the initial SL.
+    if spec_lock_fav(peak, trader.cfg) <= 0.0:
+        return
     new_sl = spec_ratchet_sl(side, entry, peak, trader.cfg)
+    # never send a stop inside the broker's minimum distance from the live market
+    new_sl, _w = clear_stops_level(side, mid, new_sl, _live_min_dist(trader))
     cur = float(sh.get('current_sl', entry))
-    sgn = 1.0 if side == 'BUY' else -1.0
     # one-way: only ever move the stop in the favorable direction
     improves = (new_sl > cur + 1e-9) if side == 'BUY' else (new_sl < cur - 1e-9)
     if improves:
@@ -246,7 +339,7 @@ def _ratchet_boost(trader, tk, sh, mid):
                 trader.adapter.modify_position_sl(int(tk), new_sl)
         except Exception:
             pass
-        if not sh.get('spec_ratchet_armed') and spec_lock_fav(peak, trader.cfg) > 0.0:
+        if not sh.get('spec_ratchet_armed'):
             sh['spec_ratchet_armed'] = True
             _pt(trader, 'RATCHET_ARMED', sh.get('anchor_label'), ticket=tk, side=side,
                 lock_level=new_sl, max_fav=round(peak, 2))
