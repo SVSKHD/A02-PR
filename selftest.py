@@ -412,6 +412,8 @@ STEP_NAMES = {
     302: "boost_spec_v2 freeze0+tstop",  # R8 freeze=0 arms trail at be_trigger (not clock) ON, still frozen OFF; tstop_after_min fires once, never at t=0
     # 2026-07-10 gate reconciles the REPRODUCIBLE SUBSET (excludes testfire + manual seeds).
     303: "sim gate reproducible",        # ST (testfire) excluded; ROGUE/FETCH legs OPENED >= 07-07 14:34 server excluded by ENTRY timestamp (opened-before/closed-after KEPT); excluded total stated; reproducible buckets reconciled to the cent; no-export hard-refuses
+    # 2026-07-10 boost_spec_v2 VISIBILITY: dynamic preflight flags + boot/ status banners.
+    304: "boost_spec_v2 visibility",     # preflight lists the flag (ON when True/OFF when False); ACTIVE block only when True; suppressed-in-band count renders on /status; OFF byte-identical
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -10202,6 +10204,68 @@ class SelfTest:
             self._record(302, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
         self._record(302, PASS if ok else FAIL, detail)
 
+    def _step_boost_spec_visibility(self):
+        # 303 boost_spec_v2 VISIBILITY (D-31, display-only): the boot/preflight/status surfaces
+        # make the flag visible. Asserts: (1) the preflight flag list is DYNAMIC -- boost_spec_v2
+        # appears in the ON list when True and the OFF list when False (no stale hardcoded list);
+        # (2) the loud ACTIVE block prints ONLY when True (empty when False -> byte-identical boot);
+        # (3) the /status boost-mode line renders SPEC_V2 + today's suppressed-in-band count, and
+        # the counter increments when a leg is $10 adverse INSIDE the band (R1 suppression); (4)
+        # the startup card line reflects the mode both ways. All values READ from cfg.
+        import dataclasses, boost_spec as bs, boost_metrics as bm
+        try:
+            off = self.cfg
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            checks = {}
+            # (1) DYNAMIC preflight flag list -- introspects every bool field on Config
+            fl_off = bm.all_bool_flags(off); fl_on = bm.all_bool_flags(on)
+            checks['flag_in_list'] = ('boost_spec_v2' in fl_off and 'boost_spec_v2' in fl_on)
+            _, lines_off = bm.preflight_lines(3.0, ['A1'], fl_off, True)
+            _, lines_on = bm.preflight_lines(3.0, ['A1'], fl_on, True)
+            off_line = [l for l in lines_off if 'flags OFF' in l][0]
+            on_line = [l for l in lines_on if 'flags ON' in l][0]
+            checks['off_in_OFF_list'] = ('boost_spec_v2' in off_line)
+            checks['on_in_ON_list'] = ('boost_spec_v2' in on_line)
+            # (2) ACTIVE block: empty OFF (byte-identical boot), present ON, values from cfg
+            checks['active_empty_off'] = (bs.active_block_lines(off) == [])
+            blk = bs.active_block_lines(on)
+            checks['active_present_on'] = (len(blk) >= 6 and 'ACTIVE' in blk[0]
+                                           and any('GATED OFF' in l for l in blk)
+                                           and any(f"{on.spec_break_dollars:.2f}" in l for l in blk)
+                                           and any(f"tstop_after_min: {on.tstop_after_min}" in l for l in blk))
+            # (3) /status boost-mode line + suppressed-in-band counter
+            checks['mode_off'] = (bs.boost_mode(off) == 'F-B' and 'F-B' in bs.boost_mode_line(off))
+            checks['mode_on'] = (bs.boost_mode(on) == 'SPEC_V2'
+                                 and bs.boost_mode_line(on, 7) == 'Boost mode: SPEC_V2 · suppressed-in-band today: 7')
+            # counter increments when a leg is >= trapped_rescue_arm adverse INSIDE the band
+            import types
+            tr = types.SimpleNamespace(cfg=on, paper=False, ptrace=None, shadow_pendings={},
+                                       _spec_state={}, _spec_suppressed_today=0,
+                                       adapter=types.SimpleNamespace(
+                                           place_market_order=lambda *a, **k: None))
+            # band [4110, 4130]; both originals filled; mid 4119 INSIDE band, BUY 4130 is
+            # 11 adverse (>= trapped_rescue_arm 10) -> R1 suppresses -> counter++
+            tr.shadow_positions = {
+                201: {'anchor_label': 'A2_10h', 'side': 'BUY', 'entry_price': 4130.0,
+                      'leg_fill_price': 4130.0, 'current_sl': 4112.0, 'boost': False},
+                202: {'anchor_label': 'A2_10h', 'side': 'SELL', 'entry_price': 4110.0,
+                      'leg_fill_price': 4110.0, 'current_sl': 4128.0, 'boost': False}}
+            bs.boost_spec_tick(tr, 4119.0)     # inside band, BUY 11 adverse
+            bs.boost_spec_tick(tr, 4119.0)     # again -> counts each tick it would have fired
+            suppressed = int(getattr(tr, '_spec_suppressed_today', 0))
+            no_order = True  # place_market_order returns None; no boost placed inside band
+            checks['suppressed_counts'] = (suppressed >= 1
+                                           and f"today: {suppressed}" in bs.boost_mode_line(on, suppressed))
+            # (4) startup card line both ways
+            checks['startup_line'] = ('SPEC_V2' in bs.startup_card_line(on)
+                                      and 'F-B' in bs.startup_card_line(off))
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items()) + f" suppressed={suppressed}"
+        except Exception as e:
+            import traceback
+            self._record(304, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(304, PASS if ok else FAIL, detail)
+
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
     # ------------------------------------------------------------------------
@@ -12458,6 +12522,7 @@ class SelfTest:
             self._step_boost_spec_freeze0_tstop()
             # Gate reconciles the REPRODUCIBLE SUBSET (excludes testfire + manual seeds).
             self._step_sim_gate_reproducible()
+            self._step_boost_spec_visibility()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

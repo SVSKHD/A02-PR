@@ -36,6 +36,53 @@ _SIDE_CHAR = {'BUY': 'B', 'SELL': 'S'}
 
 
 # ===========================================================================
+# VISIBILITY helpers (D-31 banner/status; all values READ from cfg)
+# ===========================================================================
+def is_active(cfg):
+    return bool(getattr(cfg, 'boost_spec_v2', False))
+
+
+def boost_mode(cfg):
+    """'SPEC_V2' when the flag is on, else 'F-B'."""
+    return 'SPEC_V2' if is_active(cfg) else 'F-B'
+
+
+def boost_mode_line(cfg, suppressed_today=None):
+    """The one-line boost-mode string for /status + /engines. Shows the
+    suppressed-in-band count (the whole point of R1) when SPEC_V2 is active."""
+    if is_active(cfg):
+        n = 0 if suppressed_today is None else int(suppressed_today)
+        return f"Boost mode: SPEC_V2 · suppressed-in-band today: {n}"
+    return "Boost mode: F-B (trapped-leg hedge at $10 adverse)"
+
+
+def startup_card_line(cfg):
+    """The boost-mode line appended to the boot startup card (item 3)."""
+    if is_active(cfg):
+        return "Boost mode: `SPEC_V2` (band-gated, joins winner)"
+    return "Boost mode: `F-B` (trapped-leg hedge at $10 adverse)"
+
+
+def active_block_lines(cfg):
+    """The loud [BOOST-SPEC-V2] ACTIVE block (item 2). EMPTY when the flag is off
+    (so boot is byte-identical). All numbers read from cfg."""
+    if not is_active(cfg):
+        return []
+    brk = float(getattr(cfg, 'spec_break_dollars', 1.0))
+    gap = float(getattr(cfg, 'spec_boost2_gap', 4.0))
+    lock = float(getattr(cfg, 'spec_boost_min_lock', 1.5))
+    tstop = int(getattr(cfg, 'tstop_after_min', 45))
+    return [
+        "[BOOST-SPEC-V2] ACTIVE — boosts join the winning side outside the band.",
+        "  band gate: no boost inside the straddle band (R1)",
+        f"  boost 1: band edge ±${brk:.2f} · boost 2: +${gap:.2f} after (R2/R3)",
+        f"  ratchet: +${lock:.2f} min lock, one-way, can never close negative (R5)",
+        "  F-B (trapped_late_rescue): GATED OFF",
+        f"  freeze_minutes: 0 · tstop_after_min: {tstop}",
+    ]
+
+
+# ===========================================================================
 # PURE decision functions (shared with the selftest; never hardcode a value)
 # ===========================================================================
 def band_edges(fill_a, fill_b):
@@ -216,6 +263,22 @@ def boost_spec_tick(trader, mid):
         st = trader._spec_state = {}
     cfg = trader.cfg
 
+    # item 5 (state-machine visibility): log ONCE per anchor when its straddle is
+    # pending (both legs resting, not yet filled) so a no-fill day is NOT silent /
+    # indistinguishable from "the flag never loaded".
+    armed = getattr(trader, '_spec_armed_logged', None)
+    if armed is None:
+        armed = trader._spec_armed_logged = set()
+    pend = {}
+    for _tk, _sh in list(getattr(trader, 'shadow_pendings', {}).items()):
+        a = _sh.get('anchor_label')
+        pend[a] = pend.get(a, 0) + 1
+    for a, n in pend.items():
+        if n >= 2 and a not in st and a not in armed:
+            armed.add(a)
+            log.info(f"[BOOST-SPEC-V2] armed for {str(a)[:2]} — awaiting fills to "
+                     f"establish band")
+
     # group open originals by anchor
     anchors = {}
     for tk, sh in list(trader.shadow_positions.items()):
@@ -238,6 +301,8 @@ def boost_spec_tick(trader, mid):
                                       'boost1': None, 'boost2': None, 'dir': None,
                                       'trapped': None, 'r7_done': False, 'last_mid': mid}
                 _pt(trader, 'BAND_ESTABLISHED', anchor, band_lo=lo, band_hi=hi)
+                log.info(f"[BOOST-SPEC-V2] BAND_ESTABLISHED {str(anchor)[:2]} "
+                         f"lo={lo} hi={hi}")
             else:
                 continue
         state['last_mid'] = mid
@@ -251,6 +316,10 @@ def boost_spec_tick(trader, mid):
                 arm = float(getattr(cfg, 'trapped_rescue_arm_dollars', 10.0))
                 for _t, s in origs:
                     if favorable(s['side'], float(s['leg_fill_price']), mid) <= -arm:
+                        # count it (the whole point of R1: how many boosts the old
+                        # F-B would have fired INTO the band). Per broker day.
+                        trader._spec_suppressed_today = int(
+                            getattr(trader, '_spec_suppressed_today', 0)) + 1
                         _pullback_log(trader, 'BOOST_SUPPRESSED_IN_BAND', anchor,
                                       side=s['side'], adverse=round(-favorable(
                                           s['side'], float(s['leg_fill_price']), mid), 2),

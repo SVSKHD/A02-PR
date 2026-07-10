@@ -161,6 +161,25 @@ PREFLIGHT_FLAG_KEYS = (
     'util_daily_report', 'util_preflight', 'fix_boost_telemetry', 'fix_a1_offset')
 
 
+def all_bool_flags(cfg) -> dict:
+    """{name: value} for EVERY bool-typed field on the Config dataclass. Dynamic,
+    so a NEW flag (e.g. boost_spec_v2) appears in the preflight ON/OFF banner
+    automatically -- no more stale hardcoded lists (D-31 visibility). Falls back to
+    PREFLIGHT_FLAG_KEYS only if the dataclass introspection fails."""
+    import dataclasses
+    out = {}
+    try:
+        for f in dataclasses.fields(cfg):
+            v = getattr(cfg, f.name, None)
+            if isinstance(v, bool):
+                out[f.name] = v
+        if out:
+            return out
+    except Exception:
+        pass
+    return {k: bool(getattr(cfg, k)) for k in PREFLIGHT_FLAG_KEYS if hasattr(cfg, k)}
+
+
 def run_preflight(trader):
     """feature 11 live hook: gather offset / anchors / flags / market on boot and emit
     the preflight report. ALERT-ONLY -- it surfaces an undetected offset loudly but does
@@ -172,8 +191,9 @@ def run_preflight(trader):
             return True, []
         offset = getattr(getattr(trader, 'adapter', None), 'tick_time_offset_hours', None)
         anchors = [a[0] for a in getattr(trader.cfg, 'anchors', [])]
-        flags = {k: bool(getattr(trader.cfg, k)) for k in PREFLIGHT_FLAG_KEYS
-                 if hasattr(trader.cfg, k)}
+        # D-31: iterate EVERY bool field on Config (dynamic) -> any future flag
+        # (boost_spec_v2 and beyond) shows in the ON/OFF banner automatically.
+        flags = all_bool_flags(trader.cfg)
         try:
             market_open = not trader._market_closed_now()
         except Exception:
