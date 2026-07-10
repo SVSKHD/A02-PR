@@ -96,6 +96,43 @@ Selftest total: **297 steps** (was 296; +1 = step 297 "sim tick cache").
 
 ---
 
+## Gate first-run defects — mechanism + fix (2026-07-10)
+
+The gate ran on real ticks and failed on four defects. Mechanism for each:
+
+1. **A3 / A4 never placed.** Two causes. **A3** is CUT from `cfg.anchors` at HEAD
+   (D-1, 07-02) but TRADED on 07-01 — the config timeline now carries A3 in the
+   07-01 anchor list and drops it from 07-02 (`sim_config._ANCHORS_WITH_A3`).
+   **A4/A5** were suppressed by the **anchors daystop**: `daystops.anchors_daystop`
+   locks anchor entries once realized day P&L ≥ `anchors_daily_profit_stop` (800)
+   or ≤ the loss stop (−630); a single A1/A2 full-TP (+$1050) trips +800 and locks
+   the rest of the day before A4 (16:40) / A5 (19:30). But the daystops did not
+   exist before **07-08** (D-16/17 rollout). The sim applied today's values to
+   every day → every decisive morning locked out A4/A5. Fix: the timeline disables
+   the daystops (0) before 07-08, turns them on at 07-08 (profit 400 / loss −630),
+   and raises anchors profit to 800 on 07-09 (D-18). Reproduced: with the daystop
+   off, a big A1 win on 07-01 no longer blocks A4/A5.
+2. **FETCH off.** Boundary check confirmed: fetcher is OFF before 07-07 (D-14
+   birth) and OFF on 07-09/07-10 (D-28 anchors-only) in the running sim
+   (`trader.engines['fetcher']` toggled by the timeline). Residual magnitude was
+   the 07-07 manual-seed contamination — see (3).
+3. **ROGUE / ST — unreproducible events, EXCLUDED (owner decision).** On 07-07 the
+   owner fired `/rogueseed` + `/fetchseed` (14:34 / 14:58 server, seed_source=
+   MANUAL); both engines re-anchored at the current tick, and the sim (auto-seeded
+   from A1) diverges from that instant. ST = 34 testfire legs fired by hand.
+   Decision: **exclude, do not absorb into a tolerance.** The gate now reconciles
+   the **reproducible subset** — it excludes the `ST` bucket and the
+   `(ROGUE,07-07)` / `(FETCH,07-07)` day-cells from BOTH the sim and the export
+   (MT5 deals carry no seed_source, so the carve is by engine+day, the only
+   reliable key), and computes the reproducible truth FROM the export per-day.
+   Conservative: the reproducible 07-07 rogue morning (pre-14:34) is sacrificed
+   with the rest of the day.
+4. **A1 / A5** were downstream of (1) — they re-settle once A3/A4 place (the
+   daystop + A3 fixes change which A1/A5 legs survive). Re-grade on the next run.
+
+The gate stays CLOSED until sim == export to the cent on the reproducible buckets
+on all-tick data. No Part 2.
+
 ## BLOCKED — and exactly what unblocks each
 
 ### THE GATE (Part 1B/1C validation)

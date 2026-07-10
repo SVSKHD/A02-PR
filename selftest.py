@@ -405,7 +405,9 @@ STEP_NAMES = {
     # 2026-07-10 offline simulator Part 1B/1C: real LiveTrader tick loop behind a fake broker.
     298: "sim engine drives",           # fake broker + REAL _tick(): anchor fills, real AUR_* comments, magic_day_net works, GATE-NOT-RUN header on every artifact, nothing writes to run/
     # 2026-07-10 offline simulator baseline = July AS TRADED: per-day config from the D-series.
-    299: "sim config as-traded",         # per-day config reconstruction: D-5/D-11/D-13/D-14/D-16-17/D-26-27/D-28/D-29 resolve to the right values per day incl the 07-07 14:58 intra-day rogue flip
+    299: "sim config as-traded",         # per-day config reconstruction: D-1 A3 cut, daystops 07-08, D-5/D-11/D-13/D-14/D-16-17/D-26-27/D-28/D-29 incl the 07-07 14:58 intra-day rogue flip
+    # 2026-07-10 gate reconciles the REPRODUCIBLE SUBSET (excludes testfire + manual seeds).
+    300: "sim gate reproducible",        # ST (testfire) + 07-07 manual-seed rogue/fetch excluded from BOTH sim and export; reproducible buckets reconciled to the cent; no-export hard-refuses
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9817,7 +9819,8 @@ class SelfTest:
                 ts = pd.Timestamp(broker_local, tz='UTC') - pd.Timedelta(hours=3)
                 return scfg.active_config(ts)
 
-            c2, e2, _ = at('2026-07-02 10:00')     # early window
+            c1, e1, _ = at('2026-07-01 10:00')     # 07-01 (A3 still live per D-1)
+            c2, e2, _ = at('2026-07-02 10:00')     # early window (A3 cut from here)
             c7a, e7a, _ = at('2026-07-07 12:00')   # 07-07 BEFORE the 14:58 flip
             c7b, e7b, _ = at('2026-07-07 15:00')   # 07-07 AFTER the flip
             c8, e8, _ = at('2026-07-08 10:00')     # loss-stop cut
@@ -9845,6 +9848,16 @@ class SelfTest:
                 # D-28 anchors-only + D-29 rescue on, from 07-09
                 'anchors_only': (e9['rogue'] is False and e9['fetcher'] is False and e9['anchors'] is True
                                  and c9['rescue_entry_enabled'] is True),
+                # D-1: A3 in the anchor list on 07-01, CUT from 07-02 onward
+                'a3_cut': (any(a[0].startswith('A3') for a in c1['anchors'])
+                           and not any(a[0].startswith('A3') for a in c2['anchors'])),
+                # daystops absent before 07-08 (so a big A1/A2 win can't lock A4/A5),
+                # live from 07-08, anchors profit 400->800 on 07-09 (D-16/17/18)
+                'daystops_timeline': (c2['anchors_daily_profit_stop'] == 0.0
+                                      and c2['anchors_daily_loss_stop'] == 0.0
+                                      and c8['anchors_daily_profit_stop'] == 400.0
+                                      and c8['anchors_daily_loss_stop'] == -630.0
+                                      and c9['anchors_daily_profit_stop'] == 800.0),
             }
             # apply_to_trader mutates a trader stub
             tr = types.SimpleNamespace(cfg=types.SimpleNamespace(
@@ -9864,6 +9877,65 @@ class SelfTest:
         except Exception as e:
             self._record(299, FAIL, f"raised: {e!r}"); return
         self._record(299, PASS if ok else FAIL, detail)
+
+    def _step_sim_gate_reproducible(self):
+        # 300 THE GATE reconciles the REPRODUCIBLE SUBSET (owner decision): unreproducible events
+        # -- the ST testfire bucket (fired by hand) and the 07-07 /rogueseed //fetchseed manual
+        # re-anchors (which diverge the whole day's rogue/fetch chain) -- are EXCLUDED from BOTH
+        # the sim AND the export, not absorbed into a tolerance. Asserts: exclusion is symmetric;
+        # matching reproducible subsets PASS; a real mismatch is NOT-passed (not refused); and a
+        # MISSING export HARD-REFUSES (the reproducible truth is computed FROM the export).
+        import importlib.util as _ilu, os, tempfile, csv, types, shutil
+        import pandas as pd
+        try:
+            bt = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest')
+            s = _ilu.spec_from_file_location('aureon_sim_gate_st', os.path.join(bt, 'sim_gate.py'))
+            g = _ilu.module_from_spec(s); s.loader.exec_module(g)
+            import pnl_source as _ps
+
+            def ep(x):
+                return int(pd.Timestamp(x, tz='UTC').timestamp())
+
+            def d(comment, magic, profit, t):
+                return types.SimpleNamespace(entry=1, comment=comment, magic=magic,
+                                             profit=profit, swap=0.0, commission=0.0, time=ep(t))
+            # sim: A1 +100 (07-02 keep), ST +50 (excl), ROGUE -30 (07-07 excl), ROGUE +20 (07-08 keep)
+            sim = [d('AUR_A1_BUY', _ps.ANCHORS_MAGIC, 100.0, '2026-07-02 10:00'),
+                   d('AUR_ST_BUY', _ps.ANCHORS_MAGIC, 50.0, '2026-07-02 11:00'),
+                   d('AUR_ROGUE_B', _ps.ROGUE_MAGIC, -30.0, '2026-07-07 15:00'),
+                   d('AUR_ROGUE_B', _ps.ROGUE_MAGIC, 20.0, '2026-07-08 12:00')]
+            tmp = tempfile.mkdtemp(prefix='aureon_gate_')
+            try:
+                p = os.path.join(tmp, 'deal_export.csv')
+                with open(p, 'w', newline='', encoding='utf-8') as f:
+                    w = csv.writer(f); w.writerow(['Time', 'Comment', 'Magic', 'Profit', 'Entry'])
+                    w.writerow(['2026.07.02 10:00:00', 'AUR_A1_BUY', _ps.ANCHORS_MAGIC, '100.0', 'out'])
+                    w.writerow(['2026.07.02 12:00:00', 'AUR_ST_SELL', _ps.ANCHORS_MAGIC, '-5.0', 'out'])
+                    w.writerow(['2026.07.07 14:34:00', 'AUR_ROGUE_B', _ps.ROGUE_MAGIC, '-99.0', 'out'])
+                    w.writerow(['2026.07.08 12:00:00', 'AUR_ROGUE_B', _ps.ROGUE_MAGIC, '20.0', 'out'])
+                res = g.run_gate(sim, deal_export_path=p, resolution_all_tick=True)
+                repro_ok = (res['repro_sim']['A1'] == 100.0 and res['repro_sim']['ROGUE'] == 20.0
+                            and res['repro_export']['A1'] == 100.0 and res['repro_export']['ROGUE'] == 20.0)
+                excl_ok = ('ST' in res['excluded_buckets']
+                           and 'ROGUE@2026-07-07' in res['excluded_cells']
+                           and 'FETCH@2026-07-07' in res['excluded_cells'])
+                pass_on_match = (res['passed'] is True and res['refused'] is False)
+                # a real mismatch -> NOT passed, NOT refused
+                sim2 = [sim[0], d('AUR_ROGUE_B', _ps.ROGUE_MAGIC, 999.0, '2026-07-08 12:00')]
+                res2 = g.run_gate(sim2, deal_export_path=p, resolution_all_tick=True)
+                mismatch_ok = (res2['passed'] is False and res2['refused'] is False)
+                # missing export -> HARD REFUSE
+                res3 = g.run_gate(sim, deal_export_path=None, resolution_all_tick=True)
+                no_export_ok = (res3['refused'] is True and res3.get('no_export') is True
+                                and res3['passed'] is False)
+                ok = repro_ok and excl_ok and pass_on_match and mismatch_ok and no_export_ok
+                detail = (f"repro={repro_ok} excluded={excl_ok} pass_on_match={pass_on_match} "
+                          f"mismatch_notpass={mismatch_ok} no_export_refuse={no_export_ok}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        except Exception as e:
+            self._record(300, FAIL, f"raised: {e!r}"); return
+        self._record(300, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
@@ -12115,6 +12187,8 @@ class SelfTest:
             self._step_sim_engine_drives()
             # Baseline = July AS TRADED (07-10): per-day config reconstructed from the D-series.
             self._step_sim_config_as_traded()
+            # Gate reconciles the REPRODUCIBLE SUBSET (excludes testfire + manual seeds).
+            self._step_sim_gate_reproducible()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()

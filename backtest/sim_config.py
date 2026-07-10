@@ -31,7 +31,21 @@ import pandas as pd
 
 BROKER_TZ_OFFSET_HOURS = 3
 
+# Anchor schedule (label, broker_hour, broker_minute). A3 was CUT 2026-07-02 (D-1);
+# it TRADED on 07-01, so the 07-01 baseline must carry it. A4/A5 stay throughout.
+_A1 = ("A1_02h_Asia", 2, 30)
+_A2 = ("A2_10h_London", 10, 0)
+_A3 = ("A3_1430_Overlap", 14, 30)   # CUT 07-02 (D-1); live 07-01
+_A4 = ("A4_1640_NYopen", 16, 40)
+_A5 = ("A5_1930_LateUS", 19, 30)
+_ANCHORS_WITH_A3 = [_A1, _A2, _A3, _A4, _A5]
+_ANCHORS_NO_A3 = [_A1, _A2, _A4, _A5]
+
 # Baseline (start of the window). seed_break/base_trades disabled for the WHOLE run.
+# The per-engine DAYSTOPS (soft profit-lock + hard loss-halt) did NOT exist before
+# 2026-07-08 (D-16/17 rollout); applying today's values on early days wrongly LOCKS
+# anchor entries after a big A1/A2 move and suppresses A4/A5 (the defect-1 mechanism).
+# So they are 0 (disabled) at baseline and switch on at their real dates.
 _BASE = {
     'seed_break_dollars': 0.0,
     'rogue_seed_break_dollars': 0.0,
@@ -43,20 +57,29 @@ _BASE = {
     'fetcher_daily_loss_stop': -700.0,
     'rescue_entry_enabled': False,
     'trapped_late_rescue_enabled': False,
+    'anchors': _ANCHORS_WITH_A3,                 # A3 live on 07-01
+    'anchors_daily_profit_stop': 0.0,            # daystops absent pre-07-08
+    'anchors_daily_loss_stop': 0.0,
+    'rogue_daily_profit_stop': 0.0,
+    'fetcher_daily_profit_stop': 0.0,
 }
 _BASE_ENGINES = {'anchors': True, 'rogue': True, 'fetcher': False}
 
 # (effective broker-local datetime, cfg overrides, engine overrides, citation)
 _TIMELINE = [
     ('2026-07-01 00:00', {}, {}, 'window start'),
+    ('2026-07-02 00:00', {'anchors': _ANCHORS_NO_A3}, {}, 'D-1 A3 cut'),
     ('2026-07-03 00:00', {'trapped_late_rescue_enabled': True}, {}, 'D-5 F-B live'),
     ('2026-07-07 00:00', {}, {'fetcher': True}, 'D-14 fetcher live'),
     ('2026-07-07 14:58', {'rogue_entry_confirm_redesign': 5.0, 'rogue_init_sl': 10.0}, {},
      'D-11/D-13 rogue confirm 10->5, init_sl 5->10'),
-    ('2026-07-08 00:00', {'rogue_daily_loss_stop': -370.0, 'fetcher_daily_loss_stop': -370.0}, {},
-     'D-16/17 loss stops -> -370'),
-    ('2026-07-09 00:00', {'rescue_entry_enabled': True}, {'rogue': False, 'fetcher': False},
-     'D-28 anchors-only (rogue+fetcher off) + D-29 rescue_entry on'),
+    ('2026-07-08 00:00', {'rogue_daily_loss_stop': -370.0, 'fetcher_daily_loss_stop': -370.0,
+                          'anchors_daily_profit_stop': 400.0, 'anchors_daily_loss_stop': -630.0,
+                          'rogue_daily_profit_stop': 400.0, 'fetcher_daily_profit_stop': 400.0}, {},
+     'D-16/17 daystops LIVE (loss stops -> -370, profit locks 400, anchors loss -630)'),
+    ('2026-07-09 00:00', {'rescue_entry_enabled': True, 'anchors_daily_profit_stop': 800.0},
+     {'rogue': False, 'fetcher': False},
+     'D-28 anchors-only (rogue+fetcher off) + D-29 rescue_entry on + D-18 anchors profit 400->800'),
 ]
 
 # seed_break / base_trades stay disabled the whole run (owner) -> never in the timeline.
