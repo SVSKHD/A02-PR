@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.8.6"  # R-12: reconcile CLI never executed — MT5Adapter(cfg)+connect() -> MT5Adapter(symbol); construction path now driven in selftest
+__version__ = "3.8.7"  # R-14: pnl_report drifted from MT5 authority — report anchor net now == pnl_source.magic_day_net over the SAME broker-day window; no straddling/partial/unattributable realized close is dropped
 CODENAME = "Astra Hawk"
 
 

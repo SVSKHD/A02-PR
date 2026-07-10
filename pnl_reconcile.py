@@ -68,8 +68,14 @@ def report_nets(trader, date_str, run_dir=None):
     each section's day_pnl. None on any failure. READ-ONLY; guarded."""
     try:
         import pnl_report as _pr
+        # R-14: the report MUST read the SAME broker-day window as the authority
+        # (pnl_source.broker_day_range uses trader.cfg.broker_tz_offset_hours), or
+        # report vs authority would count different deal sets and never agree.
+        off = float(getattr(getattr(trader, 'cfg', None), 'broker_tz_offset_hours',
+                            _pr.DEFAULT_BROKER_TZ_OFFSET_HOURS) or 0.0)
         rep = _pr.build_day_report(trader.adapter, str(date_str),
-                                   run_dir=run_dir or getattr(trader, 'run_dir', None))
+                                   run_dir=run_dir or getattr(trader, 'run_dir', None),
+                                   broker_tz_offset_hours=off)
         if not rep:
             return None
         a = round(sum(float(s.get('net', 0.0) or 0.0)
