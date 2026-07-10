@@ -405,13 +405,15 @@ STEP_NAMES = {
     # 2026-07-10 offline simulator Part 1B/1C: real LiveTrader tick loop behind a fake broker.
     298: "sim engine drives",           # fake broker + REAL _tick(): anchor fills, real AUR_* comments, magic_day_net works, GATE-NOT-RUN header on every artifact, nothing writes to run/
     # 2026-07-10 offline simulator baseline = July AS TRADED: per-day config from the D-series.
-    299: "sim config as-traded",         # per-day config reconstruction: D-5/D-11/D-13/D-14/D-16-17/D-26-27/D-28/D-29 resolve to the right values per day incl the 07-07 14:58 intra-day rogue flip
+    299: "sim config as-traded",         # per-day config reconstruction: D-1 A3 cut; daystops absent pre-07-08, profit 400/loss -630 on 07-08, profit 400->800 the EVENING of 07-09 (D-18); account governors 0 throughout; D-5/D-11/D-13/D-14/D-16-17/D-26-27/D-28/D-29 incl the 07-07 14:58 intra-day rogue flip
     # 2026-07-10 boost_spec_v2 (D-31): flag-gated boost redesign, DEFAULT OFF.
     300: "boost_spec_v2 off+rules",      # flag OFF byte-identical (F-B still fires at $10); pure R1-R5; in-band=0, break sides/levels, ratchet never-negative, R7 one event
     301: "boost_spec_v2 07-10 regress",  # the exact 07-10 A1 tape: flag ON -> no boost at 4127.x, boosts are SELLs on the downside break, 4-leg total != -1695.40
     302: "boost_spec_v2 freeze0+tstop",  # R8 freeze=0 arms trail at be_trigger (not clock) ON, still frozen OFF; tstop_after_min fires once, never at t=0
+    # 2026-07-10 gate reconciles the REPRODUCIBLE SUBSET (excludes testfire + manual seeds).
+    303: "sim gate reproducible",        # ST (testfire) excluded; ROGUE/FETCH legs OPENED >= 07-07 14:34 server excluded by ENTRY timestamp (opened-before/closed-after KEPT); excluded total stated; reproducible buckets reconciled to the cent; no-export hard-refuses
     # 2026-07-10 boost_spec_v2 VISIBILITY: dynamic preflight flags + boot/ status banners.
-    303: "boost_spec_v2 visibility",     # preflight lists the flag (ON when True/OFF when False); ACTIVE block only when True; suppressed-in-band count renders on /status; OFF byte-identical
+    304: "boost_spec_v2 visibility",     # preflight lists the flag (ON when True/OFF when False); ACTIVE block only when True; suppressed-in-band count renders on /status; OFF byte-identical
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9823,11 +9825,13 @@ class SelfTest:
                 ts = pd.Timestamp(broker_local, tz='UTC') - pd.Timedelta(hours=3)
                 return scfg.active_config(ts)
 
-            c2, e2, _ = at('2026-07-02 10:00')     # early window
+            c1, e1, _ = at('2026-07-01 10:00')     # 07-01 (A3 still live per D-1)
+            c2, e2, _ = at('2026-07-02 10:00')     # early window (A3 cut from here)
             c7a, e7a, _ = at('2026-07-07 12:00')   # 07-07 BEFORE the 14:58 flip
             c7b, e7b, _ = at('2026-07-07 15:00')   # 07-07 AFTER the flip
             c8, e8, _ = at('2026-07-08 10:00')     # loss-stop cut
-            c9, e9, _ = at('2026-07-09 10:00')     # anchors-only
+            c9, e9, _ = at('2026-07-09 10:00')     # 07-09 MORNING (anchors-only; profit lock still 400)
+            c9e, e9e, _ = at('2026-07-09 19:00')   # 07-09 EVENING (D-18 profit lock 400->800)
             checks = {
                 # early: confirm 10 / init_sl 5 / loss -525 / F-B off / rescue off / rogue on / fetcher off
                 'early': (c2['rogue_entry_confirm_redesign'] == 10.0 and c2['rogue_init_sl'] == 5.0
@@ -9851,6 +9855,25 @@ class SelfTest:
                 # D-28 anchors-only + D-29 rescue on, from 07-09
                 'anchors_only': (e9['rogue'] is False and e9['fetcher'] is False and e9['anchors'] is True
                                  and c9['rescue_entry_enabled'] is True),
+                # D-1: A3 in the anchor list on 07-01, CUT from 07-02 onward
+                'a3_cut': (any(a[0].startswith('A3') for a in c1['anchors'])
+                           and not any(a[0].startswith('A3') for a in c2['anchors'])),
+                # daystops absent before 07-08 (so a big A1/A2 win can't lock A4/A5),
+                # live from 07-08 (profit 400 / loss -630); anchors profit 400->800
+                # the EVENING of 07-09 (D-16/17/18) -- 07-09 MORNING still runs 400.
+                'daystops_timeline': (c2['anchors_daily_profit_stop'] == 0.0
+                                      and c2['anchors_daily_loss_stop'] == 0.0
+                                      and c8['anchors_daily_profit_stop'] == 400.0
+                                      and c8['anchors_daily_loss_stop'] == -630.0
+                                      and c9['anchors_daily_profit_stop'] == 400.0
+                                      and c9e['anchors_daily_profit_stop'] == 800.0
+                                      and c9e['anchors_daily_loss_stop'] == -630.0),
+                # account-level governors never armed (D-24 disabled) the WHOLE run
+                'account_governors_off': (c2['account_target_pct'] == 0.0
+                                          and c8['account_target_pct'] == 0.0
+                                          and c9e['account_target_pct'] == 0.0
+                                          and c2['account_daily_profit_stop_pct'] == 0.0
+                                          and c9e['account_daily_profit_stop_pct'] == 0.0),
             }
             # apply_to_trader mutates a trader stub
             tr = types.SimpleNamespace(cfg=types.SimpleNamespace(
@@ -9870,6 +9893,92 @@ class SelfTest:
         except Exception as e:
             self._record(299, FAIL, f"raised: {e!r}"); return
         self._record(299, PASS if ok else FAIL, detail)
+
+    def _step_sim_gate_reproducible(self):
+        # 303 THE GATE reconciles the REPRODUCIBLE SUBSET (owner decision): unreproducible events
+        # -- the ST testfire bucket (fired by hand) and the 07-07 /rogueseed //fetchseed manual
+        # re-anchors -- are EXCLUDED from BOTH the sim AND the export, not absorbed into a
+        # tolerance. The manual-seed carve is by ENTRY TIMESTAMP, not by day: a ROGUE/FETCH leg
+        # OPENED at/after 2026-07-07 14:34:00 server is excluded; one OPENED before is KEPT even
+        # if it CLOSES after (the whole-day/close-time carve wrongly dropped the clean morning).
+        # Entry time is paired from the IN leg via position_id on both sides. Asserts: the
+        # opened-before/closed-after leg is KEPT symmetrically; the opened-after leg is EXCLUDED;
+        # the excluded total is stated; matching subsets PASS; a real mismatch is NOT-passed (not
+        # refused); a MISSING export HARD-REFUSES (the reproducible truth is computed FROM it).
+        import importlib.util as _ilu, os, tempfile, csv, types, shutil
+        import pandas as pd
+        try:
+            bt = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest')
+            s = _ilu.spec_from_file_location('aureon_sim_gate_st', os.path.join(bt, 'sim_gate.py'))
+            g = _ilu.module_from_spec(s); s.loader.exec_module(g)
+            import pnl_source as _ps
+
+            def ep(x):
+                return int(pd.Timestamp(x, tz='UTC').timestamp())
+
+            def leg(comment, magic, pid, entry, t, profit=0.0):
+                # entry=0 IN (open) leg / entry=1 OUT (close) leg, sharing position_id
+                return types.SimpleNamespace(entry=entry, comment=comment, magic=magic,
+                                             profit=profit, swap=0.0, commission=0.0,
+                                             time=ep(t), position_id=pid)
+            R = _ps.ROGUE_MAGIC; A = _ps.ANCHORS_MAGIC
+            # sim IN+OUT pairs (position_id shared):
+            #  p1 A1    open 07-02 09:00 -> +100 close 10:00                 KEEP (A1)
+            #  p2 ST    open 07-02 10:30 -> +50  close 11:00                 EXCL (ST bucket)
+            #  p3 ROGUE open 07-07 13:00 -> -30  close 15:30 (opened BEFORE) KEEP (clean morning)
+            #  p4 ROGUE open 07-07 15:00 -> +20  close 16:00 (opened AFTER)  EXCL (manual-seed)
+            sim = [leg('AUR_A1_BUY', A, 1, 0, '2026-07-02 09:00'),
+                   leg('AUR_A1_BUY', A, 1, 1, '2026-07-02 10:00', 100.0),
+                   leg('AUR_ST_BUY', A, 2, 0, '2026-07-02 10:30'),
+                   leg('AUR_ST_BUY', A, 2, 1, '2026-07-02 11:00', 50.0),
+                   leg('AUR_ROGUE_B', R, 3, 0, '2026-07-07 13:00'),
+                   leg('AUR_ROGUE_B', R, 3, 1, '2026-07-07 15:30', -30.0),
+                   leg('AUR_ROGUE_B', R, 4, 0, '2026-07-07 15:00'),
+                   leg('AUR_ROGUE_B', R, 4, 1, '2026-07-07 16:00', 20.0)]
+            tmp = tempfile.mkdtemp(prefix='aureon_gate_')
+            try:
+                p = os.path.join(tmp, 'deal_export.csv')
+                with open(p, 'w', newline='', encoding='utf-8') as f:
+                    w = csv.writer(f)
+                    w.writerow(['Time', 'Comment', 'Magic', 'Profit', 'Entry', 'Position'])
+                    # mirror the sim pairs (IN + OUT rows sharing Position); ST closes -5.0
+                    w.writerow(['2026.07.02 09:00:00', 'AUR_A1_BUY', A, '0.0', 'in', '1'])
+                    w.writerow(['2026.07.02 10:00:00', 'AUR_A1_BUY', A, '100.0', 'out', '1'])
+                    w.writerow(['2026.07.02 10:30:00', 'AUR_ST_SELL', A, '0.0', 'in', '2'])
+                    w.writerow(['2026.07.02 11:00:00', 'AUR_ST_SELL', A, '-5.0', 'out', '2'])
+                    w.writerow(['2026.07.07 13:00:00', 'AUR_ROGUE_B', R, '0.0', 'in', '3'])
+                    w.writerow(['2026.07.07 15:30:00', 'AUR_ROGUE_B', R, '-30.0', 'out', '3'])
+                    w.writerow(['2026.07.07 15:00:00', 'AUR_ROGUE_B', R, '0.0', 'in', '4'])
+                    w.writerow(['2026.07.07 16:00:00', 'AUR_ROGUE_B', R, '20.0', 'out', '4'])
+                res = g.run_gate(sim, deal_export_path=p, resolution_all_tick=True)
+                # the opened-before/closed-after ROGUE leg (-30) is KEPT on BOTH sides; the
+                # opened-after leg (+20) is dropped -> ROGUE reproducible net == -30, not +20/-10.
+                repro_ok = (res['repro_sim']['A1'] == 100.0 and res['repro_sim']['ROGUE'] == -30.0
+                            and res['repro_export']['A1'] == 100.0 and res['repro_export']['ROGUE'] == -30.0)
+                excl_ok = ('ST' in res['excluded_buckets']
+                           and res['manual_seed_cutoff'] == '2026-07-07 14:34:00'
+                           and set(res['manual_seed_engines']) == {'ROGUE', 'FETCH'})
+                # excluded total STATED: ST (-5.0 export) + manual-seed leg (+20) = +15.0
+                exc = res['excluded']
+                exc_ok = (exc['ST'] == -5.0 and exc['MANUAL_SEED'] == 20.0 and exc['total'] == 15.0)
+                pass_on_match = (res['passed'] is True and res['refused'] is False)
+                # a real mismatch on a KEPT leg -> NOT passed, NOT refused
+                sim2 = list(sim); sim2[5] = leg('AUR_ROGUE_B', R, 3, 1, '2026-07-07 15:30', -999.0)
+                res2 = g.run_gate(sim2, deal_export_path=p, resolution_all_tick=True)
+                mismatch_ok = (res2['passed'] is False and res2['refused'] is False)
+                # missing export -> HARD REFUSE
+                res3 = g.run_gate(sim, deal_export_path=None, resolution_all_tick=True)
+                no_export_ok = (res3['refused'] is True and res3.get('no_export') is True
+                                and res3['passed'] is False)
+                ok = repro_ok and excl_ok and exc_ok and pass_on_match and mismatch_ok and no_export_ok
+                detail = (f"repro={repro_ok} excl={excl_ok} exc_total={exc_ok} "
+                          f"pass_on_match={pass_on_match} mismatch_notpass={mismatch_ok} "
+                          f"no_export_refuse={no_export_ok}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        except Exception as e:
+            self._record(303, FAIL, f"raised: {e!r}"); return
+        self._record(303, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # boost_spec_v2 (D-31) — flag-gated boost redesign, DEFAULT OFF
@@ -10154,8 +10263,8 @@ class SelfTest:
             detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items()) + f" suppressed={suppressed}"
         except Exception as e:
             import traceback
-            self._record(303, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
-        self._record(303, PASS if ok else FAIL, detail)
+            self._record(304, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(304, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
@@ -12411,6 +12520,8 @@ class SelfTest:
             self._step_boost_spec_off_rules()
             self._step_boost_spec_0710_regress()
             self._step_boost_spec_freeze0_tstop()
+            # Gate reconciles the REPRODUCIBLE SUBSET (excludes testfire + manual seeds).
+            self._step_sim_gate_reproducible()
             self._step_boost_spec_visibility()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()

@@ -383,14 +383,21 @@ def run_cli(d_from, d_to, *, run_id=None, ticks_dir=None, tick_cadence_s=1.0):
 
 
 def _find_deal_export(ticks_dir):
-    """Locate a committed MT5 deal export (…/deal_export*.csv under backtest/ or
-    its ticks dir). Returns a path or None."""
-    cands = []
-    for base in (os.path.dirname(ticks_dir), ticks_dir, _THIS):
+    """Locate a committed MT5 deal export (deal_export*.xlsx/.csv). Searched under
+    backtest/fixtures/ (the canonical home of deal_export_2026-07.xlsx), backtest/,
+    and the ticks dir. .xlsx is preferred over .csv when both are present. Returns a
+    path or None."""
+    xlsx, csv = [], []
+    for base in (os.path.join(_THIS, 'fixtures'), os.path.dirname(ticks_dir),
+                 ticks_dir, _THIS):
         if not os.path.isdir(base):
             continue
         for fn in os.listdir(base):
             low = fn.lower()
-            if low.endswith('.csv') and ('deal' in low or 'export' in low or 'truth' in low):
-                cands.append(os.path.join(base, fn))
-    return cands[0] if cands else None
+            if not ('deal' in low or 'export' in low or 'truth' in low):
+                continue
+            if low.endswith(('.xlsx', '.xls')):
+                xlsx.append(os.path.join(base, fn))
+            elif low.endswith('.csv'):
+                csv.append(os.path.join(base, fn))
+    return (xlsx or csv or [None])[0]

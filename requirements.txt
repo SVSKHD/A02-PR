@@ -1,6 +1,10 @@
 pandas>=2.0
 numpy>=1.24
 requests>=2.31
+# REQUIRED for the offline simulator gate to read the committed MT5 deal-export
+# FIXTURE (backtest/fixtures/deal_export_2026-07.xlsx). Without an Excel engine the
+# gate cannot load the .xlsx truth and HARD-REFUSES. CSV exports need no extra pkg.
+openpyxl>=3.1
 python-dotenv>=1.0   # .env loader (env_loader.py) — REQUIRED for Discord/keys
 MetaTrader5>=5.0.45 ; sys_platform == "win32"
 # REQUIRED for journaling: EOD/weekly trade journal + rescue fleet-event mirror

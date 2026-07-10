@@ -92,7 +92,7 @@ The flag was live but invisible on the boot banner. Fixed:
 5. **State-machine visibility**: `[BOOST-SPEC-V2] armed for A2 — awaiting fills`
    once per anchor when its straddle is pending, and `[BOOST-SPEC-V2]
    BAND_ESTABLISHED A2 lo=… hi=…` when the band forms — so a no-fill day is not
-   silent. Selftest **303** covers all of the above; total **303 steps**.
+   silent. Selftest **304** covers all of the above; total **304 steps**.
 
 ## WHAT REMAINS UNPROVEN
 
