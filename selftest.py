@@ -9719,6 +9719,13 @@ class SelfTest:
                 mid = base + (40.0 * min(1.0, (bh - 10.08) / 0.4) if bh >= 10.08 else 0.0)
                 rows.append((t, round(mid - 0.10, 2), round(mid + 0.10, 2)))
             df = pd.DataFrame(rows, columns=['time', 'bid', 'ask'])
+            # a SECOND day supplied as an M1 BAR frame (open/high/low/close, no
+            # bid/ask) -- the simulator must REFUSE it, never interpolate it.
+            m1rows = []
+            for i in range(30):
+                t = pd.Timestamp('2026-07-03 07:00:00', tz='UTC') + pd.Timedelta(minutes=i)
+                m1rows.append((t, 4000.0, 4001.0, 3999.0, 4000.5))
+            m1df = pd.DataFrame(m1rows, columns=['time', 'open', 'high', 'low', 'close'])
             tmp = tempfile.mkdtemp(prefix='aureon_simst_')
             run_before = _run_snapshot = None
             try:
@@ -9734,8 +9741,8 @@ class SelfTest:
                     return out
                 run_before = _snap() if os.path.isdir(run_dir) else {}
                 os.environ['AUREON_SIM_DIR'] = os.path.join(tmp, 'sim')
-                res = sim.simulate(cfg, [(date, df)], scratch_dir=os.path.join(tmp, 'st'),
-                                   tick_cadence_s=4.0)
+                res = sim.simulate(cfg, [(date, df), ('2026-07-03', m1df)],
+                                   scratch_dir=os.path.join(tmp, 'st'), tick_cadence_s=4.0)
                 deals = res.get('deals', [])
                 import pnl_source as _ps, pnl_report as _pr
                 closed = res.get('closed_positions', 0)
@@ -9745,13 +9752,25 @@ class SelfTest:
                 pa = _pr.per_anchor_stats(_pr.build_trades(deals))
                 classifies = any(k in ('A1','A2','A3','A4','A5') for k in pa)
                 fills_and_closes = (closed >= 1 and abs(anet) > 0.0)
+                # confirm-1: the M1 day was REFUSED, never interpolated/run.
+                m1_refused = ('2026-07-03' in res.get('refused_days', [])
+                              and '2026-07-03' not in res.get('days', []))
+                # §3: every emitted comment classifies (no phantom '??'/'ext' legs).
+                no_build_errors = (res.get('build_errors') == [])
+                # confirm-2: the broker-day roll used the INJECTED clock (sim date),
+                # NOT the wall clock (which is 2026-07-10 today). If it used wall
+                # time, last_broker_date would be today and every governor reset
+                # would fire on the wrong day.
+                dayroll_sim_clock = (res.get('last_broker_date') == '2026-07-02')
                 # reports carry the GATE header on EVERY artifact
-                out_dir, _reports, summ = srep.write_reports('ST', deals, cfg, [date])
+                out_dir, _reports, summ = srep.write_reports('ST', deals, cfg, res.get('days', [date]))
                 arts = glob.glob(os.path.join(out_dir, '*'))
                 hdr_all = bool(arts) and all('GATE-NOT-RUN' in open(p, encoding='utf-8').read() for p in arts)
-                # the gate runs and does NOT fabricate a pass on synthetic data
-                gate = sgate.run_gate(deals, resolution_all_tick=False)
-                gate_honest = (gate['passed'] is False)
+                # §4: the gate HARD-REFUSES on synthetic/non-tick data (not a soft warn).
+                gate = sgate.run_gate(deals, resolution_all_tick=False,
+                                      refused_days=res.get('refused_days'),
+                                      build_errors=res.get('build_errors'))
+                gate_honest = (gate['passed'] is False and gate.get('refused') is True)
                 # the run/ guard refuses run/ paths
                 guard_ok = False
                 try:
@@ -9762,10 +9781,13 @@ class SelfTest:
                 run_after = _snap() if os.path.isdir(run_dir) else {}
                 run_untouched = (run_before == run_after)
                 ok = (fills_and_closes and real_comments and classifies and hdr_all
-                      and gate_honest and guard_ok and run_untouched)
+                      and gate_honest and guard_ok and run_untouched and m1_refused
+                      and no_build_errors and dayroll_sim_clock)
                 detail = (f"closed={closed} anchors_net={anet} real_AUR_comments={real_comments} "
                           f"classifies={classifies} gate_header_on_all={hdr_all} "
-                          f"gate_not_passed={gate_honest} guard={guard_ok} run_untouched={run_untouched}")
+                          f"gate_hard_refused={gate_honest} guard={guard_ok} run_untouched={run_untouched} "
+                          f"m1_refused={m1_refused} no_build_errors={no_build_errors} "
+                          f"dayroll_sim_clock={dayroll_sim_clock}")
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
                 os.environ.pop('AUREON_SIM_DIR', None)

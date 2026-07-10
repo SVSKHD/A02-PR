@@ -129,10 +129,20 @@ def parse_deal_export(path):
 # --------------------------------------------------------------------------- #
 # the gate
 # --------------------------------------------------------------------------- #
-def run_gate(sim_deals, *, deal_export_path=None, resolution_all_tick=False):
+def run_gate(sim_deals, *, deal_export_path=None, resolution_all_tick=False,
+             refused_days=None, build_errors=None):
     """Compare sim bucket nets to TRUTH (and, if provided, to the deal export).
-    Returns {passed, resolution_ok, rows, sim, export, total_gap}. `passed` is True
-    only when resolution is all-tick AND every bucket matches TRUTH within TOL."""
+
+    §4 HARD REFUSAL: the gate does not merely 'fail' on bad inputs, it REFUSES to
+    render a verdict at all when (a) any day did not resolve to TICK (M1/synthetic
+    -> intrabar wick order is invented; 9 of 15 July whipsaws turn on it by cents),
+    or (b) the sim emitted a leg whose comment does not classify (a BUILD ERROR).
+    `passed` is True ONLY when NOT refused AND every engine bucket matches TRUTH to
+    the cent -- "off by $X because feature Y isn't wired" is the gate failing, not
+    an explanation."""
+    refused_days = list(refused_days or [])
+    build_errors = list(build_errors or [])
+    refused = bool(refused_days) or (not resolution_all_tick) or bool(build_errors)
     sim = sim_bucket_nets(sim_deals)
     export = None
     exp_deals = parse_deal_export(deal_export_path)
@@ -150,10 +160,11 @@ def run_gate(sim_deals, *, deal_export_path=None, resolution_all_tick=False):
                      'export': (export.get(b) if export else None)})
     sim_total = round(sum(sim.values()), 2)
     total_gap = round(sim_total - TRUTH_TOTAL, 2)
-    passed = bool(resolution_all_tick and all_match)
-    return {'passed': passed, 'resolution_ok': resolution_all_tick, 'rows': rows,
+    passed = bool((not refused) and all_match)
+    return {'passed': passed, 'refused': refused, 'resolution_ok': resolution_all_tick,
+            'refused_days': refused_days, 'build_errors': build_errors, 'rows': rows,
             'sim': sim, 'export': export, 'sim_total': sim_total,
-            'truth_total': TRUTH_TOTAL, 'total_gap': total_gap}
+            'truth_total': TRUTH_TOTAL, 'total_gap': total_gap, 'all_match': all_match}
 
 
 def render_gate(result) -> str:
@@ -170,16 +181,24 @@ def render_gate(result) -> str:
                  f"{result['total_gap']:>+12.2f}")
     lines.append("")
     if result['passed']:
-        lines.append("GATE PASSED — sim reproduces MT5 truth to the cent on all-tick data.")
+        lines.append("GATE PASSED — sim reproduces MT5 truth to the cent on all-tick data, "
+                     "all features wired.")
+    elif result.get('refused'):
+        lines.append("GATE **HARD-REFUSED** — the inputs are not gradeable; no verdict is rendered.")
+        if result.get('refused_days'):
+            lines.append(f"  · non-tick day(s) refused: {', '.join(result['refused_days'])} "
+                         "(M1/synthetic — intrabar wick order is INVENTED; 9 of 15 July whipsaws "
+                         "turn on it by cents, so a bar day cannot decide them).")
+        if not result['resolution_ok'] and not result.get('refused_days'):
+            lines.append("  · resolution is not all-tick for the range.")
+        if result.get('build_errors'):
+            lines.append(f"  · BUILD ERROR — {len(result['build_errors'])} leg(s) emitted a "
+                         f"comment that does not classify: {result['build_errors'][:5]}. A "
+                         "non-AUR_* comment is a simulator bug, not an 'unknown' bucket.")
+        lines.append("  Fix the inputs (commit the REAL all-tick cache; make every leg carry a "
+                     "classifying AUR_* comment). The gap is never tuned away.")
     else:
-        why = []
-        if not result['resolution_ok']:
-            why.append("resolution is NOT all-tick (some days are M1/synthetic — intrabar "
-                       "order unknown)")
-        if any(abs(r['gap']) > TOL for r in result['rows']):
-            why.append("bucket(s) differ from truth")
-        lines.append("GATE **NOT PASSED** — " + "; ".join(why) + ".")
-        lines.append("Per the spec: the gap is NOT to be tuned away. On synthetic/illustrative "
-                     "ticks a gap is EXPECTED (the sim is replaying invented prices, not July's "
-                     "real market). Re-run on the committed real-tick cache to make this meaningful.")
+        lines.append("GATE **NOT PASSED** — bucket(s) differ from truth on all-tick data. "
+                     "This is the gate failing (a missing/incorrect feature), NOT an "
+                     "explanation. Report and fix the mechanism; do not tune to match.")
     return "\n".join(lines)

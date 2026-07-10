@@ -131,9 +131,17 @@ per-anchor / rogue / fetcher output can be diffed against it to a stated toleran
   console) carries the two-line **GATE-NOT-RUN** header. Removed only when the
   gate passes.
 - **What it still cannot model / caveats:** intrabar order on any non-`tick` day
-  (M1/synthetic) is unknown — the manifest flags it and the gate refuses to pass;
+  (M1/synthetic) is unknown — the manifest flags it and the gate **hard-refuses**;
   spread/slippage are configurable approximations (defaults 0.20 / 0.0); the sim
   has not been validated against real July prices (synthetic ticks only here).
+- **Hardening (07-10, owner spec §3/§4 + confirms; see `BOOST_REDESIGN_TZ_NOTES.md`):**
+  (a) the sim replays the **cached ticks verbatim** and **REFUSES M1 days** — it
+  never interpolates invented intrabar prices; (b) every emitted leg's comment
+  **must classify** as `AUR_*` — a non-classifying comment is a **BUILD ERROR**,
+  never a phantom `??`/`ext` bucket; (c) the gate **HARD-REFUSES** (no verdict) on
+  any non-tick day or build error, rather than warning; (d) the injected clock
+  drives the **broker-day roll** (governor resets), asserted by selftest 298
+  (`last_broker_date` == sim day, not the wall clock).
 
 ### Part 2 — boost redesign (`boost_spec_v2`, default OFF)
 Gated on the GATE passing **and** on `AUREON_boost_redesign_spec.md` (not in repo).

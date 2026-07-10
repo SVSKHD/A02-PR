@@ -101,19 +101,41 @@ def build_adapter(broker, cfg):
 # --------------------------------------------------------------------------- #
 # tick source: a day's cached frame -> iterator of tick objects
 # --------------------------------------------------------------------------- #
+def is_tick_frame(df):
+    """True iff `df` is a real QUOTE-TICK sequence (bid/ask columns). An M1 bar
+    frame (open/high/low/close) is NOT a tick frame -- the simulator REFUSES to
+    run it rather than interpolating invented intrabar prices."""
+    return df is not None and len(df) > 0 and 'bid' in df.columns and 'ask' in df.columns
+
+
 def _ticks_from_frame(df):
-    """Yield tick objects (time_utc, bid, ask) from a [time,bid,ask] frame."""
-    if df is None or len(df) == 0:
+    """Yield tick objects (time_utc, bid, ask) from the CACHED tick sequence. This
+    is the cached ticks VERBATIM -- never a resampled bar. Refuses (yields nothing)
+    for a non-tick frame; callers must have excluded M1 days already."""
+    if not is_tick_frame(df):
         return
-    has_bidask = 'bid' in df.columns and 'ask' in df.columns
     for row in df.itertuples(index=False):
-        t = getattr(row, 'time')
-        if has_bidask:
-            bid = float(getattr(row, 'bid')); ask = float(getattr(row, 'ask'))
-        else:  # M1 bar frame -> synth a tick at the close (LOUD: order unknown)
-            c = float(getattr(row, 'close'))
-            bid, ask = c - 0.10, c + 0.10
-        yield _sb._Obj(time_utc=pd.Timestamp(t), bid=bid, ask=ask)
+        yield _sb._Obj(time_utc=pd.Timestamp(getattr(row, 'time')),
+                       bid=float(getattr(row, 'bid')), ask=float(getattr(row, 'ask')))
+
+
+# --------------------------------------------------------------------------- #
+# §3 build-integrity: every simulated leg must carry a comment that classifies.
+# --------------------------------------------------------------------------- #
+def unclassified_comments(deals):
+    """The set of (comment, magic) on OUT deals whose comment does NOT match a
+    known AUR_* pattern (engine is None). Per the spec these are BUILD ERRORS, not
+    an 'unknown' bucket -- the simulator must never emit a leg pnl_report would
+    dump into a phantom '??'/'ext' bucket."""
+    import pnl_report as _pr
+    bad = set()
+    for d in deals:
+        if getattr(d, 'entry', None) != 1:
+            continue
+        c = _pr.classify_comment(getattr(d, 'comment', ''), getattr(d, 'magic', 0))
+        if c['engine'] is None:
+            bad.add((str(getattr(d, 'comment', '')), int(getattr(d, 'magic', 0) or 0)))
+    return bad
 
 
 # --------------------------------------------------------------------------- #
@@ -172,11 +194,20 @@ def simulate(cfg, day_frames, *, scratch_dir, tick_cadence_s=1.0, spread=0.20,
             trader.offset_validated = True
 
             days_seen = []
+            refused_days = []
             last_tick_call = None
             for date_str, df in day_frames:
                 if df is None or len(df) == 0:
                     continue
-                broker._bars = df if ('bid' in df.columns) else None
+                if not is_tick_frame(df):
+                    # confirm-1: an M1 (or any non-tick) day is REFUSED, never
+                    # interpolated into invented ticks.
+                    refused_days.append(date_str)
+                    if progress:
+                        progress(f"REFUSED {date_str}: not a tick frame (M1) — the "
+                                 "simulator does not interpolate intrabar prices")
+                    continue
+                broker._bars = df
                 days_seen.append(date_str)
                 for tick in _ticks_from_frame(df):
                     clock.set(tick.time_utc)
@@ -198,10 +229,16 @@ def simulate(cfg, day_frames, *, scratch_dir, tick_cadence_s=1.0, spread=0.20,
                     pass
         account = {'balance': broker.balance, 'equity': round(broker.balance + broker.unrealized(), 2),
                    'open_positions': len(broker.positions)}
-        return {'deals': list(broker.deals), 'closed_positions':
-                sum(1 for d in broker.deals if d.entry == _sb.DEAL_ENTRY_OUT),
-                'days': days_seen, 'run_dir': scratch_dir, 'account': account,
-                'broker': broker}
+        deals = list(broker.deals)
+        return {'deals': deals, 'closed_positions':
+                sum(1 for d in deals if d.entry == _sb.DEAL_ENTRY_OUT),
+                'days': days_seen, 'refused_days': refused_days, 'run_dir': scratch_dir,
+                'account': account, 'broker': broker,
+                # confirm-2: the broker-day the ENGINE rolled to, taken from the
+                # injected clock (state['last_broker_date']). If the day-roll used
+                # the wall clock it would read today's date, not the sim's.
+                'last_broker_date': str((trader.state or {}).get('last_broker_date', '')),
+                'build_errors': sorted(unclassified_comments(deals))}
     finally:
         lt.telemetry_from_env = _orig_factory
         for k, v in _saved_env.items():
@@ -287,24 +324,30 @@ def run_cli(d_from, d_to, *, run_id=None, ticks_dir=None, tick_cadence_s=1.0):
     deals = res.get('deals', [])
     day_list = [d for d, _, _ in frames]
 
+    day_list = res.get('days', day_list)   # only days that actually ran (M1 refused)
     out_dir, _reports, summ = srep.write_reports(run_id, deals, cfg, day_list)
     export_path = _find_deal_export(ticks_dir)
-    gate = sgate.run_gate(deals, deal_export_path=export_path, resolution_all_tick=all_tick)
+    gate = sgate.run_gate(deals, deal_export_path=export_path, resolution_all_tick=all_tick,
+                          refused_days=res.get('refused_days'),
+                          build_errors=res.get('build_errors'))
     # persist the gate verdict alongside the reports
     with srep.sc.open_sim_file(os.path.join(out_dir, 'GATE.txt'), 'w') as f:
         f.write(sgate.render_gate(gate) + "\n")
 
     print(srep.sc.gate_header())
     print()
-    print(f"AUREON OFFLINE SIM — run {run_id}  ({len(day_list)} day(s))")
+    print(f"AUREON OFFLINE SIM — run {run_id}  ({len(day_list)} day(s) ran)")
     print("resolution per day: " + ", ".join(f"{d}={r}" for d, _, r in frames))
-    if not all_tick:
-        print("⚠  NOT all-tick — intrabar wick ORDER is unresolved on non-'tick' days; "
-              "the gate cannot pass and every number below is provisional.")
+    if res.get('refused_days'):
+        print("⚠  REFUSED (M1/non-tick, NOT interpolated): " + ", ".join(res['refused_days']))
+    if res.get('build_errors'):
+        print(f"‼  BUILD ERROR — {len(res['build_errors'])} non-classifying comment(s): "
+              f"{res['build_errors'][:5]}")
     print()
     print(sgate.render_gate(gate))
     print()
     print(f"reports written -> {out_dir}")
+    # exit 0 only on a real PASS; refused / build-error / mismatch all non-zero.
     return 0 if gate['passed'] else 1
 
 
