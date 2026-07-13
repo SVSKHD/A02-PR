@@ -401,6 +401,24 @@ class Config:
     # applied on the tick loop once the boost is +spec_boost_min_lock favorable). Defaults to the
     # rescue backstop (boost_sl_dollars $10). It is validated against symbol_info.trade_stops_level
     # before the order is sent and widened to the broker minimum if it would land inside it (R5/R6).
+
+    # ── boost_spec_v3 (2026-07-13) ───────────────────────────────────────────
+    # Additive layer ON TOP of boost_spec_v2's band model (only runs when
+    # boost_spec_v2 is also ON). Three changes, all flag-gated by
+    # boost_spec_v3_enabled so v2's immediate-fire path is byte-identical when it
+    # is OFF: (1) a per-boost-level CONFIRM GATE -- a break must dwell
+    # boost_confirm_dwell_s AND extend boost_confirm_ext past its level before the
+    # boost enters at market (kills the 07-13 fake-break B1 that hugged the edge for
+    # ~70s and stopped -$350); (2) RE-ENTRY INVALIDATION -- a FILLED boost closes at
+    # market the instant price crosses back inside the band, not at its $10 SL;
+    # (3) TRAPPED-LEG CUT -- on the first confirmed fire per anchor episode the
+    # trapped opposite anchor leg is cut at market (via the existing close path;
+    # the -$630 per-engine hard loss stop + account kill switch stay armed and the
+    # broker SL stays in place if the cut rejects). See boost_spec.py.
+    boost_spec_v3_enabled: bool = True    # confirm gate + re-entry invalidation + trapped-leg cut
+    boost_confirm_dwell_s: float = 12.0   # a break must hold >= this many seconds past its level
+    boost_confirm_ext: float = 1.50       # AND extend >= this far past the level before entry
+
     boost_trail_gap_dollars: float = 3.50  # v3.1.6: boost-ONLY breath-gap trail,
     # armed from the instant the boost fills, alongside the $10 hard SL backstop
     # (both live; whichever hits first closes the boost). One-way ratchet; once a

@@ -24,9 +24,26 @@ When ON, trapped_late_rescue (F-B) is GATED OFF (fills.py); the F-B code is kept
 Everything is READ from cfg. The PURE decision functions here are shared by the
 live driver and the selftest so they can never drift.
 
+boost_spec_v3 (2026-07-13, flag boost_spec_v3_enabled, DEFAULT ON) layers three
+changes on top of the SAME band model, gated so v2's immediate-fire path is
+byte-identical when v3 is OFF:
+  1. CONFIRM GATE — per-boost-level IDLE->ARMED->FIRE state machine (B1/B2 fully
+     independent). A break must DWELL boost_confirm_dwell_s past its level AND
+     EXTEND boost_confirm_ext past it before the boost enters at market; a single
+     tick back across the level resets that level to IDLE (its siblings untouched).
+     Kills the 07-13 fake-break B1 that hugged the edge ~70s and stopped -$350.
+  2. RE-ENTRY INVALIDATION — a FILLED boost closes at market the instant price
+     crosses back inside the band, not at its $10 SL.
+  3. TRAPPED-LEG CUT — on the first confirmed fire per anchor episode the trapped
+     opposite anchor leg is cut at market via the existing close path. Additive to
+     the -$630 per-engine hard loss stop + account kill switch (never a substitute;
+     the broker SL stays in place if the cut rejects). A confirmed cut replaces R7.
+
 PTRACE lines (every decision is greppable): BAND_ESTABLISHED, BREAK_CONFIRMED,
-BOOST1_FIRED, BOOST2_FIRED, RATCHET_ARMED, RATCHET_EXIT, R7_CLOSE, and
-BOOST_SUPPRESSED_IN_BAND (every tick F-B would have fired but R1 blocked it).
+BOOST1_FIRED, BOOST2_FIRED, RATCHET_ARMED, RATCHET_EXIT, R7_CLOSE,
+BOOST_SUPPRESSED_IN_BAND (every tick F-B would have fired but R1 blocked it), and
+(v3) BOOST_CONFIRM_ARMED, BOOST_CONFIRM_FAILED, BOOST_INVALIDATED_REENTRY,
+TRAPPED_CUT. ARMED/FIRE/FAILED and TRAPPED_CUT are mirrored to Discord telemetry.
 """
 from __future__ import annotations
 
@@ -77,7 +94,7 @@ def active_block_lines(cfg):
     back = float(getattr(cfg, 'spec_boost_sl_dollars',
                          getattr(cfg, 'boost_sl_dollars', 10.0)))
     tstop = int(getattr(cfg, 'tstop_after_min', 45))
-    return [
+    lines = [
         "[BOOST-SPEC-V2] ACTIVE — boosts join the winning side outside the band.",
         "  band gate: no boost inside the straddle band (R1)",
         f"  boost 1: band edge ±${brk:.2f} · boost 2: +${gap:.2f} after (R2/R3)",
@@ -86,6 +103,13 @@ def active_block_lines(cfg):
         "  F-B (trapped_late_rescue): GATED OFF",
         f"  freeze_minutes: 0 · tstop_after_min: {tstop}",
     ]
+    if v3_active(cfg):
+        dwell = float(getattr(cfg, 'boost_confirm_dwell_s', 12.0))
+        ext = float(getattr(cfg, 'boost_confirm_ext', 1.50))
+        lines.append(
+            f"  [v3] confirm gate: dwell {dwell:.0f}s + ext ${ext:.2f} before entry · "
+            f"re-entry invalidation · trapped-leg cut on 1st fire")
+    return lines
 
 
 # ===========================================================================
@@ -206,17 +230,89 @@ def r7_close_level(trapped_sl):
 
 
 # ===========================================================================
+# boost_spec_v3 (2026-07-13) — PURE confirm-gate rules (shared with the selftest;
+# mirrored for BUY/UP and SELL/DOWN so the two sides can never drift). All values
+# READ from cfg. These decide ARM/RESET/EXTENSION/FIRE; the driver below owns the
+# per-level state (t0, session extreme) and the order placement.
+# ===========================================================================
+def v3_active(cfg):
+    """True when the boost_spec_v3 layer (confirm gate + re-entry invalidation +
+    trapped-leg cut) is enabled. It only has effect when boost_spec_v2 is ALSO on
+    (this whole module is dormant otherwise); OFF -> v2's immediate-fire path is
+    byte-identical."""
+    return bool(getattr(cfg, 'boost_spec_v3_enabled', False))
+
+
+def boost_confirm_levels(band_lo, band_hi, direction, cfg):
+    """The ladder levels each confirm-gate rung watches, keyed by seq {1: lvl1,
+    2: lvl2}. Reuses the v2 boost1/boost2 levels VERBATIM so a v3 boost arms and
+    fires at the SAME prices the v2 ladder used (band edge ±spec_break_dollars, then
+    +spec_boost2_gap), just gated on dwell+extension instead of the first tick."""
+    l1 = boost1_level(band_lo, band_hi, direction, cfg)
+    l2 = boost2_level(l1, direction, cfg)
+    return {1: l1, 2: l2}
+
+
+def confirm_reached(mid, level, direction):
+    """ARM trigger / still-past test: has price reached/held at-or-beyond the level
+    in the break direction? UP: mid >= level; DOWN: mid <= level. Pure, mirrored."""
+    return (float(mid) >= float(level)) if direction == 'UP' else (float(mid) <= float(level))
+
+
+def confirm_crossed_back(mid, level, direction):
+    """RESET trigger: a single tick back ACROSS the level (to the inside). The exact
+    negation of confirm_reached -- UP: mid < level; DOWN: mid > level. Pure."""
+    return not confirm_reached(mid, level, direction)
+
+
+def confirm_extension_ok(session_ext, level, direction, cfg):
+    """EXTENSION gate: the running session extreme since arming has cleared
+    level ± boost_confirm_ext in the break direction (UP: session_hi >= level+ext;
+    DOWN: session_lo <= level-ext). `session_ext` is the FAVORABLE extreme (max for
+    UP, min for DOWN). Pure, mirrored."""
+    ext = float(getattr(cfg, 'boost_confirm_ext', 1.50))
+    if direction == 'UP':
+        return float(session_ext) >= float(level) + ext
+    return float(session_ext) <= float(level) - ext
+
+
+def confirm_fire_ok(elapsed_s, session_ext, level, direction, cfg):
+    """FIRE gate: the break has dwelled >= boost_confirm_dwell_s AND proven its
+    extension (confirm_extension_ok). Both must hold on the SAME tick. Pure."""
+    dwell = float(getattr(cfg, 'boost_confirm_dwell_s', 12.0))
+    return (float(elapsed_s) >= dwell) and confirm_extension_ok(session_ext, level, direction, cfg)
+
+
+def session_extreme(session_hi, session_lo, direction):
+    """The favorable-most price seen since arming, for the extension/telemetry: the
+    running MAX on an UP break, the running MIN on a DOWN break. Pure, mirrored."""
+    return float(session_hi) if direction == 'UP' else float(session_lo)
+
+
+def in_band(mid, band_lo, band_hi):
+    """RE-ENTRY test: price is back INSIDE the straddle band [lo, hi] (inclusive).
+    A filled boost that re-enters is invalidated at market (v3 change 2). Pure."""
+    return float(band_lo) <= float(mid) <= float(band_hi)
+
+
+# ===========================================================================
 # telemetry (every decision greppable via ptrace + a util_pullback_log feed)
 # ===========================================================================
 def _pt(trader, event, anchor, **kw):
+    # PositionTracer.emit(event_type, ticket=None, anchor=None, *, ...) takes ticket as
+    # its 2nd POSITIONAL; a `ticket=` field in kw would collide with a positional None
+    # ("multiple values for argument 'ticket'") and silently drop the whole line to the
+    # log fallback. Forward it positionally so ticketed events (BOOSTn_FIRED,
+    # RATCHET_ARMED, TRAPPED_CUT, BOOST_INVALIDATED_REENTRY) emit as structured PTRACE.
     tr = getattr(trader, 'ptrace', None)
+    ticket = kw.pop('ticket', None)
     if tr is not None:
         try:
-            tr.emit(event, None, anchor, **kw)
+            tr.emit(event, ticket, anchor, **kw)
             return
         except Exception:
             pass
-    log.info(f"[BOOST_SPEC] {event} anchor={anchor} " +
+    log.info(f"[BOOST_SPEC] {event} anchor={anchor} ticket={ticket} " +
              " ".join(f"{k}={v}" for k, v in kw.items()))
 
 
@@ -233,6 +329,36 @@ def _pullback_log(trader, event, anchor, **kw):
             fn({'event': event, 'anchor': anchor, **kw})
         except Exception:
             pass
+
+
+def _tele(trader, msg, sev='info'):
+    """Mirror a boost_spec_v3 decision to the operator's Discord/telemetry channel in
+    the existing one-line style (rally.py's `self.tele.info('📈 BREAK CONFIRMED …')`).
+    Best-effort and fully guarded -- telemetry must NEVER crash the tick loop, and a
+    stub trader without .tele (selftest) is a silent no-op."""
+    tele = getattr(trader, 'tele', None)
+    if tele is None:
+        return
+    fn = getattr(tele, sev, None) or getattr(tele, 'info', None)
+    if not callable(fn):
+        return
+    try:
+        fn(msg)
+    except Exception:
+        pass
+
+
+def _leg_pnl(trader, side, entry, price):
+    """Realized $ P&L of a leg closed at `price` (side/entry from its shadow). Uses
+    lot_size * contract_size, the SAME product the fill reconcile / selftest broker
+    book with. For the TRAPPED_CUT / BOOST_INVALIDATED_REENTRY telemetry only --
+    never a trade decision. Pure-ish (reads cfg); never raises."""
+    try:
+        lot = float(getattr(trader.cfg, 'lot_size', 0.0))
+        contract = float(getattr(trader.cfg, 'contract_size', 100.0))
+        return round(favorable(side, float(entry), float(price)) * lot * contract, 2)
+    except Exception:
+        return None
 
 
 # ===========================================================================
@@ -345,16 +471,197 @@ def _ratchet_boost(trader, tk, sh, mid):
                 lock_level=new_sl, max_fav=round(peak, 2))
 
 
-def boost_spec_tick(trader, mid):
-    """The per-tick boost_spec_v2 handler. Establishes each anchor's band, fires
-    boost1/boost2 on a confirmed break OUTSIDE the band (R1-R4), ratchets the
-    boosts (R5), and closes the winning side when the trapped original dies (R7).
-    Called from fills._check_boost_triggers ONLY when cfg.boost_spec_v2 is ON, so
-    it fully replaces the F-B / RALLY / RESCUE trigger path. Never raises."""
+def _now_seconds(now):
+    """Epoch-seconds 'now' for the v3 confirm-gate dwell timer. Accepts a float (epoch
+    seconds -- the selftest), a pandas Timestamp/datetime, or None -> pd.Timestamp.now().
+    In the offline simulator pandas.Timestamp.now is monkeypatched to the tick time, so
+    the SAME call yields sim-time in the sim and wall-time live; only DIFFERENCES are
+    used (episode-local elapsed), so the naive-local vs UTC base cancels. Never raises."""
+    try:
+        if now is None:
+            import pandas as _pd
+            return float(_pd.Timestamp.now().timestamp())
+        if isinstance(now, (int, float)):
+            return float(now)
+        return float(now.timestamp())
+    except Exception:
+        try:
+            import time as _t
+            return float(_t.time())
+        except Exception:
+            return 0.0
+
+
+def _suppression_tick(trader, anchor, origs, state, mid):
+    """R1 suppressed-in-band telemetry + counter (unchanged from v2): count each tick the
+    OLD F-B would have fired a boost INSIDE the band (a leg >= trapped_rescue_arm adverse).
+    Best-effort; never raises."""
+    arm = float(getattr(trader.cfg, 'trapped_rescue_arm_dollars', 10.0))
+    for _t, s in origs:
+        if favorable(s['side'], float(s['leg_fill_price']), mid) <= -arm:
+            trader._spec_suppressed_today = int(
+                getattr(trader, '_spec_suppressed_today', 0)) + 1
+            _pullback_log(trader, 'BOOST_SUPPRESSED_IN_BAND', anchor,
+                          side=s['side'], adverse=round(-favorable(
+                              s['side'], float(s['leg_fill_price']), mid), 2),
+                          band_lo=state['band_lo'], band_hi=state['band_hi'])
+            break
+
+
+def _v3_confirm_step(trader, anchor, grp, state, mid, now_s):
+    """boost_spec_v3 CONFIRM GATE (change 1): per-boost-level IDLE -> ARMED -> FIRE, in
+    place of v2's fire-on-the-first-tick. Each rung (B1, B2) is FULLY INDEPENDENT -- a
+    reset on one never touches a sibling's state. A rung ARMS the first tick it reaches
+    its level (recording t0 and the running session extreme since arming), FAILS back to
+    IDLE on a single tick back across the level (BOOST_CONFIRM_FAILED,
+    reason=re_entered|no_extension), and FIRES a market boost (exactly as v2 --
+    _place_spec_boost, same lot/SL/magic/comment) only once it has dwelled
+    boost_confirm_dwell_s AND extended boost_confirm_ext past the level. On the FIRST fire
+    of the episode the trapped opposite anchor leg is cut (change 3). Never raises."""
+    cfg = trader.cfg
+    origs = grp['orig']
+    lo, hi = state['band_lo'], state['band_hi']
+
+    # Commit the break direction on the FIRST tick outside the band (the same $1 edge as
+    # v2's boost1 level == B1's ARM level). Until then: R1 (nothing inside the band) plus
+    # the suppressed-in-band counter, exactly as v2's watching state.
+    if state.get('dir') is None:
+        d = break_direction(mid, lo, hi, cfg)
+        if d is None:
+            _suppression_tick(trader, anchor, origs, state, mid)
+            return
+        state['dir'] = d
+        state['status'] = 'broken'
+        bs = boost_side(d)
+        trapped = None
+        for _t, s in origs:
+            if s['side'] != bs:                 # opposite the break dir = trapped
+                trapped = _t
+        state['trapped'] = trapped
+        state.setdefault('rungs', {})
+        _pt(trader, 'BREAK_CONFIRMED', anchor, direction=d,
+            level=boost1_level(lo, hi, d, cfg), trapped=trapped)
+
+    d = state['dir']; bs = boost_side(d)
+    dwell = float(getattr(cfg, 'boost_confirm_dwell_s', 12.0))
+    rungs = state.setdefault('rungs', {})
+    for seq, level in boost_confirm_levels(lo, hi, d, cfg).items():
+        r = rungs.get(seq)
+        st_ = (r or {}).get('state', 'IDLE')
+        if st_ == 'FIRED':
+            continue
+        if st_ == 'IDLE':
+            if confirm_reached(mid, level, d):
+                rungs[seq] = {'state': 'ARMED', 't0': now_s, 'level': level,
+                              'session_hi': float(mid), 'session_lo': float(mid),
+                              'ext_ok': confirm_extension_ok(mid, level, d, cfg)}
+                _pt(trader, 'BOOST_CONFIRM_ARMED', anchor, level=level, side=bs,
+                    t0=round(now_s, 3), seq=seq)
+                _tele(trader, f"🕒 BOOST CONFIRM ARMED {bs} {str(anchor)[:2]} B{seq} "
+                              f"@ {level:.2f} — need dwell {dwell:.0f}s + ext "
+                              f"${float(getattr(cfg,'boost_confirm_ext',1.50)):.2f}")
+            continue
+        # ARMED: fold in this tick's running session extremes, then RESET or FIRE.
+        r['session_hi'] = max(r['session_hi'], float(mid))
+        r['session_lo'] = min(r['session_lo'], float(mid))
+        ext = session_extreme(r['session_hi'], r['session_lo'], d)
+        if confirm_extension_ok(ext, level, d, cfg):
+            r['ext_ok'] = True
+        if confirm_crossed_back(mid, level, d):
+            elapsed = max(0.0, now_s - float(r['t0']))
+            reason = 're_entered' if r.get('ext_ok') else 'no_extension'
+            _pt(trader, 'BOOST_CONFIRM_FAILED', anchor, reason=reason,
+                elapsed=round(elapsed, 1), hi=round(ext, 2), seq=seq, side=bs, level=level)
+            _tele(trader, f"⚠️ BOOST CONFIRM FAILED {bs} {str(anchor)[:2]} B{seq} "
+                          f"reason={reason} elapsed={elapsed:.0f}s hi={ext:.2f}", sev='warn')
+            rungs[seq] = {'state': 'IDLE'}           # per-level reset; siblings untouched
+            continue
+        elapsed = max(0.0, now_s - float(r['t0']))
+        if confirm_fire_ok(elapsed, ext, level, d, cfg):
+            tk = _place_spec_boost(trader, anchor, bs, seq, state)
+            if tk:
+                r['state'] = 'FIRED'; r['ticket'] = tk
+                state['boost%d' % seq] = tk           # keep v2 fields for R7 continuity
+                _pt(trader, 'BOOST%d_FIRED' % seq, anchor, ticket=tk, side=bs, level=level)
+                _tele(trader, f"🚀 BOOST FIRED {bs} {str(anchor)[:2]} B{seq} @ {level:.2f} "
+                              f"— confirmed (dwell {elapsed:.0f}s, ext ${float(getattr(cfg,'boost_confirm_ext',1.50)):.2f})")
+                _v3_trapped_cut(trader, anchor, state, mid)
+
+
+def _v3_trapped_cut(trader, anchor, state, mid):
+    """boost_spec_v3 TRAPPED-LEG CUT (change 3): on the FIRST confirmed fire per anchor
+    episode, close the trapped opposite anchor leg at market via the EXISTING close path
+    (adapter.close_position -- the same call _flatten_all and R7 use). SAFETY (E-22/E-23
+    class): additive to the -$630 per-engine hard loss stop and the account kill switch,
+    NEVER a substitute -- neither governor is read or written here, so both stay armed and
+    un-bypassed. The broker SL on the trapped leg is left untouched, so if the cut order
+    rejects/raises the leg is STILL protected and R7 stays armed as the fallback; only a
+    CONFIRMED cut sets r7_done (which is why a clean episode shows no R7_CLOSE). Never
+    raises."""
+    if state.get('trapped_cut_done'):
+        return
+    trapped = state.get('trapped')
+    if trapped is None or int(trapped) not in trader.shadow_positions:
+        return
+    sh = trader.shadow_positions.get(int(trapped), {})
+    pnl = _leg_pnl(trader, sh.get('side'),
+                   sh.get('entry_price', sh.get('leg_fill_price')), mid)
+    try:
+        res = trader.adapter.close_position(int(trapped), dry_run=trader.paper)
+    except Exception as e:
+        log.warning(f"boost_spec_v3: trapped-leg cut {trapped} raised: {e!r} -- broker "
+                    f"SL still protects it; R7 fallback armed")
+        return
+    rc = getattr(res, 'retcode', None)
+    if not (bool(res) and (rc is None or int(rc) == 10009)):
+        log.warning(f"boost_spec_v3: trapped-leg cut {trapped} rejected (rc={rc}) -- broker "
+                    f"SL still protects it; R7 fallback armed")
+        return
+    state['trapped_cut_done'] = True
+    state['r7_done'] = True            # the cut REPLACES R7 -> no R7_CLOSE this episode
+    _pt(trader, 'TRAPPED_CUT', anchor, ticket=int(trapped), pnl=pnl)
+    _tele(trader, f"✂️ TRAPPED CUT {str(anchor)[:2]} #{int(trapped)} pnl={pnl} "
+                  f"(hard loss stop + kill switch remain armed)", sev='warn')
+
+
+def _v3_reentry_invalidation(trader, anchor, state, grp, mid):
+    """boost_spec_v3 RE-ENTRY INVALIDATION (change 2): a FILLED boost closes at market the
+    instant price crosses back INSIDE the band [band_lo, band_hi] -- it does NOT wait for
+    its $10 SL. Emits BOOST_INVALIDATED_REENTRY (ticket, pnl). Routed through the existing
+    close path; guarded so a reject just leaves the boost on its broker SL. Never raises."""
+    if not in_band(mid, state['band_lo'], state['band_hi']):
+        return
+    for tk, sh in list(grp['boosts']):
+        if int(tk) not in trader.shadow_positions or sh.get('spec_invalidated'):
+            continue
+        pnl = _leg_pnl(trader, sh.get('side'), sh.get('entry_price'), mid)
+        try:
+            trader.adapter.close_position(int(tk), dry_run=trader.paper)
+        except Exception as e:
+            log.warning(f"boost_spec_v3: re-entry invalidation close {tk} raised: {e!r}")
+            continue
+        sh['spec_invalidated'] = True
+        _pt(trader, 'BOOST_INVALIDATED_REENTRY', anchor, ticket=int(tk), pnl=pnl)
+        _tele(trader, f"↩️ BOOST INVALIDATED (re-entry) {str(anchor)[:2]} #{int(tk)} "
+                      f"pnl={pnl} — closed at market inside band")
+
+
+def boost_spec_tick(trader, mid, now=None):
+    """The per-tick boost_spec handler. Establishes each anchor's band, then either
+    (v2) fires boost1/boost2 on the first tick of a confirmed break OUTSIDE the band, or
+    (v3, boost_spec_v3_enabled) runs the per-boost-level CONFIRM GATE + re-entry
+    invalidation + trapped-leg cut on top of the SAME band model. Ratchets the boosts
+    (R5) and, when the trapped original dies without an intervening cut, closes the
+    winning side (R7). Called from fills._check_boost_triggers ONLY when cfg.boost_spec_v2
+    is ON, so it fully replaces the F-B / RALLY / RESCUE trigger path. `now` (epoch s /
+    Timestamp) is the confirm-gate clock; None -> pd.Timestamp.now() (sim-time in the
+    simulator, wall-time live). Never raises."""
     st = getattr(trader, '_spec_state', None)
     if st is None:
         st = trader._spec_state = {}
     cfg = trader.cfg
+    _v3 = v3_active(cfg)
+    now_s = _now_seconds(now) if _v3 else 0.0
 
     # item 5 (state-machine visibility): log ONCE per anchor when its straddle is
     # pending (both legs resting, not yet filled) so a no-fill day is NOT silent /
@@ -392,7 +699,8 @@ def boost_spec_tick(trader, mid):
                 lo, hi = band_edges(fills[0], fills[-1])
                 state = st[anchor] = {'band_lo': lo, 'band_hi': hi, 'status': 'watching',
                                       'boost1': None, 'boost2': None, 'dir': None,
-                                      'trapped': None, 'r7_done': False, 'last_mid': mid}
+                                      'trapped': None, 'r7_done': False, 'last_mid': mid,
+                                      'rungs': {}, 'trapped_cut_done': False}
                 _pt(trader, 'BAND_ESTABLISHED', anchor, band_lo=lo, band_hi=hi)
                 log.info(f"[BOOST-SPEC-V2] BAND_ESTABLISHED {str(anchor)[:2]} "
                          f"lo={lo} hi={hi}")
@@ -400,60 +708,59 @@ def boost_spec_tick(trader, mid):
                 continue
         state['last_mid'] = mid
 
-        # --- WATCHING: R1 (nothing inside band) + break detection ---
-        if state['status'] == 'watching':
-            d = break_direction(mid, state['band_lo'], state['band_hi'], cfg)
-            if d is None:
-                # R1 suppression telemetry: would the OLD F-B have fired? (a leg
-                # >= trapped_rescue_arm_dollars adverse while inside the band)
-                arm = float(getattr(cfg, 'trapped_rescue_arm_dollars', 10.0))
+        if _v3:
+            # v3: confirm gate (arms/fires the rungs, cuts the trapped leg on 1st fire)
+            _v3_confirm_step(trader, anchor, grp, state, mid, now_s)
+        else:
+            # --- v2 WATCHING: R1 (nothing inside band) + break detection ---
+            if state['status'] == 'watching':
+                d = break_direction(mid, state['band_lo'], state['band_hi'], cfg)
+                if d is None:
+                    _suppression_tick(trader, anchor, origs, state, mid)
+                    continue
+                # BREAK confirmed
+                state['dir'] = d
+                state['status'] = 'broken'
+                bs = boost_side(d)
+                # trapped original = the leg on the LOSING side of the break
+                trapped = None
                 for _t, s in origs:
-                    if favorable(s['side'], float(s['leg_fill_price']), mid) <= -arm:
-                        # count it (the whole point of R1: how many boosts the old
-                        # F-B would have fired INTO the band). Per broker day.
-                        trader._spec_suppressed_today = int(
-                            getattr(trader, '_spec_suppressed_today', 0)) + 1
-                        _pullback_log(trader, 'BOOST_SUPPRESSED_IN_BAND', anchor,
-                                      side=s['side'], adverse=round(-favorable(
-                                          s['side'], float(s['leg_fill_price']), mid), 2),
-                                      band_lo=state['band_lo'], band_hi=state['band_hi'])
-                        break
-                continue
-            # BREAK confirmed
-            state['dir'] = d
-            state['status'] = 'broken'
-            bs = boost_side(d)
-            # trapped original = the leg on the LOSING side of the break
-            trapped = None
-            for _t, s in origs:
-                if s['side'] != bs:            # opposite the break dir = trapped
-                    trapped = _t
-            state['trapped'] = trapped
-            lvl1 = boost1_level(state['band_lo'], state['band_hi'], d, cfg)
-            _pt(trader, 'BREAK_CONFIRMED', anchor, **{'direction': d, 'level': lvl1,
-                                                      'trapped': trapped})
-            tk1 = _place_spec_boost(trader, anchor, bs, 1, state)
-            if tk1:
-                state['boost1'] = tk1
-                _pt(trader, 'BOOST1_FIRED', anchor, ticket=tk1, side=bs, level=lvl1)
+                    if s['side'] != bs:            # opposite the break dir = trapped
+                        trapped = _t
+                state['trapped'] = trapped
+                lvl1 = boost1_level(state['band_lo'], state['band_hi'], d, cfg)
+                _pt(trader, 'BREAK_CONFIRMED', anchor, **{'direction': d, 'level': lvl1,
+                                                          'trapped': trapped})
+                tk1 = _place_spec_boost(trader, anchor, bs, 1, state)
+                if tk1:
+                    state['boost1'] = tk1
+                    _pt(trader, 'BOOST1_FIRED', anchor, ticket=tk1, side=bs, level=lvl1)
 
-        # --- BROKEN: boost2 when price runs spec_boost2_gap past boost1 ---
-        if state['status'] == 'broken' and state['boost1'] and not state['boost2']:
-            d = state['dir']; bs = boost_side(d)
-            lvl1 = boost1_level(state['band_lo'], state['band_hi'], d, cfg)
-            lvl2 = boost2_level(lvl1, d, cfg)
-            if (d == 'DOWN' and mid <= lvl2) or (d == 'UP' and mid >= lvl2):
-                tk2 = _place_spec_boost(trader, anchor, bs, 2, state)
-                if tk2:
-                    state['boost2'] = tk2
-                    _pt(trader, 'BOOST2_FIRED', anchor, ticket=tk2, side=bs, level=lvl2)
+            # --- v2 BROKEN: boost2 when price runs spec_boost2_gap past boost1 ---
+            if state['status'] == 'broken' and state['boost1'] and not state['boost2']:
+                d = state['dir']; bs = boost_side(d)
+                lvl1 = boost1_level(state['band_lo'], state['band_hi'], d, cfg)
+                lvl2 = boost2_level(lvl1, d, cfg)
+                if (d == 'DOWN' and mid <= lvl2) or (d == 'UP' and mid >= lvl2):
+                    tk2 = _place_spec_boost(trader, anchor, bs, 2, state)
+                    if tk2:
+                        state['boost2'] = tk2
+                        _pt(trader, 'BOOST2_FIRED', anchor, ticket=tk2, side=bs, level=lvl2)
 
-        # --- RATCHET the spec boosts (R5) ---
+        # --- RE-ENTRY INVALIDATION (v3 change 2): a filled boost back inside the band
+        #     closes at market now, not at its $10 SL ---
+        if _v3:
+            _v3_reentry_invalidation(trader, anchor, state, grp, mid)
+
+        # --- RATCHET the spec boosts (R5) — shared by v2 and v3 ---
         for tk, sh in grp['boosts']:
-            if int(tk) in trader.shadow_positions:
+            if int(tk) in trader.shadow_positions and not sh.get('spec_invalidated'):
                 _ratchet_boost(trader, tk, sh, mid)
 
-        # --- R7: trapped original died -> close the winning side, once ---
+        # --- R7: trapped original died -> close the winning side, once. In v3 a
+        #     CONFIRMED trapped-leg cut sets r7_done, so R7 is the FALLBACK only (a cut
+        #     that rejected and let the leg ride to its broker SL) — a clean v3 episode
+        #     emits no R7_CLOSE. ---
         if state.get('trapped') is not None and not state['r7_done']:
             if int(state['trapped']) not in trader.shadow_positions:
                 # the trapped leg is gone (hit its SL). Close every winning-side leg
