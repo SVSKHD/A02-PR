@@ -6,7 +6,7 @@ banner() are byte-identical to before the split.
 """
 
 
-__version__ = "3.9.0"  # D-31 boost order geometry FIX: the spec boost opening SL is now a REAL backstop (spec_boost_sl_dollars $10) validated to clear symbol_info.trade_stops_level (widened to the broker minimum if inside), NOT breakeven-at-mid; NO placeholder TP is sent (tp=0.0), never entry+$1000; the +$1.50 ratchet arms on the tick loop at +spec_boost_min_lock favorable, not at fill. Fixes the 2026-07-10 boost-1 retcode=10016 (INVALID_STOPS) reject. selftest -> 305 (new 305 order-geometry). Flag OFF byte-identical.
+__version__ = "3.9.1"  # boost_spec_v3 (2026-07-13, flag boost_spec_v3_enabled DEFAULT ON, layered on boost_spec_v2): (1) per-boost-level CONFIRM GATE (IDLE->ARMED->FIRE, B1/B2 independent) -- a break must dwell boost_confirm_dwell_s ($12s) AND extend boost_confirm_ext ($1.50) past its level before entry, a single tick back across the level resets that level only (kills the 07-13 fake-break B1 that stopped -$350); (2) RE-ENTRY INVALIDATION -- a filled boost closes at market the instant price re-enters the band, not at its $10 SL; (3) TRAPPED-LEG CUT -- the first confirmed fire cuts the trapped opposite anchor leg via the existing close path (additive to the -$630 hard loss stop + kill switch, never a substitute; broker SL stays put if the cut rejects; a confirmed cut replaces R7). New PTRACE: BOOST_CONFIRM_ARMED/FAILED, BOOST_INVALIDATED_REENTRY, TRAPPED_CUT (ARMED/FIRE/FAILED/TRAPPED_CUT mirrored to Discord). selftest -> 308 (new 306-308). v3 flag OFF -> v2 immediate-fire byte-identical. (NB: task requested "v3.8.9" but that shipped earlier and HEAD was already 3.9.0 -- bumped forward to 3.9.1.)
 CODENAME = "Astra Hawk"
 
 

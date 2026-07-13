@@ -416,6 +416,10 @@ STEP_NAMES = {
     304: "boost_spec_v2 visibility",     # preflight lists the flag (ON when True/OFF when False); ACTIVE block only when True; suppressed-in-band count renders on /status; OFF byte-identical
     # 2026-07-10 boost order geometry: the 07-10 INVALID_STOPS reject (breakeven-at-mid SL + entry+$1000 TP).
     305: "boost_spec_v2 order stops",     # opening boost SL is a REAL backstop >= trade_stops_level from entry (not breakeven-at-mid); no placeholder TP; ratchet lock arms on the tick loop at +$1.50 fav, not at fill; a mock order_send that rejects INVALID_STOPS accepts the new geometry, rejects the old
+    # 2026-07-13 boost_spec_v3: confirm gate + re-entry invalidation + trapped-leg cut (flag boost_spec_v3_enabled, DEFAULT ON).
+    306: "boost_spec_v3 confirm",         # per-level IDLE->ARMED->FIRE: a fake break that never extends fails BOOST_CONFIRM_FAILED reason=no_extension (no fire); a real break that dwells boost_confirm_dwell_s AND extends boost_confirm_ext FIRES on the re-cross; per-level reset isolation (B1 reset leaves ARMED B2 untouched); SELL-side mirror math
+    307: "boost_spec_v3 reentry+cut",      # a FILLED boost closes at market (BOOST_INVALIDATED_REENTRY) the instant price re-enters the band, not at its $10 SL; the first confirmed fire cuts the trapped opposite leg (TRAPPED_CUT ~-$440), suppresses R7 (no R7_CLOSE); DOWN-break mirror
+    308: "boost_spec_v3 cut safety",       # cut-order REJECTION leaves the trapped leg open on its broker SL, does NOT emit TRAPPED_CUT, and leaves R7 armed as the fallback (the -$630 hard stop + kill switch are never bypassed); v3 OFF -> v2 immediate-fire byte-identical
 }
 # Steps that place REAL (throwaway) orders -> gated by the demo guard.
 MARKET_STEPS = {4, 5, 6, 8}
@@ -9985,17 +9989,20 @@ class SelfTest:
     # ------------------------------------------------------------------------
     # boost_spec_v2 (D-31) — flag-gated boost redesign, DEFAULT OFF
     # ------------------------------------------------------------------------
-    def _spec_env(self, cfg, buy_fill=4127.35, sell_fill=4117.35):
+    def _spec_env(self, cfg, buy_fill=4127.35, sell_fill=4117.35, reject_close=False):
         """A stub trader + mini fake-broker carrying the two ORIGINAL straddle legs
         (BUY buy_fill / SELL sell_fill) for driving boost_spec.boost_spec_tick. The
         broker fills spec boosts, moves SLs, closes on SL touch / R7, and books
-        realized P&L (lot*contract). All values from cfg."""
+        realized P&L (lot*contract). All values from cfg. `reject_close` makes
+        close_position REJECT (retcode INVALID_STOPS) without popping the position --
+        the broker SL stays in place -- for the v3 trapped-cut safety test (308)."""
         import types
         lot = float(cfg.lot_size); mult = lot * float(getattr(cfg, 'contract_size', 100.0))
 
         class Broker:
             def __init__(self):
                 self._tk = 800000; self.realized = {}; self.last_mid = None
+                self.reject_close = reject_close
             def _pnl(self, side, entry, px):
                 return round((1.0 if side == 'BUY' else -1.0) * (px - entry) * mult, 2)
             def place_market_order(self, sym, side, l, sl, tp, comment, dry_run, magic):
@@ -10009,6 +10016,8 @@ class SelfTest:
                     self._open[int(tk)]['sl'] = sl
                 return True
             def close_position(self, tk, dry_run=False):
+                if self.reject_close:            # cut rejected -> leg + broker SL untouched
+                    return types.SimpleNamespace(retcode=10016, comment='INVALID_STOPS')
                 p = self._open.pop(int(tk), None)
                 if p is not None:
                     self.realized[int(tk)] = self._pnl(p['side'], p['entry'], self.last_mid)
@@ -10044,7 +10053,10 @@ class SelfTest:
         import dataclasses, boost_spec as bs, boosts as _b
         try:
             off = self.cfg                       # default config: flag OFF
-            on = dataclasses.replace(self.cfg, boost_spec_v2=True, trapped_late_rescue_enabled=True)
+            # v2 immediate-fire path in isolation: boost_spec_v3_enabled OFF (the v3 confirm
+            # gate is exercised by steps 306-308). Default is v3 ON, so pin it here.
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True, boost_spec_v3_enabled=False,
+                                     trapped_late_rescue_enabled=True)
             checks = {}
             # OFF byte-identical: flag defaults False AND F-B still returns a plan at $10 adverse
             fb = _b.plan_trapped_late_rescue('SELL', 4117.35, 4127.35, off)  # +$10 adverse SELL
@@ -10107,7 +10119,8 @@ class SelfTest:
         # total is NOT -1695.40 (it is dramatically better -- the trapped BUY is the only loser).
         import dataclasses, boost_spec as bs
         try:
-            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            # the 07-10 regression is a v2 immediate-fire tape; v3 confirm gate pinned OFF.
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True, boost_spec_v3_enabled=False)
             tr, br = self._spec_env(on, buy_fill=4127.35, sell_fill=4117.35)
             # tape: establish band, break DOWN to the 4108.88 low, then recover to 4130.94
             down = [4122.0, 4119.0, 4117.35, 4116.35, 4114.0, 4112.35, 4110.5, 4109.34, 4108.88]
@@ -10279,7 +10292,8 @@ class SelfTest:
         #     NOT at fill. All values READ from cfg.
         import dataclasses, types, boost_spec as bs
         try:
-            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            # order-geometry is a v2 immediate-fire assertion; v3 confirm gate pinned OFF.
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True, boost_spec_v3_enabled=False)
             STOPS_PTS = 30; POINT = 0.01; MIN_DIST = STOPS_PTS * POINT   # $0.30 broker minimum
             sent = []            # every (side, sl, tp, rc) the broker was asked to place
 
@@ -10368,6 +10382,213 @@ class SelfTest:
             import traceback
             self._record(305, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
         self._record(305, PASS if ok else FAIL, detail)
+
+    # ------------------------------------------------------------------------
+    # boost_spec_v3 (2026-07-13) — confirm gate + re-entry invalidation + trapped cut
+    # ------------------------------------------------------------------------
+    class _SpecTrace:
+        """Capture ptrace emits with the REAL PositionTracer signature (ticket is the
+        2nd positional) so the v3 steps can assert on structured events + fields."""
+        def __init__(self): self.events = []
+        def emit(self, event_type, ticket=None, anchor=None, **kw):
+            rec = dict(kw); rec['ticket'] = ticket; rec['anchor'] = anchor
+            self.events.append((event_type, rec)); return rec
+        def has(self, ev): return any(e == ev for e, _ in self.events)
+        def of(self, ev): return [r for e, r in self.events if e == ev]
+
+    def _step_boost_spec_v3_confirm(self):
+        # 306 boost_spec_v3 CONFIRM GATE (2026-07-13). Per-boost-level IDLE->ARMED->FIRE, each
+        # rung independent. Asserts: (1) the PURE mirror rules (reached/reset/extension/fire) hold
+        # for BOTH UP and DOWN; (2) a fake break that pokes past the level but never extends
+        # boost_confirm_ext and fades back FAILS (BOOST_CONFIRM_FAILED reason=no_extension) with NO
+        # boost placed -- the 07-13 fake B1; (3) a real break that RE-CROSSES the same level,
+        # dwells boost_confirm_dwell_s AND extends FIRES the boost; (4) per-level reset ISOLATION:
+        # resetting B1 leaves an ARMED B2 (t0 + state) completely untouched. All values from cfg.
+        import dataclasses, boost_spec as bs
+        try:
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True)   # v3 default ON
+            dwell = float(on.boost_confirm_dwell_s); ext = float(on.boost_confirm_ext)
+            checks = {}
+            # (1) PURE mirror rules, both sides
+            L = 4080.83
+            checks['v3_on'] = bs.v3_active(on)
+            checks['reached_mirror'] = (bs.confirm_reached(L, L, 'UP') and bs.confirm_reached(L, L, 'DOWN')
+                and bs.confirm_reached(L + 1, L, 'UP') and not bs.confirm_reached(L + 1, L, 'DOWN'))
+            checks['reset_mirror'] = (bs.confirm_crossed_back(L - 0.01, L, 'UP')
+                and bs.confirm_crossed_back(L + 0.01, L, 'DOWN')
+                and not bs.confirm_crossed_back(L, L, 'UP'))
+            checks['ext_mirror'] = (bs.confirm_extension_ok(L + ext, L, 'UP', on)
+                and not bs.confirm_extension_ok(L + ext - 0.01, L, 'UP', on)
+                and bs.confirm_extension_ok(L - ext, L, 'DOWN', on)
+                and not bs.confirm_extension_ok(L - ext + 0.01, L, 'DOWN', on))
+            checks['fire_gate'] = (bs.confirm_fire_ok(dwell, L + ext, L, 'UP', on)
+                and not bs.confirm_fire_ok(dwell - 0.1, L + ext, L, 'UP', on)      # dwell not met
+                and not bs.confirm_fire_ok(dwell + 5, L + ext - 0.01, L, 'UP', on))  # ext not met
+            checks['session_extreme'] = (bs.session_extreme(4085, 4079, 'UP') == 4085.0
+                and bs.session_extreme(4085, 4079, 'DOWN') == 4079.0)
+
+            # driver: band [4070,4080]; B1 level = 4081 (band_hi + spec_break_dollars)
+            tr, br = self._spec_env(on, buy_fill=4080.0, sell_fill=4070.0); tr.ptrace = self._SpecTrace()
+            b1 = bs.boost1_level(4070.0, 4080.0, 'UP', on)
+            clk = [0.0]
+            def tk(mid, dt=1.0):
+                clk[0] += dt; br.advance(mid); bs.boost_spec_tick(tr, mid, now=clk[0])
+            # (2) FAKE break: arm past b1, poke to +$1.1 (< +ext), fade back -> no_extension
+            tk(4075.0)                     # inside band
+            tk(b1 + 0.2)                   # ARM B1
+            tk(b1 + 1.1)                   # poke, still < b1+ext (=+1.5)
+            tk(b1 - 1.0)                   # back across level -> FAILED
+            fail = tr.ptrace.of('BOOST_CONFIRM_FAILED')
+            checks['fake_no_extension'] = (bool(fail) and fail[0]['reason'] == 'no_extension'
+                                           and not tr.ptrace.has('BOOST1_FIRED') and br._tk == 800000)
+            # (3) REAL break: re-cross, extend, dwell -> FIRE
+            tk(b1 + 0.2)                   # RE-ARM B1 (second cross)
+            tk(b1 + ext + 0.1)             # extension proven
+            tk(b1 + ext + 0.2, dt=dwell + 1.0)   # dwelled -> FIRE
+            checks['real_fires'] = tr.ptrace.has('BOOST1_FIRED')
+            armed = tr.ptrace.of('BOOST_CONFIRM_ARMED')
+            checks['armed_twice'] = (len([a for a in armed if a['seq'] == 1]) == 2)  # fake + real
+
+            # (4) per-level reset ISOLATION on a DOWN break: B1=lvl, B2=lvl-gap
+            tr2, br2 = self._spec_env(on, buy_fill=4090.0, sell_fill=4080.0); tr2.ptrace = self._SpecTrace()
+            clk2 = [0.0]
+            def tk2(mid, dt=1.0):
+                clk2[0] += dt; br2.advance(mid); bs.boost_spec_tick(tr2, mid, now=clk2[0])
+            dl1 = bs.boost1_level(4080.0, 4090.0, 'DOWN', on)   # 4079
+            dl2 = bs.boost2_level(dl1, 'DOWN', on)              # 4075
+            tk2(4085.0)
+            tk2(dl1 - 0.5)                 # arm B1 only (<=4079, >4075)
+            tk2(dl2 - 0.5)                 # arm B2 too (<=4075); B1 still armed
+            rungs = tr2._spec_state['A1_02h_Asia']['rungs']
+            both_armed = (rungs[1]['state'] == 'ARMED' and rungs[2]['state'] == 'ARMED')
+            b1_t0 = rungs[1]['t0']
+            tk2(dl2 + 0.5)                 # >4075 resets B2 ONLY (still <=4079 so B1 holds)
+            rungs = tr2._spec_state['A1_02h_Asia']['rungs']
+            failed2 = tr2.ptrace.of('BOOST_CONFIRM_FAILED')
+            checks['reset_isolation'] = (both_armed
+                and rungs[2]['state'] == 'IDLE'
+                and rungs[1]['state'] == 'ARMED' and rungs[1]['t0'] == b1_t0
+                and any(r['seq'] == 2 for r in failed2) and not any(r['seq'] == 1 for r in failed2))
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+        except Exception as e:
+            import traceback
+            self._record(306, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(306, PASS if ok else FAIL, detail)
+
+    def _step_boost_spec_v3_reentry_cut(self):
+        # 307 boost_spec_v3 RE-ENTRY INVALIDATION + TRAPPED-LEG CUT. Asserts: (1) the first
+        # confirmed fire per episode CUTS the trapped opposite anchor leg at market (TRAPPED_CUT
+        # ticket+pnl, ~-$440 not the -$630 SL) and SUPPRESSES R7 (no R7_CLOSE for the episode);
+        # (2) a FILLED boost closes at market (BOOST_INVALIDATED_REENTRY ticket+pnl) the instant
+        # price crosses back inside the band, NOT at its $10 SL; (3) mirror correctness on a
+        # DOWN break (trapped BUY cut). All values from cfg.
+        import dataclasses, boost_spec as bs
+        try:
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            dwell = float(on.boost_confirm_dwell_s); ext = float(on.boost_confirm_ext)
+            checks = {}
+            # UP break: band [4070,4080], trapped = SELL 102
+            tr, br = self._spec_env(on, buy_fill=4080.0, sell_fill=4070.0); tr.ptrace = self._SpecTrace()
+            b1 = bs.boost1_level(4070.0, 4080.0, 'UP', on)
+            clk = [0.0]
+            def tk(mid, dt=1.0):
+                clk[0] += dt; br.advance(mid); bs.boost_spec_tick(tr, mid, now=clk[0])
+            tk(4075.0)
+            tk(b1 + 0.2)                   # arm
+            tk(b1 + ext + 0.1)             # extend
+            tk(b1 + ext + 0.2, dt=dwell + 1.0)   # FIRE -> trapped cut
+            cut = tr.ptrace.of('TRAPPED_CUT')
+            checks['trapped_cut_fires'] = (bool(cut) and cut[0]['ticket'] == 102 and 102 in br.realized)
+            # cut booked NEAR market (~-$440..-$460 for a $10-band SELL @4070 cut ~4081.7),
+            # strictly BETTER than dying at its full SL
+            sell_sl_pnl = round((4070.0 - (4070.0 + on.sl_dist)) * on.lot_size * on.contract_size, 2)
+            checks['cut_better_than_sl'] = (cut and br.realized[102] > sell_sl_pnl + 1.0)
+            checks['no_r7'] = (not tr.ptrace.has('R7_CLOSE')
+                               and tr._spec_state['A1_02h_Asia'].get('r7_done') is True
+                               and tr._spec_state['A1_02h_Asia'].get('trapped_cut_done') is True)
+            # (2) re-entry invalidation: an UN-LOCKED boost (never armed a ratchet floor above
+            # the band) reverses straight back inside the band -> closed at market NOW, on its
+            # $10 backstop still well below. (A boost that DID lock exits on its ratchet in
+            # profit before ever re-entering; this is the safety net for the one that didn't.)
+            open_before = [k for k in tr.shadow_positions if k > 800000]
+            tk(4075.0)                     # back INSIDE band -> invalidate at market
+            inval = tr.ptrace.of('BOOST_INVALIDATED_REENTRY')
+            checks['reentry_invalidates'] = (bool(open_before) and bool(inval)
+                and inval[0]['ticket'] in open_before
+                and inval[0]['ticket'] not in tr.shadow_positions
+                and inval[0].get('pnl') is not None)
+            # (3) DOWN-break mirror: trapped = BUY 101 cut
+            tr2, br2 = self._spec_env(on, buy_fill=4090.0, sell_fill=4080.0); tr2.ptrace = self._SpecTrace()
+            dl1 = bs.boost1_level(4080.0, 4090.0, 'DOWN', on)
+            clk2 = [0.0]
+            def tk2(mid, dt=1.0):
+                clk2[0] += dt; br2.advance(mid); bs.boost_spec_tick(tr2, mid, now=clk2[0])
+            tk2(4085.0)
+            tk2(dl1 - 0.2)
+            tk2(dl1 - ext - 0.1)
+            tk2(dl1 - ext - 0.2, dt=dwell + 1.0)
+            cut2 = tr2.ptrace.of('TRAPPED_CUT')
+            checks['down_mirror_cut'] = (bool(cut2) and cut2[0]['ticket'] == 101 and 101 in br2.realized
+                                         and not tr2.ptrace.has('R7_CLOSE'))
+            ok = all(checks.values())
+            detail = (" ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+                      + f" | cut_pnl={br.realized.get(102)} sl_pnl={sell_sl_pnl}")
+        except Exception as e:
+            import traceback
+            self._record(307, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(307, PASS if ok else FAIL, detail)
+
+    def _step_boost_spec_v3_cut_safety(self):
+        # 308 boost_spec_v3 CUT SAFETY + v3-OFF byte-identical. The trapped-leg cut is ADDITIVE to
+        # the -$630 hard loss stop / kill switch, never a substitute. Asserts: (1) when the cut
+        # order is REJECTED by the broker, the trapped leg stays OPEN on its unchanged broker SL,
+        # NO TRAPPED_CUT is emitted, and R7 stays armed as the fallback (r7_done not set); (2)
+        # with boost_spec_v3_enabled OFF the path is byte-identical v2 immediate-fire (boost1
+        # placed on the first break tick, no confirm-gate events). All values from cfg.
+        import dataclasses, boost_spec as bs
+        try:
+            on = dataclasses.replace(self.cfg, boost_spec_v2=True)
+            dwell = float(on.boost_confirm_dwell_s); ext = float(on.boost_confirm_ext)
+            checks = {}
+            # (1) cut REJECTION leaves the broker SL intact (DOWN break; trapped BUY 101)
+            tr, br = self._spec_env(on, buy_fill=4090.0, sell_fill=4080.0, reject_close=True)
+            tr.ptrace = self._SpecTrace()
+            sl_before = br._open[101]['sl']
+            dl1 = bs.boost1_level(4080.0, 4090.0, 'DOWN', on)
+            clk = [0.0]
+            def tk(mid, dt=1.0):
+                clk[0] += dt; br.advance(mid); bs.boost_spec_tick(tr, mid, now=clk[0])
+            tk(4085.0)
+            tk(dl1 - 0.2)                  # arm
+            tk(dl1 - ext - 0.1)            # extend
+            tk(dl1 - ext - 0.2, dt=dwell + 1.0)   # FIRE -> cut attempted, broker REJECTS
+            st = tr._spec_state['A1_02h_Asia']
+            checks['fired'] = tr.ptrace.has('BOOST1_FIRED')
+            checks['no_trapped_cut_on_reject'] = (not tr.ptrace.has('TRAPPED_CUT'))
+            checks['trapped_stays_open'] = (101 in tr.shadow_positions and 101 in br._open)
+            checks['broker_sl_intact'] = (br._open[101]['sl'] == sl_before)
+            checks['r7_fallback_armed'] = (st.get('trapped_cut_done') is not True
+                                           and st.get('r7_done') is not True)
+            # (2) v3 OFF -> v2 immediate fire, byte-identical, no confirm-gate events
+            off = dataclasses.replace(self.cfg, boost_spec_v2=True, boost_spec_v3_enabled=False)
+            tro, bro = self._spec_env(off, buy_fill=4127.35, sell_fill=4117.35); tro.ptrace = self._SpecTrace()
+            b1o = bs.boost1_level(4117.35, 4127.35, 'DOWN', off)
+            clk2 = [0.0]
+            def tko(mid):
+                clk2[0] += 1; bro.advance(mid); bs.boost_spec_tick(tro, mid, now=clk2[0])
+            tko(4122.0)                    # inside band -> nothing
+            v2_inband_zero = (bro._tk == 800000)
+            tko(b1o)                       # first break tick -> IMMEDIATE boost1
+            checks['v2_immediate_fire'] = (v2_inband_zero and tro.ptrace.has('BOOST1_FIRED')
+                and not tro.ptrace.has('BOOST_CONFIRM_ARMED')
+                and any(k > 800000 for k in tro.shadow_positions))
+            ok = all(checks.values())
+            detail = " ".join(f"{k}={'ok' if v else 'BAD'}" for k, v in checks.items())
+        except Exception as e:
+            import traceback
+            self._record(308, FAIL, f"raised: {e!r} | {traceback.format_exc().splitlines()[-1]}"); return
+        self._record(308, PASS if ok else FAIL, detail)
 
     # ------------------------------------------------------------------------
     # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
@@ -12627,6 +12848,10 @@ class SelfTest:
             self._step_sim_gate_reproducible()
             self._step_boost_spec_visibility()
             self._step_boost_spec_order_stops()
+            # boost_spec_v3 (2026-07-13): confirm gate + re-entry invalidation + trapped-leg cut.
+            self._step_boost_spec_v3_confirm()
+            self._step_boost_spec_v3_reentry_cut()
+            self._step_boost_spec_v3_cut_safety()
             # v3.7.6 daily 2% target with the A4 decision gate (repurposed account lock)
             self._step_target_levels()
             self._step_target_pre_a4()
