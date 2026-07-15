@@ -18,6 +18,7 @@ import pandas as pd
 
 from telemetry import telemetry_from_env, Severity, anchor_time_block
 from mt5_adapter import _MT5_RETCODE_MAP, mt5_comment
+import stale_leg_sweep as _stale_sweep
 
 log = logging.getLogger("AUREON")
 
@@ -706,6 +707,16 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     #         internally during its built-in rc=-1 reconcile retry)
     retry_comment = f"_R{retry_count}" if retry_count > 0 else ""
 
+    # STALE-LEG SWEEP: before this anchor's straddle rests, cancel every pending leg
+    # left behind by a PRIOR anchor (origin anchor >= stale_leg_interval away) so a
+    # non-OCO leftover can't fill on a pullback into an unwanted scratch. The rescue
+    # leg of an open position (the INTERVAL-point opposite leg) is exempt. Fired here,
+    # BEFORE placement, and fully guarded -- a sweep problem never blocks the straddle.
+    try:
+        self._sweep_stale_legs(anchor_price)
+    except Exception as _sweep_e:
+        log.warning(f"{label}: stale-leg sweep raised (continuing to placement): {_sweep_e!r}")
+
     # Fix 1 (E-13): route anchor stop orders through the SHARED place_with_retry wrapper --
     # the same rc-classification + bounded retry + abort-alert Rogue uses (never resizes the
     # lot). SUCCESS path is byte-identical (rc=10009 -> one send -> return); paper and
@@ -733,7 +744,9 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     if not skip_buy:
         buy_res = _send_stop(
             'BUY', buy_stop, sl_buy, tp_buy,
-            f"AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}")
+            _stale_sweep.tag_comment(
+                f"AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}",
+                anchor_price))
         if not self.paper:
             try:
                 buy_err = self.adapter.mt5.last_error()
@@ -742,7 +755,9 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     if not skip_sell:
         sell_res = _send_stop(
             'SELL', sell_stop, sl_sell, tp_sell,
-            f"AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}")
+            _stale_sweep.tag_comment(
+                f"AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}",
+                anchor_price))
         if not self.paper:
             try:
                 sell_err = self.adapter.mt5.last_error()
