@@ -36,6 +36,10 @@ ANCHOR_TAG_RE = re.compile(r"A:(-?\d+(?:\.\d+)?)")   # parses "A:4028.77" anywhe
 _TRADE_RETCODE_DONE = 10009     # TRADE_RETCODE_DONE fallback
 _RESCUE_LEG_TOL = 0.75          # tolerance ($) when matching the INTERVAL-point leg
 SWEEP_REASON = "stale_leg_sweep"
+# The Aureon straddle/anchor magic (mt5_adapter.place_stop_order hardcodes 20260522).
+# The sweep only ever cancels orders bearing THIS magic, so it can never touch the
+# Rogue T2 bot (20260815), the rogue rider (20260626), the fetcher, or a manual trade.
+STRADDLE_MAGIC = 20260522
 
 
 # --- comment tagging (restart-safe origin-anchor stamp) ---------------------------
@@ -74,14 +78,17 @@ def parse_anchor_comment(comment) -> Optional[float]:
         return None
 
 
-def build_registry(orders) -> Dict[int, float]:
+def build_registry(orders, magic: Optional[int] = None) -> Dict[int, float]:
     """Rebuild the anchor registry {ticket -> origin_anchor_price} by parsing the
     ``A:<price>`` comment of every order from ``mt5.orders_get()``. This is the
     restart path: the registry is reconstructed from the broker's own order state,
     so tagging survives a bot restart with no local file. Orders with no tag (or an
-    unreadable ticket) are skipped."""
+    unreadable ticket) are skipped. When ``magic`` is given, only our own orders are
+    registered (foreign-magic orders on a shared account are ignored)."""
     registry: Dict[int, float] = {}
     for o in orders or []:
+        if magic is not None and int(getattr(o, "magic", -1) or -1) != int(magic):
+            continue
         anchor = parse_anchor_comment(getattr(o, "comment", None))
         if anchor is None:
             continue
@@ -220,7 +227,7 @@ def cancel_stale_leg(mt5, ticket, origin_anchor, current_anchor, logger=None) ->
 
 def sweep_stale_legs(mt5, symbol: str, current_anchor: float,
                      interval: float = INTERVAL, registry: Optional[Dict[int, float]] = None,
-                     logger=None) -> List[dict]:
+                     logger=None, magic: Optional[int] = None) -> List[dict]:
     """Sweep every stale pending leg for ``symbol`` before the new anchor's
     straddle is placed.
 
@@ -228,6 +235,13 @@ def sweep_stale_legs(mt5, symbol: str, current_anchor: float,
     anchor differs from ``current_anchor`` by >= ``interval``, cancel it via
     ``TRADE_ACTION_REMOVE`` — UNLESS it is the rescue leg of a currently open
     position (checked against ``mt5.positions_get``), in which case it is skipped.
+
+    MULTI-BOT ISOLATION: when ``magic`` is given, ONLY orders bearing that magic are
+    considered — foreign-magic pendings (another bot on the same symbol/account, or a
+    manual trade) are never touched. ``orders_get`` returns every order on the symbol
+    regardless of magic, so this filter is what keeps the sweep from cancelling the
+    Rogue T2 bot's (or anyone else's) resting orders. ``magic=None`` preserves the
+    legacy symbol-only behavior for callers that own every order on the symbol.
 
     The origin anchor is taken from ``registry`` when supplied (the rebuilt-on-
     restart map) and otherwise parsed from the order comment, so a fresh process
@@ -259,6 +273,11 @@ def sweep_stale_legs(mt5, symbol: str, current_anchor: float,
         positions = []
 
     for o in orders:
+        # MULTI-BOT ISOLATION: skip any order that is not ours. orders_get is
+        # symbol-scoped, not magic-scoped, so without this a shared-account sweep
+        # would cancel other bots' / manual pendings.
+        if magic is not None and int(getattr(o, "magic", -1) or -1) != int(magic):
+            continue
         ticket = getattr(o, "ticket", None)
         origin = None
         if registry and ticket is not None:
@@ -312,9 +331,13 @@ def _sweep_stale_legs(self, current_anchor: float) -> List[dict]:
     symbol = getattr(cfg, "symbol", SYMBOL) if cfg is not None else SYMBOL
     interval = float(getattr(cfg, "stale_leg_interval", INTERVAL)) if cfg is not None else INTERVAL
     registry = getattr(self, "_anchor_registry", None)
+    # MULTI-BOT ISOLATION: only ever cancel our own straddle magic. On the shared
+    # XAUUSD account this keeps the sweep off the Rogue T2 bot and any manual order.
+    magic = int(getattr(cfg, "stale_leg_sweep_magic", STRADDLE_MAGIC)) if cfg is not None else STRADDLE_MAGIC
     try:
         swept = sweep_stale_legs(mt5, symbol, current_anchor,
-                                 interval=interval, registry=registry, logger=log)
+                                 interval=interval, registry=registry, logger=log,
+                                 magic=magic)
     except Exception as e:
         log.warning(f"stale_leg_sweep: unexpected failure ({e!r}) — placement proceeds")
         return []
@@ -332,8 +355,10 @@ def rebuild_registry_from_broker(self) -> Dict[int, float]:
     reg: Dict[int, float] = {}
     try:
         mt5 = self.adapter.mt5
-        symbol = getattr(getattr(self, "cfg", None), "symbol", SYMBOL)
-        reg = build_registry(mt5.orders_get(symbol=symbol) or [])
+        cfg = getattr(self, "cfg", None)
+        symbol = getattr(cfg, "symbol", SYMBOL)
+        magic = int(getattr(cfg, "stale_leg_sweep_magic", STRADDLE_MAGIC)) if cfg is not None else STRADDLE_MAGIC
+        reg = build_registry(mt5.orders_get(symbol=symbol) or [], magic=magic)
     except Exception as e:
         log.warning(f"stale_leg_sweep: registry rebuild failed ({e!r})")
     self._anchor_registry = reg
