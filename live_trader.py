@@ -2607,6 +2607,12 @@ class LiveTrader:
         # state changes while any position is open (throttled ~60s internally).
         self._maybe_position_heartbeat()
 
+        # 7d. RESCUE BOOST v2: place opposite-direction pending boosts on new
+        # straddle fills, trail filled boosts (+10 arm / $5 gap), and cancel unfilled
+        # boosts when their parent closes. Flag-gated (cfg.rescue_boost_v2_enabled,
+        # DEFAULT OFF) and fully guarded — a no-op unless explicitly enabled.
+        self._rescue_boost_v2_tick()
+
         # 8. M1 bar close → trails
         current_minute = utc_now.floor('1min')
         if current_minute != self._last_managed_minute:
@@ -2690,6 +2696,8 @@ LiveTrader._complete_deferred_anchor= _anchors_mod._complete_deferred_anchor
 import stale_leg_sweep as _stale_sweep_mod
 LiveTrader._sweep_stale_legs        = _stale_sweep_mod._sweep_stale_legs
 LiveTrader.rebuild_registry_from_broker = _stale_sweep_mod.rebuild_registry_from_broker
+import rescue_boost as _rescue_boost_mod
+LiveTrader._rescue_boost_v2_tick    = _rescue_boost_mod._rescue_boost_v2_tick
 LiveTrader._place_orders_for_anchor = _anchors_mod._place_orders_for_anchor
 LiveTrader._anchor_sched_utc        = _anchors_mod._anchor_sched_utc
 LiveTrader._mark_anchor_placed      = _anchors_mod._mark_anchor_placed

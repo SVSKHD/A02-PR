@@ -284,6 +284,24 @@ def test_foreign_magic_pending_survives_sweep():
     assert all(r["order"] != 999 for r in removes), "foreign-magic order must survive"
 
 
+def test_rescue_boost_pending_exempt_from_sweep():
+    """A rescue-boost order (comment 'RB1:<ticket>' / 'RB2:<ticket>', straddle
+    magic) is a recovery leg of an open position and must never be swept, even if
+    it happens to also carry an 'A:' tag and look stale."""
+    boost = FakeOrder(701, FakeMT5.ORDER_TYPE_SELL_STOP, 4057.0,
+                      f"RB1:12345 {sweep.tag_comment('x', A1)}", magic=STRADDLE_MAGIC)
+    stale = FakeOrder(101, FakeMT5.ORDER_TYPE_SELL_STOP, 4023.77,
+                      sweep.tag_comment("AUR_A1_SELL", A1), magic=STRADDLE_MAGIC)
+    mt5 = FakeMT5(orders=[boost, stale], positions=[])
+    log = ListLogger()
+
+    res = sweep.sweep_stale_legs(mt5, SYMBOL, A2, logger=log, magic=STRADDLE_MAGIC)
+
+    # only the plain stale leg is swept; the rescue boost survives
+    assert [r["ticket"] for r in res] == [101], res
+    assert all(r["order"] != 701 for r in _removes(mt5)), mt5.sent
+
+
 # --- standalone runner ------------------------------------------------------------
 def _run_all():
     tests = [v for k, v in sorted(globals().items())
