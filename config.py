@@ -29,6 +29,17 @@ class Config:
     # job, a tighter post-hold trail keeps more of the move (gap 1.0 best at every
     # freeze level in the grid). The hold protects the runner; the gap banks it.
     min_step: float = 0.10  # v2.5.5: back to 0.10 to match the 0.30 trail gap
+    # --- stale-leg sweep (non-OCO leftover-leg cancellation) --------------------
+    # A non-OCO straddle leaves the unfilled opposite leg of the OLD anchor resting
+    # after one leg fills and price runs to the next anchor. Those stale legs later
+    # fill on a pullback and open unwanted scratch trades. When ON, the bot cancels
+    # every pending order from a prior anchor (origin anchor >= stale_leg_interval
+    # away) BEFORE placing the new anchor's straddle -- except the rescue leg of an
+    # open position (the INTERVAL-point opposite leg), which is always kept. Origin
+    # anchors are stamped into the order comment ("A:<price>") so the registry
+    # rebuilds from broker state on restart. See stale_leg_sweep.py.
+    stale_leg_sweep_enabled: bool = True
+    stale_leg_interval: float = 20.0   # anchor spacing / stale threshold (points)
     # --- trail-lock root-cause guards (2026-06-19 A2 incident) -----------------
     # A lock level advanced off a max_fav the market never produced, parking an
     # invalid stop ABOVE a long's market and force-closing a trade that was only

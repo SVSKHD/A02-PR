@@ -236,6 +236,10 @@ class LiveTrader:
         self.shadow_positions: Dict = {}
         self.shadow_pendings: Dict = {}
 
+        # Stale-leg sweep: ticket -> origin anchor price. Rebuilt from broker order
+        # comments ("A:<price>") on startup so anchor tagging survives a restart.
+        self._anchor_registry: Dict = {}
+
         # v2.5: rehydrate shadow_positions max_fav/fill_time from persisted state
         # so a mid-trade restart doesn't lose the $5 lock or freeze gate state.
         self._pending_shadow_rehydrate = self.state.get('shadow_positions_extended', {})
@@ -2174,6 +2178,17 @@ class LiveTrader:
     # ------------------------------------------------------------------------
 
     def run(self):
+        # Stale-leg sweep: rebuild the origin-anchor registry from broker order
+        # comments so anchor tagging survives this restart (guarded; a failure just
+        # falls back to per-order comment parsing during the sweep).
+        try:
+            if bool(getattr(self.cfg, 'stale_leg_sweep_enabled', True)) and not self.paper:
+                reg = self.rebuild_registry_from_broker()
+                if reg:
+                    log.info(f"stale_leg_sweep: anchor registry rebuilt from broker "
+                             f"({len(reg)} tagged pending(s))")
+        except Exception as _reg_e:
+            log.warning(f"stale_leg_sweep: startup registry rebuild skipped: {_reg_e!r}")
         _boost_sl = float(getattr(self.cfg, 'boost_sl_dollars', 10.0))
         _boost_n = int(getattr(self.cfg, 'rescue_boost_count', 2))
         _whip_cap = _boost_n * _boost_sl * self.cfg.lot_size * 100
@@ -2672,6 +2687,9 @@ LiveTrader._flatten_all             = _risk_mod._flatten_all
 LiveTrader._process_anchor_if_due   = _anchors_mod._process_anchor_if_due
 LiveTrader._process_anchor          = _anchors_mod._process_anchor
 LiveTrader._complete_deferred_anchor= _anchors_mod._complete_deferred_anchor
+import stale_leg_sweep as _stale_sweep_mod
+LiveTrader._sweep_stale_legs        = _stale_sweep_mod._sweep_stale_legs
+LiveTrader.rebuild_registry_from_broker = _stale_sweep_mod.rebuild_registry_from_broker
 LiveTrader._place_orders_for_anchor = _anchors_mod._place_orders_for_anchor
 LiveTrader._anchor_sched_utc        = _anchors_mod._anchor_sched_utc
 LiveTrader._mark_anchor_placed      = _anchors_mod._mark_anchor_placed
