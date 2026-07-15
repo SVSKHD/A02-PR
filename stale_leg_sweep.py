@@ -278,6 +278,13 @@ def sweep_stale_legs(mt5, symbol: str, current_anchor: float,
         # would cancel other bots' / manual pendings.
         if magic is not None and int(getattr(o, "magic", -1) or -1) != int(magic):
             continue
+        # RESCUE-BOOST EXEMPTION: a live rescue boost (comment "RB1:<t>"/"RB2:<t>")
+        # is the recovery leg of an open straddle position and shares our own magic;
+        # it is never a stale straddle leg, so never sweep it. (It also carries no
+        # "A:" origin tag, so it would be skipped below as unknown-origin — this is
+        # the explicit, self-documenting guard + matches the rescue-boost feature.)
+        if _is_rescue_boost_comment(getattr(o, "comment", None)):
+            continue
         ticket = getattr(o, "ticket", None)
         origin = None
         if registry and ticket is not None:
@@ -311,6 +318,17 @@ def _try_int(v):
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+_RESCUE_BOOST_RE = re.compile(r"RB[12]:\d+")
+
+
+def _is_rescue_boost_comment(comment) -> bool:
+    """True for a rescue-boost order comment ("RB1:<ticket>"/"RB2:<ticket>"). Such
+    orders are recovery legs of an open position and must never be swept."""
+    if not comment:
+        return False
+    return bool(_RESCUE_BOOST_RE.search(str(comment)))
 
 
 # --- LiveTrader binding (hooked in live_trader.py) --------------------------------

@@ -21,6 +21,13 @@ MT5 Python SDK, VPS-hosted, Discord alerts, frozen selftest baseline.
 - **v3.2.5** — A1 tick-fallback anchor capture, tick-hold boost/trail (0.3s refresh, 3-tick hold). (merged PR #41)
 - **v3.2.6** — boost breath-gap +$8 ARM GATE (incident 2026-06-23 fix); A3 double-fill log. (merged PR #43)
 - **v3.2.7** — rally-only break-and-hold gate (RESCUE fires free on commit). (this build)
+- **rescue boost v2** — pre-SL counter-direction recovery: when a straddle leg fills, rest TWO
+  opposite-direction pending stops at original entry ∓15 / ∓25 (lot 0.45), each SL at the original
+  entry; a filled boost trails after +10 (gap 5, one-way); unfilled boosts cancel when the parent
+  closes; the original keeps its 18-pt hard SL and rides to its own SL/TP untouched. Tagged
+  `RB1:<ticket>`/`RB2:<ticket>` (restart-safe, exempt from stale_leg_sweep). Mirror-symmetric.
+  `rescue_boost.py` + `tests/test_rescue_boost.py` (8/8). Flag `rescue_boost_v2_enabled` **DEFAULT
+  OFF** (adds real counter orders on the live path). Distinct from the market-order rescue fleet.
 - **stale-leg sweep** — automatic non-OCO leftover-leg cancellation: before a new anchor's
   straddle is placed, every pending leg from a prior anchor (origin anchor ≥ `stale_leg_interval`
   = 20.0 away) is cancelled (`TRADE_ACTION_REMOVE`), EXCEPT the rescue leg (the INTERVAL-point

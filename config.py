@@ -40,6 +40,22 @@ class Config:
     # rebuilds from broker state on restart. See stale_leg_sweep.py.
     stale_leg_sweep_enabled: bool = True
     stale_leg_interval: float = 20.0   # anchor spacing / stale threshold (points)
+    # --- rescue boost v2 (pre-SL counter-direction recovery) -------------------
+    # When a straddle leg fills, rest TWO pending stop orders in the OPPOSITE
+    # direction so a confirmed reversal recovers the leg's hard-SL loss and profits
+    # on continuation. DISTINCT from the market-order rescue fleet (rescue.py). The
+    # original keeps its 18-pt hard SL unchanged and rides to its own SL/TP; each
+    # boost's SL sits at the original entry; unfilled boosts are cancelled when the
+    # parent closes. Boosts are tagged "RB1:<ticket>"/"RB2:<ticket>" (restart-safe)
+    # and are exempt from stale_leg_sweep. DEFAULT OFF -- this adds real counter
+    # orders on the live path; opt in per rescue_boost.py. See rescue_boost.py.
+    rescue_boost_v2_enabled: bool = False
+    rescue_boost_v2_lot: float = 0.45
+    rescue_boost_v2_offset_1: float = 15.0   # boost #1: entry ∓ 15 (adverse)
+    rescue_boost_v2_offset_2: float = 25.0   # boost #2: entry ∓ 25 (adverse)
+    rescue_boost_v2_trail_activation: float = 10.0
+    rescue_boost_v2_trail_gap: float = 5.0
+    rescue_boost_v2_max_boosts: int = 2
     # --- trail-lock root-cause guards (2026-06-19 A2 incident) -----------------
     # A lock level advanced off a max_fav the market never produced, parking an
     # invalid stop ABOVE a long's market and force-closing a trade that was only
