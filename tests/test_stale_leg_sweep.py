@@ -19,13 +19,18 @@ A2 = 4048.77   # A1 + INTERVAL
 
 
 # --- MT5 mocks --------------------------------------------------------------------
+STRADDLE_MAGIC = 20260522   # Aureon anchor magic
+FOREIGN_MAGIC = 20260815    # e.g. the Rogue T2 bot on the same symbol/account
+
+
 class FakeOrder:
     """Mirrors the fields of an mt5.orders_get() TradeOrder we read."""
-    def __init__(self, ticket, type_, price_open, comment):
+    def __init__(self, ticket, type_, price_open, comment, magic=STRADDLE_MAGIC):
         self.ticket = ticket
         self.type = type_
         self.price_open = price_open
         self.comment = comment
+        self.magic = magic
 
 
 class FakePosition:
@@ -258,6 +263,25 @@ def test_acceptance_full_flow():
     # The rescue leg (102) is never sent to REMOVE.
     assert all(not (r["action"] == FakeMT5.TRADE_ACTION_REMOVE and r.get("order") == 102)
                for r in mt5.sent), mt5.sent
+
+
+def test_foreign_magic_pending_survives_sweep():
+    """MULTI-BOT ISOLATION: a stale pending bearing a FOREIGN magic (e.g. the Rogue
+    T2 bot) is never cancelled — the sweep filters strictly by the straddle magic."""
+    ours = FakeOrder(101, FakeMT5.ORDER_TYPE_SELL_STOP, 4023.77,
+                     sweep.tag_comment("AUR_A1_SELL", A1), magic=STRADDLE_MAGIC)
+    foreign = FakeOrder(999, FakeMT5.ORDER_TYPE_SELL_STOP, 4023.77,
+                        sweep.tag_comment("ROGUE_T2", A1), magic=FOREIGN_MAGIC)
+    mt5 = FakeMT5(orders=[ours, foreign], positions=[])
+    log = ListLogger()
+
+    res = sweep.sweep_stale_legs(mt5, SYMBOL, A2, logger=log, magic=STRADDLE_MAGIC)
+
+    # only our own stale leg was cancelled
+    assert len(res) == 1 and res[0]["ticket"] == 101, res
+    removes = _removes(mt5)
+    assert len(removes) == 1 and removes[0]["order"] == 101, mt5.sent
+    assert all(r["order"] != 999 for r in removes), "foreign-magic order must survive"
 
 
 # --- standalone runner ------------------------------------------------------------
