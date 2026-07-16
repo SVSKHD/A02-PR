@@ -391,6 +391,72 @@ def a1_entry_decision(anchor_price, current_price, cfg):
     return False, None, None, None
 
 
+def runaway_should_reanchor(st, anchor_price, current_price, cfg):
+    """2026-07-16 RUNAWAY detector (PURE, no mutation): has price RUN >= rogue_runaway_trigger
+    past the ACTIVE anchor in one direction? Returns (trigger, direction) with direction
+    'UP'/'DN' (the continuation side). The CALLER additionally gates on "no open position AND
+    no close preceded this anchor" (a1_last_close is None -> the seed anchor, OR runaway_active
+    -> an existing runaway chain); this core only decides the distance + loop guards:
+
+      * disabled (flag off or trigger <= 0) -> never,
+      * < 3 re-anchors used today (rogue caps the loop at 3/day), AND
+      * >= rogue_runaway_trigger from the PREVIOUS runaway price (spacing guard) so a single
+        fast leg can't plant a stack of re-anchors on top of each other."""
+    if not bool(getattr(cfg, 'rogue_runaway_reanchor_enabled', False)):
+        return False, None
+    trig = float(getattr(cfg, 'rogue_runaway_trigger', 0.0) or 0.0)
+    if trig <= 0.0:
+        return False, None
+    try:
+        a = float(anchor_price)
+        p = float(current_price)
+    except (TypeError, ValueError):
+        return False, None
+    move = p - a
+    if abs(move) < trig:
+        return False, None
+    if int(st.get('runaway_count', 0)) >= 3:
+        return False, None                    # loop guard: max 3 runaway re-anchors per day
+    last = st.get('runaway_last_px')
+    if last is not None:
+        try:
+            if abs(p - float(last)) < trig:
+                return False, None            # each re-anchor must be >= trigger from the last
+        except (TypeError, ValueError):
+            pass
+    return True, ('UP' if move > 0 else 'DN')
+
+
+def runaway_entry_decision(anchor_price, current_price, runaway_dir, cfg):
+    """2026-07-16 RUNAWAY continuation entry (PURE). Off a runaway re-anchor, ENTER only in
+    the SAME direction as the runaway once price has displaced rogue_runaway_confirm ($) from
+    the new anchor -- CONTINUATION ONLY. A counter-trend move (opposite the runaway) is
+    REFUSED (never fade a runaway re-anchor). The chase cap (rogue_chase_cap_dollars) still
+    bounds the far side and the init SL is the normal rogue_init_sl. Returns
+    (enter, side, entry_price, init_sl). Mirrors a1_entry_decision's shape/SL geometry, with a
+    smaller confirm and the direction lock."""
+    confirm = float(getattr(cfg, 'rogue_runaway_confirm', 8.0))
+    init_sl = float(getattr(cfg, 'rogue_init_sl', 10.0))
+    cap = float(getattr(cfg, 'rogue_chase_cap_dollars', 0.0) or 0.0)
+    try:
+        a = float(anchor_price)
+        p = float(current_price)
+    except (TypeError, ValueError):
+        return False, None, None, None
+    move = p - a
+    if cap > 0 and abs(move) > cap:
+        return False, None, None, None        # exhausted move -> no chase (same as A1 entry)
+    if runaway_dir == 'DN':
+        if move <= -confirm:
+            return True, 'SELL', round(p, 2), round(p + init_sl, 2)
+        return False, None, None, None        # above the anchor = counter-trend / not yet
+    if runaway_dir == 'UP':
+        if move >= confirm:
+            return True, 'BUY', round(p, 2), round(p - init_sl, 2)
+        return False, None, None, None        # below the anchor = counter-trend / not yet
+    return False, None, None, None
+
+
 def chase_rejected(anchor_price, current_price, cfg):
     """P3 GATE 1 (E-17) telemetry helper: is the current tick a CHASE reject -- |move| off
     the anchor beyond rogue_chase_cap_dollars? Returns (rejected, move) where move is
@@ -646,6 +712,48 @@ def _plant_fresh_anchor_a1(trader, st, price):
         pass
 
 
+def _plant_runaway_reanchor(trader, st, old_anchor, direction):
+    """2026-07-16 RUNAWAY: plant a FRESH chained continuation anchor at the current SETTLED
+    tick (the same sane/held discipline A1's tick fallback uses -- passes max_tick_jump +
+    hold_ticks via seed_tick_price). This is a CHAINED anchor with the chain meta CLEARED
+    (chain_anchor/chain_time = None), exactly like _plant_fresh_anchor_a1: the driver's
+    `chained` test is therefore False, so Gate 2's chain cooldown is not applied -- correct,
+    because NO close preceded this re-anchor. The CONTINUATION-only direction lock lives
+    downstream (runaway_entry_decision). Increments the 3/day counter and records the price
+    for the spacing guard. Guarded; never raises onto the driver."""
+    try:
+        px = seed_tick_price(trader)
+        if px is None:
+            return False
+        px = round(float(px), 2)
+        st['a1_last_close'] = px
+        st['a1_reverted'] = False
+        st['chain_time'] = None
+        st['chain_anchor'] = None
+        st['runaway_active'] = True
+        st['runaway_dir'] = direction
+        st['runaway_anchor_px'] = px
+        st['runaway_count'] = int(st.get('runaway_count', 0)) + 1
+        st['runaway_last_px'] = px
+        try:
+            moved = abs(px - float(old_anchor))
+        except (TypeError, ValueError):
+            moved = 0.0
+        confirm = float(getattr(trader.cfg, 'rogue_runaway_confirm', 8.0))
+        msg = (f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ROGUE RUNAWAY REANCHOR @ {px:.2f} "
+               f"(moved {moved:.2f} off old anchor {float(old_anchor):.2f}) "
+               f"dir={direction} #{st['runaway_count']}/3 — continuation ${confirm:g} only")
+        log.warning(msg)
+        try:
+            trader.tele.info(msg)
+        except Exception:
+            pass
+        _persist_state(trader)
+        return True
+    except Exception:
+        return False
+
+
 def _budget_exhausted_alert(trader, st, b, gap_sec):
     """RULE 2: the anchor's trade budget is spent without an earned extension -> loud one-time
     log + Discord (n trades, last two not both wins, gap length). Fires ONCE per exhaustion
@@ -740,6 +848,9 @@ def _drive_a1(trader, st, allow_new_entries=True):
             and seed_source != SEED_MANUAL):
         b_anchor, b_latched = seed_budget.break_seed_anchor(st, seed_px, price, brk)
         if b_anchor is None:
+            # NO_ANCHOR: the $10 break has not latched yet. anchor= the A1 ref so the line
+            # shows the running travel (e.g. move=-9.67 is the 2026-07-16 upside near-miss).
+            _ptrace_reject(trader, st, 'NO_ANCHOR', price, seed_px)
             return                              # price has not travelled $10 from A1 yet
         seed_px, seed_source = b_anchor, seed_budget.SEED_A1_BREAK
         if b_latched:
@@ -753,6 +864,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
                 pass
     anchor = a1_seed_anchor(st.get('a1_last_close'), seed_px)
     if anchor is None:
+        _ptrace_reject(trader, st, 'NO_ANCHOR', price, seed_px)
         return
     if st.get('a1_last_close') is None:
         _record_seed(trader, st, seed_px, seed_source)
@@ -771,6 +883,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
         st['chain_disp_dn'] = max(float(st.get('chain_disp_dn', 0.0)), -d)
     ok, _why = can_enter(st['gov'], trader.cfg)   # BRAKE: daily loss stop / cap / fail-pause
     if not ok:
+        _ptrace_reject(trader, st, 'GOVERNOR', price, anchor)
         return
     # RULE 2 (earned trade budget): SUBORDINATE to the loss stop above (can_enter ranks first;
     # a loss-stopped day is terminal -- no fresh anchor resurrects it). During the exhaustion
@@ -781,6 +894,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
         b = st.setdefault('budget', seed_budget.new_budget())
         _now = _epoch()
         if seed_budget.budget_in_gap(b, _now):
+            _ptrace_reject(trader, st, 'BUDGET', price, anchor)
             return
         if seed_budget.budget_gap_ready(b, _now):
             _plant_fresh_anchor_a1(trader, st, price)
@@ -789,14 +903,40 @@ def _drive_a1(trader, st, allow_new_entries=True):
         if not ok_b:
             _gap = seed_budget.budget_start_gap(b, trader.cfg, _now)
             _budget_exhausted_alert(trader, st, b, _gap)
+            _ptrace_reject(trader, st, 'BUDGET', price, anchor)
             return
-    enter, side, epx, sl = a1_entry_decision(anchor, price, trader.cfg)
+    # 2026-07-16 RUNAWAY: on a runaway re-anchor the entry is CONTINUATION-only off the new
+    # anchor at the smaller rogue_runaway_confirm; otherwise the normal A1 entry decision.
+    on_runaway = (bool(st.get('runaway_active'))
+                  and st.get('a1_last_close') is not None
+                  and st.get('runaway_anchor_px') is not None
+                  and abs(float(st['a1_last_close']) - float(st['runaway_anchor_px'])) < 1e-9)
+    if on_runaway:
+        enter, side, epx, sl = runaway_entry_decision(
+            anchor, price, st.get('runaway_dir'), trader.cfg)
+    else:
+        enter, side, epx, sl = a1_entry_decision(anchor, price, trader.cfg)
     if not enter:
+        # 2026-07-16 RUNAWAY RE-ANCHOR (band-overshoot recovery): if price has RUN past the
+        # active anchor with no position and no close-owed cooldown (the seed anchor, or an
+        # existing runaway chain), plant a fresh continuation anchor at the settled tick and
+        # hunt from there next tick. Gated by can_enter/budget above (already passed) so a
+        # loss-stopped / capped day never re-anchors; the plant itself takes NO slot -- the
+        # ENTRY off it consumes the governor slot as usual.
+        reanchor_eligible = (st.get('a1_last_close') is None or bool(st.get('runaway_active')))
+        if reanchor_eligible:
+            _trig, _rdir = runaway_should_reanchor(st, anchor, price, trader.cfg)
+            if _trig and _plant_runaway_reanchor(trader, st, anchor, _rdir):
+                return
         # P3 GATE 1 (E-17): if this no-enter is a CHASE reject (|move| > cap), say so --
         # once per episode. NO slot is consumed (slots are only consumed on a real fill
         # in _mark_rogue_open) and NO latch is set: the anchor stays planted and the gate
         # re-evaluates per tick, so a pullback inside the band allows entry again.
         _log_chase_reject(trader, st, anchor, price)
+        # PTRACE: CHASE_CAP when past the cap, else BAND_NOT_HELD (move below confirm / no
+        # tick landed inside the entry band -- the 2026-07-16 band-overshoot signature).
+        _rej, _mv = chase_rejected(anchor, price, trader.cfg)
+        _ptrace_reject(trader, st, 'CHASE_CAP' if _rej else 'BAND_NOT_HELD', price, anchor)
         return
     # P3 GATE 2 (E-17): a CHAINED anchor additionally needs the cooldown elapsed AND the
     # $6 fresh displacement in the entry direction. The reversal-recovery leg is exempt
@@ -809,6 +949,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
             st.get('chain_time'), _epoch(), disp, trader.cfg)
         if not allowed:
             _log_chain_block(trader, st, why2, remaining)
+            _ptrace_reject(trader, st, 'COOLDOWN', price, anchor)
             return
     # a reversal-recovery leg uses the wider per-rescue cap as its SL (still bounded).
     if st.get('a1_reverted'):
@@ -951,6 +1092,38 @@ def _epoch():
         return 0.0
 
 
+def _ptrace_reject(trader, st, reason, price, anchor):
+    """DIAGNOSTIC (2026-07-16): emit ONE structured PTRACE line each time Rogue evaluates a
+    tick and does NOT take an entry, tagged with the blocking reason. This exists because
+    the 2026-07-16 zero-entry day was AMBIGUOUS from the logs -- a fast crash blew through
+    the $8-wide entry band and no single line said "why no fill". reason in
+    (NO_ANCHOR / BAND_NOT_HELD / CHASE_CAP / COOLDOWN / BUDGET / GOVERNOR). Throttled to ONE
+    line per reason per minute (a persistent block can't spam). PURE TELEMETRY -- never
+    changes a trading decision; log-only (no Discord). Guarded; never raises onto the
+    driver."""
+    try:
+        now = _epoch()
+        seen = st.setdefault('_ptrace_log', {})
+        last = seen.get(reason)
+        if last is not None and (now - float(last)) < 60.0:
+            return
+        seen[reason] = now
+        try:
+            a = float(anchor)
+            atxt = f"{a:.2f}"
+            mtxt = f"{float(price) - a:+.2f}"
+        except (TypeError, ValueError):
+            atxt, mtxt = "none", "n/a"
+        try:
+            ptxt = f"{float(price):.2f}"
+        except (TypeError, ValueError):
+            ptxt = "none"
+        log.info(f"{ROGUE_ALERT_PREFIX} PTRACE reject={reason} px={ptxt} "
+                 f"anchor={atxt} move={mtxt}")
+    except Exception:
+        pass
+
+
 def _log_chase_reject(trader, st, anchor, price):
     """P3 GATE 1 (E-17) telemetry: log a CHASE-REJECT once per episode -- an episode ends
     when the tick is no longer beyond the cap (pullback inside the band / below confirm),
@@ -1074,6 +1247,13 @@ def _mark_rogue_open(trader, st, entry_px, sl, tk, rc):
     side = st['leg_dir']
     st['open'] = {'ticket': tk, 'side': side, 'entry': entry_px, 'sl': sl,
                   'peak': entry_px, 'magic': ROGUE_MAGIC, 'leg_type': ROGUE_LEG_TYPE}
+    # 2026-07-16: this entry consumed the runaway continuation anchor -- clear the active
+    # markers so a later post-close chained anchor (cooldown OWED) is never mistaken for a
+    # runaway continuation. runaway_count / runaway_last_px persist (the daily loop + spacing
+    # guards span the whole day).
+    st['runaway_active'] = False
+    st['runaway_dir'] = None
+    st['runaway_anchor_px'] = None
     record_entry(st['gov'])
     # RULE 2: this entry consumes one of the anchor session's budget attempts.
     seed_budget.budget_record_entry(st.setdefault('budget', seed_budget.new_budget()))
