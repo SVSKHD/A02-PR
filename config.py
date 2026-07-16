@@ -306,6 +306,26 @@ class Config:
     # by design) but still chase-capped. 0 disables each check independently.
     rogue_chain_cooldown_sec: float = 300.0
     rogue_chain_min_displacement: float = 6.0
+    # --- 2026-07-16 RUNAWAY RE-ANCHOR (band-overshoot recovery) -------------------
+    # ROOT CAUSE 2026-07-16 (magic 20260626, A1-anchor mode): the $10 break latched the
+    # downside anchor at 4020.59, but the ~$65 crash stepped from move -9.59 (above the
+    # entry band) straight to move -21.59 (below the band AND past the $20 chase cap)
+    # between two consecutive mid samples -- no tick landed inside the $8-wide band
+    # (confirm 12 .. cap 20), so a1_entry_decision never fired, and every later tick was a
+    # chase reject. Rogue watched its exact target move and took ZERO entries.
+    # FIX: when price RUNS >= rogue_runaway_trigger past the ACTIVE anchor in one direction
+    # while Rogue holds NO position and took NO entry off that anchor (no close preceded it
+    # -> chain cooldown is not owed), plant a FRESH chained anchor at the current SETTLED
+    # tick (same sane/held discipline as A1's tick fallback: max_tick_jump + hold_ticks).
+    # From the new anchor, an entry needs rogue_runaway_confirm displacement in the SAME
+    # direction as the runaway -- CONTINUATION ONLY, never counter-trend off a runaway
+    # re-anchor. Normal init SL (rogue_init_sl) and the chase cap still apply from the new
+    # anchor; the governor budget slot check runs as usual. Loop guard: max 3 re-anchors
+    # per day, each >= rogue_runaway_trigger from the previous. Flag OFF -> byte-identical
+    # to today's behavior. Rogue-only; the anchor engine and the legacy path are untouched.
+    rogue_runaway_reanchor_enabled: bool = True   # DEFAULT ON for tomorrow's test day
+    rogue_runaway_trigger: float = 25.0           # move off the active anchor ($) -> runaway
+    rogue_runaway_confirm: float = 8.0            # fresh displacement off the NEW anchor to enter
     # --- v3.2.4 Feature E: lot config + FP-rule guard --------------------------
     # Account profile gates the pre-trade worst-case-stack check. STANDARD_5PCT =
     # 5% daily ($2,500 @ $50k); FPZERO_1PCT = 1% floating ($500). A stack whose
