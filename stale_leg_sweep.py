@@ -321,14 +321,19 @@ def _try_int(v):
 
 
 _RESCUE_BOOST_RE = re.compile(r"RB[12]:\d+")
+# Rogue v2 stop-mode orders ("RGS:A1" / "RGS:C<n>") are the Rogue engine's own
+# resting stops (magic 20260626), NOT anchor straddle legs — never sweep them.
+_ROGUE_STOP_RE = re.compile(r"RGS:(?:A1|C\d+)")
 
 
 def _is_rescue_boost_comment(comment) -> bool:
-    """True for a rescue-boost order comment ("RB1:<ticket>"/"RB2:<ticket>"). Such
-    orders are recovery legs of an open position and must never be swept."""
+    """True for an order the sweep must never touch — a rescue-boost recovery leg
+    ("RB1:<ticket>"/"RB2:<ticket>") or a Rogue stop-mode order ("RGS:A1"/"RGS:C<n>").
+    Both are their engine's own live orders, never a stale straddle leg."""
     if not comment:
         return False
-    return bool(_RESCUE_BOOST_RE.search(str(comment)))
+    c = str(comment)
+    return bool(_RESCUE_BOOST_RE.search(c) or _ROGUE_STOP_RE.search(c))
 
 
 # --- LiveTrader binding (hooked in live_trader.py) --------------------------------

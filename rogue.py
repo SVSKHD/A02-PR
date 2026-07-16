@@ -995,6 +995,14 @@ def drive(trader, allow_new_entries=True):
             st = {'day': today, 'gov': new_day_state(),
                   'anchor': None, 'leg_dir': None, 'open': None}
             trader._rogue = st
+        # Rogue v2 STOP MODE: resting pending-stop engine (OCO ±rogue_trigger + chain).
+        # Gated on the flag so the legacy band engine below stays byte-identical when
+        # OFF. In stop mode the seed-break / confirm-band / runaway / hold_ticks paths
+        # are inert (never reached) -- the stop engine owns entries end to end.
+        if bool(getattr(trader.cfg, 'rogue_stop_mode', False)):
+            import rogue_stop as _rs
+            _rs.drive_stop(trader, st, allow_new_entries=allow_new_entries)
+            return
         # Fix 4: A1-ANCHORED REDESIGN (flag-gated, DEFAULT OFF). ON -> the new engine seeds
         # from the day's A1 anchor (read-only) / chains to the last closed Rogue level and
         # skips monster-detection. OFF (default) -> fall through to the legacy monster

@@ -273,6 +273,17 @@ class Config:
     # E-1 ghost: the stale "DEFAULT OFF / legacy monster is live" comment no longer
     # matched the live config.)
     rogue_a1_anchor_mode: bool = True           # Fix 4 master flag (DEFAULT ON, live engine)
+    # --- Rogue v2 STOP MODE (rogue_stop.py) --------------------------------------
+    # Resting pending-stop entry engine: replaces the seed-break + confirm-band +
+    # tick-hold model with an OCO pair at anchor ± rogue_trigger that fills broker-
+    # side (cannot miss a fast move — the 2026-07-16 $65-crash zero-entry fix), then
+    # chains rogue_chain_step beyond each fill. Flag ON = stop engine; OFF = legacy
+    # band engine, byte-identical. Runaway re-anchor + directional hold_ticks are
+    # band-engine concepts, inert in stop mode (kept, gated on the flag).
+    rogue_stop_mode: bool = True                 # NEW master flag; False = legacy band engine
+    rogue_trigger: float = 17.0                  # OCO entry distance from the A1 anchor
+    rogue_chain_step: float = 12.0               # each chain stop: this far beyond the prior fill
+    rogue_stop_init_sl: float = 10.0             # init SL ($) on every stop-mode fill
     rogue_entry_confirm_redesign: float = 5.0  # $ off the anchor to ENTER in the move dir
     rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
     rogue_daily_soft_lock: float = 30.0         # soft banked floor ($) -- NEVER a hard stop

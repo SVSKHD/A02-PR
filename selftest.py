@@ -546,7 +546,13 @@ class SelfTest:
         # EXPLICITLY (via _mk_break_cfg / cfg_over) to test the new rules at production values.
         try:
             import dataclasses as _dc
-            cfg = _dc.replace(cfg, seed_break_dollars=0.0, engine_base_trades_per_anchor=0)
+            # Every drive-based Rogue test predates the seed knobs AND Rogue v2 stop mode
+            # (rogue_stop_mode). The selftest 312-baseline is the LEGACY band engine, so pin
+            # stop mode OFF here -- the legacy `_r.drive()` path runs byte-identically. The new
+            # stop-mode engine is covered by tests/test_rogue_stop.py, which enables it
+            # explicitly. Steps that want stop mode set it via cfg_over, never the base.
+            cfg = _dc.replace(cfg, seed_break_dollars=0.0, engine_base_trades_per_anchor=0,
+                              rogue_stop_mode=False)
         except Exception:
             pass
         self.cfg = cfg
