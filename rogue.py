@@ -740,6 +740,9 @@ def _drive_a1(trader, st, allow_new_entries=True):
             and seed_source != SEED_MANUAL):
         b_anchor, b_latched = seed_budget.break_seed_anchor(st, seed_px, price, brk)
         if b_anchor is None:
+            # NO_ANCHOR: the $10 break has not latched yet. anchor= the A1 ref so the line
+            # shows the running travel (e.g. move=-9.67 is the 2026-07-16 upside near-miss).
+            _ptrace_reject(trader, st, 'NO_ANCHOR', price, seed_px)
             return                              # price has not travelled $10 from A1 yet
         seed_px, seed_source = b_anchor, seed_budget.SEED_A1_BREAK
         if b_latched:
@@ -753,6 +756,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
                 pass
     anchor = a1_seed_anchor(st.get('a1_last_close'), seed_px)
     if anchor is None:
+        _ptrace_reject(trader, st, 'NO_ANCHOR', price, seed_px)
         return
     if st.get('a1_last_close') is None:
         _record_seed(trader, st, seed_px, seed_source)
@@ -771,6 +775,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
         st['chain_disp_dn'] = max(float(st.get('chain_disp_dn', 0.0)), -d)
     ok, _why = can_enter(st['gov'], trader.cfg)   # BRAKE: daily loss stop / cap / fail-pause
     if not ok:
+        _ptrace_reject(trader, st, 'GOVERNOR', price, anchor)
         return
     # RULE 2 (earned trade budget): SUBORDINATE to the loss stop above (can_enter ranks first;
     # a loss-stopped day is terminal -- no fresh anchor resurrects it). During the exhaustion
@@ -781,6 +786,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
         b = st.setdefault('budget', seed_budget.new_budget())
         _now = _epoch()
         if seed_budget.budget_in_gap(b, _now):
+            _ptrace_reject(trader, st, 'BUDGET', price, anchor)
             return
         if seed_budget.budget_gap_ready(b, _now):
             _plant_fresh_anchor_a1(trader, st, price)
@@ -789,6 +795,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
         if not ok_b:
             _gap = seed_budget.budget_start_gap(b, trader.cfg, _now)
             _budget_exhausted_alert(trader, st, b, _gap)
+            _ptrace_reject(trader, st, 'BUDGET', price, anchor)
             return
     enter, side, epx, sl = a1_entry_decision(anchor, price, trader.cfg)
     if not enter:
@@ -797,6 +804,10 @@ def _drive_a1(trader, st, allow_new_entries=True):
         # in _mark_rogue_open) and NO latch is set: the anchor stays planted and the gate
         # re-evaluates per tick, so a pullback inside the band allows entry again.
         _log_chase_reject(trader, st, anchor, price)
+        # PTRACE: CHASE_CAP when past the cap, else BAND_NOT_HELD (move below confirm / no
+        # tick landed inside the entry band -- the 2026-07-16 band-overshoot signature).
+        _rej, _mv = chase_rejected(anchor, price, trader.cfg)
+        _ptrace_reject(trader, st, 'CHASE_CAP' if _rej else 'BAND_NOT_HELD', price, anchor)
         return
     # P3 GATE 2 (E-17): a CHAINED anchor additionally needs the cooldown elapsed AND the
     # $6 fresh displacement in the entry direction. The reversal-recovery leg is exempt
@@ -809,6 +820,7 @@ def _drive_a1(trader, st, allow_new_entries=True):
             st.get('chain_time'), _epoch(), disp, trader.cfg)
         if not allowed:
             _log_chain_block(trader, st, why2, remaining)
+            _ptrace_reject(trader, st, 'COOLDOWN', price, anchor)
             return
     # a reversal-recovery leg uses the wider per-rescue cap as its SL (still bounded).
     if st.get('a1_reverted'):
@@ -949,6 +961,38 @@ def _epoch():
         return float(_t.time())
     except Exception:
         return 0.0
+
+
+def _ptrace_reject(trader, st, reason, price, anchor):
+    """DIAGNOSTIC (2026-07-16): emit ONE structured PTRACE line each time Rogue evaluates a
+    tick and does NOT take an entry, tagged with the blocking reason. This exists because
+    the 2026-07-16 zero-entry day was AMBIGUOUS from the logs -- a fast crash blew through
+    the $8-wide entry band and no single line said "why no fill". reason in
+    (NO_ANCHOR / BAND_NOT_HELD / CHASE_CAP / COOLDOWN / BUDGET / GOVERNOR). Throttled to ONE
+    line per reason per minute (a persistent block can't spam). PURE TELEMETRY -- never
+    changes a trading decision; log-only (no Discord). Guarded; never raises onto the
+    driver."""
+    try:
+        now = _epoch()
+        seen = st.setdefault('_ptrace_log', {})
+        last = seen.get(reason)
+        if last is not None and (now - float(last)) < 60.0:
+            return
+        seen[reason] = now
+        try:
+            a = float(anchor)
+            atxt = f"{a:.2f}"
+            mtxt = f"{float(price) - a:+.2f}"
+        except (TypeError, ValueError):
+            atxt, mtxt = "none", "n/a"
+        try:
+            ptxt = f"{float(price):.2f}"
+        except (TypeError, ValueError):
+            ptxt = "none"
+        log.info(f"{ROGUE_ALERT_PREFIX} PTRACE reject={reason} px={ptxt} "
+                 f"anchor={atxt} move={mtxt}")
+    except Exception:
+        pass
 
 
 def _log_chase_reject(trader, st, anchor, price):
