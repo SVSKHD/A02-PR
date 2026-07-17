@@ -1153,10 +1153,11 @@ class SelfTest:
         self._record(15, PASS if ok else FAIL, detail)
 
     def _step_hold_gate(self):
-        # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
-        # inside the 45m hold (live 2026-06-16: A2/A3 BE-scratched at 6.2m/2.8m).
-        # The higher protective locks (+$6->+$4, +$10->peak-2) MUST stay active
-        # inside the hold. Drive the REAL strategy core at the held times below.
+        # 2026-07-17 HOLD-EXEMPT PROFIT LOCKS: the discrete profit-lock rungs (BE at
+        # +$5, +$4 at +$6, peak-2 at +$10) now ALL engage inside the 45m hold -- they
+        # are upward-only ratchets that can't scratch early. The hold window's REMAINING
+        # job is to gate the fine-grained continuous be_trigger trail (not asserted here).
+        # Drive the REAL strategy core at the held times below.
         from strategy import Position, update_position_on_bar
         try:
             cfg = self.cfg
@@ -1179,10 +1180,10 @@ class SelfTest:
             at_lock4 = lambda sl: abs(sl - (entry + 4.0)) < 0.01
 
             checks = {
-                # +$3 fav, 3m held -> SL still ORIGINAL (no move to entry)
+                # +$3 fav, 3m held -> SL still ORIGINAL (no rung below +$5)
                 "+3@3m_no_move":   at_sl0(run(3, 3)),
-                # the disease: +$5 fav, 3m held -> GATED, SL still ORIGINAL
-                "+5@3m_gated":     at_sl0(run(5, 3)),
+                # 2026-07-17: +$5 fav, 3m held -> BE rung now FIRES in the hold (SL->entry)
+                "+5@3m_be":        at_entry(run(5, 3)),
                 # +$6 fav, 10m held -> the +$6->+$4 lock STILL engages in the hold
                 "+6@10m_lock4":    at_lock4(run(6, 10)),
                 # +$5 fav, 50m held -> post-hold, BE/entry move permitted (>= entry)

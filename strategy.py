@@ -429,13 +429,18 @@ def update_position_on_bar(pos: Position, bar: pd.Series, ts: pd.Timestamp,
         elif pos.role != 'rescue':
             if fav >= 6.00:
                 _apply_lock(2, pos.entry_price + _sgn * 4.00)
-            elif fav >= 5.00 and not in_freeze:
-                # v3.0.7 HOLD-GATE: the breakeven-to-entry stop move must NOT engage
-                # inside the 45m hold. Live 2026-06-16: A2/A4 hit +$5 fav early, then
-                # pulled back and BE-scratched to $0 at 6.2m/2.8m held. Raising the arm
-                # to +$5 did not fix this -- the disease is the TIMING. The higher
-                # protective locks (+$6->+$4, +$10->peak-2 above) stay active inside
-                # the hold; ONLY this entry move waits for hold expiry.
+            elif fav >= 5.00:
+                # 2026-07-17 HOLD-EXEMPT PROFIT LOCKS: the +$5 breakeven rung now
+                # fires DURING the hold, alongside the +$6->+$4 and +$10->peak-2 rungs
+                # (all already hold-exempt). These are UPWARD-ONLY ratchets: a profit
+                # lock can only realize on a retrace THROUGH profit, so it cannot
+                # scratch a position early -- the hold rule's purpose (block premature
+                # exits in the first 45m) does not apply to it. Evidence: on 07-17 the
+                # BE (+5.2) / lock+4 (+6.1) rungs were SKIPPED "hold window active" and
+                # a +7.77 peak rode back to -10 open. The hold window's REMAINING job is
+                # to gate the fine-grained continuous be_trigger trail below (that trail
+                # follows the peak by trail_gap and CAN scratch on a small pullback --
+                # the real premature-exit risk the hold protects against).
                 _apply_lock(1, pos.entry_price)
 
         if not in_freeze and fav >= cfg.be_trigger:

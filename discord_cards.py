@@ -195,6 +195,20 @@ def card_rogue_reseed(anchor_price, buy, sell, footer=None):
         ], footer=footer)
 
 
+def card_lock_fallback_close(anchor, side, lock_price, bid, ask, rc, footer=None):
+    """The 2026-07-17 fallback: a profit lock the broker rejected twice, closed at
+    market because price was through it. RED — it's a forced realization."""
+    return build_embed(
+        f"🔒 {_short(anchor)} LOCK_FALLBACK_CLOSE", RED, author=_author(anchor),
+        fields=[
+            ("Side", side),
+            ("Lock (rejected)", _price(lock_price)),
+            ("Bid / Ask", f"{_price(bid)} / {_price(ask)}"),
+            ("Reject rc", rc),
+            ("Action", "market close (lock realized, not abandoned)", False),
+        ], footer=footer)
+
+
 def card_fill(anchor, side, entry, ticket, role=None, sl=None, tp=None,
               sched_actual=None, footer=None):
     fields = [

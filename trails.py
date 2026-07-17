@@ -21,6 +21,65 @@ from mt5_adapter import _MT5_RETCODE_MAP
 
 log = logging.getLogger("AUREON")
 
+# --- SL-modify reject handling (2026-07-17: base_lock modify REJECTED rc=10016 with
+# no retry/fallback -> a +7.77 peak rode back to -10 open). PURE helpers so the
+# retry/broker-min-adjust/fallback-close decision is unit-testable offline. -----------
+STOPS_REJECT_RCS = frozenset({10016, 10013})   # INVALID_STOPS / INVALID -> adjust + retry
+
+
+def is_stops_reject(rc) -> bool:
+    """True for a stops-class SL-modify reject (10016 INVALID_STOPS / 10013 INVALID)
+    that warrants a broker-min-adjusted retry then a would-have-fired fallback."""
+    return rc in STOPS_REJECT_RCS
+
+
+def broker_min_sl(side: str, bid: float, ask: float, floor: float) -> float:
+    """The closest LEGAL stop to market for a re-try: `floor` below the bid (BUY) or
+    above the ask (SELL). `floor` is the broker's min stop distance (>= a small probe
+    minimum). Never sends an illegal (through-market) value again."""
+    return round(bid - float(floor), 2) if side == "BUY" else round(ask + float(floor), 2)
+
+
+def lock_would_fire(side: str, intended: float, bid: float, ask: float) -> bool:
+    """True when price is AT-OR-BEYOND the intended lock level — i.e. the lock 'would
+    have fired' as an SL. For a BUY the stop sits below: fired when bid <= intended;
+    for a SELL it sits above: fired when ask >= intended. Only then does a
+    still-rejected modify escalate to a market close (never scratch a live winner)."""
+    return (bid <= float(intended)) if side == "BUY" else (ask >= float(intended))
+
+
+def _modify_ok(res) -> bool:
+    return res is not None and (
+        getattr(res, "retcode", None) == 10009
+        or (isinstance(res, dict) and res.get("paper")))
+
+
+def modify_sl_with_fallback(modify_fn, close_fn, side, intended, bid, ask, floor):
+    """Never abandon a rejected profit lock silently. `modify_fn(sl)` sends an SL
+    modify (returns the MT5 result); `close_fn()` market-closes. Flow:
+      1. modify at `intended`; DONE if accepted;
+      2. a stops-class reject (10016/10013) -> retry ONCE at the broker-min-adjusted
+         level (broker_min_sl); RETRY_OK if accepted;
+      3. still rejected AND the lock would have fired (price at/through it) ->
+         market-close (FALLBACK_CLOSE);
+      4. otherwise keep the old stop and retry next bar (KEEP).
+    Returns {'ok', 'outcome', 'sl', 'rc'}. Pure orchestration (no IO of its own) so
+    the whole decision is unit-testable with fake callables."""
+    r1 = modify_fn(intended)
+    if _modify_ok(r1):
+        return {"ok": True, "outcome": "DONE", "sl": intended, "rc": getattr(r1, "retcode", None)}
+    rc = getattr(r1, "retcode", None) if r1 is not None else None
+    if not is_stops_reject(rc):
+        return {"ok": False, "outcome": "REJECT", "sl": intended, "rc": rc}
+    adj = broker_min_sl(side, bid, ask, floor)
+    r2 = modify_fn(adj)
+    if _modify_ok(r2):
+        return {"ok": True, "outcome": "RETRY_OK", "sl": adj, "rc": rc}
+    if lock_would_fire(side, intended, bid, ask):
+        close_fn()
+        return {"ok": True, "outcome": "FALLBACK_CLOSE", "sl": intended, "rc": rc}
+    return {"ok": False, "outcome": "KEEP", "sl": intended, "rc": rc}
+
 
 def _resolve_parent_sl(self, shadow):
     """E-6: READ-ONLY resolve a boost's PARENT anchor-leg current trailing stop, from
@@ -359,14 +418,52 @@ def _manage_trails_on_bar_close(self):
                 # (truthy) on BOTH success and broker rejection -- treating it as
                 # a boolean masked failed re-asserts. Confirm retcode == 10009
                 # (DONE); otherwise the SL really didn't move and we must warn.
+                # 2026-07-17: a rejected profit-lock modify must NEVER be abandoned
+                # silently (base_lock rc=10016 with no retry let a +7.77 peak ride back
+                # to -10 open). Retry once broker-min-adjusted; if still rejected AND the
+                # lock would have fired, market-close it (LOCK_FALLBACK_CLOSE).
+                _bid = _ask = None
+                _floor = 0.30
+                try:
+                    _tk = self.adapter.mt5.symbol_info_tick(self.cfg.symbol)
+                    _si = self.adapter.mt5.symbol_info(self.cfg.symbol)
+                    if _tk is not None:
+                        _bid, _ask = float(_tk.bid), float(_tk.ask)
+                    if _si is not None and getattr(_si, 'trade_stops_level', 0) > 0:
+                        _floor = max(_floor, _si.trade_stops_level * _si.point)
+                except Exception:
+                    pass
                 ok = False
                 try:
-                    _res = self.adapter.modify_position_sl(ticket, intended)
-                    ok = (_res is not None and (
-                        getattr(_res, 'retcode', None) == 10009
-                        or (isinstance(_res, dict) and _res.get('paper'))))
+                    _plan = modify_sl_with_fallback(
+                        lambda sl: self.adapter.modify_position_sl(ticket, sl),
+                        lambda: self.adapter.close_position(ticket, dry_run=self.paper),
+                        shadow['side'], intended,
+                        _bid if _bid is not None else intended,
+                        _ask if _ask is not None else intended, _floor)
+                    ok = _plan['ok']
+                    if _plan['outcome'] == 'RETRY_OK':
+                        pos.current_sl = _plan['sl']
+                        shadow['current_sl'] = _plan['sl']
+                        log.info(f"SL modify RETRY OK ticket={ticket} {shadow['side']} "
+                                 f"broker-min adjusted ${intended}→${_plan['sl']} (rc={_plan['rc']})")
+                    elif _plan['outcome'] == 'FALLBACK_CLOSE':
+                        shadow['lock_fallback_close'] = True
+                        _msg = (f"🔒 *LOCK_FALLBACK_CLOSE* {shadow['anchor_label']} "
+                                f"{shadow['side']} @ market — lock `${intended}` rejected "
+                                f"(rc={_plan['rc']}) twice AND price through it "
+                                f"(bid ${_bid} / ask ${_ask}). Realized rather than abandoned.")
+                        log.warning(_msg)
+                        try:
+                            import discord_cards as _dc
+                            self.tele.send(_msg, Severity.WARN,
+                                           card=_dc.card_lock_fallback_close(
+                                               shadow['anchor_label'], shadow['side'],
+                                               intended, _bid, _ask, _plan['rc']))
+                        except Exception:
+                            self.tele.warn(_msg)
                 except Exception as e:
-                    log.warning(f"modify_position_sl raised for {ticket}: {e}")
+                    log.warning(f"modify_position_sl / fallback raised for {ticket}: {e}")
                 if not ok:
                     self.tele.warn(
                         f"⚠️ *SL modify FAILED* ticket={ticket} {shadow['side']}\n"
