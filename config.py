@@ -284,6 +284,9 @@ class Config:
     rogue_trigger: float = 17.0                  # OCO entry distance from the A1 anchor
     rogue_chain_step: float = 12.0               # each chain stop: this far beyond the prior fill
     rogue_stop_init_sl: float = 10.0             # init SL ($) on every stop-mode fill
+    rogue_anchor_grace_min: float = 10.0         # capture within this many min of the
+    # scheduled 02:30 = SCHEDULED; a first boot later than this with no stored anchor
+    # = LATE-CAPTURE. The daily anchor is captured ONCE and RELOADED on restart.
     rogue_entry_confirm_redesign: float = 5.0  # $ off the anchor to ENTER in the move dir
     rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
     rogue_daily_soft_lock: float = 30.0         # soft banked floor ($) -- NEVER a hard stop
