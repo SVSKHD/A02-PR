@@ -323,7 +323,7 @@ def _try_int(v):
 _RESCUE_BOOST_RE = re.compile(r"RB[12]:\d+")
 # Rogue v2 stop-mode orders ("RGS:A1" / "RGS:C<n>") are the Rogue engine's own
 # resting stops (magic 20260626), NOT anchor straddle legs — never sweep them.
-_ROGUE_STOP_RE = re.compile(r"RGS:(?:A1|C\d+)")
+_ROGUE_STOP_RE = re.compile(r"RGS:(?:S\d:)?(?:A1|C\d+)")
 
 
 def _is_rescue_boost_comment(comment) -> bool:

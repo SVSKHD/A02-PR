@@ -114,8 +114,11 @@ def snapshot(trader):
                 'seed_source': r.get('seed_source'),
                 'seed_recorded_px': r.get('seed_recorded_px'),
                 # Rogue v2 stop mode: the FIXED daily anchor (captured once at 02:30,
-                # RELOADED on restart, never re-snapshotted) + its consumed flag.
+                # RELOADED on restart, never re-snapshotted) + its consumed flag; and
+                # the 3-session variant (per-session anchor, reloaded on restart).
                 'rogue_daily': r.get('rogue_daily'),
+                'rogue_session': r.get('rogue_session'),
+                '_rogue_session_active': r.get('_rogue_session_active'),
                 'a1_snap_px': r.get('a1_snap_px'),
                 'day_open_px': r.get('day_open_px'),
                 # 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2):
@@ -344,8 +347,11 @@ def recover_on_boot(trader):
                   'a1_snap_px': r.get('a1_snap_px'),
                   'day_open_px': r.get('day_open_px'),
                   # Rogue v2 stop mode: reload the FIXED daily anchor so a same-day
-                  # restart re-arms the SAME levels (never a re-snapshot).
+                  # restart re-arms the SAME levels (never a re-snapshot); + the
+                  # per-session anchor + active-session marker for 3-session mode.
                   'rogue_daily': r.get('rogue_daily'),
+                  'rogue_session': r.get('rogue_session'),
+                  '_rogue_session_active': r.get('_rogue_session_active'),
                   # 2026-07-09 restore the $10-break latch + the per-anchor trade budget
                   # (runtime-only; absent in an older file -> not-latched + a fresh budget).
                   'break_latched': bool(r.get('break_latched', False)),

@@ -37,7 +37,9 @@ from typing import Dict, List, Optional, Tuple
 log = logging.getLogger("AUREON")
 
 ROGUE_MAGIC = 20260626
-RGS_RE = re.compile(r"RGS:(A1|C\d+)")
+# "RGS:A1" / "RGS:C<n>" (single-session) or "RGS:S1:A1" / "RGS:S2:C<n>" (3-session
+# mode). The session segment is optional so single-session comments are byte-identical.
+RGS_RE = re.compile(r"RGS:(?:(S\d):)?(A1|C\d+)")
 RGS_PREFIX = "RGS:"
 
 
@@ -71,16 +73,26 @@ class RogueStopParams:
 
 
 # --- comment tagging --------------------------------------------------------------
-def oco_comment() -> str:
-    return "RGS:A1"
+def oco_comment(session=None) -> str:
+    return f"RGS:{session}:A1" if session else "RGS:A1"
 
 
-def chain_comment(n: int) -> str:
-    return f"RGS:C{int(n)}"
+def chain_comment(n: int, session=None) -> str:
+    return f"RGS:{session}:C{int(n)}" if session else f"RGS:C{int(n)}"
 
 
 def parse_rgs(comment) -> Optional[str]:
-    """Return 'A1' or 'C<n>' for a Rogue-stop order comment, else None."""
+    """Return the tag 'A1' or 'C<n>' for a Rogue-stop order comment, else None
+    (session-agnostic — 'RGS:S2:C1' -> 'C1')."""
+    if not comment:
+        return None
+    m = RGS_RE.search(str(comment))
+    return m.group(2) if m else None
+
+
+def rgs_session(comment) -> Optional[str]:
+    """Return the session segment ('S1'/'S2'/'S3') of an RGS comment, or None for a
+    single-session (untagged) order."""
     if not comment:
         return None
     m = RGS_RE.search(str(comment))
@@ -118,22 +130,23 @@ class StopOrder:
     comment: str
 
 
-def oco_plan(anchor: float, params: RogueStopParams) -> List[StopOrder]:
-    """The two resting stops at anchor ± trigger, each with its init SL."""
+def oco_plan(anchor: float, params: RogueStopParams, session=None) -> List[StopOrder]:
+    """The two resting stops at anchor ± trigger, each with its init SL. `session`
+    (S1/S2/S3) tags the comment in 3-session mode; None -> single-session comment."""
     buy = round(anchor + params.trigger, 2)
     sell = round(anchor - params.trigger, 2)
     return [
-        StopOrder("BUY", buy, init_sl_price("BUY", buy, params), oco_comment()),
-        StopOrder("SELL", sell, init_sl_price("SELL", sell, params), oco_comment()),
+        StopOrder("BUY", buy, init_sl_price("BUY", buy, params), oco_comment(session)),
+        StopOrder("SELL", sell, init_sl_price("SELL", sell, params), oco_comment(session)),
     ]
 
 
 def chain_next(fill_price: float, direction: str, n: int,
-               params: RogueStopParams) -> StopOrder:
+               params: RogueStopParams, session=None) -> StopOrder:
     """The next chain stop: chain_step beyond the fill, SAME direction, init SL."""
     price = round(fill_price + _sgn(direction) * params.chain_step, 2)
     return StopOrder(direction, price, init_sl_price(direction, price, params),
-                     chain_comment(n))
+                     chain_comment(n, session))
 
 
 def update_trail(side: str, entry: float, peak: float, current_sl: float,
@@ -197,6 +210,7 @@ class RogueStopManager:
         self.chain_idx = 0
         self.reseed_after = 0.0        # epoch; re-seed only when now >= this
         self.traded = False            # a fill has happened this session
+        self.session = None            # 'S1'/'S2'/'S3' in 3-session mode, else None
         self._peaks: Dict[int, float] = {}
         self._tracked: Dict[int, dict] = {}
         # Optional card / persistence hooks (default None -> no-op). Prices passed to
@@ -238,6 +252,21 @@ class RogueStopManager:
         except Exception as e:  # never raise onto the live loop
             self.log.warning(f"rogue_stop: on_tick failed ({e!r}) — continuing")
 
+    # -- session scoping --------------------------------------------------------
+    def _is_current(self, o) -> bool:
+        """True if an order/position belongs to the ACTIVE session (or single-session
+        mode). A position CARRIED from a prior session is not current — it keeps
+        trailing but never blocks or drives the new session's OCO/chain."""
+        if self.session is None:
+            return True
+        return rgs_session(getattr(o, "comment", "")) == self.session
+
+    def _cur_positions(self):
+        return [p for p in self.broker.positions() if self._is_current(p)]
+
+    def _cur_pendings(self):
+        return [o for o in self.broker.pendings() if self._is_current(o)]
+
     # -- fills ------------------------------------------------------------------
     def _detect_fills(self) -> None:
         positions = self.broker.positions()
@@ -248,6 +277,12 @@ class RogueStopManager:
                 continue
             tag = parse_rgs(p.comment)
             if tag is None:
+                continue
+            # a position carried from a PRIOR session: adopt for trailing/closes, but
+            # do NOT consume a slot or drive a chain (that belongs to its own session).
+            if not self._is_current(p):
+                self._tracked[tk] = {"side": p.side, "entry": p.entry, "comment": p.comment}
+                self._peaks[tk] = p.entry
                 continue
             self._tracked[tk] = {"side": p.side, "entry": p.entry, "comment": p.comment}
             self._peaks[tk] = p.entry
@@ -262,9 +297,10 @@ class RogueStopManager:
             self.log.info(f"rogue_stop: FILL {p.comment} {p.side} @ {p.entry} "
                           f"(slot {self.gov.get('reanchor_count')})")
             if tag == "A1":
-                # OCO: cancel the resting sibling (opposite side, RGS:A1)
+                # OCO: cancel the resting sibling (opposite side, same session's A1)
                 for o in pendings:
-                    if parse_rgs(o.comment) == "A1" and o.side != p.side:
+                    if (parse_rgs(o.comment) == "A1" and self._is_current(o)
+                            and o.side != p.side):
                         self.broker.cancel(int(o.ticket))
                         self.log.info(f"rogue_stop: OCO sibling {o.side} @ {o.price} cancelled")
                 self.chain_idx = 0
@@ -272,8 +308,8 @@ class RogueStopManager:
             self._place_next_chain(p.side, p.entry)
 
     def _place_next_chain(self, direction: str, fill_price: float) -> None:
-        # never stack: cancel any resting chain pending before placing the next
-        for o in self.broker.pendings():
+        # never stack: cancel any resting chain pending (this session) before the next
+        for o in self._cur_pendings():
             if (parse_rgs(o.comment) or "").startswith("C"):
                 self.broker.cancel(int(o.ticket))
         ok, why = self._can_place()
@@ -281,7 +317,7 @@ class RogueStopManager:
             self.log.info(f"rogue_stop: chain not placed ({why}) — governor gate")
             return
         self.chain_idx += 1
-        c = chain_next(fill_price, direction, self.chain_idx, self.p)
+        c = chain_next(fill_price, direction, self.chain_idx, self.p, self.session)
         tk = self.broker.place_stop(c.side, c.price, c.sl, c.comment)
         self.log.info(f"rogue_stop: CHAIN {c.comment} {c.side} stop @ {c.price} "
                       f"SL {c.sl} (beyond fill {fill_price})")
@@ -329,9 +365,12 @@ class RogueStopManager:
 
     # -- seed / re-seed ---------------------------------------------------------
     def _seed_or_reseed(self, price: float, now: float) -> None:
-        if self.broker.positions():
-            return  # not flat — chain/trail is running
-        pendings = self.broker.pendings()
+        # "flat" is SESSION-scoped: a position carried from a prior session keeps
+        # trailing but must not block THIS session's OCO (the spec: positions carry,
+        # each session still seeds its own ±17 pair).
+        if self._cur_positions():
+            return  # not flat this session — chain/trail is running
+        pendings = self._cur_pendings()
         # flat: cancel any leftover chain stop (reversal left it resting)
         chain_pendings = [o for o in pendings if (parse_rgs(o.comment) or "").startswith("C")]
         for o in chain_pendings:
@@ -365,7 +404,7 @@ class RogueStopManager:
         self._place_oco(round(float(price), 2), kind="reseed")
 
     def _place_oco(self, anchor: float, kind: str = "seed") -> None:
-        orders = oco_plan(anchor, self.p)
+        orders = oco_plan(anchor, self.p, self.session)
         for s in orders:
             self.broker.place_stop(s.side, s.price, s.sl, s.comment)
         self.log.info(f"rogue_stop: OCO seeded @ {anchor:.2f} "
@@ -533,17 +572,18 @@ def _capture_price(trader, sched_utc, scheduled: bool):
 
 
 def _post_anchor_card(trader, source: str, actual_ts: str, anchor: float,
-                      params: RogueStopParams) -> None:
-    """Post the Rogue daily-anchor Discord card. Level prices come from oco_plan (the
-    exact StopOrder values that WILL be placed) — never recomputed in the card layer."""
+                      params: RogueStopParams, label: str = ROGUE_ANCHOR_LABEL) -> None:
+    """Post the Rogue anchor Discord card (title ROGUE_02h_Asia in single mode,
+    ROGUE_S1/S2/S3 in session mode). Level prices come from oco_plan (the exact
+    StopOrder values that WILL be placed) — never recomputed in the card layer."""
     try:
         import discord_cards as _dc
         plan = {o.side: o for o in oco_plan(anchor, params)}
         card = _dc.card_rogue_anchor(
-            ROGUE_ANCHOR_LABEL, source, actual_ts, anchor, params, plan["BUY"], plan["SELL"])
+            label, source, actual_ts, anchor, params, plan["BUY"], plan["SELL"])
         from telemetry import Severity
         trader.tele.send(
-            f"🗡️ {ROGUE_ANCHOR_LABEL} anchor ${anchor:.2f} ({source})",
+            f"🗡️ {label} anchor ${anchor:.2f} ({source})",
             Severity.INFO, card=card, important=True)
     except Exception as e:
         log.warning(f"rogue_stop: anchor card post failed ({e!r})")
@@ -603,7 +643,9 @@ def _ensure_daily_anchor(trader, st, now_utc, mgr) -> None:
 
 
 def _mark_oco_consumed(trader, st):
-    d = st.get("rogue_daily")
+    # mark the ACTIVE store's OCO consumed (per-session in 3-session mode, else daily)
+    key = "rogue_session" if bool(getattr(trader.cfg, "rogue_sessions_enabled", False)) else "rogue_daily"
+    d = st.get(key)
     if isinstance(d, dict) and not d.get("oco_consumed"):
         d["oco_consumed"] = True
         try:
@@ -613,17 +655,140 @@ def _mark_oco_consumed(trader, st):
             pass
 
 
-def drive_stop(trader, st, allow_new_entries: bool = True) -> None:
+# --- THREE-SESSION MODE (flag-gated: rogue_sessions_enabled) -----------------------
+# Sessions in IST: S1 05:00–12:30, S2 12:30–19:10, S3 19:30–23:00 (S3 skipped Fri).
+# S1 start reuses A1's schedule (server 02:30 / Monday 03:30). S2/S3 convert their IST
+# start to UTC (IST = UTC+5:30). Governors stay DAILY; open positions carry across
+# boundaries; each session cancels only its OWN unfilled pendings at its end.
+SESSIONS_IST = [("S1", (5, 0), (12, 30)), ("S2", (12, 30), (19, 10)),
+                ("S3", (19, 30), (23, 0))]
+
+
+def _ist_to_utc(broker_date, h, m):
+    import pandas as pd
+    ist_wall = pd.Timestamp(year=broker_date.year, month=broker_date.month,
+                            day=broker_date.day, hour=int(h), minute=int(m), tz="UTC")
+    return ist_wall - pd.Timedelta(hours=5, minutes=30)   # IST wall -> UTC instant
+
+
+def session_windows_utc(cfg, broker_date):
+    """Ordered [(name, start_utc, end_utc)] for the broker date. S1 uses the existing
+    schedule (Monday cushion); S3 is skipped on Fridays (weekday 4)."""
+    wins = [("S1", rogue_scheduled_utc(cfg, broker_date), _ist_to_utc(broker_date, 12, 30)),
+            ("S2", _ist_to_utc(broker_date, 12, 30), _ist_to_utc(broker_date, 19, 10))]
+    if broker_date.weekday() != 4:      # not Friday -> S3 runs
+        wins.append(("S3", _ist_to_utc(broker_date, 19, 30), _ist_to_utc(broker_date, 23, 0)))
+    return wins
+
+
+def resolve_session(cfg, now_utc, broker_date):
+    """The active session (name, start_utc, end_utc) for now_utc, or (None, None, None)
+    in a gap (19:10–19:30, or outside the trading window)."""
+    for name, s, e in session_windows_utc(cfg, broker_date):
+        if s <= now_utc < e:
+            return name, s, e
+    return None, None, None
+
+
+def _cancel_session_pendings(mgr, session) -> int:
+    """Cancel a session's unfilled RGS pendings (OCO + chains). Positions are NEVER
+    touched — they carry across the boundary with their SL/trail intact."""
+    if session is None:
+        return 0
+    n = 0
+    for o in mgr.broker.pendings():
+        if rgs_session(o.comment) == session:
+            if mgr.broker.cancel(int(o.ticket)):
+                n += 1
+    return n
+
+
+def _ensure_session_anchor(trader, st, now_utc, mgr) -> None:
+    """3-session controller: resolve the active session, cancel the prior session's
+    unfilled pendings at a boundary (positions carry), and capture/reload the active
+    session's anchor (never re-snapshot). Governors are daily (untouched here)."""
+    import rogue as _r
+    cfg = trader.cfg
+    params = mgr.p
+    try:
+        broker_date = trader._broker_date(now_utc)
+    except Exception:
+        broker_date = now_utc.date()
+    date_str = str(broker_date)
+    name, start, end = resolve_session(cfg, now_utc, broker_date)
+    prev = st.get("_rogue_session_active", "__unset__")
+
+    if name != prev:
+        # BOUNDARY: cancel the prior session's unfilled pendings; positions carry.
+        prior = prev if prev != "__unset__" else None
+        n = _cancel_session_pendings(mgr, prior)
+        if n:
+            log.info(f"rogue_stop: session {prior}→{name} boundary — cancelled {n} "
+                     f"unfilled {prior} pending(s); open positions carry")
+        st["_rogue_session_active"] = name
+        mgr.session = name
+        mgr.chain_idx = 0
+        mgr.reseed_after = 0.0          # drop a cooldown crossing the boundary
+        st["_rogue_anchor_announced"] = False
+        _r._persist_state(trader)
+
+    if name is None:
+        mgr.session = None
+        mgr._daily_anchor = None        # gap: no new entries; positions carry
+        return
+
+    mgr.session = name
+    stored = st.get("rogue_session")
+    has_today = bool(stored and stored.get("date") == date_str and stored.get("session") == name)
+    grace = float(getattr(cfg, "rogue_anchor_grace_min", 10.0))
+    decision = anchor_decision(now_utc, start, has_today, grace)
+
+    if decision == WAIT:
+        mgr._daily_anchor = None
+        return
+    if decision == RELOAD:
+        mgr._daily_anchor = float(stored["anchor"])
+        mgr.traded = bool(stored.get("oco_consumed", False))
+        if not st.get("_rogue_anchor_announced"):
+            st["_rogue_anchor_announced"] = True
+            log.info(f"ROGUE {name} ANCHOR RELOADED @ {stored['anchor']} "
+                     f"(captured {stored.get('ts')}, source {stored.get('source')})")
+            _post_anchor_card(trader, RELOAD, str(stored.get("ts")),
+                              float(stored["anchor"]), params, label=f"ROGUE_{name}")
+        return
+
+    scheduled = decision == CAPTURE_SCHEDULED
+    px = _capture_price(trader, start, scheduled)
+    if px is None:
+        mgr._daily_anchor = None
+        return
+    ts = now_utc.isoformat()
+    st["rogue_session"] = {"date": date_str, "session": name, "anchor": float(px),
+                           "ts": ts, "source": decision, "oco_consumed": False}
+    st["_rogue_anchor_announced"] = True
+    mgr._daily_anchor = float(px)
+    mgr.traded = False
+    if decision == CAPTURE_LATE:
+        log.warning(f"ROGUE {name} ANCHOR LATE-CAPTURE @ {px}")
+    else:
+        log.info(f"ROGUE {name} ANCHOR SCHEDULED @ {px}")
+    _post_anchor_card(trader, decision, ts, float(px), params, label=f"ROGUE_{name}")
+    _r._persist_state(trader)
+
+
+def drive_stop(trader, st, allow_new_entries: bool = True, now_utc=None) -> None:
     """Live per-tick Rogue STOP-MODE driver. Gated by the caller on
-    cfg.rogue_stop_mode. Establishes the FIXED daily anchor (Commit 1), builds the
-    shim + manager (persisted on the trader), and steps it once. Fully guarded."""
+    cfg.rogue_stop_mode. Establishes the FIXED anchor (single daily #121, or per
+    session when rogue_sessions_enabled), builds the shim + manager (persisted on the
+    trader), and steps it once. Fully guarded. `now_utc` is injectable for tests."""
     import rogue as _r
     try:
         price = _r._mid(trader)
         if price is None:
             return
         now = _r._epoch()
-        now_utc = _rogue_now_utc()
+        if now_utc is None:
+            now_utc = _rogue_now_utc()
         mgr = getattr(trader, "_rogue_stop_mgr", None)
         if mgr is None:
             def _post_chain(order, fill_px):
@@ -641,9 +806,13 @@ def drive_stop(trader, st, allow_new_entries: bool = True) -> None:
         else:
             mgr.broker = _StopBroker(trader)
             mgr.gov = st.setdefault("gov", _r.new_day_state())
-        # FIXED daily anchor first (capture-on-schedule / reload-on-restart)
+        # FIXED anchor first (capture-on-schedule / reload-on-restart). Three-session
+        # mode when rogue_sessions_enabled, else the single daily anchor (#121).
         if now_utc is not None:
-            _ensure_daily_anchor(trader, st, now_utc, mgr)
+            if bool(getattr(trader.cfg, "rogue_sessions_enabled", False)):
+                _ensure_session_anchor(trader, st, now_utc, mgr)
+            else:
+                _ensure_daily_anchor(trader, st, now_utc, mgr)
         if not allow_new_entries:
             mgr._trail(price)   # post-EOD / kill-locked: manage + trail only
             return
