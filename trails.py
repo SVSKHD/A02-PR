@@ -449,6 +449,13 @@ def _manage_trails_on_bar_close(self):
                                  f"broker-min adjusted ${intended}→${_plan['sl']} (rc={_plan['rc']})")
                     elif _plan['outcome'] == 'FALLBACK_CLOSE':
                         shadow['lock_fallback_close'] = True
+                        try:   # decision-grade review line
+                            import review_log as _rv
+                            _rv.get_review_logger(self.cfg).lock(
+                                'ANCHOR', 'fallback', intended=intended, landed=None,
+                                level='LOCK_FALLBACK_CLOSE')
+                        except Exception:
+                            pass
                         _msg = (f"🔒 *LOCK_FALLBACK_CLOSE* {shadow['anchor_label']} "
                                 f"{shadow['side']} @ market — lock `${intended}` rejected "
                                 f"(rc={_plan['rc']}) twice AND price through it "

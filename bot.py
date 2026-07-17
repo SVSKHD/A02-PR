@@ -58,10 +58,12 @@ def main():
 
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
     parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
-                                         'testfire', 'verifyfb', 'rescuestats',
+                                         'testfire', 'testorder', 'verifyfb', 'rescuestats',
                                          'bescratchscan', 'rogueseed', 'fetchseed',
                                          'dailyreport', 'reconcile', 'fetchticks',
-                                         'simulate'])
+                                         'simulate', 'review'])
+    parser.add_argument('--i-know-this-is-real', action='store_true',
+                        help="testorder: allow running against a non-demo account")
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
     parser.add_argument('--start', default='2025-01-01')
     parser.add_argument('--end', default='2026-12-31')
@@ -172,6 +174,46 @@ def main():
         from testfire import run_testfire
         ok = run_testfire(cfg, anchor=args.anchor, force_window=args.force_window)
         sys.exit(0 if ok else 1)
+
+    elif args.mode == 'testorder':
+        # Risk-free LIVE ORDER-PATH verification (distinct from `testfire`, which
+        # fires a real strategy anchor). Places/modifies/cancels a far pending +
+        # opens/SL-modifies/closes a 0.01 market position, all magic 20260817 /
+        # "TESTORDER" (exempt from stale_leg_sweep + invisible to rescue/rogue).
+        # DEMO only (override: --i-know-this-is-real); refuses under a live PID lock.
+        # See testorder.py.
+        from mt5_adapter import MT5Adapter
+        from testorder import run_testorder
+        _adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'),
+                              expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))
+        try:
+            code = run_testorder(cfg, _adapter, allow_real=args.i_know_this_is_real)
+        finally:
+            try:
+                _adapter.shutdown()
+            except Exception:
+                pass
+        sys.exit(code)
+
+    elif args.mode == 'review':
+        # Post/print today's decision-grade session-review digest (fills, closes by
+        # reason, net by engine, locks armed/fired/fallback, rejects) from
+        # logs/review_YYYY-MM-DD.log. No MT5 needed. Also callable from the Discord
+        # /review command via review_log.post_review_digest. See review_log.py.
+        from review_log import post_review_digest
+        try:
+            from telemetry import telemetry_from_env
+            _tele = telemetry_from_env(component="AUREON-review")
+        except Exception:
+            _tele = None
+        text = post_review_digest(cfg, _tele, day=(args.start if args.start else None))
+        print(text)
+        try:
+            if _tele is not None:
+                _tele.stop(timeout=6.0)
+        except Exception:
+            pass
+        sys.exit(0)
 
     elif args.mode == 'verifyfb':
         # Firebase backfill verifier. Read-only by default (lists docs, names
