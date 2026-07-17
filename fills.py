@@ -471,12 +471,17 @@ def _reconcile_with_broker(self):
                     hold_min = None
                 hold_txt = f"  |  held `{hold_min:.1f}m`" if hold_min is not None else ""
                 # Freeze-breach alarm: a Trail-class exit before the freeze window
-                # elapsed should be impossible. Exits AT entry (+/- $0.40) are the
-                # +$3 BASE LOCK firing, which IS allowed during freeze -- excluded.
+                # elapsed should be impossible. 2026-07-17: profit-lock rungs (BE / +$4 /
+                # peak-2) now fire DURING the hold by design, so a Trail exit IN PROFIT
+                # inside the hold is EXPECTED (the discrete locks realizing) -- excluded.
+                # Only a Trail exit at a LOSS (below entry for BUY / above for SELL) inside
+                # the hold is anomalous and still worth the alarm.
+                _fb_sgn = 1.0 if shadow['side'] == 'BUY' else -1.0
+                _fb_profit = _fb_sgn * (close_price - float(shadow['entry_price']))
                 if (hold_min is not None and outcome == 'Trail'
                         and self.cfg.freeze_minutes > 0
                         and hold_min < self.cfg.freeze_minutes - 0.5
-                        and abs(close_price - float(shadow['entry_price'])) > 0.40):
+                        and _fb_profit < -0.40):
                     self.tele.warn(
                         f"🚨 *FREEZE BREACH* {shadow['anchor_label']} "
                         f"{shadow['side']}: Trail exit after only {hold_min:.1f}m "
