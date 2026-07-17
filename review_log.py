@@ -75,13 +75,18 @@ class ReviewLogger:
             log.warning(f"review_log: emit failed ({e!r})")
 
     # --- decision-grade events (one line each) ---------------------------------
-    def fill(self, engine: str, side: str, lot: float, price: float, tag=None) -> None:
-        self._emit("FILL", _kv(engine=engine, side=side, lot=lot, price=price, tag=tag))
+    # `test=1` marks a TESTFIRE (TF_) event so it is bucketed into the digest's
+    # separate TEST section and never mixed into the real-day stats (None -> omitted,
+    # so every real-anchor line is byte-identical to before).
+    def fill(self, engine: str, side: str, lot: float, price: float, tag=None,
+             test=None) -> None:
+        self._emit("FILL", _kv(engine=engine, side=side, lot=lot, price=price, tag=tag,
+                               test=test))
 
     def close(self, engine: str, side: str, lot: float, price: float, reason: str,
-              pnl: float, tag=None) -> None:
+              pnl: float, tag=None, test=None) -> None:
         self._emit("CLOSE", _kv(engine=engine, side=side, lot=lot, price=price,
-                                reason=reason, pnl=_signed(pnl), tag=tag))
+                                reason=reason, pnl=_signed(pnl), tag=tag, test=test))
 
     def lock(self, engine: str, action: str, intended=None, landed=None,
              level=None) -> None:
@@ -89,14 +94,16 @@ class ReviewLogger:
                                intended=intended, landed=(landed if landed is not None else "-"),
                                level=level))
 
-    def pending(self, engine: str, action: str, tag: str, level=None, price=None) -> None:
+    def pending(self, engine: str, action: str, tag: str, level=None, price=None,
+                test=None) -> None:
         # action: placed / cancelled / swept
         self._emit("PENDING", _kv(engine=engine, action=action, tag=tag,
-                                  level=level, price=price))
+                                  level=level, price=price, test=test))
 
-    def anchor(self, engine: str, price: float, source: str, label=None, impl=None) -> None:
+    def anchor(self, engine: str, price: float, source: str, label=None, impl=None,
+               test=None) -> None:
         self._emit("ANCHOR", _kv(engine=engine, price=price, source=source,
-                                 label=label, impl=impl))
+                                 label=label, impl=impl, test=test))
 
     def governor(self, engine: str, event: str, detail=None) -> None:
         # event: loss_stop / profit_lock / cap / halt / resume
@@ -149,11 +156,26 @@ def summarize(lines: List[str]) -> dict:
     locks = {"armed": 0, "fired": 0, "fallback": 0}
     rejects = 0
     anchors = 0
+    # TEST (TF_ / testfire) events are aggregated SEPARATELY and NEVER mixed into the
+    # real-day stats, win counts, or fleet tallies (Feature 2 journal/review separation).
+    test = {"fills": 0, "closes": 0, "net": 0.0, "closes_by_reason": {}}
     for raw in lines:
         rec = parse_line(raw)
         if rec is None:
             continue
         t = rec["_type"]
+        if rec.get("test") == "1":
+            if t == "FILL":
+                test["fills"] += 1
+            elif t == "CLOSE":
+                test["closes"] += 1
+                r = rec.get("reason", "?")
+                test["closes_by_reason"][r] = test["closes_by_reason"].get(r, 0) + 1
+                try:
+                    test["net"] += float(rec.get("pnl", 0))
+                except ValueError:
+                    pass
+            continue   # NEVER fold a test event into the real-day aggregation
         if t == "FILL":
             fills += 1
         elif t == "CLOSE":
@@ -179,19 +201,31 @@ def summarize(lines: List[str]) -> dict:
     return {"fills": fills, "closes_by_reason": closes_by_reason,
             "net_by_engine": {k: round(v, 2) for k, v in net_by_engine.items()},
             "locks": locks, "rejects": rejects, "anchors": anchors,
-            "net_total": round(sum(net_by_engine.values()), 2)}
+            "net_total": round(sum(net_by_engine.values()), 2),
+            "test": {"fills": test["fills"], "closes": test["closes"],
+                     "net": round(test["net"], 2),
+                     "closes_by_reason": test["closes_by_reason"]}}
 
 
 def format_digest(summary: dict, day: str = "") -> str:
     cbr = ", ".join(f"{k} {v}" for k, v in sorted(summary["closes_by_reason"].items())) or "—"
     nbe = ", ".join(f"{k} {v:+.2f}" for k, v in sorted(summary["net_by_engine"].items())) or "—"
     lk = summary["locks"]
-    return (f"📋 REVIEW {day}\n"
-            f"fills: {summary['fills']} · anchors: {summary['anchors']}\n"
-            f"closes: {cbr}\n"
-            f"net by engine: {nbe}  (total {summary['net_total']:+.2f})\n"
-            f"locks: armed {lk['armed']} / fired {lk['fired']} / fallback {lk['fallback']} · "
-            f"rejects {summary['rejects']}")
+    out = (f"📋 REVIEW {day}\n"
+           f"fills: {summary['fills']} · anchors: {summary['anchors']}\n"
+           f"closes: {cbr}\n"
+           f"net by engine: {nbe}  (total {summary['net_total']:+.2f})\n"
+           f"locks: armed {lk['armed']} / fired {lk['fired']} / fallback {lk['fallback']} · "
+           f"rejects {summary['rejects']}")
+    # Separate TEST section — TESTFIRE (TF_) events are shown apart and are NOT part of
+    # the real-day totals above (never counted into wins / net / fleet tallies).
+    tst = summary.get("test") or {}
+    if tst.get("fills") or tst.get("closes"):
+        tcbr = ", ".join(f"{k} {v}" for k, v in sorted((tst.get("closes_by_reason") or {}).items())) or "—"
+        out += (f"\n— TEST (testfire; excluded from the totals above) —\n"
+                f"test fills: {tst.get('fills', 0)} · closes: {tst.get('closes', 0)} "
+                f"({tcbr}) · test net: {tst.get('net', 0.0):+.2f}")
+    return out
 
 
 def read_summary(log_dir: str, day: str) -> dict:

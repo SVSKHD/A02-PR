@@ -99,7 +99,9 @@ ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
                     # v3.7.1 manual current-tick re-seed (live testing)
                     "rogueseed","fetchseed",
                     # v3.7.3 per-engine daily stops status + overrides
-                    "daylock"}
+                    "daylock",
+                    # 2026-07-18 in-process /testfire (isolated TF_ straddle; demo-only)
+                    "testfire"}
 
 
 HELP_TEXT = """*AUREON v2 commands*
@@ -119,6 +121,8 @@ HELP_TEXT = """*AUREON v2 commands*
 🪣 `/fetcher flatten confirm` — close ONLY Fetcher-magic (20260707) positions
 🌱 `/rogueseed` — re-anchor Rogue at the current tick (live testing; DEMO-only)
 🌱 `/fetchseed` — re-anchor Fetcher at the current tick (live testing; DEMO-only)
+🧪 `/testfire` — fire ONE isolated TF_ straddle inside the running bot (DEMO-only; real schedule untouched)
+🧪 `/testfire status` — last run time, result, whether one is in flight
 🔒 `/daylock status` — per-engine day P&L vs profit/loss stops + lock state
 🔓 `/daylock anchors off` — override the anchors profit lock (loss stop stays)
 🔓 `/daylock off` — override the account lock (disabled by default)
@@ -658,6 +662,21 @@ class Watchdog:
             else:
                 self.tele.info("Usage: `/daylock status` · `/daylock anchors off` · "
                                "`/daylock off`")
+        elif cmd == "testfire":
+            # 2026-07-18 /testfire [status]: the watchdog only PARSES + queues; the bot
+            # runs the isolated TF_ straddle (or renders status) on its next tick and
+            # replies with the placement table / refusal reason.
+            toks = (raw_text or "").split()[1:]
+            sub = toks[0].lower() if toks else "run"
+            if sub == "status":
+                self._write_command("testfire_status")
+                self.tele.info("🧪🔥 `/testfire status` queued — bot will report the last "
+                               "run + in-flight state next tick.")
+            else:
+                self._write_command("testfire")
+                self.tele.info("🧪🔥 `/testfire` queued — bot fires ONE isolated TF_ straddle "
+                               "next tick (DEMO-only; the real anchor schedule is UNAFFECTED). "
+                               "It replies with the placement table or the refusal reason.")
         elif cmd == "today":
             self.tele.info(self._format_today_summary())
         elif cmd in ("anchors", "rogue", "fetcher"):

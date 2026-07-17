@@ -31,7 +31,7 @@ JOURNAL_COLUMNS = [
     'entry_price', 'lot', 'initial_sl', 'initial_tp', 'max_favorable',
     'exit_time_ist', 'actual_exit_price', 'modeled_trail_exit',
     'trail_slip', 'exit_reason', 'realized_pnl_usd', 'ticket',
-    'nohold_trail_exit', 'role', 'trigger_source',
+    'nohold_trail_exit', 'role', 'trigger_source', 'test',
 ]
 
 
@@ -192,6 +192,12 @@ def _write_journal(self, shadow, close_deal, close_price, outcome, pnl_usd, tick
         # manual on-demand entry. The TESTFIRE trade still COUNTS toward validation;
         # this column makes it auditable, not excluded.
         shadow.get('trigger_source', 'SCHEDULED'),
+        # 2026-07-18: test=1 for a TF_ TESTFIRE leg (or trigger_source TESTFIRE) so a
+        # test row is filterable end-to-end (CSV + Firebase) and never counted into the
+        # real-day journal stats / win tallies.
+        (1 if (shadow.get('test')
+               or str(shadow.get('anchor_label', '')).startswith('TF_')
+               or shadow.get('trigger_source') == 'TESTFIRE') else 0),
     ]
     # R-8 self-heal: migrate a journal file whose header predates a later-appended column
     # (rewrite header, back up to .bak) BEFORE appending, so header width == row width. No-op

@@ -796,6 +796,22 @@ class LiveTrader:
                     _fetcher.manual_seed(self, _rogue.seed_tick_price(self))
                 except Exception:
                     pass
+            elif cmd == "testfire":
+                # Discord /testfire: run ONE isolated TF_ straddle INSIDE this running
+                # process (does NOT stop the bot, does NOT suppress the real scheduler).
+                # All guards (demo-only, no-FP, one-at-a-time, active-anchor-window,
+                # anchors-brake, 10-min rate limit) enforced in handle_testfire_command.
+                try:
+                    import testfire as _tf
+                    _tf.handle_testfire_command(self)
+                except Exception as e:
+                    log.warning(f"testfire command failed (non-fatal): {e!r}")
+            elif cmd == "testfire_status":
+                try:
+                    import testfire as _tf
+                    _tf.handle_testfire_status(self)
+                except Exception as e:
+                    log.warning(f"testfire status failed (non-fatal): {e!r}")
             elif cmd == "daylock_status":
                 # v3.7.3 /daylock status -> per-engine day P&L vs both thresholds + lock
                 # state for all three engines (+ the disabled-by-default account lock).
@@ -2621,6 +2637,10 @@ class LiveTrader:
         # 7b. v2.5: Complete any deferred anchor placement (settle window or retry)
         self._complete_deferred_anchor()
 
+        # 7b-tf. In-process /testfire completion — a SEPARATE deferred slot, placed
+        # concurrently with (and never delaying) the real scheduled anchors above.
+        self._complete_testfire_anchor()
+
         # 7c. v3.3.0 POSITION_HEARTBEAT: keep the ticket trace gapless between
         # state changes while any position is open (throttled ~60s internally).
         self._maybe_position_heartbeat()
@@ -2711,6 +2731,7 @@ LiveTrader._flatten_all             = _risk_mod._flatten_all
 LiveTrader._process_anchor_if_due   = _anchors_mod._process_anchor_if_due
 LiveTrader._process_anchor          = _anchors_mod._process_anchor
 LiveTrader._complete_deferred_anchor= _anchors_mod._complete_deferred_anchor
+LiveTrader._complete_testfire_anchor= _anchors_mod._complete_testfire_anchor
 import stale_leg_sweep as _stale_sweep_mod
 LiveTrader._sweep_stale_legs        = _stale_sweep_mod._sweep_stale_legs
 LiveTrader.rebuild_registry_from_broker = _stale_sweep_mod.rebuild_registry_from_broker

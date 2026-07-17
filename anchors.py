@@ -471,7 +471,37 @@ def _complete_deferred_anchor(self):
 
     d = self._deferred_anchor
     self._deferred_anchor = None  # consume
+    _place_completed_anchor(self, d)
 
+
+def _complete_testfire_anchor(self):
+    """In-process /testfire completion via a SEPARATE deferred slot
+    (self._testfire_deferred) so a test straddle can NEVER delay or consume a real
+    scheduled-anchor placement (the real _deferred_anchor slot is untouched). Same
+    tick-freshness / warmup / current-mid placement path as a real anchor; records
+    the placement latency + legs for /testfire status + the summary card."""
+    d = getattr(self, '_testfire_deferred', None)
+    if d is None:
+        return
+    if pd.Timestamp.now(tz='UTC') < d['defer_until']:
+        return
+    self._testfire_deferred = None
+    import time as _t
+    _t0 = _t.monotonic()
+    _place_completed_anchor(self, d)
+    try:
+        import testfire as _tf
+        _tf.record_testfire_placement(self, d.get('label'), (_t.monotonic() - _t0) * 1000.0)
+    except Exception:
+        pass
+
+
+def _place_completed_anchor(self, d):
+    """Shared deferred-placement body (real anchor AND /testfire): tick-freshness,
+    trade-channel warmup, current-price anchoring, then _place_orders_for_anchor.
+    A plain module function (called, not bound onto LiveTrader) so the offline
+    testfire selftest's direct _complete_deferred_anchor(tr) needs no extra stub
+    binding."""
     label = d['label']
     anchor_price = d['anchor_price']
     anchor_utc = d['anchor_utc']
@@ -707,15 +737,26 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     #         internally during its built-in rc=-1 reconcile retry)
     retry_comment = f"_R{retry_count}" if retry_count > 0 else ""
 
+    # 2026-07-18: TF-ness is derived from the LABEL (TF_<HHMMSS>) as well as the CLI
+    # _testfire_mode flag, so an in-process /testfire (which never sets _testfire_mode,
+    # to keep the real scheduler running) is still recognised for isolation + tagging,
+    # while a REAL anchor placing concurrently is NEVER mistagged (its label is A1..A5).
+    # Defined HERE (before the sweep) so the whole placement body can gate on it.
+    _is_tf = str(label).startswith('TF_') or getattr(self, '_testfire_mode', False)
+
     # STALE-LEG SWEEP: before this anchor's straddle rests, cancel every pending leg
     # left behind by a PRIOR anchor (origin anchor >= stale_leg_interval away) so a
     # non-OCO leftover can't fill on a pullback into an unwanted scratch. The rescue
     # leg of an open position (the INTERVAL-point opposite leg) is exempt. Fired here,
     # BEFORE placement, and fully guarded -- a sweep problem never blocks the straddle.
-    try:
-        self._sweep_stale_legs(anchor_price)
-    except Exception as _sweep_e:
-        log.warning(f"{label}: stale-leg sweep raised (continuing to placement): {_sweep_e!r}")
+    # ISOLATION: a TF_ test straddle NEVER runs the sweep — a test anchor must never
+    # touch (cancel) a real resting anchor leg (Feature-2 one-way isolation). TF_ orders
+    # are also exempt from being swept BY a real anchor (stale_leg_sweep TF_ exemption).
+    if not _is_tf:
+        try:
+            self._sweep_stale_legs(anchor_price)
+        except Exception as _sweep_e:
+            log.warning(f"{label}: stale-leg sweep raised (continuing to placement): {_sweep_e!r}")
 
     # Fix 1 (E-13): route anchor stop orders through the SHARED place_with_retry wrapper --
     # the same rc-classification + bounded retry + abort-alert Rogue uses (never resizes the
@@ -743,7 +784,8 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     sell_err = None
     # 2026-07-17: a manual TESTFIRE straddle carries a "TF_" comment marker so its real
     # deals are excluded SYMMETRICALLY from the daily total + halt (pnl_source._is_test).
-    _tf = 'TF_' if getattr(self, '_testfire_mode', False) else ''
+    # `_is_tf` was resolved above (before the sweep) from the label / _testfire_mode.
+    _tf = 'TF_' if _is_tf else ''
     if not skip_buy:
         buy_res = _send_stop(
             'BUY', buy_stop, sl_buy, tp_buy,
@@ -789,22 +831,38 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     buy_ok  = (buy_ticket  is not None) if not skip_buy  else True   # treat skipped-by-design as "no problem"
     sell_ok = (sell_ticket is not None) if not skip_sell else True
 
+    # /testfire result capture (TF_ only): the per-leg retcode + ticket for the
+    # PASS/FAIL table surfaced to Discord. Real anchors never touch this attribute.
+    if _is_tf:
+        self._testfire_leg_capture = {
+            'BUY':  {'rc': (getattr(buy_res, 'retcode', None) if buy_res is not None else None),
+                     'ticket': buy_ticket, 'skipped': bool(skip_buy)},
+            'SELL': {'rc': (getattr(sell_res, 'retcode', None) if sell_res is not None else None),
+                     'ticket': sell_ticket, 'skipped': bool(skip_sell)},
+        }
+
     if buy_ok and sell_ok:
         # v3.0.5: this anchor has PLACED -> mark it (gates any further/late
         # attempts; one placement per anchor per day). sched_utc rides along on
         # the shadow pendings so fill/close can print scheduled vs actual times.
-        self._mark_anchor_placed(label)
+        # ISOLATION: a TF_ test anchor is NEVER marked placed — it must never enter
+        # state['processed_anchors_today'] or consume a real anchor slot (Feature 2).
+        if not _is_tf:
+            self._mark_anchor_placed(label)
         try:  # decision-grade review line (one per anchor straddle placement)
             import review_log as _rv
             _rv.get_review_logger(getattr(self, 'cfg', None)).pending(
-                'ANCHOR', 'placed', tag=label, price=float(anchor_price))
+                'ANCHOR', 'placed', tag=label, price=float(anchor_price),
+                test=(1 if _is_tf else None))
         except Exception:
             pass
         sched_iso = anchor_utc.isoformat()
         # v3.2.9: tag the source so a manual TESTFIRE entry is auditable in the
         # journal and distinguishable from a clock-scheduled anchor. Defaults to
-        # 'SCHEDULED' so every existing (scheduled) placement is unchanged.
-        trigger_source = getattr(self, '_trigger_source', 'SCHEDULED')
+        # 'SCHEDULED'. A TF_ label ALWAYS reads TESTFIRE (derived from the label, so
+        # the in-process path — which never sets _trigger_source — is tagged too).
+        trigger_source = ('TESTFIRE' if str(label).startswith('TF_')
+                          else getattr(self, '_trigger_source', 'SCHEDULED'))
         if buy_ticket is not None:
             self.shadow_pendings[buy_ticket] = {
                 'anchor_label': label, 'side': 'BUY',
@@ -812,6 +870,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                 'entry_price': buy_stop,
                 'sched_utc': sched_iso,
                 'trigger_source': trigger_source,
+                'test': bool(_is_tf),
             }
         if sell_ticket is not None:
             self.shadow_pendings[sell_ticket] = {
@@ -820,6 +879,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                 'entry_price': sell_stop,
                 'sched_utc': sched_iso,
                 'trigger_source': trigger_source,
+                'test': bool(_is_tf),
             }
         # Hot polling window
         self._hot_poll_until = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=30)
@@ -923,9 +983,14 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                     'recovery': True,
                     'fill_time': pd.Timestamp.now(tz='UTC').isoformat(),  # v2.3
                     'sched_utc': anchor_utc.isoformat(),  # v3.0.5
+                    'test': bool(_is_tf),
+                    'trigger_source': ('TESTFIRE' if _is_tf else
+                                       getattr(self, '_trigger_source', 'SCHEDULED')),
                 }
             # v3.0.5: an in-flight recovery fill IS this anchor's placement.
-            self._mark_anchor_placed(label)
+            # ISOLATION: a TF_ test anchor is never marked into the real placed set.
+            if not _is_tf:
+                self._mark_anchor_placed(label)
             self.tele.success(
                 f"✅ *{label} recovery {breakout_side} filled @ ${fill_price}*"
             )
@@ -954,7 +1019,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         )
         retry_delay = self.RETRY_BACKOFF_BASE_SEC * (1 + retry_count)  # 15s, then 30s
         next_defer = pd.Timestamp.now(tz='UTC') + pd.Timedelta(seconds=retry_delay)
-        self._deferred_anchor = {
+        _retry_slot = {
             'label': label,
             'anchor_utc': anchor_utc,
             'anchor_price': anchor_price,    # use the *current* anchor
@@ -967,6 +1032,12 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
             'gap_sl_override':  gap_sl_dist if gap_mode else None,
             'gap_re_anchor':    anchor_price if gap_mode else None,
         }
+        # ISOLATION: a TF_ retry re-uses the SEPARATE testfire slot so it can never
+        # occupy the real _deferred_anchor slot (which would delay a real anchor).
+        if _is_tf:
+            self._testfire_deferred = _retry_slot
+        else:
+            self._deferred_anchor = _retry_slot
         err_detail = ""
         if not self.paper and (buy_err or sell_err):
             err_detail = (f"\nBUY  mt5.last\\_error: `{buy_err}`"
