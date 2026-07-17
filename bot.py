@@ -61,7 +61,7 @@ def main():
                                          'testfire', 'testorder', 'verifyfb', 'rescuestats',
                                          'bescratchscan', 'rogueseed', 'fetchseed',
                                          'dailyreport', 'reconcile', 'fetchticks',
-                                         'simulate'])
+                                         'simulate', 'review'])
     parser.add_argument('--i-know-this-is-real', action='store_true',
                         help="testorder: allow running against a non-demo account")
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
@@ -194,6 +194,26 @@ def main():
             except Exception:
                 pass
         sys.exit(code)
+
+    elif args.mode == 'review':
+        # Post/print today's decision-grade session-review digest (fills, closes by
+        # reason, net by engine, locks armed/fired/fallback, rejects) from
+        # logs/review_YYYY-MM-DD.log. No MT5 needed. Also callable from the Discord
+        # /review command via review_log.post_review_digest. See review_log.py.
+        from review_log import post_review_digest
+        try:
+            from telemetry import telemetry_from_env
+            _tele = telemetry_from_env(component="AUREON-review")
+        except Exception:
+            _tele = None
+        text = post_review_digest(cfg, _tele, day=(args.start if args.start else None))
+        print(text)
+        try:
+            if _tele is not None:
+                _tele.stop(timeout=6.0)
+        except Exception:
+            pass
+        sys.exit(0)
 
     elif args.mode == 'verifyfb':
         # Firebase backfill verifier. Read-only by default (lists docs, names

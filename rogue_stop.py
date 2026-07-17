@@ -587,6 +587,12 @@ def _post_anchor_card(trader, source: str, actual_ts: str, anchor: float,
             Severity.INFO, card=card, important=True)
     except Exception as e:
         log.warning(f"rogue_stop: anchor card post failed ({e!r})")
+    try:  # decision-grade review line (one per capture/reload)
+        import review_log as _rv
+        _rv.get_review_logger(getattr(trader, "cfg", None)).anchor(
+            "ROGUE", float(anchor), source, label=label)
+    except Exception:
+        pass
 
 
 def _ensure_daily_anchor(trader, st, now_utc, mgr) -> None:

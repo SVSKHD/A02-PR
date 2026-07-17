@@ -251,6 +251,13 @@ def run_testorder(cfg, adapter=None, *, broker=None, allow_real=False, clock=Non
     ts = now_iso or _now_iso()
     write_ledger_row(ledger_path or _default_ledger_path(cfg), ts, steps)
     _post_card(notifier, steps)
+    # decision-grade review line (flagged TEST)
+    try:
+        import review_log as _rv
+        _rv.get_review_logger(cfg).testrun(
+            "PASS" if all_passed(steps) else "FAIL", sum(s.ok for s in steps), len(steps))
+    except Exception:
+        pass
     return 0 if all_passed(steps) else 1
 
 
