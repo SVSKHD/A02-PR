@@ -88,6 +88,14 @@ def _rescue_event_open(self, ev):
     """Register an in-flight fleet event (called right after the boosts are placed).
     Tracks member tickets so each close can be attributed; finalizes when all
     members have closed. OBSERVER -- caller wraps this in try/except."""
+    # TF_ ISOLATION (Feature 2): a TESTFIRE straddle's rescue/rally boosts DO fire and
+    # manage normally, but their FLEET EVENT is never opened — so it never lands in
+    # rescue_events.csv, the Firestore mirror, or the running CRASH_WIN / WHIPSAW_LOSS
+    # tally. Test events must never pollute the real fleet counters.
+    if str(ev.get("anchor", "")).startswith("TF_"):
+        log.info(f"rescue_event: TF_ test event ({ev.get('anchor')}) — excluded from the "
+                 f"fleet tally / CSV / Firestore (test=1).")
+        return
     members = set(ev.get("members") or [])
     if not members:
         log.warning(f"rescue_event_open {ev.get('event_id')}: no member tickets — skipping")

@@ -118,8 +118,9 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
             try:  # decision-grade review line (each rally / rescue boost fill)
                 import review_log as _rv
                 _eng = 'RALLY' if plan.kind == 'RALLY' else 'RB'
+                _tfb = 1 if str(anchor or '').startswith('TF_') else None
                 _rv.get_review_logger(getattr(self, 'cfg', None)).fill(
-                    _eng, side, float(self.cfg.lot_size), float(b_fp), tag=anchor)
+                    _eng, side, float(self.cfg.lot_size), float(b_fp), tag=anchor, test=_tfb)
             except Exception:
                 pass
             # v3.2.3 BOOST_FIRE telemetry (per placed boost) -- the gapless trace

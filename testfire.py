@@ -229,6 +229,322 @@ def arm_testfire(trader, label='A2', now_utc=None):
     return trader._deferred_anchor
 
 
+# ============================================================================
+# IN-PROCESS TESTFIRE (Discord /testfire) — runs inside the RUNNING live process
+# ----------------------------------------------------------------------------
+# Unlike run_testfire() (a standalone process that OWNS the book and SUPPRESSES
+# the scheduler via _testfire_mode), the in-process path is FULLY ISOLATED from
+# the real anchor schedule:
+#   * the test straddle gets its OWN anchor identity "TF_<HHMMSS>" — never A1..A5,
+#     never a real anchor slot, never in state['processed_anchors_today'];
+#   * it uses a SEPARATE deferred slot (trader._testfire_deferred) so it can never
+#     delay or consume a real scheduled-anchor placement;
+#   * it NEVER sets trader._testfire_mode, so the real scheduler keeps running
+#     completely unaware the test exists.
+# TF-ness is carried by the label prefix (TF_) end-to-end, so anchors, sweep,
+# review-log, journal and the fleet tally all recognise + isolate a test event.
+# ============================================================================
+TESTFIRE_LABEL_PREFIX = "TF_"
+
+
+def is_testfire_label(label) -> bool:
+    """True iff an anchor label is a TESTFIRE test-anchor identity (TF_<...>)."""
+    return str(label or "").startswith(TESTFIRE_LABEL_PREFIX)
+
+
+def make_testfire_label(now_utc) -> str:
+    """The INDIVIDUAL identity for one test straddle: TF_<HHMMSS> (broker-agnostic
+    UTC stamp). Never collides with A1..A5 and never reuses a real anchor slot."""
+    try:
+        stamp = pd.Timestamp(now_utc).strftime("%H%M%S")
+    except Exception:
+        stamp = "000000"
+    return f"{TESTFIRE_LABEL_PREFIX}{stamp}"
+
+
+def _active_real_anchor(trader, now_utc):
+    """The label of a scheduled anchor whose PLACEMENT WINDOW is currently ACTIVE
+    (its time has passed and the late window has not elapsed, and it is not already
+    placed), else None. Mirrors anchors._process_anchor_if_due's `0 <= delta <
+    window_s` eligibility EXACTLY (via the trader's own Monday-shift + datetime
+    resolution) so a test-fire never races a real straddle that is placing THIS
+    minute — while a test at 09:58 (A2 still 2 min in the FUTURE) is allowed, since
+    A2's window is not yet active. Guarded -> None (fail-open on read error; the
+    other rails still gate)."""
+    try:
+        cfg = trader.cfg
+        off = int(getattr(cfg, 'broker_tz_offset_hours', 3))
+        late = getattr(cfg, 'anchor_late_window_min', 0)
+        window_s = max(120.0, late * 60.0)
+        now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
+        broker_date = trader._broker_date(now)
+        processed = set((getattr(trader, 'state', {}) or {}).get('processed_anchors_today', set()) or set())
+        for label, hour, minute in getattr(cfg, 'anchors', []) or []:
+            if label in processed:
+                continue
+            r_hour, r_minute = trader._resolved_anchor_hm(label, broker_date, hour, minute)
+            anchor_utc = trader._anchor_datetime_utc(broker_date, r_hour, off, r_minute)
+            delta = (now - anchor_utc).total_seconds()
+            if 0.0 <= delta < window_s:
+                return label
+    except Exception:
+        return None
+    return None
+
+
+def testfire_preflight_inproc(trader, now_utc=None):
+    """Fail-closed gate for the IN-PROCESS /testfire (concurrent with the live bot).
+    Returns (ok, reason). Reuses the CLI rails EXCEPT flat-book (rail 3) — the live
+    book is NOT expected to be flat (real anchors may be open); isolation, not
+    flatness, keeps the test clean. Applied rails: DEMO-only (1), NO-FP (2),
+    ONE-AT-A-TIME (5), ACTIVE-ANCHOR-WINDOW (a narrower rail 4), ANCHORS-BRAKE (6).
+    The 10-minute rate limit is enforced by the caller."""
+    cfg = trader.cfg
+    now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
+    try:
+        mt5 = trader.adapter.mt5
+    except Exception as e:
+        return False, f"REFUSED: no broker adapter ({e!r}) — fail-closed"
+
+    # Rail 1: DEMO ONLY.
+    try:
+        ai = mt5.account_info()
+    except Exception as e:
+        return False, f"REFUSED: cannot read account_info ({e!r}) — fail-closed"
+    if ai is None:
+        return False, "REFUSED: account_info() is None — cannot confirm DEMO; fail-closed"
+    try:
+        demo = int(getattr(ai, 'trade_mode', -1)) == int(getattr(mt5, 'ACCOUNT_TRADE_MODE_DEMO', 0))
+    except Exception:
+        demo = False
+    if not demo:
+        return False, ("REFUSED [rail 1 DEMO-ONLY]: account trade_mode is NOT "
+                       "ACCOUNT_TRADE_MODE_DEMO. /testfire places REAL orders and runs on "
+                       "the demo terminal only.")
+
+    # Rail 2: refuse any FP/funded profile (even on demo).
+    profile = str(getattr(cfg, 'account_profile', 'STANDARD_5PCT'))
+    if profile != 'STANDARD_5PCT':
+        return False, (f"REFUSED [rail 2 NO-FP]: account_profile={profile} is an FP/funded "
+                       f"profile. /testfire is for the demo (STANDARD_5PCT) only.")
+
+    # Rail 5: one test-fire at a time.
+    if getattr(trader, '_testfire_event_open', False):
+        return False, ("REFUSED [rail 5 ONE-AT-A-TIME]: a prior /testfire is still in "
+                       "flight. Wait for it to resolve (see /testfire status).")
+
+    # Rail 4 (narrowed): refuse only while a real anchor's placement window is ACTIVE
+    # this minute — never for merely being NEAR a future anchor (the test must run
+    # independently; the real anchor still fires on schedule).
+    active = _active_real_anchor(trader, now)
+    if active is not None:
+        return False, (f"REFUSED [rail 4 ACTIVE-WINDOW]: scheduled anchor {active} is in its "
+                       f"placement window right now. /testfire never races a real anchor that "
+                       f"is placing — retry once {active} has placed.")
+
+    # Rail 6 (E-23): obey the ANCHORS daily brake (loss halt / profit lock / account
+    # lock / Friday hold / engine OFF). A test-fire is NEW anchor risk. Fail-closed.
+    try:
+        import daystops as _ds
+        broker_date = trader._broker_date(now)
+        dp = trader._anchors_day_pnl_computed()
+        daystop_blocked = bool(_ds.anchors_daystop(dp, trader.cfg, trader.state)[0])
+        entries_blocked = bool(trader._anchor_entries_blocked(broker_date, now))
+    except Exception as e:
+        return False, (f"REFUSED [rail 6 ANCHORS-BRAKE]: cannot evaluate the anchors daily "
+                       f"brake ({e!r}) — fail-closed.")
+    if daystop_blocked or entries_blocked:
+        return False, ("REFUSED [rail 6 ANCHORS-BRAKE]: anchors entries blocked — daily loss "
+                       "halt / profit lock / account lock (or Friday hold / anchors engine "
+                       "OFF). A test-fire is NEW anchor risk and obeys the same brake.")
+
+    return True, ("CLEARED: demo, STANDARD_5PCT, one-at-a-time, no active anchor window, "
+                  "anchors brake clear — firing an isolated TF_ straddle.")
+
+
+def arm_testfire_inproc(trader, now_utc=None):
+    """Arm ONE isolated test straddle inside the RUNNING process. Drops a deferred
+    anchor onto trader._testfire_deferred (a SEPARATE slot from the real
+    _deferred_anchor) with a TF_<HHMMSS> identity; the live loop's
+    _complete_testfire_anchor places it on the next tick via the SAME
+    _place_orders_for_anchor path (current-mid straddle). Does NOT set
+    _testfire_mode, so the real scheduler is entirely unaffected. Returns the label.
+    NO broker orders are placed here."""
+    now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
+    label = make_testfire_label(now)
+    mid = None
+    try:
+        tk = trader.adapter.mt5.symbol_info_tick(trader.cfg.symbol)
+        if tk is not None:
+            mid = (float(tk.bid) + float(tk.ask)) / 2.0
+    except Exception:
+        mid = None
+    trader._testfire_event_open = True
+    trader._testfire_deferred = {
+        'label': label,
+        'anchor_utc': now,
+        'anchor_price': mid,      # re-taken as current price at placement
+        'defer_until': now,       # fire on the next tick
+        'retry_count': 0,
+        'gap_mode_locked': False,
+        'gap_lot_override': None,
+        'gap_sl_override': None,
+        'gap_re_anchor': None,
+    }
+    # result record (surfaced by /testfire status + the placement/summary cards)
+    try:
+        st = trader.state.setdefault('testfire', {})
+        st.update({'label': label, 'armed_iso': now.isoformat(), 'in_flight': True,
+                   'result': 'ARMED', 'legs': {}})
+    except Exception:
+        pass
+    log.info(f"TESTFIRE (in-process) armed [{label}] @ ~"
+             f"${mid if mid is not None else float('nan'):.2f} — isolated TF_ straddle, "
+             f"scheduler untouched.")
+    return label
+
+
+def _tf_positions_or_pendings_open(trader) -> bool:
+    """True iff any TF_ test order/position (or a pending TF placement) is still live."""
+    try:
+        for coll in (getattr(trader, 'shadow_positions', {}) or {},
+                     getattr(trader, 'shadow_pendings', {}) or {}):
+            for info in coll.values():
+                if is_testfire_label((info or {}).get('anchor_label')):
+                    return True
+        if getattr(trader, '_testfire_deferred', None) is not None:
+            return True
+    except Exception:
+        return True   # fail-safe: if unsure, treat as still open (never re-fire early)
+    return False
+
+
+def record_testfire_placement(trader, label, latency_ms):
+    """Record the /testfire placement outcome (per-leg retcode + ticket + latency) into
+    state['testfire'] and post the PASS/FAIL table to Discord. If NO leg placed, tear the
+    event down immediately (nothing to manage). Guarded — never raises onto the loop."""
+    try:
+        cap = getattr(trader, '_testfire_leg_capture', None) or {}
+        trader._testfire_leg_capture = None
+        legs = {}
+        placed = 0
+        for side in ('BUY', 'SELL'):
+            c = cap.get(side) or {}
+            if c.get('skipped'):
+                legs[side] = {'status': 'SKIPPED', 'rc': c.get('rc'), 'ticket': c.get('ticket')}
+            elif c.get('ticket') is not None:
+                placed += 1
+                legs[side] = {'status': 'PLACED', 'rc': c.get('rc'), 'ticket': c.get('ticket')}
+            else:
+                legs[side] = {'status': 'REJECTED', 'rc': c.get('rc'), 'ticket': None}
+        result = 'PLACED' if placed >= 1 else 'REJECTED'
+        st = trader.state.setdefault('testfire', {})
+        st.update({'label': label, 'result': result, 'legs': legs,
+                   'latency_ms': round(float(latency_ms), 1),
+                   'placed_iso': pd.Timestamp.now(tz='UTC').isoformat()})
+        # PASS/FAIL table (same shape as the CLI verification tables): per-leg row + total.
+        rows = "\n".join(
+            f"  {side:<4} {legs[side]['status']:<8} rc={legs[side]['rc']} "
+            f"ticket={legs[side]['ticket']}" for side in ('BUY', 'SELL'))
+        verdict = "✅ PASS" if placed >= 1 else "❌ FAIL"
+        body = (f"🧪🔥 *TESTFIRE {label}* — {verdict}\n"
+                f"```\n{rows}\n  placement latency: {latency_ms:.0f} ms\n```")
+        try:
+            (trader.tele.success if placed >= 1 else trader.tele.error)(body)
+        except Exception:
+            pass
+        if placed == 0:
+            # nothing resting/open -> the event is finished; release the one-at-a-time latch.
+            st['in_flight'] = False
+            trader._testfire_event_open = False
+        log.info(f"TESTFIRE placement {label}: {result} legs={legs} latency={latency_ms:.0f}ms")
+    except Exception as e:
+        log.warning(f"record_testfire_placement failed (non-fatal): {e!r}")
+
+
+def testfire_maybe_teardown(trader):
+    """Called from the close-detection path: once a /testfire event's LAST TF_ order/
+    position has resolved, release the one-at-a-time latch and post the final summary so
+    the next /testfire may run. No-op unless an event is open and fully resolved. Guarded."""
+    try:
+        if not getattr(trader, '_testfire_event_open', False):
+            return
+        if _tf_positions_or_pendings_open(trader):
+            return
+        trader._testfire_event_open = False
+        st = trader.state.setdefault('testfire', {})
+        st['in_flight'] = False
+        st['result'] = 'RESOLVED'
+        st['resolved_iso'] = pd.Timestamp.now(tz='UTC').isoformat()
+        try:
+            trader.tele.info(f"🧪🔥 *TESTFIRE {st.get('label', '')} resolved* — all test legs "
+                             f"closed; /testfire is clear to run again.")
+        except Exception:
+            pass
+        log.info(f"TESTFIRE event {st.get('label','')} resolved — one-at-a-time latch released.")
+    except Exception as e:
+        log.warning(f"testfire_maybe_teardown failed (non-fatal): {e!r}")
+
+
+def handle_testfire_command(trader, now_utc=None):
+    """Discord /testfire (in-process): rate-limit -> preflight -> arm ONE isolated TF_
+    straddle. The live loop places + manages it; results post as it runs. Guarded."""
+    now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
+    rate_sec = float(getattr(trader.cfg, 'testfire_rate_limit_sec', 600.0))
+    st = (getattr(trader, 'state', {}) or {}).get('testfire', {}) or {}
+    last = st.get('last_run_epoch')
+    if last is not None:
+        try:
+            elapsed = now.timestamp() - float(last)
+            if elapsed < rate_sec:
+                wait = (rate_sec - elapsed) / 60.0
+                trader.tele.warn(f"🧪🔥 /testfire REFUSED [rate-limit]: last run "
+                                 f"{elapsed/60.0:.1f} min ago — one run per "
+                                 f"{rate_sec/60.0:.0f} min. Try again in {wait:.1f} min.")
+                return False
+        except Exception:
+            pass
+    ok, reason = testfire_preflight_inproc(trader, now)
+    if not ok:
+        try:
+            trader.tele.error(f"🧪🔥 /testfire {reason}")
+        except Exception:
+            pass
+        return False
+    trader.state.setdefault('testfire', {})['last_run_epoch'] = now.timestamp()
+    label = arm_testfire_inproc(trader, now)
+    try:
+        trader.tele.warn(
+            f"🧪🔥 *TESTFIRE armed* [{label}] — placing ONE isolated straddle at current "
+            f"mid (+/-${getattr(trader.cfg, 'trigger_dist', 5.0):.0f}, $"
+            f"{getattr(trader.cfg, 'sl_dist', 18.0):.0f} SL / ${getattr(trader.cfg, 'tp_dist', 30.0):.0f} "
+            f"TP, No-OCO). Real anchor schedule is UNAFFECTED; results post as it runs "
+            f"(/testfire status).")
+    except Exception:
+        pass
+    return True
+
+
+def handle_testfire_status(trader):
+    """Discord /testfire status: last run time, result, whether one is in flight. Guarded."""
+    try:
+        st = (getattr(trader, 'state', {}) or {}).get('testfire', {}) or {}
+        if not st:
+            trader.tele.info("🧪🔥 /testfire status: no test-fire has run this session.")
+            return
+        inflight = "YES" if (st.get('in_flight') or getattr(trader, '_testfire_event_open', False)) else "no"
+        legs = st.get('legs') or {}
+        legs_txt = ", ".join(f"{s}:{(legs.get(s) or {}).get('status','?')}" for s in ('BUY', 'SELL')) or "—"
+        when = st.get('placed_iso') or st.get('armed_iso') or "—"
+        trader.tele.info(
+            f"🧪🔥 *TESTFIRE status*\n"
+            f"  last: {st.get('label','—')} @ {when}\n"
+            f"  result: {st.get('result','—')}  ({legs_txt})\n"
+            f"  in flight: {inflight}")
+    except Exception as e:
+        log.warning(f"handle_testfire_status failed (non-fatal): {e!r}")
+
+
 def _prime_anchors_daypnl(trader):
     """E-23: rebuild the anchors realized day P&L from broker deal history BEFORE the
     preflight so rail 6 evaluates the anchors daily brake against the day's real number.

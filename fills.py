@@ -353,10 +353,11 @@ def _reconcile_with_broker(self):
             }
             try:  # decision-grade review line (one per anchor-leg fill)
                 import review_log as _rv
+                _tf1 = 1 if (info.get('test') or str(info.get('anchor_label', '')).startswith('TF_')) else None
                 _rv.get_review_logger(getattr(self, 'cfg', None)).fill(
                     'ANCHOR', info['side'],
                     float(getattr(broker_p, 'volume', 0.0) or 0.0),
-                    float(broker_p.price_open), tag=info['anchor_label'])
+                    float(broker_p.price_open), tag=info['anchor_label'], test=_tf1)
             except Exception:
                 pass
             # v3.3.0 FILL + PREDICT telemetry (spec 1.1/1.4): log the realized fill
@@ -525,11 +526,12 @@ def _reconcile_with_broker(self):
                     import review_log as _rv
                     _eng = ('RALLY' if shadow.get('boost_kind') == 'RALLY'
                             else 'RB' if shadow.get('boost') else 'ANCHOR')
+                    _tfc = 1 if (shadow.get('test') or str(shadow.get('anchor_label', '')).startswith('TF_')) else None
                     _rv.get_review_logger(getattr(self, 'cfg', None)).close(
                         _eng, shadow.get('side'),
                         float(getattr(close_deal, 'volume', 0.0) or 0.0),
                         close_price, reason=outcome, pnl=pnl_usd,
-                        tag=shadow.get('anchor_label'))
+                        tag=shadow.get('anchor_label'), test=_tfc)
                 except Exception:
                     pass
                 # Append to today's trade log
@@ -598,6 +600,14 @@ def _reconcile_with_broker(self):
                             f"history yet -- alerted degraded")
         except Exception as e:
             self.tele.warn(f"Could not fetch close deal for {ticket}: {e}")
+
+    # /testfire teardown: once the last TF_ test leg has resolved, release the
+    # one-at-a-time latch + post the final summary (no-op unless a test event is open).
+    try:
+        import testfire as _tf
+        _tf.testfire_maybe_teardown(self)
+    except Exception:
+        pass
 
 
 # ============================================================================
