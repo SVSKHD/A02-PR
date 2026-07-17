@@ -351,6 +351,14 @@ def _reconcile_with_broker(self):
                 'boost_fired':    False,
                 'sibling_ticket': info.get('sibling_ticket'),
             }
+            try:  # decision-grade review line (one per anchor-leg fill)
+                import review_log as _rv
+                _rv.get_review_logger(getattr(self, 'cfg', None)).fill(
+                    'ANCHOR', info['side'],
+                    float(getattr(broker_p, 'volume', 0.0) or 0.0),
+                    float(broker_p.price_open), tag=info['anchor_label'])
+            except Exception:
+                pass
             # v3.3.0 FILL + PREDICT telemetry (spec 1.1/1.4): log the realized fill
             # and the full exit-door prediction up front, so a grep on the ticket
             # reconstructs the position from its first instant. Never blocks a fill.
@@ -513,6 +521,17 @@ def _reconcile_with_broker(self):
                                        nh_shadow=(nh_txt.strip() or None)),
                     event_key=f"close:{ticket}",
                 )
+                try:  # decision-grade review line (one per close, ALL exit reasons)
+                    import review_log as _rv
+                    _eng = ('RALLY' if shadow.get('boost_kind') == 'RALLY'
+                            else 'RB' if shadow.get('boost') else 'ANCHOR')
+                    _rv.get_review_logger(getattr(self, 'cfg', None)).close(
+                        _eng, shadow.get('side'),
+                        float(getattr(close_deal, 'volume', 0.0) or 0.0),
+                        close_price, reason=outcome, pnl=pnl_usd,
+                        tag=shadow.get('anchor_label'))
+                except Exception:
+                    pass
                 # Append to today's trade log
                 with open(self.daylog_path, "a", newline="", encoding='utf-8') as f:
                     csv.writer(f).writerow([
@@ -568,6 +587,13 @@ def _reconcile_with_broker(self):
                                        day_total=self.state.get('daily_pnl')),
                     event_key=f"close:{ticket}",
                 )
+                try:  # decision-grade review line (degraded close: no deal yet)
+                    import review_log as _rv
+                    _rv.get_review_logger(getattr(self, 'cfg', None)).close(
+                        'ANCHOR', shadow.get('side'), 0.0, None,
+                        reason='CLOSED', pnl=None, tag=shadow.get('anchor_label'))
+                except Exception:
+                    pass
                 log.warning(f"close detected for {ticket} but no close deal in "
                             f"history yet -- alerted degraded")
         except Exception as e:

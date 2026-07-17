@@ -295,17 +295,36 @@ class Telemetry:
     def critical(self, msg, **tags): self.send(msg, Severity.CRITICAL, tags)
 
     def stop(self, timeout: float = 5.0):
-        """Drain queue and stop worker."""
+        """Drain queue and stop worker. IDEMPOTENT + interrupt-tolerant: a Ctrl+C
+        during the worker join must not raise a traceback out of shutdown (the
+        testfire Ctrl+C crash). A SECOND Ctrl+C forces an immediate return."""
+        if getattr(self, "_stopped", False):
+            return                       # idempotent: safe to call twice
+        self._stopped = True
         self._stop_event.set()
-        self._worker.join(timeout=timeout)
-        # Drain any remaining
-        while not self._queue.empty():
+        try:
+            self._worker.join(timeout=timeout)
+        except KeyboardInterrupt:
+            # first Ctrl+C during join -> try one more brief, interruptible join;
+            # a second Ctrl+C propagates only after we've released resources.
             try:
-                self._deliver(self._queue.get_nowait())
-            except Exception:
+                self._worker.join(timeout=0.5)
+            except KeyboardInterrupt:
                 pass
-        if self._fh:
-            self._fh.close()
+        # Drain any remaining (guarded; never raises on interrupt)
+        try:
+            while not self._queue.empty():
+                try:
+                    self._deliver(self._queue.get_nowait())
+                except Exception:
+                    pass
+        except KeyboardInterrupt:
+            pass
+        try:
+            if self._fh:
+                self._fh.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------------
     # Worker

@@ -202,6 +202,13 @@ class RescueBoostManager:
                 self.log.info(
                     f"rescue_boost: placed {b.comment} {b.side} {b.lot} @ {b.price} "
                     f"SL {b.sl} (parent {ticket} {p.side} @ {p.entry})")
+                try:  # decision-grade review line (RB v2 boost pending placed)
+                    import review_log as _rv
+                    _rv.get_review_logger().pending(
+                        'RB', 'placed', tag=b.comment, level=b.idx,
+                        price=float(b.price))
+                except Exception:
+                    pass
             have.add(ticket)
         return placed
 
@@ -244,6 +251,12 @@ class RescueBoostManager:
                     self.log.info(
                         f"rescue_boost: cancelled orphan {getattr(o,'comment','')} "
                         f"ticket={o.ticket} (parent {parent} closed)")
+                    try:  # decision-grade review line (RB v2 orphan cancelled)
+                        import review_log as _rv
+                        _rv.get_review_logger().pending(
+                            'RB', 'cancelled', tag=getattr(o, 'comment', ''))
+                    except Exception:
+                        pass
         return cancelled
 
     # -- one step ---------------------------------------------------------------

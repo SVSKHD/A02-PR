@@ -382,11 +382,17 @@ class PositionTracer:
         side = record.get("side")
         hist = self._history.get(ticket, [])
 
-        # (1) An EXIT via trail/stop-through/lock with NO preceding TRAIL_ADVANCE.
+        # (1) An EXIT via trail/stop-through/lock with NO preceding stop advance.
+        # 2026-07-17 fix: a LOCK_ARM (a lock rung engaging) IS a protective-stop
+        # advance — a lock-rung exit (journal SL_lock_N, exit_type TRAIL) that armed
+        # its rung must NOT false-flag exit_trail_without_trail_advance. A genuine
+        # violation (a trail/lock exit with NEITHER a TRAIL_ADVANCE nor a LOCK_ARM)
+        # still fires.
         if et == EXIT:
             xt = str(record.get("exit_type", "")).upper()
             if any(t in xt for t in TRAIL_EXIT_TYPES) or xt.startswith("SL_LOCK"):
-                if not self._events_for(ticket, TRAIL_ADVANCE):
+                if not (self._events_for(ticket, TRAIL_ADVANCE)
+                        or self._events_for(ticket, LOCK_ARM)):
                     self.violation(ticket, anchor,
                                    "exit_trail_without_trail_advance",
                                    exit_type=record.get("exit_type"))

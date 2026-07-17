@@ -94,8 +94,9 @@ class ReviewLogger:
         self._emit("PENDING", _kv(engine=engine, action=action, tag=tag,
                                   level=level, price=price))
 
-    def anchor(self, engine: str, price: float, source: str, label=None) -> None:
-        self._emit("ANCHOR", _kv(engine=engine, price=price, source=source, label=label))
+    def anchor(self, engine: str, price: float, source: str, label=None, impl=None) -> None:
+        self._emit("ANCHOR", _kv(engine=engine, price=price, source=source,
+                                 label=label, impl=impl))
 
     def governor(self, engine: str, event: str, detail=None) -> None:
         # event: loss_stop / profit_lock / cap / halt / resume

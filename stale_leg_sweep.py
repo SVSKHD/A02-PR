@@ -310,6 +310,14 @@ def sweep_stale_legs(mt5, symbol: str, current_anchor: float,
             "cancelled": ok,
             "reason": SWEEP_REASON,
         })
+        if ok:
+            try:  # decision-grade review line (stale anchor leg swept)
+                import review_log as _rv
+                _rv.get_review_logger().pending(
+                    'ANCHOR', 'swept', tag=f"origin_{origin}",
+                    price=(float(current_anchor) if current_anchor is not None else None))
+            except Exception:
+                pass
     return results
 
 

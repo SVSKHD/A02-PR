@@ -25,6 +25,21 @@ ROGUE_MAGIC = 20260626          # distinct from the anchor magic (20260522) + wa
 ROGUE_LABEL = "ROGUE"
 ROGUE_LEG_TYPE = "rogue"
 ROGUE_ALERT_PREFIX = "[ROGUE]"
+
+
+def rogue_impl(cfg) -> str:
+    """The SINGLE source of truth for which Rogue implementation `drive()` runs, from
+    config alone (config wins on every tick / new-day boot; nothing persisted can
+    silently revert it). 'stop' -> the resting pending-stop engine (rogue_stop);
+    'band' -> the A1-anchored confirm-band engine; 'legacy' -> monster detection.
+    2026-07-17: a live day ran 'band' with 174 BAND_NOT_HELD rejects despite the flag
+    — this makes the choice explicit (boot banner + review event) so a silent revert
+    can never go unnoticed again, and mirrors drive()'s dispatch order exactly."""
+    if bool(getattr(cfg, 'rogue_stop_mode', False)):
+        return 'stop'
+    if bool(getattr(cfg, 'rogue_a1_anchor_mode', False)):
+        return 'band'
+    return 'legacy'
 ROGUE_GLYPH = "🦏"               # chart glyph distinct from the anchor glyphs
 
 
@@ -341,6 +356,22 @@ def promote_on_boot(trader):
             trader.cfg.rogue_enabled = bool(explicit)
             log.info(f"{ROGUE_ALERT_PREFIX} demo account -> rogue {'ON' if explicit else 'OFF'} "
                      f"(explicit config override; promotion skipped).")
+        # 2026-07-17 hardening: make the running implementation EXPLICIT at boot so a
+        # silent band-mode revert (174 BAND_NOT_HELD rejects that live day) can never go
+        # unnoticed. Config wins on every boot; the persisted value is audit-only.
+        impl = rogue_impl(trader.cfg)
+        log.info(f"{ROGUE_ALERT_PREFIX} ROGUE IMPL: {impl} "
+                 f"(rogue_stop_mode={bool(getattr(trader.cfg, 'rogue_stop_mode', False))}, "
+                 f"rogue_a1_anchor_mode={bool(getattr(trader.cfg, 'rogue_a1_anchor_mode', False))})")
+        try:
+            trader.state['rogue_impl'] = impl
+        except Exception:
+            pass
+        try:
+            import review_log as _rv
+            _rv.get_review_logger(trader.cfg).governor('ROGUE', 'engine_impl', detail=impl)
+        except Exception:
+            pass
         return bool(trader.cfg.rogue_enabled)
     except Exception as e:
         log.warning(f"{ROGUE_ALERT_PREFIX} promote_on_boot non-fatal: {e!r}")
@@ -1279,6 +1310,13 @@ def _mark_rogue_open(trader, st, entry_px, sl, tk, rc):
         trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} ENTER {side} @ {entry_px} "
                          f"SL {sl} (slot {st['gov']['reanchor_count']}/"
                          f"{int(getattr(trader.cfg, 'rogue_max_reentries_per_day', 10))}) rc={rc}")
+    except Exception:
+        pass
+    try:  # decision-grade review line (one per rogue detection-mode fill)
+        import review_log as _rv
+        _rv.get_review_logger(getattr(trader, 'cfg', None)).fill(
+            'ROGUE', side, float(getattr(trader.cfg, 'rogue_lot', getattr(trader.cfg, 'lot_size', 0.0)) or 0.0),
+            float(entry_px), tag=ROGUE_LABEL)
     except Exception:
         pass
     _persist_state(trader)

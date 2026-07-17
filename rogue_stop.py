@@ -237,6 +237,15 @@ class RogueStopManager:
             n_f = self.broker.flatten_own()
             self.log.info(f"rogue_stop: LOSS STOP (day_pnl {self.gov.get('day_pnl')}) "
                           f"— cancelled {n_p} pendings, flattened {n_f} positions (own magic)")
+            if not getattr(self, '_loss_halt_logged', False):
+                self._loss_halt_logged = True
+                try:  # decision-grade review line (rogue loss-stop halt engaged, once)
+                    import review_log as _rv
+                    _rv.get_review_logger(getattr(self, 'cfg', None)).governor(
+                        'ROGUE', 'loss_stop',
+                        detail=f"day_pnl={float(self.gov.get('day_pnl', 0.0)):.2f}")
+                except Exception:
+                    pass
             return True
         return False
 
@@ -296,6 +305,13 @@ class RogueStopManager:
                     pass
             self.log.info(f"rogue_stop: FILL {p.comment} {p.side} @ {p.entry} "
                           f"(slot {self.gov.get('reanchor_count')})")
+            try:  # decision-grade review line (one per rogue stop-mode fill)
+                import review_log as _rv
+                _rv.get_review_logger(getattr(self, 'cfg', None)).fill(
+                    'ROGUE', p.side, float(self.p.lot), float(p.entry),
+                    tag=parse_rgs(p.comment) or p.comment)
+            except Exception:
+                pass
             if tag == "A1":
                 # OCO: cancel the resting sibling (opposite side, same session's A1)
                 for o in pendings:
@@ -315,12 +331,25 @@ class RogueStopManager:
         ok, why = self._can_place()
         if not ok:
             self.log.info(f"rogue_stop: chain not placed ({why}) — governor gate")
+            try:  # decision-grade review line (governor blocked a chain stop)
+                import review_log as _rv
+                _rv.get_review_logger(getattr(self, 'cfg', None)).governor(
+                    'ROGUE', 'block', detail=f"chain:{why}")
+            except Exception:
+                pass
             return
         self.chain_idx += 1
         c = chain_next(fill_price, direction, self.chain_idx, self.p, self.session)
         tk = self.broker.place_stop(c.side, c.price, c.sl, c.comment)
         self.log.info(f"rogue_stop: CHAIN {c.comment} {c.side} stop @ {c.price} "
                       f"SL {c.sl} (beyond fill {fill_price})")
+        try:  # decision-grade review line (rogue chain stop placed)
+            import review_log as _rv
+            _rv.get_review_logger(getattr(self, 'cfg', None)).pending(
+                'ROGUE', 'placed', tag=parse_rgs(c.comment) or c.comment,
+                level=self.chain_idx, price=float(c.price))
+        except Exception:
+            pass
         if self.on_chain:
             try:
                 self.on_chain(c, fill_price)   # card from the ACTUAL placed order
@@ -362,6 +391,15 @@ class RogueStopManager:
             self.reseed_after = now + self.p.cooldown_sec
             self.log.info(f"rogue_stop: CLOSE {info['comment']} pnl {pnl:+.2f} "
                           f"(cooldown {self.p.cooldown_sec:.0f}s before re-seed)")
+            try:  # decision-grade review line (one per rogue stop-mode close)
+                import review_log as _rv
+                _xp = float(deal.get("exit_price")) if deal and deal.get("exit_price") is not None else None
+                _rv.get_review_logger(getattr(self, 'cfg', None)).close(
+                    'ROGUE', info.get('side'), float(self.p.lot), _xp,
+                    reason=('SL' if pnl <= 0 else 'TRAIL'), pnl=pnl,
+                    tag=parse_rgs(info.get('comment')) or info.get('comment'))
+            except Exception:
+                pass
 
     # -- seed / re-seed ---------------------------------------------------------
     def _seed_or_reseed(self, price: float, now: float) -> None:
@@ -409,6 +447,12 @@ class RogueStopManager:
             self.broker.place_stop(s.side, s.price, s.sl, s.comment)
         self.log.info(f"rogue_stop: OCO seeded @ {anchor:.2f} "
                       f"(buy {anchor + self.p.trigger:.2f} / sell {anchor - self.p.trigger:.2f})")
+        try:  # decision-grade review line (rogue OCO seed / re-seed placed)
+            import review_log as _rv
+            _rv.get_review_logger(getattr(self, 'cfg', None)).pending(
+                'ROGUE', kind, tag='OCO', price=float(anchor))
+        except Exception:
+            pass
         cb = self.on_reseed if kind == "reseed" else self.on_seed
         if cb:
             try:
@@ -587,10 +631,10 @@ def _post_anchor_card(trader, source: str, actual_ts: str, anchor: float,
             Severity.INFO, card=card, important=True)
     except Exception as e:
         log.warning(f"rogue_stop: anchor card post failed ({e!r})")
-    try:  # decision-grade review line (one per capture/reload)
-        import review_log as _rv
+    try:  # decision-grade review line (one per capture/reload), carrying the impl
+        import review_log as _rv, rogue as _r
         _rv.get_review_logger(getattr(trader, "cfg", None)).anchor(
-            "ROGUE", float(anchor), source, label=label)
+            "ROGUE", float(anchor), source, label=label, impl=_r.rogue_impl(trader.cfg))
     except Exception:
         pass
 

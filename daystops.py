@@ -219,7 +219,9 @@ def rebuild_anchors_day_pnl(trader, dt_from=None, dt_to=None):
         import pnl_source as _ps
         # SINGLE SOURCE OF TRUTH: anchors realized day P&L via pnl_source.magic_day_net
         # (the SAME function the report / reconcile / rogue+fetcher rebuilds use, by magic).
-        day_pnl = _ps.magic_day_net(deals, ANCHORS_MAGIC)
+        # exclude_test: the TESTFIRE preflight priming rebuild must apply the SAME symmetric
+        # test-trade filter as computed_anchors_day_pnl (2026-07-17 one-sided-total fix).
+        day_pnl = _ps.magic_day_net(deals, ANCHORS_MAGIC, exclude_test=True)
         n_out = sum(1 for d in deals if int(getattr(d, 'magic', 0) or 0) == ANCHORS_MAGIC
                     and getattr(d, 'entry', None) == 1)
         log.info(f"{ANCHORS_ALERT_PREFIX} day P&L rebuilt from history: ${day_pnl:+.2f} "
@@ -275,7 +277,9 @@ def computed_anchors_day_pnl(trader, deals=None):
         if deals is None:
             deals = _ps.fetch_day_deals(trader)
         if deals is not None:
-            computed = _ps.magic_day_net(deals, ANCHORS_MAGIC)
+            # exclude_test: TESTFIRE (TF_ marker) trades are symmetrically off BOTH the
+            # displayed daily total and this halt-decision value (2026-07-17 fix).
+            computed = _ps.magic_day_net(deals, ANCHORS_MAGIC, exclude_test=True)
     except Exception as e:
         log.warning(f"{ANCHORS_ALERT_PREFIX} computed day-pnl read failed: {e!r}")
         computed = None
