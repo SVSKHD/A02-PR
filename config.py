@@ -287,6 +287,10 @@ class Config:
     rogue_anchor_grace_min: float = 10.0         # capture within this many min of the
     # scheduled 02:30 = SCHEDULED; a first boot later than this with no stored anchor
     # = LATE-CAPTURE. The daily anchor is captured ONCE and RELOADED on restart.
+    # Three-session mode (IST S1 05:00–12:30 / S2 12:30–19:10 / S3 19:30–23:00, S3
+    # skipped Fridays). Each session captures its own anchor + OCO; open positions
+    # carry across boundaries; governors stay DAILY. DEFAULT OFF (single daily anchor).
+    rogue_sessions_enabled: bool = False
     rogue_entry_confirm_redesign: float = 5.0  # $ off the anchor to ENTER in the move dir
     rogue_reversal_dollars: float = 10.0        # $ PAST entry against the trade = reversal
     rogue_daily_soft_lock: float = 30.0         # soft banked floor ($) -- NEVER a hard stop
