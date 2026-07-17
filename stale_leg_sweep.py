@@ -328,12 +328,12 @@ _ROGUE_STOP_RE = re.compile(r"RGS:(?:S\d:)?(?:A1|C\d+)")
 
 def _is_rescue_boost_comment(comment) -> bool:
     """True for an order the sweep must never touch — a rescue-boost recovery leg
-    ("RB1:<ticket>"/"RB2:<ticket>") or a Rogue stop-mode order ("RGS:A1"/"RGS:C<n>").
-    Both are their engine's own live orders, never a stale straddle leg."""
+    ("RB1:<ticket>"/"RB2:<ticket>"), a Rogue stop-mode order ("RGS:A1"/"RGS:C<n>"),
+    or a TESTORDER order-path-verification order. None is ever a stale straddle leg."""
     if not comment:
         return False
     c = str(comment)
-    return bool(_RESCUE_BOOST_RE.search(c) or _ROGUE_STOP_RE.search(c))
+    return bool(_RESCUE_BOOST_RE.search(c) or _ROGUE_STOP_RE.search(c) or "TESTORDER" in c)
 
 
 # --- LiveTrader binding (hooked in live_trader.py) --------------------------------
