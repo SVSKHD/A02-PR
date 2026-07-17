@@ -186,7 +186,8 @@ class RogueStopManager:
     """
 
     def __init__(self, broker, params: RogueStopParams, gov: dict, cfg,
-                 anchor_provider, logger=None):
+                 anchor_provider, logger=None,
+                 on_seed=None, on_chain=None, on_reseed=None, on_first_fill=None):
         self.broker = broker
         self.p = params
         self.gov = gov
@@ -198,6 +199,12 @@ class RogueStopManager:
         self.traded = False            # a fill has happened this session
         self._peaks: Dict[int, float] = {}
         self._tracked: Dict[int, dict] = {}
+        # Optional card / persistence hooks (default None -> no-op). Prices passed to
+        # these are the ACTUAL placed StopOrder values, never recomputed downstream.
+        self.on_seed = on_seed          # (anchor, [StopOrder], kind) on initial OCO
+        self.on_chain = on_chain        # (StopOrder, fill_price) on each chain stop
+        self.on_reseed = on_reseed      # (anchor, [StopOrder]) on a re-seed OCO
+        self.on_first_fill = on_first_fill  # () when the FIRST fill of the day lands
 
     # -- governor ---------------------------------------------------------------
     def _can_place(self) -> Tuple[bool, str]:
@@ -244,8 +251,14 @@ class RogueStopManager:
                 continue
             self._tracked[tk] = {"side": p.side, "entry": p.entry, "comment": p.comment}
             self._peaks[tk] = p.entry
+            was_flat = not self.traded
             self.traded = True
             self._consume_slot()   # every FILL counts toward the 10-entry budget
+            if was_flat and self.on_first_fill:
+                try:
+                    self.on_first_fill()   # persist "daily OCO consumed today"
+                except Exception:
+                    pass
             self.log.info(f"rogue_stop: FILL {p.comment} {p.side} @ {p.entry} "
                           f"(slot {self.gov.get('reanchor_count')})")
             if tag == "A1":
@@ -272,6 +285,11 @@ class RogueStopManager:
         tk = self.broker.place_stop(c.side, c.price, c.sl, c.comment)
         self.log.info(f"rogue_stop: CHAIN {c.comment} {c.side} stop @ {c.price} "
                       f"SL {c.sl} (beyond fill {fill_price})")
+        if self.on_chain:
+            try:
+                self.on_chain(c, fill_price)   # card from the ACTUAL placed order
+            except Exception:
+                pass
 
     # -- trailing ---------------------------------------------------------------
     def _trail(self, price: float) -> None:
@@ -322,15 +340,19 @@ class RogueStopManager:
         if oco_resting:
             return  # OCO already armed and waiting for the first fill
         if not self.traded:
-            # FIRST seed of the session — anchor = A1 snapshot, no slot consumed
+            # FIRST seed of the session — anchor = the fixed DAILY anchor (never a
+            # re-snapshot), no slot consumed. Reconcile-safe: only reached when flat,
+            # no OCO resting, and the day's OCO has not been consumed by a fill.
             anchor = self.anchor_provider()
             if anchor is None:
                 return
-            self._place_oco(anchor)
+            self._place_oco(anchor, kind="seed")
             return
         # RE-SEED after a close: gated by cooldown + governor, anchor = current price,
-        # and it consumes a slot (re-seeds count toward the budget).
-        if now < self.reseed_after:
+        # and it consumes a slot (re-seeds count toward the budget). reseed_after is set
+        # ONLY by an observed close this run, so a bare restart (traded reloaded True,
+        # reseed_after 0) never spuriously re-seeds — reconcile leaves the day untouched.
+        if self.reseed_after <= 0.0 or now < self.reseed_after:
             return
         ok, why = self._can_place()
         if not ok:
@@ -340,13 +362,20 @@ class RogueStopManager:
         self.chain_idx = 0
         self.log.info(f"rogue_stop: RE-SEED at {price:.2f} "
                       f"(slot {self.gov.get('reanchor_count')})")
-        self._place_oco(round(float(price), 2))
+        self._place_oco(round(float(price), 2), kind="reseed")
 
-    def _place_oco(self, anchor: float) -> None:
-        for s in oco_plan(anchor, self.p):
+    def _place_oco(self, anchor: float, kind: str = "seed") -> None:
+        orders = oco_plan(anchor, self.p)
+        for s in orders:
             self.broker.place_stop(s.side, s.price, s.sl, s.comment)
         self.log.info(f"rogue_stop: OCO seeded @ {anchor:.2f} "
                       f"(buy {anchor + self.p.trigger:.2f} / sell {anchor - self.p.trigger:.2f})")
+        cb = self.on_reseed if kind == "reseed" else self.on_seed
+        if cb:
+            try:
+                cb(anchor, orders) if kind == "reseed" else cb(anchor, orders, kind)
+            except Exception:
+                pass
 
 
 # --- live MT5 shim + driver -------------------------------------------------------
@@ -444,35 +473,210 @@ class _StopBroker:
         return n
 
 
+# --- INDEPENDENT DAILY ROGUE ANCHOR (Commit 1) ------------------------------------
+ROGUE_ANCHOR_LABEL = "ROGUE_02h_Asia"
+
+
+def rogue_scheduled_utc(cfg, broker_date):
+    """The UTC instant of Rogue's OWN daily anchor. Rogue reuses A1's schedule
+    (server 02:30, Monday cushion -> 03:30) but captures INDEPENDENTLY — it never
+    reads the anchor engine's A1 object, and works with the anchors engine disabled.
+    `broker_date` is a `datetime.date` (has weekday()). Returns a pandas UTC Timestamp."""
+    import anchors as _a
+    import pandas as pd
+    label, h, m = cfg.anchors[0]           # ("A1_02h_Asia", 2, 30)
+    rh, rm = _a.resolved_anchor_hm(label, broker_date, h, m, cfg)   # Monday -> 03:30
+    off = int(getattr(cfg, "broker_tz_offset_hours", 3))
+    broker_local = pd.Timestamp(year=broker_date.year, month=broker_date.month,
+                                day=broker_date.day, hour=int(rh), minute=int(rm), tz="UTC")
+    return broker_local - pd.Timedelta(hours=off)   # broker-local -> real UTC
+
+
+# anchor-capture decision outcomes
+RELOAD = "RELOADED"
+CAPTURE_SCHEDULED = "SCHEDULED"
+CAPTURE_LATE = "LATE-CAPTURE"
+WAIT = "WAIT"
+
+
+def anchor_decision(now_utc, sched_utc, has_stored_today: bool,
+                    grace_min: float = 10.0) -> str:
+    """PURE: what to do this tick for the daily anchor.
+      - a stored anchor for today exists -> RELOAD (never re-snapshot);
+      - before the scheduled time and nothing stored -> WAIT;
+      - at/just after the schedule (within grace) -> CAPTURE_SCHEDULED;
+      - well past the schedule with nothing stored (a late first boot) -> CAPTURE_LATE.
+    """
+    if has_stored_today:
+        return RELOAD
+    if now_utc < sched_utc:
+        return WAIT
+    late = (now_utc - sched_utc).total_seconds() > float(grace_min) * 60.0
+    return CAPTURE_LATE if late else CAPTURE_SCHEDULED
+
+
+def _capture_price(trader, sched_utc, scheduled: bool):
+    """Capture the anchor price. SCHEDULED -> the M5 close ending at the scheduled
+    time (with the shared tick-fallback); LATE -> a sane settled current tick. Returns
+    a float or None. Reuses the SAME capture discipline A1 uses."""
+    import rogue as _r
+    try:
+        if scheduled:
+            px = trader.adapter.get_m5_close(trader.cfg.symbol, sched_utc)
+            if px is not None:
+                return round(float(px), 2)
+        # late boot (or the M5 bar is missing): settle a sane current tick
+        return _r.seed_tick_price(trader)
+    except Exception as e:
+        log.warning(f"rogue_stop: anchor capture failed ({e!r})")
+        return None
+
+
+def _post_anchor_card(trader, source: str, actual_ts: str, anchor: float,
+                      params: RogueStopParams) -> None:
+    """Post the Rogue daily-anchor Discord card. Level prices come from oco_plan (the
+    exact StopOrder values that WILL be placed) — never recomputed in the card layer."""
+    try:
+        import discord_cards as _dc
+        plan = {o.side: o for o in oco_plan(anchor, params)}
+        card = _dc.card_rogue_anchor(
+            ROGUE_ANCHOR_LABEL, source, actual_ts, anchor, params, plan["BUY"], plan["SELL"])
+        from telemetry import Severity
+        trader.tele.send(
+            f"🗡️ {ROGUE_ANCHOR_LABEL} anchor ${anchor:.2f} ({source})",
+            Severity.INFO, card=card, important=True)
+    except Exception as e:
+        log.warning(f"rogue_stop: anchor card post failed ({e!r})")
+
+
+def _ensure_daily_anchor(trader, st, now_utc, mgr) -> None:
+    """Establish/reload the FIXED daily Rogue anchor and hand it to the manager. This
+    is the fix for the 2026-07-16/17 restart re-snapshot: the anchor is captured ONCE
+    on schedule, persisted, and RELOADED on every restart — never re-snapshotted."""
+    import rogue as _r
+    cfg = trader.cfg
+    params = mgr.p
+    try:
+        broker_date = trader._broker_date(now_utc)
+    except Exception:
+        broker_date = now_utc.date()
+    date_str = str(broker_date)
+    stored = st.get("rogue_daily")
+    has_today = bool(stored and stored.get("date") == date_str)
+    sched = rogue_scheduled_utc(cfg, broker_date)
+    grace = float(getattr(cfg, "rogue_anchor_grace_min", 10.0))
+    decision = anchor_decision(now_utc, sched, has_today, grace)
+
+    if decision == WAIT:
+        mgr._daily_anchor = None
+        return
+    if decision == RELOAD:
+        mgr._daily_anchor = float(stored["anchor"])
+        mgr.traded = bool(stored.get("oco_consumed", False))   # consumed -> don't re-place OCO
+        if not st.get("_rogue_anchor_announced"):
+            st["_rogue_anchor_announced"] = True
+            log.info(f"ROGUE ANCHOR RELOADED @ {stored['anchor']} "
+                     f"(captured {stored.get('ts')}, source {stored.get('source')})")
+            _post_anchor_card(trader, RELOAD, str(stored.get("ts")),
+                              float(stored["anchor"]), params)
+        return
+
+    # CAPTURE (scheduled or late)
+    scheduled = decision == CAPTURE_SCHEDULED
+    px = _capture_price(trader, sched, scheduled)
+    if px is None:
+        mgr._daily_anchor = None
+        return
+    ts = now_utc.isoformat()
+    st["rogue_daily"] = {"date": date_str, "anchor": float(px), "ts": ts,
+                         "source": decision, "oco_consumed": False}
+    st["_rogue_anchor_announced"] = True
+    mgr._daily_anchor = float(px)
+    mgr.traded = False
+    if decision == CAPTURE_LATE:
+        log.warning(f"ROGUE ANCHOR LATE-CAPTURE @ {px} (first boot after "
+                    f"{sched.strftime('%H:%M')} UTC with no stored anchor)")
+    else:
+        log.info(f"ROGUE ANCHOR SCHEDULED @ {px} (captured {ts})")
+    _post_anchor_card(trader, decision, ts, float(px), params)
+    _r._persist_state(trader)
+
+
+def _mark_oco_consumed(trader, st):
+    d = st.get("rogue_daily")
+    if isinstance(d, dict) and not d.get("oco_consumed"):
+        d["oco_consumed"] = True
+        try:
+            import rogue as _r
+            _r._persist_state(trader)
+        except Exception:
+            pass
+
+
 def drive_stop(trader, st, allow_new_entries: bool = True) -> None:
     """Live per-tick Rogue STOP-MODE driver. Gated by the caller on
-    cfg.rogue_stop_mode. Builds the shim + manager (persisted on the trader) and
-    steps it once. Fully guarded."""
+    cfg.rogue_stop_mode. Establishes the FIXED daily anchor (Commit 1), builds the
+    shim + manager (persisted on the trader), and steps it once. Fully guarded."""
     import rogue as _r
     try:
         price = _r._mid(trader)
         if price is None:
             return
         now = _r._epoch()
+        now_utc = _rogue_now_utc()
         mgr = getattr(trader, "_rogue_stop_mgr", None)
         if mgr is None:
-            def _anchor():
-                try:
-                    seed_px, _src = _r.resolve_seed(trader, st)
-                    return float(seed_px) if seed_px is not None else None
-                except Exception:
-                    return None
-            mgr = RogueStopManager(_StopBroker(trader), RogueStopParams.from_config(trader.cfg),
-                                   st.setdefault("gov", _r.new_day_state()), trader.cfg,
-                                   anchor_provider=_anchor, logger=log)
+            def _post_chain(order, fill_px):
+                _post_chain_card(trader, order, fill_px)
+            def _post_reseed(anchor, orders):
+                _post_reseed_card(trader, anchor, orders)
+            mgr = RogueStopManager(
+                _StopBroker(trader), RogueStopParams.from_config(trader.cfg),
+                st.setdefault("gov", _r.new_day_state()), trader.cfg,
+                anchor_provider=lambda: getattr(mgr, "_daily_anchor", None), logger=log,
+                on_chain=_post_chain, on_reseed=_post_reseed,
+                on_first_fill=lambda: _mark_oco_consumed(trader, st))
+            mgr._daily_anchor = None
             trader._rogue_stop_mgr = mgr
         else:
             mgr.broker = _StopBroker(trader)
             mgr.gov = st.setdefault("gov", _r.new_day_state())
+        # FIXED daily anchor first (capture-on-schedule / reload-on-restart)
+        if now_utc is not None:
+            _ensure_daily_anchor(trader, st, now_utc, mgr)
         if not allow_new_entries:
-            # post-EOD / kill-locked: manage + trail only, no new seeds/chains
-            mgr._trail(price)
+            mgr._trail(price)   # post-EOD / kill-locked: manage + trail only
             return
         mgr.on_tick(price, now)
     except Exception as e:
         log.warning(f"rogue_stop: drive_stop non-fatal: {e!r}")
+
+
+def _rogue_now_utc():
+    try:
+        import pandas as pd
+        return pd.Timestamp.now(tz="UTC")
+    except Exception:
+        return None
+
+
+def _post_chain_card(trader, order, fill_px):
+    try:
+        import discord_cards as _dc
+        from telemetry import Severity
+        card = _dc.card_rogue_chain(order, fill_px)
+        trader.tele.send(f"🗡️ ROGUE CHAIN {order.comment} {order.side} @ ${order.price:.2f}",
+                         Severity.INFO, card=card)
+    except Exception as e:
+        log.warning(f"rogue_stop: chain card failed ({e!r})")
+
+
+def _post_reseed_card(trader, anchor, orders):
+    try:
+        import discord_cards as _dc
+        from telemetry import Severity
+        plan = {o.side: o for o in orders}
+        card = _dc.card_rogue_reseed(anchor, plan["BUY"], plan["SELL"])
+        trader.tele.send(f"🗡️ ROGUE RESEED anchor ${anchor:.2f}", Severity.INFO, card=card)
+    except Exception as e:
+        log.warning(f"rogue_stop: reseed card failed ({e!r})")

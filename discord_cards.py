@@ -147,6 +147,54 @@ def card_anchor_placed(anchor, anchor_price, buy_sl, buy_tp, sell_sl, sell_tp,
         ], footer=footer)
 
 
+def card_rogue_anchor(label, source, actual_ts, anchor_price, params, buy, sell,
+                      footer=None):
+    """Rogue daily-anchor card. Every level line shows the absolute price, the offset
+    that produced it, and the derived init-SL + next-chain prices in ABSOLUTE terms.
+    `buy` / `sell` are the ACTUAL StopOrder objects that will be placed (price + sl);
+    the chain preview is derived from params (fill ± chain_step), never recomputed
+    anywhere else. IST 05:00 == server 02:30 (Monday cushion 06:00 / 03:30)."""
+    trg, step = params.trigger, params.chain_step
+    buy_chain = round(buy.price + step, 2)
+    sell_chain = round(sell.price - step, 2)
+    return build_embed(
+        f"🗡️ {label}", ORANGE, author=_author(label),
+        fields=[
+            ("scheduled", "5:00 AM IST (server 02:30 · IST 05:00)", False),
+            ("actual", f"{actual_ts} (source: {source})", False),
+            ("anchor", _price(anchor_price)),
+            ("Lot", params.lot),
+            ("BUY stop",
+             f"{_price(buy.price)}  (anchor +{trg:g} · init SL {_price(buy.sl)} · "
+             f"chain +{step:g} → {_price(buy_chain)})", False),
+            ("SELL stop",
+             f"{_price(sell.price)}  (anchor −{trg:g} · init SL {_price(sell.sl)} · "
+             f"chain +{step:g} → {_price(sell_chain)})", False),
+        ], footer=footer)
+
+
+def card_rogue_chain(order, fill_price, footer=None):
+    """Rogue chain-placement card — prices from the ACTUAL placed StopOrder."""
+    return build_embed(
+        f"🗡️ ROGUE {order.comment}", ORANGE, author=_author("ROGUE"),
+        fields=[
+            (f"{order.side} stop",
+             f"{_price(order.price)}  (fill {_price(fill_price)} ±12 · "
+             f"init SL {_price(order.sl)})", False),
+        ], footer=footer)
+
+
+def card_rogue_reseed(anchor_price, buy, sell, footer=None):
+    """Rogue re-seed card (fresh ±17 OCO at the current price after an SL)."""
+    return build_embed(
+        "🗡️ ROGUE RESEED", ORANGE, author=_author("ROGUE"),
+        fields=[
+            ("anchor", _price(anchor_price)),
+            ("BUY", f"{_price(buy.price)} (±17)"),
+            ("SELL", f"{_price(sell.price)} (±17)"),
+        ], footer=footer)
+
+
 def card_fill(anchor, side, entry, ticket, role=None, sl=None, tp=None,
               sched_actual=None, footer=None):
     fields = [
