@@ -185,6 +185,23 @@ def _manage_trails_on_bar_close(self):
         shadow['current_sl'] = pos.current_sl
         shadow['max_fav'] = pos.max_fav
 
+        # decision-grade review line: emit ONCE when a lock rung engages (BE / +4 /
+        # peak) -- transition-gated via a transient per-ticket map so a mid-trade
+        # lock is auditable without one line per bar. Never touches the trade path.
+        try:
+            _seen = getattr(self, '_review_lock_level', None)
+            if _seen is None:
+                _seen = self._review_lock_level = {}
+            _new_ll = int(lock_level_for(pos, self.cfg) or 0)
+            if _new_ll > int(_seen.get(ticket, 0)):
+                _seen[ticket] = _new_ll
+                import review_log as _rv
+                _rv.get_review_logger(getattr(self, 'cfg', None)).lock(
+                    'ANCHOR', 'floor_set', intended=round(pos.current_sl, 2),
+                    landed=round(pos.current_sl, 2), level=_new_ll)
+        except Exception:
+            pass
+
         # v3.1.6: a BOOST manages its OWN breath-gap trail + $10 backstop in
         # strategy (_update_boost_on_bar). When that returns a close, close THIS
         # boost ticket at market -- both stops live, whichever hit first. ISOLATION:

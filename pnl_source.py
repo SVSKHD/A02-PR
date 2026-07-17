@@ -48,15 +48,34 @@ def _magic(d):
         return 0
 
 
-def magic_day_net(deals, magic):
+# 2026-07-17: TESTFIRE trades carry a "TF_" comment marker so they can be excluded
+# from the daily total AND the halt SYMMETRICALLY (a test SL and a test win are both
+# excluded). Testorder uses its OWN magic (20260817) so it is already off the anchor
+# magic — this marker is for the real-anchor TESTFIRE path.
+TEST_COMMENT_MARK = "TF_"
+
+
+def _is_test(d) -> bool:
+    """True iff a deal is a TESTFIRE trade (comment carries the TF_ marker)."""
+    try:
+        return TEST_COMMENT_MARK in str(getattr(d, 'comment', '') or '')
+    except Exception:
+        return False
+
+
+def magic_day_net(deals, magic, exclude_test=False):
     """PURE, the SINGLE TRUTH: realized net over the CLOSING deals (entry == 1) whose magic
     matches `magic`, in `deals`. Summing ALL out deals (not last-out-per-position) so a
-    partial close can never be dropped. Returns a 2dp float. Guarded per-deal."""
+    partial close can never be dropped. Returns a 2dp float. Guarded per-deal.
+
+    exclude_test=True SYMMETRICALLY drops TESTFIRE deals (TF_ comment marker) — a test SL
+    and a test win are both excluded, so the daily total can never freeze one-sided
+    (2026-07-17: a testfire -630 SL counted but its +155/+156/+346 wins did not)."""
     m = int(magic)
     total = 0.0
     for d in (deals or []):
         try:
-            if _magic(d) == m and _is_out(d):
+            if _magic(d) == m and _is_out(d) and not (exclude_test and _is_test(d)):
                 total += deal_pnl(d)
         except Exception:
             continue

@@ -741,11 +741,14 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
     sell_res = None
     buy_err = None
     sell_err = None
+    # 2026-07-17: a manual TESTFIRE straddle carries a "TF_" comment marker so its real
+    # deals are excluded SYMMETRICALLY from the daily total + halt (pnl_source._is_test).
+    _tf = 'TF_' if getattr(self, '_testfire_mode', False) else ''
     if not skip_buy:
         buy_res = _send_stop(
             'BUY', buy_stop, sl_buy, tp_buy,
             _stale_sweep.tag_comment(
-                f"AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}",
+                f"{_tf}AUR_{label[:2]}_BUY{'_G' if gap_mode else ''}{retry_comment}",
                 anchor_price))
         if not self.paper:
             try:
@@ -756,7 +759,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         sell_res = _send_stop(
             'SELL', sell_stop, sl_sell, tp_sell,
             _stale_sweep.tag_comment(
-                f"AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}",
+                f"{_tf}AUR_{label[:2]}_SELL{'_G' if gap_mode else ''}{retry_comment}",
                 anchor_price))
         if not self.paper:
             try:
@@ -791,6 +794,12 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         # attempts; one placement per anchor per day). sched_utc rides along on
         # the shadow pendings so fill/close can print scheduled vs actual times.
         self._mark_anchor_placed(label)
+        try:  # decision-grade review line (one per anchor straddle placement)
+            import review_log as _rv
+            _rv.get_review_logger(getattr(self, 'cfg', None)).pending(
+                'ANCHOR', 'placed', tag=label, price=float(anchor_price))
+        except Exception:
+            pass
         sched_iso = anchor_utc.isoformat()
         # v3.2.9: tag the source so a manual TESTFIRE entry is auditable in the
         # journal and distinguishable from a clock-scheduled anchor. Defaults to

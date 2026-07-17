@@ -115,6 +115,13 @@ def place_fleet(self, leg_ticket, leg_shadow, plan):
                 card=dc.card_boost(bi + 1, side, b_fp, round(b_fp - sgn * sl_d, 2),
                                    round(b_fp + sgn * tp_d, 2), f"{rc}"),
                 event_key=f"boost:{b_tk}")
+            try:  # decision-grade review line (each rally / rescue boost fill)
+                import review_log as _rv
+                _eng = 'RALLY' if plan.kind == 'RALLY' else 'RB'
+                _rv.get_review_logger(getattr(self, 'cfg', None)).fill(
+                    _eng, side, float(self.cfg.lot_size), float(b_fp), tag=anchor)
+            except Exception:
+                pass
             # v3.2.3 BOOST_FIRE telemetry (per placed boost) -- the gapless trace
             # of the stack. parent_ticket links it to the leg that triggered it.
             if _tr is not None:

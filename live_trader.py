@@ -1163,6 +1163,12 @@ class LiveTrader:
                 self.tele.warn(msg)
             except Exception:
                 pass
+            try:  # decision-grade review line (anchors profit lock engaged, once)
+                import review_log as _rv
+                _rv.get_review_logger(getattr(self, 'cfg', None)).governor(
+                    'ANCHOR', 'profit_lock', detail=f"day_pnl=+{float(day_pnl):.2f}")
+            except Exception:
+                pass
             try:
                 import p1_state as _p1
                 _p1.save(self, force=True)
@@ -1204,6 +1210,12 @@ class LiveTrader:
                     log.warning(msg)
                     try:
                         self.tele.warn(msg)
+                    except Exception:
+                        pass
+                    try:  # decision-grade review line (account day lock engaged, once)
+                        import review_log as _rv
+                        _rv.get_review_logger(getattr(self, 'cfg', None)).governor(
+                            'ACCOUNT', 'cap', detail=f"combined=+{combined:.2f}")
                     except Exception:
                         pass
             return bool(blocked)
@@ -1318,6 +1330,12 @@ class LiveTrader:
             log.warning(msg)
             try:
                 self.tele.warn(msg)
+            except Exception:
+                pass
+            try:  # decision-grade review line (scheduled anchor skipped by a day stop)
+                import review_log as _rv
+                _rv.get_review_logger(getattr(self, 'cfg', None)).governor(
+                    'ANCHOR', 'halt', detail=f"{names.get(kind, kind or 'day_stop')}:{label}")
             except Exception:
                 pass
             self._save_state()

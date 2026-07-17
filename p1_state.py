@@ -299,6 +299,15 @@ def recover_on_boot(trader):
                         trader.tele.warn(msg)
                     except Exception:
                         pass
+                    try:  # decision-grade review line (engine-state override on boot)
+                        import review_log as _rv
+                        _rv.get_review_logger(getattr(trader, 'cfg', None)).governor(
+                            'ANCHOR' if name == 'anchors' else name.upper(),
+                            'state_override',
+                            detail=f"{name}=restored_{'ON' if restored else 'OFF'}_"
+                                   f"vs_default_{'ON' if boot_default else 'OFF'}")
+                    except Exception:
+                        pass
             summary['engines'] = dict(trader.engines)
         # --- restore ROGUE governors + chain anchor + open ticket ---
         r = data.get('rogue')
