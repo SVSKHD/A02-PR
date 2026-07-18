@@ -1,0 +1,31 @@
+
+=== 2026-06-05  |  lot 0.35  |  dark 42%  |  ran full day ===
+  02:30  ANCHOR seed 3299.10
+  03:05  ARM SHORT @3297.19 [ATRx 1.60 | bias BOTH]
+  03:07  ARM LONG @3300.69 [ATRx 1.60 | bias BOTH]
+  03:15  DISARM (6 quiet M5)
+  03:34  ARM LONG @3300.94 [BOX break 3298.3-3299.9 | bias BOTH]
+  03:40  DISARM (6 quiet M5)
+  03:43  ARM LONG @3301.39 [BOX break 3298.3-3300.4 | bias BOTH]
+  03:52  DISARM (6 quiet M5)
+  05:33  ARM LONG @3302.36 [BOX break 3299.3-3301.4 | bias LONG]
+  05:41  DISARM (6 quiet M5)
+  05:43  ARM LONG @3303.12 [BOX break 3299.7-3302.1 | bias LONG]
+  05:50  DISARM (6 quiet M5)
+  07:14  ARM LONG @3304.88 [BOX break 3301.5-3303.9 | bias LONG]
+  07:20  DISARM (6 quiet M5)
+  08:00  ARM LONG @3305.45 [ATRx 1.64 | bias LONG]
+  08:10  DISARM (6 quiet M5)
+  09:06  ARM LONG @3305.59 [BOX break 3302.2-3304.6 | bias LONG]
+  09:12  FILL ENTRY LONG @3305.59 SL 3295.59
+  #  seq kind  side  entry@          exit@               pts     PnL$  peak pullbk  exit   armed-by
+  -------------------------------------------------------------------------------------------------
+  1  1   ENTRY LONG  09:12 3305.59  18:00 3302.49    -3.10  -108.50   2.8    3.9  EOD    BOX break 3302.2-3304.6 | bias LONG
+  -------------------------------------------------------------------------------------------------
+  day total: -108.50 $   (governor-checked P/L -108.50)
+
+========================================================================
+  SUMMARY dark_chop
+  day          fills        PnL$   dark%  halt
+  2026-06-05       1     -108.50      42  -
+  TOTAL                  -108.50
