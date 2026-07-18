@@ -1,0 +1,26 @@
+
+=== 2026-06-01  |  lot 0.35  |  dark 32%  |  ran full day ===
+  02:30  ANCHOR seed 3350.38
+  02:57  ARM LONG @3353.58 [BOX break 3347.4-3352.6 | bias BOTH]
+  03:03  DISARM (6 quiet M5)
+  03:35  ARM LONG @3354.92 [ATRx 1.58 | bias BOTH]
+  03:43  FILL ENTRY LONG @3354.92 SL 3344.92
+  09:16  RE-ANCHOR 3345.39 (seq 1 closed)
+  11:32  ARM SHORT @3326.88 [BOX break 3327.9-3335.7 | bias SHORT]
+  11:37  FILL ENTRY SHORT @3326.88 SL 3336.88
+  13:09  RE-ANCHOR 3321.23 (seq 2 closed)
+  13:56  ARM SHORT @3315.71 [ATRx 1.65 | bias SHORT]
+  13:59  FILL ENTRY SHORT @3315.71 SL 3325.71
+  #  seq kind  side  entry@          exit@               pts     PnL$  peak pullbk  exit   armed-by
+  -------------------------------------------------------------------------------------------------
+  1  1   ENTRY LONG  03:43 3354.92  09:16 3344.92   -10.00  -350.00   5.5   10.1  SL     ATRx 1.58 | bias BOTH
+  2  2   ENTRY SHORT 11:37 3326.88  13:09 3321.71     5.17   180.95  10.2    1.6  TRAIL  BOX break 3327.9-3335.7 | bias SHORT
+  3  3   ENTRY SHORT 13:59 3315.71  18:00 3315.73    -0.02    -0.70   4.6    8.5  EOD    ATRx 1.65 | bias SHORT
+  -------------------------------------------------------------------------------------------------
+  day total: -169.75 $   (governor-checked P/L -169.75)
+
+========================================================================
+  SUMMARY single_trend
+  day          fills        PnL$   dark%  halt
+  2026-06-01       3     -169.75      32  -
+  TOTAL                  -169.75

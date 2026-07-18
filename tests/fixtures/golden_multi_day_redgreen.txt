@@ -1,0 +1,73 @@
+
+=== 2026-06-02  |  lot 0.35  |  dark 52%  |  ran full day ===
+  02:30  ANCHOR seed 3363.84
+  02:46  ARM SHORT @3358.61 [BOX break 3359.6-3364.6 | bias BOTH]
+  02:46  FILL ENTRY SHORT @3358.61 SL 3368.61
+  04:45  FILL CHAIN SHORT @3346.61 SL 3356.61
+  07:21  RE-ANCHOR 3356.19 (seq 1 closed)
+  07:50  ARM LONG @3373.19 [ATRx 1.71 | bias LONG]
+  08:05  DISARM (6 quiet M5)
+  13:50  ARM SHORT @3339.19 [ATRx 1.55 | bias BOTH]
+  13:51  ARM LONG @3373.19 [ATRx 1.55 | bias BOTH]
+  14:00  DISARM (6 quiet M5)
+  14:57  ARM LONG @3373.95 [ATRx 1.52 | bias LONG]
+  14:59  FILL ENTRY LONG @3373.95 SL 3363.95
+  #  seq kind  side  entry@          exit@               pts     PnL$  peak pullbk  exit   armed-by
+  -------------------------------------------------------------------------------------------------
+  1  1   ENTRY SHORT 02:46 3358.61  06:12 3345.43    13.18   461.30  18.2    4.1  TRAIL  BOX break 3359.6-3364.6 | bias BOTH
+  2  1   CHAIN SHORT 04:45 3346.61  07:21 3356.61   -10.00  -350.00   6.2   10.2  SL     BOX break 3359.6-3364.6 | bias BOTH
+  3  2   ENTRY LONG  14:59 3373.95  18:00 3376.13     2.18    76.30   9.0    1.7  EOD    ATRx 1.52 | bias LONG
+  -------------------------------------------------------------------------------------------------
+  day total: +187.60 $   (governor-checked P/L +187.60)
+
+=== 2026-06-03  |  lot 0.35  |  dark 33%  |  ran full day ===
+  02:30  ANCHOR seed 3358.48
+  04:37  ARM SHORT @3356.79 [BOX break 3357.8-3362.3 | bias SHORT]
+  04:44  DISARM (6 quiet M5)
+  05:59  ARM SHORT @3355.98 [BOX break 3357.0-3361.4 | bias SHORT]
+  06:00  FILL ENTRY SHORT @3355.98 SL 3365.98
+  08:13  RE-ANCHOR 3366.00 (seq 1 closed)
+  09:11  ARM LONG @3372.76 [BOX break 3364.2-3371.8 | bias LONG]
+  09:13  FILL ENTRY LONG @3372.76 SL 3362.76
+  11:55  FILL CHAIN LONG @3384.76 SL 3374.76
+  13:58  FILL CHAIN LONG @3396.76 SL 3386.76
+  #  seq kind  side  entry@          exit@               pts     PnL$  peak pullbk  exit   armed-by
+  -------------------------------------------------------------------------------------------------
+  1  1   ENTRY SHORT 06:00 3355.98  08:13 3365.98   -10.00  -350.00   2.8   10.6  SL     BOX break 3357.0-3361.4 | bias SHORT
+  2  2   ENTRY LONG  09:13 3372.76  15:39 3395.45    22.69   794.15  27.7    1.5  TRAIL  BOX break 3364.2-3371.8 | bias LONG
+  3  2   CHAIN LONG  11:55 3384.76  15:39 3395.45    10.69   374.15  15.7    3.5  TRAIL  BOX break 3364.2-3371.8 | bias LONG
+  4  2   CHAIN LONG  13:58 3396.76  18:00 3397.32     0.56    19.60   3.7    3.0  EOD    BOX break 3364.2-3371.8 | bias LONG
+  -------------------------------------------------------------------------------------------------
+  day total: +837.90 $   (governor-checked P/L +837.90)
+
+=== 2026-06-04  |  lot 0.35  |  dark 39%  |  ran full day ===
+  02:30  ANCHOR seed 3396.41
+  02:41  ARM SHORT @3393.17 [BOX break 3394.2-3400.9 | bias SHORT]
+  02:47  DISARM (6 quiet M5)
+  02:51  ARM SHORT @3392.44 [BOX break 3393.4-3400.5 | bias SHORT]
+  02:51  FILL ENTRY SHORT @3392.44 SL 3402.44
+  08:49  RE-ANCHOR 3401.98 (seq 1 closed)
+  09:51  ARM LONG @3403.63 [ATRx 1.53 | bias LONG]
+  10:00  DISARM (6 quiet M5)
+  12:16  ARM SHORT @3396.72 [BOX break 3397.7-3401.3 | bias BOTH]
+  12:22  DISARM (6 quiet M5)
+  12:59  ARM LONG @3402.20 [BOX break 3396.8-3401.2 | bias LONG]
+  13:05  DISARM (6 quiet M5)
+  14:11  ARM SHORT @3398.09 [BOX break 3399.1-3402.7 | bias BOTH]
+  14:11  FILL ENTRY SHORT @3398.09 SL 3408.09
+  17:38  FILL CHAIN SHORT @3386.09 SL 3396.09
+  #  seq kind  side  entry@          exit@               pts     PnL$  peak pullbk  exit   armed-by
+  -------------------------------------------------------------------------------------------------
+  1  1   ENTRY SHORT 02:51 3392.44  08:49 3402.44   -10.00  -350.00   0.2   10.1  SL     BOX break 3393.4-3400.5 | bias SHORT
+  2  2   ENTRY SHORT 14:11 3398.09  18:00 3387.26    10.83   379.05  13.3    1.8  EOD    BOX break 3399.1-3402.7 | bias BOTH
+  3  2   CHAIN SHORT 17:38 3386.09  18:00 3387.26    -1.17   -40.95   1.3    1.8  EOD    BOX break 3399.1-3402.7 | bias BOTH
+  -------------------------------------------------------------------------------------------------
+  day total: -11.90 $   (governor-checked P/L -11.90)
+
+========================================================================
+  SUMMARY multi_day_redgreen
+  day          fills        PnL$   dark%  halt
+  2026-06-02       3      187.60      52  -
+  2026-06-03       4      837.90      33  -
+  2026-06-04       3      -11.90      39  -
+  TOTAL                  1013.60
