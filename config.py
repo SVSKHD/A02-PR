@@ -107,6 +107,41 @@ class Config:
     rogue_chain_step: float = 12.0
     rogue_stop_init_sl: float = 10.0
     rogue_anchor_grace_min: float = 10.0
+    # ── ROGUE MONSTER ENGINE — the LIVE Rogue engine (magic 20260626) ──────────
+    # The sole Rogue implementation (drive() -> rogue_monster_live.drive_monster).
+    # Boot banner reads 'ROGUE IMPL: monster'. Values are the rp2-validated set
+    # (+$19.4k May/Jun/Jul @ 0.35). Arming gate -> H1/M15 bias -> stop entry ->
+    # chain -> trail; adaptive guards caution/giveback/red-day/side-fatigue.
+    # NOTE: reuses rogue_chain_step (12) above; legacy stop/band keys above are
+    # inert (dead-key removal + selftest cleanup tracked as follow-up).
+    rogue_lot: float = 0.35
+    rogue_atr_mult: float = 1.5            # M5 range expansion vs ATR(20)
+    rogue_atr_period: int = 20
+    rogue_vel_points: float = 12.0         # M1 velocity threshold
+    rogue_vel_minutes: int = 5
+    rogue_box_bars: int = 12               # M5 consolidation-box length
+    rogue_box_max_range: float = 8.0       # box qualifies if range <= this (pts)
+    rogue_disarm_bars: int = 6             # hysteresis: disarm after N quiet bars
+    rogue_edge_offset: float = 1.0         # stop beyond the box edge
+    rogue_fallback_trigger: float = 17.0   # anchor +/- when velocity-armed, no box
+    rogue_sl_cap: float = 10.0             # hard SL cap behind entry
+    rogue_max_chains: int = 3
+    rogue_trail_start: float = 10.0        # trail arms at +this
+    rogue_trail_gap: float = 5.0
+    rogue_day_loss_halt: float = -1000.0   # governor: halt day at this realized loss
+    rogue_profit_lock: float = 1000.0      # governor: lock day at this realized gain
+    rogue_max_entries: int = 10
+    rogue_consec_sl_limit: int = 2         # caution after N straight full SLs
+    rogue_caution_cooldown_min: int = 90
+    rogue_caution_atr_boost: float = 0.5   # gate tightening while in caution
+    rogue_day_profit_trail_start: float = 600.0   # giveback arms once day P/L >= this
+    rogue_day_profit_giveback: float = 300.0      # ...halt if it retraces by this
+    rogue_redday_atr_step: float = 0.5     # next day after a red day starts tightened
+    rogue_side_fatigue_sl: int = 2         # N same-side SLs -> that side needs real bias
+    rogue_reanchor_cooldown_s: int = 300
+    rogue_bias_m15_lookback: int = 8
+    rogue_bias_h1_lookback: int = 4
+    rogue_candle_confirm: bool = False     # M5 engulfing/dragonfly confirm; inert while False
     account_profile: str = "STANDARD_5PCT"
     fp_standard_pct: float = 0.05
     fp_zero_pct: float = 0.01

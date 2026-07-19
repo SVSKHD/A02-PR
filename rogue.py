@@ -28,19 +28,23 @@ ROGUE_ALERT_PREFIX = "[ROGUE]"
 
 
 def rogue_impl(cfg) -> str:
-    """The SINGLE source of truth for which Rogue implementation `drive()` runs, from
-    config alone (config wins on every tick / new-day boot; nothing persisted can
-    silently revert it). 'stop' -> the resting pending-stop engine (rogue_stop);
-    'band' -> the A1-anchored confirm-band engine; 'legacy' -> monster detection.
-    2026-07-17: a live day ran 'band' with 174 BAND_NOT_HELD rejects despite the flag
-    — this makes the choice explicit (boot banner + review event) so a silent revert
-    can never go unnoticed again, and mirrors drive()'s dispatch order exactly."""
-    if bool(getattr(cfg, 'rogue_stop_mode', False)):
-        return 'stop'
-    if bool(getattr(cfg, 'rogue_a1_anchor_mode', False)):
-        return 'band'
-    return 'legacy'
+    """The Rogue implementation `drive()` runs. There is now exactly ONE: the
+    'monster' engine (rogue_monster_live). The legacy stop-mode / A1 band /
+    monster-detection engines were deleted, so this is a constant — kept as a
+    function so the boot banner + review event + selftest keep a stable seam."""
+    return 'monster'
 ROGUE_GLYPH = "🦏"               # chart glyph distinct from the anchor glyphs
+
+
+def _rml_cfg_hash(cfg):
+    """Short stable hash of the monster config keys, for the boot card / audit."""
+    try:
+        import hashlib
+        keys = sorted(k for k in vars(cfg) if k.startswith("rogue_"))
+        blob = ";".join(f"{k}={getattr(cfg, k)}" for k in keys)
+        return hashlib.sha256(blob.encode()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
 
 
 def _persist_state(trader):
@@ -361,10 +365,33 @@ def promote_on_boot(trader):
         # unnoticed. Config wins on every boot; the persisted value is audit-only.
         impl = rogue_impl(trader.cfg)
         log.info(f"{ROGUE_ALERT_PREFIX} ROGUE IMPL: {impl} "
-                 f"(rogue_stop_mode={bool(getattr(trader.cfg, 'rogue_stop_mode', False))}, "
-                 f"rogue_a1_anchor_mode={bool(getattr(trader.cfg, 'rogue_a1_anchor_mode', False))})")
+                 f"(engine=rogue_monster_live, magic={ROGUE_MAGIC}, "
+                 f"candle_confirm={bool(getattr(trader.cfg, 'rogue_candle_confirm', False))})")
         try:
             trader.state['rogue_impl'] = impl
+        except Exception:
+            pass
+        # Boot card: ROGUE IMPL monster + current anchor/guard state + config hash.
+        try:
+            import rogue_monster_live as _rml
+            import rogue_monster_state as _rms
+            import discord_cards as _dc
+            stored = _rms.load(_rml._run_dir(trader))
+            anchor = stored.get('anchor') if stored else None
+            guards = []
+            if stored and stored.get('consec_sl', 0) >= 2:
+                guards.append('CAUTION')
+            if stored and float(stored.get('extra_atr', 0.0)):
+                guards.append('RED-DAY')
+            cfg_hash = _rml_cfg_hash(trader.cfg)
+            card = _dc.card_monster_boot(anchor, 'armed' if anchor else 'dark',
+                                         ','.join(guards) or 'none', cfg_hash)
+            tele = getattr(trader, 'tele', None)
+            if tele is not None:
+                try:
+                    tele.send(f"{ROGUE_ALERT_PREFIX} boot", getattr(tele, 'INFO', 20), card=card)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -1026,65 +1053,12 @@ def drive(trader, allow_new_entries=True):
             st = {'day': today, 'gov': new_day_state(),
                   'anchor': None, 'leg_dir': None, 'open': None}
             trader._rogue = st
-        # Rogue v2 STOP MODE: resting pending-stop engine (OCO ±rogue_trigger + chain).
-        # Gated on the flag so the legacy band engine below stays byte-identical when
-        # OFF. In stop mode the seed-break / confirm-band / runaway / hold_ticks paths
-        # are inert (never reached) -- the stop engine owns entries end to end.
-        if bool(getattr(trader.cfg, 'rogue_stop_mode', False)):
-            import rogue_stop as _rs
-            _rs.drive_stop(trader, st, allow_new_entries=allow_new_entries)
-            return
-        # Fix 4: A1-ANCHORED REDESIGN (flag-gated, DEFAULT OFF). ON -> the new engine seeds
-        # from the day's A1 anchor (read-only) / chains to the last closed Rogue level and
-        # skips monster-detection. OFF (default) -> fall through to the legacy monster
-        # pipeline below, byte-identical.
-        if bool(getattr(trader.cfg, 'rogue_a1_anchor_mode', False)):
-            # Keep the default (entry-taking) call 2-arg so a test/monkeypatch that binds a
-            # 2-arg _drive_a1 stays valid; only the trail-only path passes the kwarg.
-            if allow_new_entries:
-                _drive_a1(trader, st)
-            else:
-                _drive_a1(trader, st, allow_new_entries=False)
-            return
-        bars = _recent_m5(trader)
-        if not bars:
-            return
-        # 1. WATCH / DETECT -> drop a fresh anchor at the move-completion price.
-        is_monster, mdir, completion = detect_monster(bars, trader.cfg)
-        if is_monster and st.get('open') is None:
-            st['anchor'] = completion
-            # the next leg Rogue hunts is the REVERSAL off the completed extreme: a SELL
-            # move (low) -> hunt the BUY bounce; a BUY move (high) -> hunt the SELL fade.
-            st['leg_dir'] = 'BUY' if mdir == 'SELL' else 'SELL'
-            log.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} monster {mdir} -> anchor @ "
-                     f"{completion}, hunting next leg {st['leg_dir']}")
-        # 2. ENTRY (gated): only on a NEW slot AND the setup gate (a live anchor). Fix 3:
-        # NEW entries are refused when allow_new_entries is False (post-EOD trail-only).
-        price = _mid(trader)
-        if (allow_new_entries and st.get('open') is None
-                and st.get('anchor') is not None and price is not None):
-            ok, _why = can_enter(st['gov'], trader.cfg)
-            enter, epx, sl = entry_decision(st['anchor'], st['leg_dir'], price, trader.cfg)
-            if enter:
-                # MODEL GATE (pass-through by default). Computes + logs a confidence score
-                # for EVERY confirmed setup; only BLOCKS when rogue_model_gate_enabled AND
-                # the score is below threshold. With the gate disabled (default) this is
-                # byte-neutral to the order path: placement still happens iff (ok and enter),
-                # exactly as before -- the score is logged but never blocks. An untrained
-                # model and any predict() error both score 1.0 (fail OPEN), so the model
-                # can never silently kill Rogue. One eval logged per anchor (no flooding).
-                if not _model_gate(trader, st, price, epx, sl, ok):
-                    pass   # gated: SKIP_BY_MODEL already logged; do NOT enter
-                elif ok:
-                    _place_rogue_entry(trader, st, epx, sl)
-        # 3. DETECT a broker-side close FIRST (E-2/E-3): book the governor + clear st['open']
-        # so the day-stop/fail-pause get real data AND Rogue can re-enter the same day (and
-        # the patternlog observe() close branch then runs). If still open, manage the trail.
-        if st.get('open') is not None:
-            detect_close(trader, st)
-        # 4. MANAGE the open winner on the adaptive trail (RIDE-WINNER-UNLIMITED).
-        if st.get('open') is not None and price is not None:
-            _manage_rogue_open(trader, st, price)
+        # ROGUE "monster" engine — the SOLE implementation. The legacy stop-mode,
+        # A1 band engine and monster-detection pipeline have been removed (no
+        # toggles, no dead paths). All decisions + MT5 order translation live in
+        # rogue_monster_live.drive_monster (parity-proven core; magic 20260626).
+        import rogue_monster_live as _rml
+        _rml.drive_monster(trader, st, allow_new_entries=allow_new_entries)
     except Exception as e:
         log.warning(f"{ROGUE_ALERT_PREFIX} drive non-fatal: {e!r}")
 
@@ -1570,24 +1544,47 @@ def eod_flatten(trader):
         if not bool(getattr(trader.cfg, 'rogue_flatten_at_eod', False)):
             return False
         st = getattr(trader, '_rogue', None)
-        if not st or not st.get('open') or st['open'].get('ticket') is None:
+        n, pnl = _close_all_rogue(trader, reason="EOD")
+        if st is not None:
+            st['open'] = None
+            if st.get('monster') is not None:
+                st['monster']['positions'] = {}
+        if not n:
             return False
-        tk = int(st['open']['ticket'])
-        trader.adapter.close_position(tk, dry_run=trader.paper)   # ROGUE ticket ONLY
-        pnl = _rogue_close_pnl(trader, tk)
-        if pnl is None:
-            pnl = 0.0
-        record_close(st['gov'], pnl, float(pnl) <= 0.0, trader.cfg)
-        st['open'] = None
+        record_close(st['gov'], pnl, float(pnl) <= 0.0, trader.cfg) if st and st.get('gov') else None
         try:
             trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} EOD flatten -> closed "
-                             f"#{tk} P&L ${float(pnl):+.2f}")
+                             f"{n} leg(s) P&L ${float(pnl):+.2f}")
         except Exception:
             pass
         return True
     except Exception as e:
         log.warning(f"{ROGUE_ALERT_PREFIX} eod_flatten non-fatal: {e!r}")
         return False
+
+
+def _close_all_rogue(trader, reason="flatten"):
+    """Close EVERY open ROGUE_MAGIC position (TF_ test legs excluded). Returns
+    (count_closed, total_realized_pnl). The monster engine can hold multiple legs
+    (entry + chains), so flatten paths must sweep them all, not just the primary."""
+    n = 0
+    total = 0.0
+    try:
+        for p in (trader.adapter.mt5.positions_get(symbol=trader.cfg.symbol) or []):
+            if int(getattr(p, 'magic', -1)) != ROGUE_MAGIC:
+                continue
+            if 'TF_' in str(getattr(p, 'comment', '') or ''):
+                continue
+            tk = int(p.ticket)
+            trader.adapter.close_position(tk, dry_run=trader.paper)
+            pv = _rogue_close_pnl(trader, tk)
+            total += float(pv) if pv is not None else 0.0
+            n += 1
+    except Exception as e:
+        log.warning(f"{ROGUE_ALERT_PREFIX} _close_all_rogue non-fatal: {e!r}")
+    if n:
+        log.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} {reason} -> closed {n} Rogue leg(s)")
+    return n, total
 
 
 def force_close_open(trader, reason="flatten"):
@@ -1599,19 +1596,20 @@ def force_close_open(trader, reason="flatten"):
     20260522 ticket). Returns True if it closed one. Guarded; never raises."""
     try:
         st = getattr(trader, '_rogue', None)
-        if not st or not st.get('open') or st['open'].get('ticket') is None:
+        n, pnl = _close_all_rogue(trader, reason=reason)
+        if st is not None:
+            st['open'] = None
+            if st.get('monster') is not None:
+                st['monster']['positions'] = {}
+                st['monster']['pend'] = None
+        if not n:
             return False
-        tk = int(st['open']['ticket'])
-        trader.adapter.close_position(tk, dry_run=trader.paper)   # ROGUE ticket ONLY
-        pnl = _rogue_close_pnl(trader, tk)
-        if pnl is None:
-            pnl = 0.0
-        record_close(st['gov'], pnl, float(pnl) <= 0.0, trader.cfg)
-        st['open'] = None
+        if st and st.get('gov'):
+            record_close(st['gov'], pnl, float(pnl) <= 0.0, trader.cfg)
         _persist_state(trader)
         try:
             trader.tele.info(f"{ROGUE_ALERT_PREFIX} {ROGUE_GLYPH} {reason} flatten -> closed "
-                             f"#{tk} P&L ${float(pnl):+.2f}")
+                             f"{n} leg(s) P&L ${float(pnl):+.2f}")
         except Exception:
             pass
         return True
