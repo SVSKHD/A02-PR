@@ -244,6 +244,44 @@ def trail_target(side, entry, peak, cfg):
     return (entry + peak - cfg.trail_gap) if side == "LONG" else (entry - peak + cfg.trail_gap)
 
 
+# ── arming gate (pure; shared by the sim loop and the live adapter) ──────────
+def gate_eval(m5_closed, m5_atr_last, vel_window_m1, px_c, anchor, eff_atr_mult, cfg):
+    """Evaluate the arming gate on closed M5 bars. Returns (gate_hit, box):
+      gate_hit  – '' or a reason string ('ATRx ..' / 'VEL ..' / 'BOX break ..')
+      box       – (lo, hi) of the qualifying M5 box, or None
+    `m5_atr_last` is ATR(atr_period) at the current bar (np.nan if unavailable);
+    `vel_window_m1` is the M1 slice over the last vel_minutes."""
+    gate_hit = ""
+    box = None
+    if len(m5_closed) >= cfg.box_bars + 1 and anchor is not None:
+        last = m5_closed.iloc[-1]
+        a = m5_atr_last
+        if not np.isnan(a) and (last.high - last.low) > eff_atr_mult * a:
+            gate_hit = f"ATRx {(last.high-last.low)/a:.2f}"
+        if len(vel_window_m1) >= 2:
+            vel = abs(vel_window_m1.close.iloc[-1] - vel_window_m1.close.iloc[0])
+            if vel >= cfg.vel_points:
+                gate_hit = gate_hit or f"VEL {vel:.1f}p/{cfg.vel_minutes}m"
+        bx = m5_closed.iloc[-(cfg.box_bars + 1):-1]
+        if len(bx) == cfg.box_bars and (bx.high.max() - bx.low.min()) <= cfg.box_max_range:
+            box = (bx.low.min(), bx.high.max())
+            if px_c > box[1] or px_c < box[0]:
+                gate_hit = gate_hit or f"BOX break {box[0]:.1f}-{box[1]:.1f}"
+    return gate_hit, box
+
+
+def arm_side(gate_hit, px_c, m1_close_upto, m5_closed_len, bias):
+    """Pick the side to arm from the gate hit + short-term momentum, limited by bias.
+    Returns 'LONG' / 'SHORT' / None."""
+    side = None
+    if "VEL" in gate_hit or "BOX" in gate_hit or "ATR" in gate_hit:
+        mom = px_c - m1_close_upto.iloc[-min(5, m5_closed_len)]
+        want = "LONG" if mom > 0 else "SHORT"
+        if bias in ("BOTH", want):
+            side = want
+    return side
+
+
 class MonsterEngine:
     """Stateful monster engine. Cross-day state (extra_atr red-day carry) lives on
     the instance; per-day state is (re)built by start_day(). The full adaptive
@@ -312,36 +350,20 @@ class MonsterEngine:
         caution_on = caution_active(self.consec_sl, c)
         eff_atr_mult = effective_atr_mult(c, self._extra_atr, caution_on)
         m5_closed = self.m5_day[self.m5_day.index <= t]
-        gate_hit = ""
-        box = None
-        if len(m5_closed) >= c.box_bars + 1 and self.anchor is not None:
-            last = m5_closed.iloc[-1]
-            a = self.m5_atr.loc[:t].iloc[-1] if len(self.m5_atr.loc[:t]) else np.nan
-            if not np.isnan(a) and (last.high - last.low) > eff_atr_mult * a:
-                gate_hit = f"ATRx {(last.high-last.low)/a:.2f}"
-            w = self.m1_day[(self.m1_day.index <= t)
-                            & (self.m1_day.index > t - pd.Timedelta(minutes=c.vel_minutes))]
-            if len(w) >= 2:
-                vel = abs(w.close.iloc[-1] - w.close.iloc[0])
-                if vel >= c.vel_points:
-                    gate_hit = gate_hit or f"VEL {vel:.1f}p/{c.vel_minutes}m"
-            bx = m5_closed.iloc[-(c.box_bars + 1):-1]
-            if len(bx) == c.box_bars and (bx.high.max() - bx.low.min()) <= c.box_max_range:
-                box = (bx.low.min(), bx.high.max())
-                if px_c > box[1] or px_c < box[0]:
-                    gate_hit = gate_hit or f"BOX break {box[0]:.1f}-{box[1]:.1f}"
+        _atr_slice = self.m5_atr.loc[:t]
+        m5_atr_last = _atr_slice.iloc[-1] if len(_atr_slice) else np.nan
+        vel_window = self.m1_day[(self.m1_day.index <= t)
+                                 & (self.m1_day.index > t - pd.Timedelta(minutes=c.vel_minutes))]
+        gate_hit, box = gate_eval(m5_closed, m5_atr_last, vel_window, px_c,
+                                  self.anchor, eff_atr_mult, c)
 
         in_cd = (self.last_seq_close_t is not None
                  and (t - self.last_seq_close_t).total_seconds() < c.reanchor_cooldown_s)
 
         if gate_hit and not self.open_pos and not in_cd and not in_cooldown and self.anchor is not None:
             b = bias_of(self.m15, self.h1, t, c)
-            side = None
-            if "VEL" in gate_hit or "BOX" in gate_hit or "ATR" in gate_hit:
-                mom = px_c - self.m1_day[self.m1_day.index <= t].close.iloc[-min(5, len(m5_closed))]
-                want = "LONG" if mom > 0 else "SHORT"
-                if b in ("BOTH", want):
-                    side = want
+            side = arm_side(gate_hit, px_c,
+                            self.m1_day[self.m1_day.index <= t].close, len(m5_closed), b)
             if side and fatigue_blocks(self.sl_by_side, side, b, c):
                 self.events.append((t, f"FATIGUE block {side} (SLs {self.sl_by_side[side]}, bias BOTH)"))
                 side = None

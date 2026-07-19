@@ -233,6 +233,49 @@ def test_trail_target_primitive():
     assert rm.trail_target("SHORT", 3000.0, 12.0, cfg) == 2993.0
 
 
+# ── gate + arm-side decision (pure; the live adapter consumes these) ─────────
+def _m5(rows):
+    idx = pd.date_range("2026-06-10 02:00", periods=len(rows), freq="5min")
+    return pd.DataFrame(rows, index=idx)
+
+
+def test_gate_eval_box_break():
+    cfg = rm.MonsterCfg(box_bars=12, box_max_range=8.0)
+    # 12 flat box bars (range 2) then a breakout bar
+    rows = [{"open": 100, "high": 101, "low": 99, "close": 100} for _ in range(12)]
+    rows.append({"open": 100, "high": 103, "low": 100, "close": 102})   # last (breakout)
+    m5 = _m5(rows)
+    gate_hit, box = rm.gate_eval(m5, float("nan"), m5.iloc[0:0], 102.0, 100.0, 1.5, cfg)
+    assert box == (99.0, 101.0)
+    assert "BOX break" in gate_hit
+
+
+def test_gate_eval_velocity():
+    cfg = rm.MonsterCfg(vel_points=12.0, vel_minutes=5, box_bars=12, box_max_range=8.0)
+    rows = [{"open": 100, "high": 101, "low": 99, "close": 100} for _ in range(13)]
+    m5 = _m5(rows)
+    vel_win = pd.DataFrame({"close": [100.0, 113.0]},
+                           index=pd.date_range("2026-06-10 03:00", periods=2, freq="1min"))
+    gate_hit, box = rm.gate_eval(m5, float("nan"), vel_win, 113.0, 100.0, 1.5, cfg)
+    assert "VEL" in gate_hit
+
+
+def test_gate_eval_dark_when_short_history():
+    cfg = rm.MonsterCfg(box_bars=12)
+    m5 = _m5([{"open": 100, "high": 101, "low": 99, "close": 100} for _ in range(5)])
+    gate_hit, box = rm.gate_eval(m5, float("nan"), m5.iloc[0:0], 100.0, 100.0, 1.5, cfg)
+    assert gate_hit == "" and box is None
+
+
+def test_arm_side():
+    closes = pd.Series([100.0, 100.0, 100.0, 100.0, 102.0])
+    assert rm.arm_side("BOX break 99-101", 102.0, closes, 13, "BOTH") == "LONG"
+    assert rm.arm_side("BOX break 99-101", 102.0, closes, 13, "SHORT") is None   # bias blocks
+    down = pd.Series([100.0, 100.0, 100.0, 100.0, 98.0])
+    assert rm.arm_side("VEL 12p/5m", 98.0, down, 13, "BOTH") == "SHORT"
+    assert rm.arm_side("", 98.0, down, 13, "BOTH") is None   # no gate -> no side
+
+
 # ── adaptive-guard integration (events fire on real runs) ────────────────────
 def test_caution_triggers_on_two_sls():
     closes = ([3000.0] * 66 + [3001.0] * 2 + [2990.0] * 2 + [2990.0] * 70

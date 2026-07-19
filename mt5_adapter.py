@@ -387,7 +387,11 @@ class MT5Adapter:
 
     def place_stop_order(self, symbol: str, side: str, price: float,
                          lot: float, sl: float, tp: float,
-                         comment: str = "AUREON_v2", dry_run: bool = False):
+                         comment: str = "AUREON_v2", dry_run: bool = False,
+                         magic: int = 20260522):
+        # `magic` defaults to the anchor magic (20260522) so every existing caller
+        # is byte-identical; the ROGUE monster adapter passes rogue.ROGUE_MAGIC
+        # (20260626) to tag its own resting stops (own-magic isolation rule).
         comment = mt5_comment(comment)  # MT5 rejects comments > 31 chars (boost root cause)
         mt5 = self.mt5
         if side == 'BUY':
@@ -403,7 +407,7 @@ class MT5Adapter:
             "sl": sl,
             "tp": tp,
             "deviation": 20,
-            "magic": 20260522,
+            "magic": int(magic),
             "comment": comment,
             "type_time": mt5.ORDER_TIME_DAY,
             "type_filling": mt5.ORDER_FILLING_IOC,
@@ -423,7 +427,7 @@ class MT5Adapter:
         if rc == -1:
             import time as _time
             _time.sleep(0.5)  # let broker settle
-            existing = self.find_pending_by_price(symbol, side, price, lot)
+            existing = self.find_pending_by_price(symbol, side, price, lot, magic=int(magic))
             if existing is not None:
                 log.info(
                     f"✅ Placed {side} stop @ {price} lot={lot}: rc=-1 but RECONCILED — "
