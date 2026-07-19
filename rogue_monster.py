@@ -90,6 +90,15 @@ class MonsterCfg:
     bias_h1_lookback: int = 4
     # candle module — inert while False (structure-context confirmation only)
     candle_confirm: bool = False
+    # BE lock (Fix A, v3.1.0) — once peak >= be_lock_arm and BEFORE the trail arms,
+    # ratchet SL to entry +/- be_lock_floor (breakeven). arm 0.0 = disabled. The
+    # engine default is 0.0 so golden/parity runs stay byte-identical; the LIVE
+    # config sets 5.0 (A+C validated: beat baseline in all 3 of May/Jun/Jul).
+    be_lock_arm: float = 0.0
+    be_lock_floor: float = 0.0
+    # Asia block (Fix C, v3.1.0) — suppress arming before this SERVER hour.
+    # 0 = disabled (engine default, parity-safe); LIVE config sets 7 (A+C validated).
+    asia_start_hour: int = 0
 
 
 @dataclass
@@ -244,6 +253,19 @@ def trail_target(side, entry, peak, cfg):
     return (entry + peak - cfg.trail_gap) if side == "LONG" else (entry - peak + cfg.trail_gap)
 
 
+def be_lock_target(side, entry, cfg):
+    """Breakeven-lock stop (Fix A): entry +/- be_lock_floor. Used once peak reaches
+    be_lock_arm and before the trail arms; the caller ratchets it monotonically."""
+    return (entry + cfg.be_lock_floor) if side == "LONG" else (entry - cfg.be_lock_floor)
+
+
+def be_engaged(peak, cfg):
+    """True if the BE lock is active for a position at `peak` favourable points and
+    the trail has not yet armed — the condition that classifies a stop-out as a 'BE'
+    scratch rather than a full SL."""
+    return cfg.be_lock_arm > 0 and peak >= cfg.be_lock_arm and peak < cfg.trail_start
+
+
 # ── arming gate (pure; shared by the sim loop and the live adapter) ──────────
 def gate_eval(m5_closed, m5_atr_last, vel_window_m1, px_c, anchor, eff_atr_mult, cfg):
     """Evaluate the arming gate on closed M5 bars. Returns (gate_hit, box):
@@ -364,6 +386,11 @@ class MonsterEngine:
             b = bias_of(self.m15, self.h1, t, c)
             side = arm_side(gate_hit, px_c,
                             self.m1_day[self.m1_day.index <= t].close, len(m5_closed), b)
+            # Fix C: Asia block — suppress an otherwise-valid arm before the server
+            # start hour (anchor seed + re-anchor unchanged; gate math ran for logs).
+            if side and c.asia_start_hour > 0 and t.hour < c.asia_start_hour:
+                self.events.append((t, "ASIA block (arm suppressed)"))
+                side = None
             if side and fatigue_blocks(self.sl_by_side, side, b, c):
                 self.events.append((t, f"FATIGUE block {side} (SLs {self.sl_by_side[side]}, bias BOTH)"))
                 side = None
@@ -419,9 +446,19 @@ class MonsterEngine:
             if p["peak"] >= c.trail_start:
                 tr_sl = trail_target(p["side"], p["entry"], p["peak"], c)
                 p["sl"] = max(p["sl"], tr_sl) if p["side"] == "LONG" else min(p["sl"], tr_sl)
+            elif c.be_lock_arm > 0 and p["peak"] >= c.be_lock_arm:
+                # Fix A: ratchet SL to breakeven+floor once peak reaches be_lock_arm
+                # and before the trail arms. Ratchet only — never loosens.
+                be_sl = be_lock_target(p["side"], p["entry"], c)
+                p["sl"] = max(p["sl"], be_sl) if p["side"] == "LONG" else min(p["sl"], be_sl)
             hit_sl = (px_l <= p["sl"]) if p["side"] == "LONG" else (px_h >= p["sl"])
             if hit_sl:
-                reason = "TRAIL" if p["peak"] >= c.trail_start else "SL"
+                if p["peak"] >= c.trail_start:
+                    reason = "TRAIL"
+                elif be_engaged(p["peak"], c):
+                    reason = "BE"        # breakeven scratch — NOT a full SL (Fix A)
+                else:
+                    reason = "SL"
                 tr = Trade(self.seq_no, p["kind"], p["side"], p["time"], p["entry"], t,
                            p["sl"], p["sl"], round(p["peak"], 2), round(p["mae"], 2),
                            reason, p["arm_reason"])
@@ -435,10 +472,12 @@ class MonsterEngine:
                         self.events.append((t, f"CAUTION on: {self.consec_sl} straight SLs, "
                                                f"cooldown {c.caution_cooldown_min}m, "
                                                f"atr_mult +{c.caution_atr_boost}"))
-                else:
+                elif reason == "TRAIL":
                     if self.consec_sl >= c.consec_sl_limit:
                         self.events.append((t, "CAUTION off (winner)"))
                     self.consec_sl = 0
+                # reason == "BE": neutral scratch — leaves consec_sl / side-fatigue /
+                # caution untouched (Fix A).
                 self.open_pos.remove(p)
                 closed_now = True
 

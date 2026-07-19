@@ -233,6 +233,75 @@ def test_trail_target_primitive():
     assert rm.trail_target("SHORT", 3000.0, 12.0, cfg) == 2993.0
 
 
+# ── Fix A: breakeven lock ─────────────────────────────────────────────────────
+def test_be_lock_target_and_engaged():
+    cfg = rm.MonsterCfg(be_lock_arm=5.0, be_lock_floor=0.0, trail_start=10.0)
+    assert rm.be_lock_target("LONG", 3001.6, cfg) == 3001.6      # floor 0 -> entry
+    assert rm.be_lock_target("SHORT", 2998.4, cfg) == 2998.4
+    cfg1 = rm.MonsterCfg(be_lock_arm=5.0, be_lock_floor=1.0)
+    assert rm.be_lock_target("LONG", 3001.6, cfg1) == 3002.6     # floor 1 -> entry+1
+    assert rm.be_lock_target("SHORT", 2998.4, cfg1) == 2997.4
+    # engaged only in [be_lock_arm, trail_start)
+    assert rm.be_engaged(4.99, cfg) is False
+    assert rm.be_engaged(5.0, cfg) is True                       # arms at exactly +5
+    assert rm.be_engaged(9.99, cfg) is True
+    assert rm.be_engaged(10.0, cfg) is False                     # trail takes over
+    # inert when disabled
+    off = rm.MonsterCfg(be_lock_arm=0.0)
+    assert rm.be_engaged(7.0, off) is False
+
+
+def test_be_lock_scratch_does_not_count_as_sl():
+    # fill LONG @3001.6, run to +5 (peak) -> BE lock to entry, reverse to entry -> BE exit
+    closes = [3000.0] * 66 + [3001.0] + [3006.6] + [3001.0] * 3
+    eng = _run(closes, be_lock_arm=5.0, be_lock_floor=0.0, asia_start_hour=0)
+    trs = [tr for tr in eng.trades if tr.kind == "ENTRY"]
+    assert trs and trs[0].reason == "BE"
+    assert abs(trs[0].exit - 3001.6) < 1e-6           # SL held at breakeven, not -10
+    # a BE scratch must NOT increment consec_sl / side-fatigue / trigger caution
+    assert eng.consec_sl == 0
+    assert eng.sl_by_side == {"LONG": 0, "SHORT": 0}
+    assert not any("CAUTION on" in e for _, e in eng.events)
+
+
+def test_be_lock_floor_respected():
+    closes = [3000.0] * 66 + [3001.0] + [3006.6] + [3002.0] * 3
+    eng = _run(closes, be_lock_arm=5.0, be_lock_floor=1.0, asia_start_hour=0)
+    trs = [tr for tr in eng.trades if tr.kind == "ENTRY"]
+    assert trs and trs[0].reason == "BE"
+    assert abs(trs[0].exit - 3002.6) < 1e-6           # locked at entry + floor(1)
+
+
+def test_be_lock_inert_at_zero_is_full_sl():
+    # same shape but arm=0 -> no BE ratchet, a reverse to the -10 stop is a full SL
+    closes = [3000.0] * 66 + [3001.0] + [3006.6] + [2991.0] * 3
+    eng = _run(closes, be_lock_arm=0.0, asia_start_hour=0)
+    trs = [tr for tr in eng.trades if tr.kind == "ENTRY"]
+    assert trs and trs[0].reason == "SL"
+    assert eng.consec_sl == 1
+
+
+# ── Fix C: Asia block ─────────────────────────────────────────────────────────
+def test_asia_block_suppresses_arm_before_hour():
+    bars = [3000.0] * 66 + [3001.0, 3001.0]           # arm at ~03:xx server
+    blocked = _run(bars, asia_start_hour=7)            # 3 < 7 -> suppressed
+    assert len(blocked.trades) == 0
+    assert any("ASIA block (arm suppressed)" in e for _, e in blocked.events)
+    permitted = _run(bars, asia_start_hour=0)          # disabled -> arms
+    assert len(permitted.trades) >= 1
+    assert not any("ASIA" in e for _, e in permitted.events)
+
+
+def test_asia_permits_at_start_hour():
+    # bars starting 07:00 server: hour 7 is NOT < 7 -> arming permitted
+    bars = [3000.0] * 66 + [3001.0, 3001.0]
+    eng = rm.MonsterEngine(rm.MonsterCfg(asia_start_hour=7))
+    m1 = _mk(bars, start="2026-06-10 07:00")
+    eng.run(m1)
+    assert len(eng.trades) >= 1
+    assert not any("ASIA" in e for _, e in eng.events)
+
+
 # ── gate + arm-side decision (pure; the live adapter consumes these) ─────────
 def _m5(rows):
     idx = pd.date_range("2026-06-10 02:00", periods=len(rows), freq="5min")
