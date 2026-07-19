@@ -195,6 +195,78 @@ def card_rogue_reseed(anchor_price, buy, sell, footer=None):
         ], footer=footer)
 
 
+# ── ROGUE "monster" engine cards (magic 20260626) ───────────────────────────
+# Absolute prices come straight from the actual order payloads / engine state —
+# never recomputed here. 🗡️ glyph, ORANGE neutral / GREEN win / RED loss+halt.
+def card_monster_boot(anchor, armed, guards, config_hash, footer=None):
+    """Boot card: which impl is live, current anchor, armed/dark, guard states."""
+    return build_embed(
+        "🗡️ ROGUE IMPL: monster", BLUE, author=_author("ROGUE"),
+        fields=[
+            ("anchor", _price(anchor) if anchor is not None else "unseeded"),
+            ("state", armed),
+            ("guards", guards or "none"),
+            ("config", str(config_hash)),
+        ], footer=footer)
+
+
+def card_monster_armed(side, level, reason, anchor=None, footer=None):
+    """Armed card: side + trigger level + why (gate reason | bias)."""
+    return build_embed(
+        f"🗡️ ROGUE armed {side}", ORANGE, author=_author("ROGUE"),
+        fields=[
+            ("trigger", _price(level)),
+            ("reason", reason, False),
+            ("anchor", _price(anchor) if anchor is not None else "—"),
+        ], footer=footer)
+
+
+def card_monster_reanchor(anchor_price, seq, footer=None):
+    return build_embed(
+        "🗡️ ROGUE re-anchor", ORANGE, author=_author("ROGUE"),
+        fields=[
+            ("new anchor", _price(anchor_price)),
+            ("after sequence", seq),
+        ], footer=footer)
+
+
+def card_monster_fill(kind, side, price, sl, ticket=None, footer=None):
+    return build_embed(
+        f"🗡️ ROGUE {side} {kind} FILL", ORANGE, author=_author("ROGUE"),
+        fields=[
+            ("entry", _price(price)),
+            ("init SL", _price(sl)),
+            ("ticket", ticket if ticket is not None else "—"),
+        ], footer=footer)
+
+
+def card_monster_sequence(anchor, entries, chains, pnl, exit_reason, footer=None):
+    """Sequence summary: anchor, entry+chain count, realized P/L, exit reason."""
+    color = GREEN if (isinstance(pnl, (int, float)) and pnl >= 0) else RED
+    return build_embed(
+        "🗡️ ROGUE sequence", color, author=_author("ROGUE"),
+        fields=[
+            ("anchor", _price(anchor) if anchor is not None else "—"),
+            ("entries / chains", f"{entries} / {chains}"),
+            ("P/L", _money(pnl)),
+            ("exit", exit_reason, False),
+        ], footer=footer)
+
+
+def card_monster_guard(name, detail, footer=None):
+    """Adaptive-guard event: CAUTION on/off, FATIGUE, GIVEBACK, RED-DAY CARRY."""
+    return build_embed(
+        f"🗡️ ROGUE guard · {name}", AMBER, author=_author("ROGUE"),
+        fields=[("detail", detail, False)], footer=footer)
+
+
+def card_monster_governor(name, day_pnl, footer=None):
+    """Governor halt: day-loss / profit-lock / giveback / entry-cap."""
+    return build_embed(
+        f"🗡️ ROGUE halt · {name}", RED, author=_author("ROGUE"),
+        fields=[("day P/L", _money(day_pnl))], footer=footer)
+
+
 def card_lock_fallback_close(anchor, side, lock_price, bid, ask, rc, footer=None):
     """The 2026-07-17 fallback: a profit lock the broker rejected twice, closed at
     market because price was through it. RED — it's a forced realization."""

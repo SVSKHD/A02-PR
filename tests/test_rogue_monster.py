@@ -203,6 +203,36 @@ def test_redday_carry_predicate():
     assert rm.redday_carry(100.0, cfg) == 0.0
 
 
+# ── order-price primitives (pure; the live adapter consumes these) ───────────
+def test_entry_level_primitive():
+    cfg = rm.MonsterCfg(edge_offset=1.0, fallback_trigger=17.0)
+    # with a box: beyond the edge by edge_offset
+    assert rm.entry_level("LONG", (2999.4, 3000.6), 3000.0, cfg) == 3001.6
+    assert rm.entry_level("SHORT", (2999.4, 3000.6), 3000.0, cfg) == 2998.4
+    # no box: anchor +/- fallback_trigger
+    assert rm.entry_level("LONG", None, 3000.0, cfg) == 3017.0
+    assert rm.entry_level("SHORT", None, 3000.0, cfg) == 2983.0
+
+
+def test_init_sl_primitive():
+    cfg = rm.MonsterCfg(sl_cap=10.0)
+    assert rm.init_sl("LONG", 3001.6, cfg) == 2991.6
+    assert rm.init_sl("SHORT", 2998.4, cfg) == 3008.4
+
+
+def test_chain_level_primitive():
+    cfg = rm.MonsterCfg(chain_step=12.0)
+    assert rm.chain_level("LONG", 3001.6, cfg) == 3013.6
+    assert rm.chain_level("SHORT", 2998.4, cfg) == 2986.4
+
+
+def test_trail_target_primitive():
+    cfg = rm.MonsterCfg(trail_gap=5.0)
+    # LONG at +12 peak -> entry + 12 - 5
+    assert rm.trail_target("LONG", 3000.0, 12.0, cfg) == 3007.0
+    assert rm.trail_target("SHORT", 3000.0, 12.0, cfg) == 2993.0
+
+
 # ── adaptive-guard integration (events fire on real runs) ────────────────────
 def test_caution_triggers_on_two_sls():
     closes = ([3000.0] * 66 + [3001.0] * 2 + [2990.0] * 2 + [2990.0] * 70

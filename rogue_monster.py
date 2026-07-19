@@ -219,6 +219,31 @@ def redday_carry(day_total, cfg):
     return cfg.redday_atr_step if day_total < 0 else 0.0
 
 
+# ── order-price primitives (pure; shared by the sim loop and the live adapter) ─
+def entry_level(side, box, anchor, cfg):
+    """Resting-stop trigger price: beyond the box edge (+edge_offset) when a box is
+    present, else the anchor +/- fallback_trigger."""
+    if box:
+        return (box[1] + cfg.edge_offset) if side == "LONG" else (box[0] - cfg.edge_offset)
+    return (anchor + cfg.fallback_trigger) if side == "LONG" else (anchor - cfg.fallback_trigger)
+
+
+def init_sl(side, entry, cfg):
+    """Initial stop: sl_cap points behind entry."""
+    return entry - cfg.sl_cap if side == "LONG" else entry + cfg.sl_cap
+
+
+def chain_level(side, entry, cfg):
+    """Next chain stop: chain_step points beyond the fill, in the trade direction."""
+    return entry + cfg.chain_step if side == "LONG" else entry - cfg.chain_step
+
+
+def trail_target(side, entry, peak, cfg):
+    """Trailed stop price for a position at `peak` favourable points. Only meaningful
+    once peak >= trail_start; the caller ratchets it monotonically."""
+    return (entry + peak - cfg.trail_gap) if side == "LONG" else (entry - peak + cfg.trail_gap)
+
+
 class MonsterEngine:
     """Stateful monster engine. Cross-day state (extra_atr red-day carry) lives on
     the instance; per-day state is (re)built by start_day(). The full adaptive
@@ -333,10 +358,7 @@ class MonsterEngine:
                 self.armed_side = side
                 self.arm_reason = f"{gate_hit} | bias {b}"
                 self.quiet_m5 = 0
-                if box:
-                    lvl = (box[1] + c.edge_offset) if side == "LONG" else (box[0] - c.edge_offset)
-                else:
-                    lvl = (self.anchor + c.fallback_trigger) if side == "LONG" else (self.anchor - c.fallback_trigger)
+                lvl = entry_level(side, box, self.anchor, c)
                 self.pend = {"side": side, "level": lvl, "kind": "ENTRY", "arm_reason": self.arm_reason}
                 self.events.append((t, f"ARM {side} @{lvl:.2f} [{self.arm_reason}]"))
         elif not gate_hit and self.armed_side and not self.open_pos:
@@ -351,7 +373,7 @@ class MonsterEngine:
             hit = (px_h >= self.pend["level"]) if self.pend["side"] == "LONG" else (px_l <= self.pend["level"])
             if hit:
                 e = self.pend["level"]
-                sl = e - c.sl_cap if self.pend["side"] == "LONG" else e + c.sl_cap
+                sl = init_sl(self.pend["side"], e, c)
                 if self.pend["kind"] == "ENTRY":
                     self.seq_no += 1
                     self.seq_open_reason = self.pend["arm_reason"]
@@ -360,7 +382,7 @@ class MonsterEngine:
                                       "arm_reason": self.pend["arm_reason"]})
                 self.entries += 1
                 self.events.append((t, f"FILL {self.pend['kind']} {self.pend['side']} @{e:.2f} SL {sl:.2f}"))
-                nxt = e + c.chain_step if self.pend["side"] == "LONG" else e - c.chain_step
+                nxt = chain_level(self.pend["side"], e, c)
                 n_ch = sum(1 for p in self.open_pos if p["kind"] == "CHAIN")
                 self.pend = ({"side": self.pend["side"], "level": nxt, "kind": "CHAIN",
                              "arm_reason": self.seq_open_reason}
@@ -373,8 +395,7 @@ class MonsterEngine:
             p["peak"] = max(p["peak"], fav)
             p["mae"] = max(p["mae"], adv)
             if p["peak"] >= c.trail_start:
-                tr_sl = (p["entry"] + p["peak"] - c.trail_gap) if p["side"] == "LONG" \
-                        else (p["entry"] - p["peak"] + c.trail_gap)
+                tr_sl = trail_target(p["side"], p["entry"], p["peak"], c)
                 p["sl"] = max(p["sl"], tr_sl) if p["side"] == "LONG" else min(p["sl"], tr_sl)
             hit_sl = (px_l <= p["sl"]) if p["side"] == "LONG" else (px_h >= p["sl"])
             if hit_sl:
