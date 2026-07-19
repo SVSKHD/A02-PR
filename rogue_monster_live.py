@@ -75,6 +75,9 @@ def cfg_to_monster(cfg):
     d.bias_m15_lookback = int(g("rogue_bias_m15_lookback", d.bias_m15_lookback))
     d.bias_h1_lookback = int(g("rogue_bias_h1_lookback", d.bias_h1_lookback))
     d.candle_confirm = bool(g("rogue_candle_confirm", d.candle_confirm))
+    d.be_lock_arm = float(g("rogue_be_lock_arm", d.be_lock_arm))       # Fix A
+    d.be_lock_floor = float(g("rogue_be_lock_floor", d.be_lock_floor))  # Fix A
+    d.asia_start_hour = int(g("rogue_asia_start_hour", d.asia_start_hour))  # Fix C
     return d
 
 
@@ -334,7 +337,7 @@ def _reconcile(trader, m, mcfg, positions, px, t):
         pend = m.get("pend")
         kind = pend["kind"] if (pend and pend.get("side") == side) else ("CHAIN" if known else "ENTRY")
         if kind == "ENTRY":
-            m["seq_no"] += 1; m["chains_in_seq"] = 0
+            m["seq_no"] += 1; m["chains_in_seq"] = 0; m["seq_pnl"] = 0.0
         else:
             m["chains_in_seq"] += 1
         known[tks] = {"side": side, "entry": entry, "peak": 0.0, "kind": kind,
@@ -351,17 +354,32 @@ def _reconcile(trader, m, mcfg, positions, px, t):
                 _log(trader, "CHAIN", side=side, level=lvl)
 
     closed_any = False
+    last_reason = None
     for tks in list(known.keys()):
         if tks in cur:
             continue
         pos = known.pop(tks)
-        reason = "TRAIL" if pos["peak"] >= mcfg.trail_start else "SL"
+        # Fix A: a stop-out with the BE lock engaged (peak < trail_start) is a
+        # breakeven scratch, not a full SL.
+        if pos["peak"] >= mcfg.trail_start:
+            reason = "TRAIL"
+        elif rm.be_engaged(pos["peak"], mcfg):
+            reason = "BE"
+        else:
+            reason = "SL"
         _apply_close_guards(trader, m, mcfg, pos, reason, t)
         pnl = _closed_pnl(trader, int(tks))
+        m["seq_pnl"] = float(m.get("seq_pnl", 0.0)) + pnl
+        last_reason = reason
         _log(trader, "CLOSE", side=pos["side"], kind=pos["kind"], price=px, pnl=pnl, reason=reason)
         closed_any = True
 
     if closed_any and not known:
+        # sequence summary card carries the exit reason (BE where applicable)
+        _card(trader, "sequence", anchor=m.get("anchor"),
+              entries=1, chains=int(m.get("chains_in_seq", 0)),
+              pnl=round(float(m.get("seq_pnl", 0.0)), 2), exit_reason=last_reason or "SL")
+        m["seq_pnl"] = 0.0
         # sequence done: cancel any dangling chain pending, roll the anchor, cooldown
         for tk in list(_rogue_pendings(trader).keys()):
             try:
@@ -397,10 +415,12 @@ def _apply_close_guards(trader, m, mcfg, pos, reason, t):
             d = f"{m['consec_sl']} straight SLs, cooldown {mcfg.caution_cooldown_min}m, atr +{mcfg.caution_atr_boost}"
             _log(trader, "GUARD", guard="CAUTION_ON", detail=d)
             _card(trader, "guard", name="CAUTION_ON", detail=d)
-    else:
+    elif reason == "TRAIL":
         if m["consec_sl"] >= mcfg.consec_sl_limit:
             _log(trader, "GUARD", guard="CAUTION_OFF", detail="winner")
         m["consec_sl"] = 0
+    # reason == "BE": neutral scratch (Fix A) — consec_sl / side-fatigue / caution
+    # left untouched; a BE exit is neither a full SL nor a caution-resetting winner.
 
 
 def _manage_trails(trader, m, mcfg, positions, px):
@@ -423,6 +443,20 @@ def _manage_trails(trader, m, mcfg, positions, px):
                     p["sl"] = tr
                 except Exception as e:
                     log.warning(f"{_GLYPH} trail modify {tks} non-fatal: {e!r}")
+        elif mcfg.be_lock_arm > 0 and p["peak"] >= mcfg.be_lock_arm:
+            # Fix A: ratchet SL to breakeven+floor before the trail arms (same SL-modify
+            # path as a trail move -> retry -> LOCK_FALLBACK_CLOSE). Ratchet only.
+            be = rm.be_lock_target(p["side"], p["entry"], mcfg)
+            better = (be > p["sl"]) if p["side"] == "LONG" else (be < p["sl"])
+            if better:
+                try:
+                    trader.adapter.modify_position_sl(int(tks), round(be, 2),
+                                                      dry_run=bool(getattr(trader, "paper", False)))
+                    _log(trader, "BELOCK", ticket=int(tks), price=round(be, 2))  # "BE lock set @<price>"
+                    p["sl"] = be
+                    p["be_set"] = True
+                except Exception as e:
+                    log.warning(f"{_GLYPH} BE lock modify {tks} non-fatal: {e!r}")
 
 
 def _maybe_arm(trader, m, mcfg, m1, t, px, positions, pendings, new_bar):
@@ -458,6 +492,11 @@ def _maybe_arm(trader, m, mcfg, m1, t, px, positions, pendings, new_bar):
         return
     b = rm.bias_of(m15, h1, t, mcfg)
     side = rm.arm_side(gate_hit, px, m1.close, len(m5), b)
+    # Fix C: Asia block — suppress an otherwise-valid arm before the server start hour
+    # (anchor seed + re-anchor unchanged; the gate math above still ran for the log).
+    if side and mcfg.asia_start_hour > 0 and pd.Timestamp(t).hour < mcfg.asia_start_hour:
+        _log(trader, "ASIA", detail="arm suppressed", side=side)
+        return
     if side and rm.fatigue_blocks(m["sl_by_side"], side, b, mcfg):
         _log(trader, "GUARD", guard="FATIGUE", detail=f"{side} SLs {m['sl_by_side'][side]}")
         _card(trader, "guard", name="FATIGUE", detail=f"{side} needs real bias")

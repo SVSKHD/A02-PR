@@ -88,8 +88,13 @@ class Trader:
         self.tele = None
 
 
-def _mk_trader(tmp):
+def _mk_trader(tmp, be_lock_arm=0.0, be_lock_floor=0.0, asia_start_hour=0):
     cfg = Config()
+    # Base tests exercise the core mechanics with the v3.1.0 A+C refinements OFF
+    # (matches the parity contract: both keys at 0 -> byte-identical to baseline).
+    cfg.rogue_be_lock_arm = be_lock_arm
+    cfg.rogue_be_lock_floor = be_lock_floor
+    cfg.rogue_asia_start_hour = asia_start_hour
     broker = sb.FakeBroker("XAUUSD", cfg, starting_balance=50000.0, spread=0.0)
     adapter = TestAdapter(broker, "XAUUSD")
     trader = Trader(cfg, adapter, str(tmp))
@@ -211,6 +216,45 @@ def test_persistence_roundtrip(tmp_path):
     back = rms.load(str(tmp_path))
     assert back["anchor"] == 3005.5 and back["consec_sl"] == 2
     assert back["anchor_day"] == "2026-06-10" and back["extra_atr"] == 0.5
+
+
+def test_be_lock_scratch_live(tmp_path):
+    # Fix A through the live path: BE lock ratchets the broker SL to breakeven at +5,
+    # and a stop-out there is a scratch (consec_sl unchanged), not a full SL.
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path, be_lock_arm=5.0, be_lock_floor=0.0)
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    _tick(broker, 3001.6)                                   # fill entry
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    m = trader._rogue["monster"]
+    tk = int(sorted(m["positions"].keys(), key=int)[0])
+    # run to +5 -> BE lock modifies the broker SL up to breakeven (entry)
+    adapter.feed_m1(_bars_ending(3006.6))
+    _tick(broker, 3006.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    assert abs(adapter.mt5.positions_get(ticket=tk)[0].sl - 3001.6) < 1e-6, "SL ratcheted to BE"
+    # reverse to breakeven -> BE scratch close
+    adapter.feed_m1(_bars_ending(3001.0))
+    _tick(broker, 3001.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    assert len(m["positions"]) == 0, "position closed at BE"
+    assert m["consec_sl"] == 0, "BE scratch must NOT count as an SL"
+    assert m["sl_by_side"] == {"LONG": 0, "SHORT": 0}
+
+
+def test_asia_block_live(tmp_path):
+    # Fix C through the live path: before the server start hour, no arm / no pending.
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path, asia_start_hour=7)
+    adapter.feed_m1(_arm_bars())                            # bars at ~03:xx server (< 7)
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    m = trader._rogue["monster"]
+    assert m["anchor"] is not None, "anchor still seeds at 02:30"
+    assert m.get("pend") is None, "Asia block: no arm before 07:00"
+    assert len(adapter.mt5.orders_get(symbol="XAUUSD")) == 0, "no resting order placed"
 
 
 def _run_all():

@@ -131,6 +131,17 @@ def _cfg_from_args(args):
         cfg.atr_mult = args.atr_mult
     if args.profit_lock is not None:
         cfg.profit_lock = args.profit_lock
+    # v3.1.0 A+C refinements. Engine defaults are OFF (0) for parity; --ac turns on
+    # the validated set (BE lock arm 5 / floor 0, Asia start 07:00) that reproduced
+    # May 14954 / Jun 13172 / Jul 12247. Individual flags override.
+    if args.ac:
+        cfg.be_lock_arm, cfg.be_lock_floor, cfg.asia_start_hour = 5.0, 0.0, 7
+    if args.be_lock_arm is not None:
+        cfg.be_lock_arm = args.be_lock_arm
+    if args.be_lock_floor is not None:
+        cfg.be_lock_floor = args.be_lock_floor
+    if args.asia_start_hour is not None:
+        cfg.asia_start_hour = args.asia_start_hour
     return cfg
 
 
@@ -145,6 +156,11 @@ def main(argv=None):
     ap.add_argument("--lot", type=float, default=None)
     ap.add_argument("--atr-mult", dest="atr_mult", type=float, default=None)
     ap.add_argument("--profit-lock", dest="profit_lock", type=float, default=None)
+    ap.add_argument("--ac", action="store_true",
+                    help="enable the validated v3.1.0 A+C set (BE lock 5/0, Asia 07:00)")
+    ap.add_argument("--be-lock-arm", dest="be_lock_arm", type=float, default=None)
+    ap.add_argument("--be-lock-floor", dest="be_lock_floor", type=float, default=None)
+    ap.add_argument("--asia-start-hour", dest="asia_start_hour", type=int, default=None)
     args = ap.parse_args(argv)
 
     cfg = _cfg_from_args(args)

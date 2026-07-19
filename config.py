@@ -1,4 +1,4 @@
-"""AUREON — Config dataclass (split from bot.py, v3.0.0). Byte-identical."""
+"""AUREON — Config dataclass, v3.1.0 — monster engine + A+C refinements (BE lock, Asia block)."""
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 @dataclass
@@ -142,6 +142,13 @@ class Config:
     rogue_bias_m15_lookback: int = 8
     rogue_bias_h1_lookback: int = 4
     rogue_candle_confirm: bool = False     # M5 engulfing/dragonfly confirm; inert while False
+    # ── MONSTER refinements v3.1.0 (rp3 A+C — validated 3/3 months over baseline) ──
+    # Fix A breakeven lock: at +be_lock_arm, before the trail arms, ratchet SL to
+    # entry +/- floor. A BE stop-out is a scratch (no consec_sl / side-fatigue / caution).
+    rogue_be_lock_arm: float = 5.0         # arm 0.0 = disabled; A+C validated at 5.0
+    rogue_be_lock_floor: float = 0.0       # breakeven (entry) lock
+    # Fix C Asia block: no arming before this server hour (0 = disabled). A+C validated at 7.
+    rogue_asia_start_hour: int = 7
     account_profile: str = "STANDARD_5PCT"
     fp_standard_pct: float = 0.05
     fp_zero_pct: float = 0.01
