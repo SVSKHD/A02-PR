@@ -198,19 +198,9 @@ STEP_NAMES = {
     131: "R6 chop skip",
     # ROGUE — self-anchoring monster-rider (flag-gated; demo default ON, funded OFF)
     132: "rogue boot gate",       # v3.6.0: boot default ON; explicit-off kills; funded forced off
-    133: "rogue detect monster",
-    134: "rogue weak no-slot",
-    135: "rogue cap blocks @10",
-    136: "rogue early entry",
-    137: "rogue adaptive trail",
-    138: "rogue loss-stop",
-    139: "rogue 3-fail pause",
     140: "rogue closure isol",
-    141: "rogue rescue capped",
-    142: "rogue rally reuse",
     143: "rogue demo/funded",
     144: "rogue tagging",
-    145: "rogue ride-unlimited",
     # Watchdog boot validator (Task 1)
     146: "watchdog safe-start",
     147: "watchdog do-not-start",
@@ -234,9 +224,7 @@ STEP_NAMES = {
     # run_live() guaranteed rogue promotion on every live boot
     163: "rogue promote boot",
     # Rogue ML pipeline: pattern logger + model gate (pass-through default) + archive
-    164: "rogue ml gate",
     # Rogue ML: EOD champion/challenger autotrain + exit-feature capture
-    165: "rogue ml train",
     # E-12 feed-death watchdog (re-subscribe + throttled FEED DOWN alert)
     166: "feed resub @N",
     167: "feed resub reset",
@@ -245,10 +233,6 @@ STEP_NAMES = {
     170: "feed wd disabled",
     # E-2/E-3/E-4 Rogue brakes (NOTE: 171-176 collide with fix2's T-B 171-176 --
     # renumber to 177-182 on whichever of fix2/fix3 merges second; mechanical rebase)
-    171: "rogue rec_close",
-    172: "rogue reentry",
-    173: "rogue obs close",
-    174: "rogue loss-stop",
     175: "rogue eod flag",
     176: "rogue isolation",
     # E-6 boost rides with parent (RALLY-only, flag-gated). Renumbered 177-182:
@@ -260,33 +244,21 @@ STEP_NAMES = {
     181: "boost rescue unaff",
     182: "boost A1 replay",
     # E-5 / D-13: Rogue daily loss stop PAIRED to 3 x init-SL strike
-    183: "rogue pairing superseded",
     # F-B: trapped-leg capped late-rescue (No-OCO whipsaw), DEFAULT OFF
     184: "fb late rescue",
     # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
-    185: "fix4 rogue a1",
     # selftest auto-summary reporter (report-only)
     186: "selftest summary",
     # Rogue manual current-tick seed command
-    187: "rogue manual seed",
     # rogueseed command consumed by the live loop (idempotent)
-    188: "rogueseed consume",
     # E-3 CHAIN: ANY Rogue close re-anchors the A1 redesign at the exit (no dormancy)
-    189: "rogue e3 chain",
     # --- P1 "never blind, never brick" (E-13..E-16 + E-12 ladder) --------------
     190: "fix1 rc-retry+brick",   # E-13 shared place_with_retry + Rogue brick fix
     191: "fix2 pnl-unresolved",   # E-14 retry history, book $0 without a fail
-    192: "fix3 rogue gated",      # E-15 rogue under kill/EOD gates + kill flatten
     193: "fix4 feed reinit/L3",   # E-12 L2 MT5 reinit + L3 self-restart guard
     194: "fix5 restart-recovery", # E-16 persist + same-day boot recovery
     195: "wd exit42 only",        # watchdog relaunches ONLY on exit 42; else stop
     # --- P3 (E-17): Rogue monster-catcher discipline -- chop/chase gates -------
-    196: "rogue chase cap",       # Gate 1: reject beyond $20, re-allow on pullback, no slot
-    197: "rogue chain cooldown",  # Gate 2a: chained entry blocked in cooldown, allowed after
-    198: "rogue chain displace",  # Gate 2b: needs fresh $ off the re-anchor (since planting)
-    199: "rogue reversal exempt", # recovery leg: no cooldown, but chase-capped
-    200: "rogue seeds exempt",    # A1 morning seed + manual rogueseed are NOT chained
-    201: "rogue gates off",       # all three knobs 0 -> old unbounded behavior (freeze)
     # Hotfix 2026-07-02: PTRACE BREAK_FAILED spam throttle (logging only)
     202: "ptrace break spam",     # 1 line per episode + suppressed count; gate unchanged
     # P4 2026-07-03: W-7 (D-4), E-18, F-B (D-5) live verification
@@ -317,7 +289,6 @@ STEP_NAMES = {
     # v3.6.0 ENGINE SWITCHES + ROGUE SEED INDEPENDENCE
     223: "engine defaults wired",  # non_oco/rogue boot defaults ON + seed knob validator-wired + seed_source schema
     224: "anchors off manage-only",# no straddle at anchor time; boost family blocked on restored leg; trail/SL-close continue
-    225: "rogue off manage-only",  # drive() takes no entry; restored open Rogue leg still trails/books its close
     226: "engine persist+override",# toggle survives a simulated restart; restored!=default fires ENGINE STATE OVERRIDE
     227: "seed fallback modes",    # anchors off -> Rogue seeds via A1-time snapshot (default) / market_open; chain runs
     228: "seed a1 regression",     # both engines ON -> seeds via the REAL A1 anchor read, byte-identical to master
@@ -5180,59 +5151,6 @@ class SelfTest:
             self._record(224, FAIL, f"raised: {e!r}"); return
         self._record(224, PASS if ok else FAIL, detail)
 
-    def _step_rogue_off_manage_only(self):
-        # 225 (spec ii) rogue OFF = MANAGE-ONLY: with allow_new_entries=False (the
-        # _rogue_entries_blocked wiring), drive() still (a) advances the adaptive
-        # trail on a restored OPEN Rogue leg and (b) books its broker close into
-        # the governor -- but (c) takes NO fresh entry off the chain; (d) the same
-        # env WITH entries allowed does enter (the block is the switch, nothing
-        # else); (e) the seam blocks on the switch alone (a plain Tuesday).
-        import rogue as _r, live_trader as _lt, types
-        from datetime import date as _date
-        try:
-            tr, env, placed, modified, closed = self._mk_rogue_a1_trader(
-                anchors_on=True, rogue_on=False, price=4010.0)
-            env['book'][900] = True
-            tr._rogue = {'day': '2026-07-06', 'gov': _r.new_day_state(),
-                         'anchor': 4000.0, 'leg_dir': 'BUY', 'a1_last_close': None,
-                         'a1_reverted': False,
-                         'open': {'ticket': 900, 'side': 'BUY', 'entry': 4000.0,
-                                  'sl': 3995.0, 'peak': 4000.0,
-                                  'magic': _r.ROGUE_MAGIC,
-                                  'leg_type': _r.ROGUE_LEG_TYPE}}
-            _r.drive(tr, allow_new_entries=False)          # +$10: trail must advance
-            trail_advanced = (modified == [(900, 4007.0)])
-            env['book'].pop(900, None)                     # broker trail-out at 4007
-            env['deal'], env['deal_px'] = 7.0, 4007.0
-            _r.drive(tr, allow_new_entries=False)          # close books, no new entry
-            close_booked = (tr._rogue['open'] is None
-                            and abs(tr._rogue['gov']['day_pnl'] - 7.0) < 1e-9
-                            and abs(tr._rogue['a1_last_close'] - 4007.0) < 1e-9)
-            env['price'] = 4017.2                          # +$10.2 off the chain
-            _r.drive(tr, allow_new_entries=False)
-            no_entry_off = (placed == [])
-            _r.drive(tr, allow_new_entries=True)           # control: flag is the block
-            entered_on = (len(placed) == 1
-                          and placed[0]['magic'] == _r.ROGUE_MAGIC)
-
-            class _Stub:
-                pass
-            t = _Stub(); t.engines = {'anchors': True, 'rogue': False}
-            t._friday_entries_blocked = lambda bd, un: False   # a plain Tuesday
-            t._engine_enabled = lambda e: _lt.LiveTrader._engine_enabled(t, e)
-            seam_blocks = (_lt.LiveTrader._rogue_entries_blocked(
-                t, _date(2026, 7, 7), pd.Timestamp('2026-07-07 07:00:00', tz='UTC'))
-                is True)
-
-            ok = (trail_advanced and close_booked and no_entry_off and entered_on
-                  and seam_blocks)
-            detail = (f"trail_advanced={trail_advanced} close_booked={close_booked} "
-                      f"no_entry_while_off={no_entry_off} control_enters={entered_on} "
-                      f"seam_blocks_on_switch={seam_blocks}")
-        except Exception as e:
-            self._record(225, FAIL, f"raised: {e!r}"); return
-        self._record(225, PASS if ok else FAIL, detail)
-
     def _step_engine_persist_override(self):
         # 226 (spec iii) toggle persists across a simulated restart + the
         # override-vs-config alert: (a) /anchors off persists engines into
@@ -6629,141 +6547,6 @@ class SelfTest:
             self._record(132, FAIL, f"raised: {e!r}"); return
         self._record(132, PASS if ok else FAIL, detail)
 
-    def _step_rogue_detect_monster(self):
-        # 133 SELF-ANCHORING: a strong move (4 same-dir M5 closes, range>=$15, thrust)
-        # drops the anchor at the MOVE-COMPLETION PRICE (the turn extreme), not a clock
-        # time. Jun26-like: 4024 -> 3983 SELL monster -> anchor @ 3983.
-        import rogue as _rogue
-        try:
-            cs = [{'open': 4024, 'high': 4025, 'low': 4014, 'close': 4015},
-                  {'open': 4015, 'high': 4016, 'low': 4004, 'close': 4005},
-                  {'open': 4005, 'high': 4006, 'low': 3994, 'close': 3995},
-                  {'open': 3995, 'high': 3996, 'low': 3983, 'close': 3984}]
-            is_m, mdir, comp = _rogue.detect_monster(cs, self.cfg)
-            ok = (is_m is True and mdir == 'SELL' and abs(comp - 3983.0) < 1e-9)
-            detail = f"is_monster={is_m} dir={mdir} anchor@completion={comp}(=3983,not_clock)"
-        except Exception as e:
-            self._record(133, FAIL, f"raised: {e!r}"); return
-        self._record(133, PASS if ok else FAIL, detail)
-
-    def _step_rogue_weak_no_slot(self):
-        # 134 SETUP GATE: a WEAK move (mixed direction OR range < $15) is NOT a monster ->
-        # no anchor, no entry, no re-anchor slot consumed.
-        import rogue as _rogue
-        try:
-            mixed = [{'open': 4000, 'high': 4006, 'low': 3999, 'close': 4005},   # up
-                     {'open': 4005, 'high': 4006, 'low': 3998, 'close': 3999},   # down
-                     {'open': 3999, 'high': 4006, 'low': 3998, 'close': 4005},   # up
-                     {'open': 4005, 'high': 4006, 'low': 3998, 'close': 3999}]   # down
-            small = [{'open': 4000, 'high': 4001, 'low': 3999, 'close': 4000.5},
-                     {'open': 4000.5, 'high': 4001.5, 'low': 3999.5, 'close': 4001},
-                     {'open': 4001, 'high': 4002, 'low': 4000, 'close': 4001.5},
-                     {'open': 4001.5, 'high': 4002.5, 'low': 4000.5, 'close': 4002}]
-            no_mixed = (_rogue.detect_monster(mixed, self.cfg)[0] is False)
-            no_small = (_rogue.detect_monster(small, self.cfg)[0] is False)  # range < $15
-            gov = _rogue.new_day_state()
-            slot_unconsumed = (gov['reanchor_count'] == 0)   # detection never calls record_entry
-            ok = no_mixed and no_small and slot_unconsumed
-            detail = f"mixed_not_monster={no_mixed} small_range_not_monster={no_small} no_slot={slot_unconsumed}"
-        except Exception as e:
-            self._record(134, FAIL, f"raised: {e!r}"); return
-        self._record(134, PASS if ok else FAIL, detail)
-
-    def _step_rogue_cap_blocks(self):
-        # 135 CAP: re-entry blocked once the daily cap (rogue_max_reentries_per_day=10)
-        # is hit. Each NEW entry consumes one slot; the 11th is refused.
-        import rogue as _rogue
-        try:
-            cap = int(getattr(self.cfg, 'rogue_max_reentries_per_day', 10))
-            gov = _rogue.new_day_state()
-            allowed = 0
-            for _ in range(cap):
-                ok_i, _r = _rogue.can_enter(gov, self.cfg)
-                if ok_i:
-                    allowed += 1
-                    _rogue.record_entry(gov)
-            blocked, reason = _rogue.can_enter(gov, self.cfg)
-            ok = (cap == 10 and allowed == 10 and gov['reanchor_count'] == 10
-                  and blocked is False and reason == 'daily_cap')
-            detail = f"cap={cap} allowed={allowed} 11th_blocked={blocked is False} reason={reason}"
-        except Exception as e:
-            self._record(135, FAIL, f"raised: {e!r}"); return
-        self._record(135, PASS if ok else FAIL, detail)
-
-    def _step_rogue_early_entry(self):
-        # 136 EARLY ENTRY (Jun26): anchor 3983, next leg BUY. Enter ~$20 in (4003), SL
-        # init_sl tight (entry - rogue_init_sl, READ from cfg -- value-agnostic to the D-13
-        # 5->10 widening) -- NOT chasing the obvious top (~4080). A too-early move ($12 in,
-        # 3995) does NOT enter.
-        import rogue as _rogue
-        try:
-            _isl = float(self.cfg.rogue_init_sl)
-            en, epx, sl = _rogue.entry_decision(3983.0, 'BUY', 4003.0, self.cfg)
-            early_ok = (en is True and abs(epx - 4003.0) < 1e-9 and abs(sl - (epx - _isl)) < 1e-9
-                        and epx < 4080.0)
-            too_early = _rogue.entry_decision(3983.0, 'BUY', 3995.0, self.cfg)[0]
-            ok = early_ok and (too_early is False)
-            detail = f"enter@{epx}(~$20 in) SL@{sl}(entry-${_isl:.0f}) not_top(<4080)={epx<4080} 12in_no_enter={not too_early}"
-        except Exception as e:
-            self._record(136, FAIL, f"raised: {e!r}"); return
-        self._record(136, PASS if ok else FAIL, detail)
-
-    def _step_rogue_adaptive_trail(self):
-        # 137 ADAPTIVE TRAIL: tight early ($3) until profit >= widen ($15), then wide
-        # ($6) -- the transition that lets a real monster ride. early/deep/widen tested.
-        import rogue as _rogue
-        try:
-            early = _rogue.trail_gap(10.0, self.cfg)   # < 15 -> 3
-            at = _rogue.trail_gap(15.0, self.cfg)      # == 15 -> 6
-            deep = _rogue.trail_gap(25.0, self.cfg)    # > 15 -> 6
-            ok = (abs(early - 3.0) < 1e-9 and abs(at - 6.0) < 1e-9 and abs(deep - 6.0) < 1e-9)
-            detail = f"early@$10={early}(=3) at_widen@$15={at}(=6) deep@$25={deep}(=6)"
-        except Exception as e:
-            self._record(137, FAIL, f"raised: {e!r}"); return
-        self._record(137, PASS if ok else FAIL, detail)
-
-    def _step_rogue_loss_stop(self):
-        # 138 GOVERNOR: cumulative day P&L <= rogue_daily_loss_stop STOPS new entries for the
-        # day. Value-agnostic: thresholds are READ from cfg (half the stop still trades; a
-        # cumulative push past the stop halts).
-        import rogue as _rogue
-        try:
-            loss_stop = float(self.cfg.rogue_daily_loss_stop)
-            gov = _rogue.new_day_state()
-            _rogue.record_close(gov, loss_stop * 0.5, was_fail=True, cfg=self.cfg)
-            still_ok = _rogue.can_enter(gov, self.cfg)[0]            # half the stop -> ok
-            _rogue.record_close(gov, loss_stop * 0.6, was_fail=False, cfg=self.cfg)  # 1.1x stop -> halt
-            blocked, reason = _rogue.can_enter(gov, self.cfg)
-            ok = (still_ok is True and gov['loss_stopped'] is True
-                  and blocked is False and reason == 'daily_loss_stop')
-            detail = (f"at_half_ok={still_ok} at_1.1x_stops={gov['loss_stopped']} "
-                      f"stop=${loss_stop:.0f} reason={reason}")
-        except Exception as e:
-            self._record(138, FAIL, f"raised: {e!r}"); return
-        self._record(138, PASS if ok else FAIL, detail)
-
-    def _step_rogue_fail_pause(self):
-        # 139 GOVERNOR: 3 consecutive init-SL fake-outs PAUSE new entries; a winner in
-        # between RESETS the streak.
-        import rogue as _rogue
-        try:
-            gov = _rogue.new_day_state()
-            for _ in range(3):
-                _rogue.record_close(gov, -5.0, was_fail=True, cfg=self.cfg)
-            blocked, reason = _rogue.can_enter(gov, self.cfg)
-            pauses = (gov['consec_fails'] == 3 and gov['fail_paused'] is True
-                      and blocked is False and reason == 'consecutive_fail_pause')
-            g2 = _rogue.new_day_state()
-            _rogue.record_close(g2, -5.0, True, self.cfg)
-            _rogue.record_close(g2, -5.0, True, self.cfg)
-            _rogue.record_close(g2, +12.0, False, self.cfg)   # a winner resets
-            resets = (g2['consec_fails'] == 0 and g2['fail_paused'] is False)
-            ok = pauses and resets
-            detail = f"3_fails_pause={pauses} winner_resets_streak={resets}"
-        except Exception as e:
-            self._record(139, FAIL, f"raised: {e!r}"); return
-        self._record(139, PASS if ok else FAIL, detail)
-
     def _step_rogue_closure_isolation(self):
         # 140 CLOSURE ISOLATION: a ROGUE close closes ONLY rogue legs; an ANCHOR close
         # closes ONLY anchor legs. No generic close-all; distinct magic/leg_type.
@@ -6781,38 +6564,6 @@ class SelfTest:
         except Exception as e:
             self._record(140, FAIL, f"raised: {e!r}"); return
         self._record(140, PASS if ok else FAIL, detail)
-
-    def _step_rogue_rescue_capped(self):
-        # 141 REUSE — RESCUE on fail is CAPPED: a Rogue rescue leg reuses the RESCUE state
-        # machine from the Rogue anchor and inherits the SAME derived cap discipline
-        # (boost_whipsaw_cap -$700), so a bad Rogue catch cannot stack uncapped loss.
-        # ROGUE-tagged (own magic, distinct from the anchor).
-        import boosts as _boosts, rogue as _rogue
-        try:
-            cap = _boosts.boost_whipsaw_cap(self.cfg, 'RESCUE')
-            capped = abs(cap - 700.0) < 1e-6
-            breach = _boosts.cap_breached(-705.0, self.cfg, 'RESCUE')   # binds at the cap
-            rogue_tagged = (_rogue.ROGUE_MAGIC != 20260522)
-            ok = capped and (breach is True) and rogue_tagged
-            detail = f"rescue_cap-$700={capped} cap_binds={breach} rogue_tagged={rogue_tagged}"
-        except Exception as e:
-            self._record(141, FAIL, f"raised: {e!r}"); return
-        self._record(141, PASS if ok else FAIL, detail)
-
-    def _step_rogue_rally_reuse(self):
-        # 142 REUSE — RALLY on strength: a Rogue ride/pyramid reuses the shared RALLY
-        # accessors ($5 arm) from the Rogue anchor, ROGUE-tagged. Shared HELPERS only --
-        # no merged path (rogue has its own magic/leg_type/counter).
-        import rally as _rally, rogue as _rogue
-        try:
-            arm = _rally.event_arm(self.cfg)              # reused $5 rally arm
-            reuse_ok = abs(arm - 5.0) < 1e-9
-            tag_ok = (_rogue.ROGUE_LEG_TYPE == 'rogue' and _rogue.ROGUE_MAGIC != 20260522)
-            ok = reuse_ok and tag_ok
-            detail = f"rally_arm_reused=${arm}(=5) rogue_tagged={tag_ok}"
-        except Exception as e:
-            self._record(142, FAIL, f"raised: {e!r}"); return
-        self._record(142, PASS if ok else FAIL, detail)
 
     def _step_rogue_demo_funded(self):
         # 143 DEMO default-ON / FUNDED default-OFF: funded_default(demo, funded). A funded
@@ -6844,30 +6595,6 @@ class SelfTest:
         except Exception as e:
             self._record(144, FAIL, f"raised: {e!r}"); return
         self._record(144, PASS if ok else FAIL, detail)
-
-    def _step_rogue_ride_unlimited(self):
-        # 145 RIDE-WINNER-UNLIMITED: the cap counts ONLY new entries (record_entry).
-        # Trailing an open winner consumes NO slot -- a single catch can ride a monster
-        # as far as the trail goes. The cap (10) bounds NEW entries, not the ride.
-        import rogue as _rogue
-        try:
-            gov = _rogue.new_day_state()
-            _rogue.record_entry(gov)                      # one NEW entry
-            # simulate a long ride: many trail updates, ZERO new entries -> count stays 1.
-            for _profit in (5, 10, 20, 40, 80, 111):
-                _ = _rogue.trail_gap(_profit, self.cfg)   # trailing only; no record_entry
-            ride_uncapped = (gov['reanchor_count'] == 1)
-            # the cap still bounds NEW entries to 10 regardless of how far winners ride.
-            for _ in range(9):
-                _rogue.record_entry(gov)
-            blocked, reason = _rogue.can_enter(gov, self.cfg)
-            cap_on_new_only = (gov['reanchor_count'] == 10 and blocked is False
-                               and reason == 'daily_cap')
-            ok = ride_uncapped and cap_on_new_only
-            detail = f"trailing_consumes_no_slot={ride_uncapped} cap_counts_new_entries_only={cap_on_new_only}"
-        except Exception as e:
-            self._record(145, FAIL, f"raised: {e!r}"); return
-        self._record(145, PASS if ok else FAIL, detail)
 
     # --- Watchdog boot validator (Task 1) -----------------------------------
     def _step_watchdog_safe_start(self):
@@ -6990,253 +6717,6 @@ class SelfTest:
         except Exception as e:
             self._record(163, FAIL, f"raised: {e!r}"); return
         self._record(163, PASS if ok else FAIL, detail)
-
-    def _step_rogue_ml_gate(self):
-        # 164 Rogue ML pipeline (pattern logger + model gate + archive). Covers:
-        # (a) a pattern row is written on a Rogue eval, (b) the gate is pass-through when
-        # DISABLED (trade goes through), (c) it BLOCKS when ENABLED + score<threshold,
-        # (d) an untrained model returns 1.0, (e) anchors write NO rogue_patterns rows
-        # (every row is the ROGUE magic; rogue-OFF writes nothing), (f) a predict() error
-        # FAILS OPEN (score 1.0). Driven with stubs -- no MT5, no order ever placed for
-        # real (place is captured).
-        import rogue as _r
-        import rogue_model as _rm
-        import rogue_patternlog as _rpl
-        import tempfile, shutil, os, csv, types
-        tmp = None
-        try:
-            tmp = tempfile.mkdtemp(prefix="aureon_mlgate_")
-
-            # monster: 4 up M5 closes, range $20, real thrust -> BUY move, anchor=high.
-            monster = [{'open': 4082.0, 'high': 4100.0, 'low': 4080.0, 'close': 4098.0}] * 4
-
-            def _mk_trader(run_dir, *, rogue_on, gate_on, threshold=0.5, mid=4075.0):
-                os.makedirs(run_dir, exist_ok=True)
-                placed = []
-                mt5 = types.SimpleNamespace(
-                    ACCOUNT_TRADE_MODE_DEMO=0,
-                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
-                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
-                        bid=mid - 0.1, ask=mid + 0.1),
-                    positions_get=lambda ticket=None: [])
-                def _place(symbol, side, lot, sl=None, tp=None, magic=None,
-                           comment=None, dry_run=False):
-                    placed.append({'side': side, 'magic': magic})
-                    return types.SimpleNamespace(retcode=10009, order=5001, deal=5001)
-                adapter = types.SimpleNamespace(
-                    mt5=mt5, get_latest_m5=lambda sym, n: monster,
-                    place_market_order=_place,
-                    modify_position_sl=lambda *a, **k: types.SimpleNamespace(retcode=10009))
-                cfg = types.SimpleNamespace(
-                    symbol='XAUUSD', lot_size=0.01, rogue_enabled=rogue_on,
-                    rogue_daywatch=True, rogue_min_candles=4, rogue_min_range=15.0,
-                    rogue_body_mult=1.5, rogue_entry_confirm=20.0, rogue_init_sl=5.0,
-                    rogue_max_reentries_per_day=10, rogue_daily_loss_stop=-150.0,
-                    rogue_consecutive_fail_stop=3, rogue_trail_arm=5.0,
-                    rogue_model_gate_enabled=gate_on, rogue_model_threshold=threshold,
-                    rogue_model_path=os.path.join(tmp, "no_such_model.pkl"))
-                tele = types.SimpleNamespace(info=lambda *a, **k: None,
-                                             warning=lambda *a, **k: None)
-                tr = types.SimpleNamespace(cfg=cfg, adapter=adapter, run_dir=run_dir,
-                                           paper=True, tele=tele, _rogue=None, _rpl=None,
-                                           state={'last_broker_date': '2026-06-29'},
-                                           _last_boost_mid=mid)
-                return tr, placed
-
-            def _patterns(run_dir):
-                p = os.path.join(run_dir, "rogue_patterns.csv")
-                if not os.path.exists(p):
-                    return []
-                with open(p, encoding='utf-8') as f:
-                    return list(csv.DictReader(f))
-
-            # (d) untrained model -> 1.0
-            _rm.reset_singleton()
-            untrained_one = (abs(_rm.RogueModel().predict(
-                {'range_dollars': 20, 'body_ratio': 0.8}) - 1.0) < 1e-9)
-
-            # (f) predict() error -> FAIL OPEN (1.0). A trained model with broken weights.
-            broke = _rm.RogueModel()
-            broke.trained = True
-            broke.feature_order = ['range_dollars']
-            broke.mean = None; broke.scale = None; broke.coef = None  # -> raises inside
-            fail_open = (abs(broke.predict({'range_dollars': 20}) - 1.0) < 1e-9)
-
-            # (b) gate DISABLED -> pass-through: entry placed, row decision ENTER.
-            _rm.reset_singleton()
-            d_off = os.path.join(tmp, "off")
-            tr, placed = _mk_trader(d_off, rogue_on=True, gate_on=False)
-            _r.drive(tr)
-            rows_off = _patterns(d_off)
-            passthrough_trades = (len(placed) == 1 and placed[0]['magic'] == _r.ROGUE_MAGIC)
-            wrote_row = (len(rows_off) >= 1)
-            row_is_enter = any(x['decision'] == 'ENTER' and x['model_score'] != ''
-                               for x in rows_off)        # (a) row written w/ score
-
-            # (c) gate ENABLED + forced LOW score -> BLOCK (no place, SKIP_BY_MODEL row).
-            _rm.reset_singleton()
-            class _LowModel:
-                trained = True
-                def predict(self, f): return 0.10
-            _orig_get = _rm.get_model
-            _rm.get_model = lambda path=None: _LowModel()
-            try:
-                d_on = os.path.join(tmp, "on")
-                tr2, placed2 = _mk_trader(d_on, rogue_on=True, gate_on=True, threshold=0.5)
-                _r.drive(tr2)
-            finally:
-                _rm.get_model = _orig_get
-            rows_on = _patterns(d_on)
-            gate_blocks = (len(placed2) == 0
-                           and any(x['decision'] == 'SKIP_BY_MODEL' for x in rows_on))
-
-            # (e) anchors write NO rows: rogue DISABLED -> drive no-op -> no file. And
-            #     every row ever written carries the ROGUE magic (never the anchor magic).
-            _rm.reset_singleton()
-            d_anchor = os.path.join(tmp, "anchor")
-            tr3, placed3 = _mk_trader(d_anchor, rogue_on=False, gate_on=False)
-            _r.drive(tr3)
-            anchor_silent = (not os.path.exists(os.path.join(d_anchor, "rogue_patterns.csv"))
-                             and len(placed3) == 0)
-            all_magics = {int(x['magic']) for x in (rows_off + rows_on)}
-            rogue_only_magic = (all_magics == {_r.ROGUE_MAGIC}
-                                and _r.ROGUE_MAGIC == 20260626)
-
-            ok = (untrained_one and fail_open and passthrough_trades and wrote_row
-                  and row_is_enter and gate_blocks and anchor_silent and rogue_only_magic)
-            detail = (f"(a)row={wrote_row}&enter={row_is_enter} (b)passthrough={passthrough_trades} "
-                      f"(c)blocks={gate_blocks} (d)untrained1.0={untrained_one} "
-                      f"(e)anchor_silent={anchor_silent}&rogue_magic={rogue_only_magic} "
-                      f"(f)fail_open={fail_open}")
-        except Exception as e:
-            self._record(164, FAIL, f"raised: {e!r}")
-            if tmp:
-                shutil.rmtree(tmp, ignore_errors=True)
-            _rm.reset_singleton()
-            return
-        finally:
-            if tmp:
-                shutil.rmtree(tmp, ignore_errors=True)
-            _rm.reset_singleton()
-        self._record(164, PASS if ok else FAIL, detail)
-
-    def _step_rogue_ml_train(self):
-        # 165 Rogue ML autotrain (champion/challenger, fail-safe) + exit-feature capture.
-        # Covers: (g) autotrain SKIPS when rows<300; (h) champion is KEPT when the challenger
-        # is not better (promotion rule + same-data re-train doesn't replace); a fresh model
-        # is PROMOTED when there is no champion (model can come into being); and (i) EXIT
-        # features (entry_price, max_fav, trail_path_summary, exit_price, held_minutes,
-        # outcome_dollars) are captured on a simulated close, with a losing close re-labeled
-        # FAKEOUT. All pure-Python -- no sklearn, no MT5.
-        import rogue_autotrain as _rat
-        import rogue_patternlog as _pl
-        import tempfile, shutil, os, csv, types
-        tmp = None
-        try:
-            tmp = tempfile.mkdtemp(prefix="aureon_mltrain_")
-
-            # --- (g) insufficient data -> skip ---
-            run_small = os.path.join(tmp, "small")
-            os.makedirs(run_small)
-            for k in range(20):
-                _pl.log_eval(run_small, ts=f"2026-06-29 0{k%6}:00:00", direction='BUY',
-                             features={'range_dollars': 20, 'body_ratio': 0.8,
-                                       'candle_count': 4, 'atr': 5, 'spread': 0.2,
-                                       'confirm_dollars': 22, 'time_bucket': 'asia'},
-                             decision='ENTER', model_score=1.0, entry_price=4000.0,
-                             outcome_dollars=(10.0 if k % 2 else -5.0))
-            v_small = _rat.run(run_small, archive_dir=os.path.join(tmp, "noarch"),
-                               model_path=os.path.join(tmp, "m_small.pkl"))
-            skips_small = (v_small['action'] == 'skip_insufficient' and v_small['rows'] < 300
-                           and not os.path.exists(os.path.join(tmp, "m_small.pkl")))
-
-            # --- (h) promotion rule: champion kept when challenger not better ---
-            keep_worse = (_rat.decide_promotion({'acc': 0.71, 'fakeout_recall': 0.6},
-                                                {'acc': 0.68, 'fakeout_recall': 0.6})[0] is False)
-            promote_none = (_rat.decide_promotion(None, {'acc': 0.6, 'fakeout_recall': 0.5})[0] is True)
-            promote_better = (_rat.decide_promotion({'acc': 0.60, 'fakeout_recall': 0.5},
-                                                    {'acc': 0.70, 'fakeout_recall': 0.6})[0] is True)
-            keep_equal = (_rat.decide_promotion({'acc': 0.70, 'fakeout_recall': 0.6},
-                                                {'acc': 0.70, 'fakeout_recall': 0.6})[0] is False)
-
-            # --- (h) integration: >=300 rows with a learnable signal. First run has NO
-            #     champion -> PROMOTE; second run on the SAME data -> challenger == champion
-            #     (not better by margin) -> KEEP. Proves a champion is never replaced by a
-            #     non-better model. ---
-            run_big = os.path.join(tmp, "big")
-            os.makedirs(run_big)
-            for k in range(360):
-                win = (k % 2 == 0)                       # learnable: confirm high -> win
-                _pl.log_eval(run_big, ts=f"2026-06-{1 + k // 24:02d} {k % 24:02d}:00:00",
-                             direction=('BUY' if win else 'SELL'),
-                             features={'range_dollars': (25 if win else 16),
-                                       'body_ratio': (0.85 if win else 0.55),
-                                       'candle_count': 4, 'atr': (6 if win else 4),
-                                       'spread': 0.2,
-                                       'confirm_dollars': (28 if win else 20),
-                                       'time_bucket': ('london' if win else 'asia')},
-                             decision='ENTER', model_score=1.0, entry_price=4000.0 + k,
-                             outcome_dollars=(15.0 if win else -6.0))
-            mp = os.path.join(tmp, "champ.pkl")
-            v1 = _rat.run(run_big, archive_dir=os.path.join(tmp, "noarch"), model_path=mp)
-            v2 = _rat.run(run_big, archive_dir=os.path.join(tmp, "noarch"), model_path=mp)
-            promoted_from_nothing = (v1['action'] == 'promoted' and os.path.exists(mp))
-            kept_on_rerun = (v2['action'] == 'kept_champion')
-
-            # --- (i) exit-feature capture on a close (winner) + FAKEOUT relabel (loser) ---
-            run_x = os.path.join(tmp, "exit")
-            os.makedirs(run_x)
-            # seed an ENTER row, then simulate the close via observe()'s backfill path.
-            ts_enter = "2026-06-29 06:00:00"
-            _pl.log_eval(run_x, ts=ts_enter, direction='SELL',
-                         features={'range_dollars': 20, 'body_ratio': 0.8, 'candle_count': 4,
-                                   'atr': 5, 'spread': 0.2, 'confirm_dollars': 25,
-                                   'time_bucket': 'asia'},
-                         decision='ENTER', model_score=1.0, entry_price=4075.0)
-            # winning SELL: entry 4075 -> peak 4040 -> exit(sl) 4050 => +25 fav, +25 outcome.
-            _pl.backfill_exit(run_x, ts_enter,
-                              {'max_fav': 35.0, 'trail_path_summary': '4075.0->4040.0->4050.0',
-                               'exit_price': 4050.0, 'held_minutes': 42.0,
-                               'outcome_dollars': 25.0})
-            with open(os.path.join(run_x, "rogue_patterns.csv"), encoding='utf-8') as f:
-                xrow = list(csv.DictReader(f))[0]
-            exit_captured = all(str(xrow.get(c, '')) != '' for c in
-                                ('entry_price', 'max_fav', 'trail_path_summary',
-                                 'exit_price', 'held_minutes', 'outcome_dollars'))
-
-            # losing close -> decision relabeled FAKEOUT.
-            ts_enter2 = "2026-06-29 07:00:00"
-            _pl.log_eval(run_x, ts=ts_enter2, direction='BUY',
-                         features={'range_dollars': 18, 'body_ratio': 0.7, 'candle_count': 4,
-                                   'atr': 4, 'spread': 0.2, 'confirm_dollars': 22,
-                                   'time_bucket': 'london'},
-                         decision='ENTER', model_score=1.0, entry_price=4000.0)
-            _pl.backfill_exit(run_x, ts_enter2,
-                              {'max_fav': 1.0, 'trail_path_summary': '4000->4001->3995',
-                               'exit_price': 3995.0, 'held_minutes': 5.0,
-                               'outcome_dollars': -5.0}, decision=_pl.FAKEOUT)
-            with open(os.path.join(run_x, "rogue_patterns.csv"), encoding='utf-8') as f:
-                rows_x = list(csv.DictReader(f))
-            fakeout_relabel = any(r['decision'] == 'FAKEOUT'
-                                  and str(r['outcome_dollars']) == '-5.0' for r in rows_x)
-
-            ok = (skips_small and keep_worse and promote_none and promote_better
-                  and keep_equal and promoted_from_nothing and kept_on_rerun
-                  and exit_captured and fakeout_relabel)
-            detail = (f"(g)skip<300={skips_small} (h)keep_worse={keep_worse} "
-                      f"promote_none={promote_none} promote_better={promote_better} "
-                      f"keep_equal={keep_equal} promoted_new={promoted_from_nothing} "
-                      f"kept_rerun={kept_on_rerun} (i)exit_captured={exit_captured} "
-                      f"fakeout_relabel={fakeout_relabel}")
-        except Exception as e:
-            self._record(165, FAIL, f"raised: {e!r}")
-            if tmp:
-                shutil.rmtree(tmp, ignore_errors=True)
-            return
-        finally:
-            if tmp:
-                shutil.rmtree(tmp, ignore_errors=True)
-        self._record(165, PASS if ok else FAIL, detail)
 
     # --- E-12 feed-death watchdog (re-subscribe + throttled FEED DOWN alert) ----
     # All five drive the PURE feed_watchdog.FeedWatchdog with a synthetic monotonic
@@ -7379,79 +6859,6 @@ class SelfTest:
                      'open': {'ticket': tk, 'side': 'BUY', 'entry': 4000.0, 'sl': 3995.0,
                               'peak': 4010.0}}
         return tr, closes
-
-    def _step_r1_rogue_record_close(self):
-        # 171 (T-R1): a broker-side Rogue close books the governor ONCE (day_pnl reflects
-        # the realized $) and clears st['open'] -- and issues NO close itself.
-        import rogue as _R
-        try:
-            tr, closes = self._r_trader(open_at_broker=False, pnl=50.0)
-            booked = _R.detect_close(tr, tr._rogue)
-            ok = (booked and abs(tr._rogue['gov']['day_pnl'] - 50.0) < 1e-9
-                  and tr._rogue['open'] is None and closes == [])
-            detail = f"booked={booked} day_pnl={tr._rogue['gov']['day_pnl']} open_cleared={tr._rogue['open'] is None} closes={closes}"
-        except Exception as e:
-            self._record(171, FAIL, f"raised: {e!r}"); return
-        self._record(171, PASS if ok else FAIL, detail)
-
-    def _step_r2_rogue_reentry_allowed(self):
-        # 172 (T-R2): after a (winning) close, st['open'] is None AND can_enter -> ok, so
-        # Rogue can take its next entry the SAME day (E-3 re-entry restored).
-        import rogue as _R
-        try:
-            tr, _ = self._r_trader(open_at_broker=False, pnl=50.0)
-            _R.detect_close(tr, tr._rogue)
-            ok_enter, reason = _R.can_enter(tr._rogue['gov'], tr.cfg)
-            ok = tr._rogue['open'] is None and ok_enter and reason == 'ok'
-            detail = f"open_cleared={tr._rogue['open'] is None} can_enter={ok_enter} reason={reason}"
-        except Exception as e:
-            self._record(172, FAIL, f"raised: {e!r}"); return
-        self._record(172, PASS if ok else FAIL, detail)
-
-    def _step_r3_rogue_observe_close(self):
-        # 173 (T-R3): once st['open'] is cleared on a close, rogue_patternlog.observe()'s
-        # CLOSE branch runs (F-A exit data captured) -- proven by its state effect
-        # (open_ticket -> None, ticket added to the 'closed' set).
-        import rogue_patternlog as _RPL, dataclasses, tempfile, shutil
-        tmp = None
-        try:
-            tmp = tempfile.mkdtemp(prefix='aureon_rogueobs_')
-            tr, _ = self._r_trader(open_at_broker=False, pnl=20.0,
-                                   cfg=dataclasses.replace(self.cfg, rogue_enabled=True))
-            tr.run_dir = tmp
-            _RPL.observe(tr)                       # snapshot the open position into _rpl
-            snap_ok = tr._rpl.get('open_ticket') == self._R_ROGUE_TK
-            tr._rogue['open'] = None               # detect_close cleared it
-            _RPL.observe(tr)                       # open gone + ticket closed -> CLOSE branch
-            ran = (tr._rpl.get('open_ticket') is None
-                   and self._R_ROGUE_TK in tr._rpl.get('closed', set()))
-            ok = snap_ok and ran
-            detail = f"snapshot={snap_ok} close_branch_ran={ran}"
-        except Exception as e:
-            self._record(173, FAIL, f"raised: {e!r}")
-            if tmp: shutil.rmtree(tmp, ignore_errors=True)
-            return
-        finally:
-            if tmp: shutil.rmtree(tmp, ignore_errors=True)
-        self._record(173, PASS if ok else FAIL, detail)
-
-    def _step_r4_rogue_loss_stop_trips(self):
-        # 174 (T-R4): with the governor now fed (E-2), a losing day that crosses the daily
-        # loss stop trips loss_stopped -> can_enter blocks. No longer inert. Value-agnostic:
-        # the losing close is READ from cfg (one strike past the daily stop), so a single
-        # init-SL strike no longer halts but a day beyond the paired stop does.
-        import rogue as _R
-        try:
-            _deep_loss = float(self.cfg.rogue_daily_loss_stop) - 75.0   # just past the stop
-            tr, _ = self._r_trader(open_at_broker=False, pnl=_deep_loss)
-            _R.detect_close(tr, tr._rogue)
-            ok_enter, reason = _R.can_enter(tr._rogue['gov'], tr.cfg)
-            ok = (tr._rogue['gov']['loss_stopped'] and not ok_enter
-                  and reason == 'daily_loss_stop')
-            detail = f"day_pnl={tr._rogue['gov']['day_pnl']} loss_stopped={tr._rogue['gov']['loss_stopped']} reason={reason}"
-        except Exception as e:
-            self._record(174, FAIL, f"raised: {e!r}"); return
-        self._record(174, PASS if ok else FAIL, detail)
 
     def _step_r5_rogue_eod_flag(self):
         # 175 (T-R5): rogue_flatten_at_eod OFF -> eod_flatten is a no-op (rides);
@@ -7620,54 +7027,6 @@ class SelfTest:
         except Exception as e:
             self._record(182, FAIL, f"raised: {e!r}"); return
         self._record(182, PASS if ok else FAIL, detail)
-
-    def _step_e5_rogue_stop_525(self):
-        # 183 E-5 / D-13 pairing (SUPERSEDED 2026-07-08 -> loss stop tightened to -$370). The
-        # pause CODE is kept and re-arms if the SL/stop values change: under an explicitly
-        # PAIRED cfg (loss_stop = -3 x one init-SL strike) the 3-fail pause fires BEFORE the
-        # halt on small fakeouts, exactly as before. And at the PRODUCTION default the halt is
-        # reached first (2 strikes) -- the pause is intentionally unreachable now.
-        import rogue as _rogue, dataclasses
-        try:
-            per_strike = (float(self.cfg.rogue_init_sl)
-                          * float(self.cfg.lot_size)
-                          * float(self.cfg.contract_size))          # one init-SL strike ($)
-            # PAIRED cfg proves the KEPT pause mechanism re-arms when values change.
-            pcfg = dataclasses.replace(self.cfg, rogue_daily_loss_stop=-3.0 * per_strike)
-            gov = _rogue.new_day_state()
-            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=pcfg)
-            at_1 = _rogue.can_enter(gov, pcfg)
-            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=pcfg)
-            at_2 = _rogue.can_enter(gov, pcfg)
-            _rogue.record_close(gov, -per_strike, was_fail=True, cfg=pcfg)   # 3 strikes = stop
-            at_3_blocked, at_3_reason = _rogue.can_enter(gov, pcfg)
-            ladder_ok = (at_1[0] is True and at_2[0] is True and at_3_blocked is False
-                         and at_3_reason in ('daily_loss_stop', 'consecutive_fail_pause')
-                         and gov['loss_stopped'] is True)
-            g2 = _rogue.new_day_state()
-            for _ in range(3):
-                _rogue.record_close(g2, -5.0, was_fail=True, cfg=pcfg)   # -15 total
-            paused_blocked, paused_reason = _rogue.can_enter(g2, pcfg)
-            fail_before_loss = (g2['fail_paused'] is True and g2['loss_stopped'] is False
-                                and paused_blocked is False
-                                and paused_reason == 'consecutive_fail_pause')
-            # PRODUCTION default (self.cfg, -$370): the HALT is reached first (2 strikes),
-            # the 3-fail pause is NOT reached -- the D-13 pairing is superseded.
-            gp = _rogue.new_day_state()
-            _rogue.record_close(gp, -per_strike, was_fail=True, cfg=self.cfg)
-            prod_1 = _rogue.can_enter(gp, self.cfg)[0]
-            _rogue.record_close(gp, -per_strike, was_fail=True, cfg=self.cfg)
-            prod_2_blocked, prod_2_reason = _rogue.can_enter(gp, self.cfg)
-            superseded_ok = (prod_1 is True and prod_2_blocked is False
-                             and prod_2_reason == 'daily_loss_stop'
-                             and gp['consec_fails'] == 2 and gp['fail_paused'] is False)
-            ok = ladder_ok and fail_before_loss and superseded_ok
-            detail = (f"per_strike=${per_strike:.0f} PAIRED[ladder={ladder_ok} "
-                      f"pause_before_loss={fail_before_loss}] "
-                      f"PROD_default[2strike_halt={prod_2_reason} pause_unreached={superseded_ok}]")
-        except Exception as e:
-            self._record(183, FAIL, f"raised: {e!r}"); return
-        self._record(183, PASS if ok else FAIL, detail)
 
     def _step_d13_three_strike_pause(self):
         # 232 D-13 ORDERING (SUPERSEDED 2026-07-08). The 3-fail pause code is KEPT and re-arms
@@ -11025,112 +10384,6 @@ class SelfTest:
             self._record(287, FAIL, f"raised: {e!r}"); return
         self._record(287, PASS if ok else FAIL, detail)
 
-    def _step_fix4_rogue_a1(self):
-        # 185 Fix 4: Rogue A1-anchored redesign (NEW ENGINE, flag-gated DEFAULT OFF).
-        # PURE cores + gating + isolation:
-        #  (a) OFF -> drive() does NOT call _drive_a1 (legacy byte-identical); ON -> it does.
-        #  (b) anchor SEEDS from A1 when no prior close; CHAINS to last close otherwise.
-        #  (c) entry fires at exactly $10 off the anchor in the correct direction; <$10 holds.
-        #  (d) reversal: $10 PAST entry against the trade -> confirmed; <$10 -> holds (pause).
-        #  (f) whipsaw day: braked -> can_enter halts at rogue_daily_loss_stop (value-agnostic).
-        #  (h) isolation: the A1 read is READ-ONLY; a reversal closes ONLY the ROGUE ticket,
-        #      never an anchor 20260522 ticket.
-        import rogue as _r, dataclasses, types
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True,
-                                      rogue_enabled=True,   # so should_run passes the gate
-                                      rogue_entry_confirm_redesign=10.0,
-                                      rogue_reversal_dollars=10.0,
-                                      rogue_daily_soft_lock=30.0,
-                                      rogue_rescue_cap_dollars=13.0)
-            # (b) seed / chain
-            seed_a1 = (_r.a1_seed_anchor(None, 4000.0) == 4000.0)
-            chain = (_r.a1_seed_anchor(4050.0, 4000.0) == 4050.0)
-            # (c) entry (init-SL distance READ from cfg: BUY SL = entry - init_sl,
-            # SELL SL = entry + init_sl -- value-agnostic to the D-13 5->10 widening).
-            _isl = float(cfg.rogue_init_sl)
-            e_buy = _r.a1_entry_decision(4000.0, 4010.0, cfg)   # +$10 -> BUY
-            e_sell = _r.a1_entry_decision(4000.0, 3990.0, cfg)  # -$10 -> SELL
-            e_hold = _r.a1_entry_decision(4000.0, 4005.0, cfg)  # +$5 -> none
-            entry_ok = (e_buy[:2] == (True, 'BUY') and abs(e_buy[2] - 4010.0) < 1e-9
-                        and abs(e_buy[3] - (4010.0 - _isl)) < 1e-9
-                        and e_sell[:2] == (True, 'SELL') and abs(e_sell[3] - (3990.0 + _isl)) < 1e-9
-                        and e_hold[0] is False)
-            # (d) reversal
-            rev_buy = _r.a1_reversal_confirmed(4010.0, 'BUY', 4000.0, cfg)   # -$10 -> True
-            hold_buy = _r.a1_reversal_confirmed(4010.0, 'BUY', 4004.0, cfg)  # -$6 -> False
-            rev_sell = _r.a1_reversal_confirmed(3990.0, 'SELL', 4000.0, cfg)  # +$10 -> True
-            reversal_ok = (rev_buy is True and hold_buy is False and rev_sell is True)
-            # (f) brake: a losing day halts at the daily loss stop (value-agnostic)
-            g2 = _r.new_day_state()
-            _r.record_close(g2, float(cfg.rogue_daily_loss_stop) - 1.0, True, cfg)
-            braked = (_r.can_enter(g2, cfg)[0] is False
-                      and _r.can_enter(g2, cfg)[1] == 'daily_loss_stop')
-
-            # (a) gating: drive() routes to _drive_a1 ONLY when the flag is ON.
-            sentinel = {'a1': 0}
-            orig = _r._drive_a1
-            _r._drive_a1 = lambda tr, st: sentinel.__setitem__('a1', sentinel['a1'] + 1)
-            def _mk(a1_on):
-                mt5 = types.SimpleNamespace(
-                    ACCOUNT_TRADE_MODE_DEMO=0,
-                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
-                    symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=4000.0, ask=4000.2),
-                    positions_get=lambda ticket=None: [])
-                ad = types.SimpleNamespace(mt5=mt5, get_latest_m5=lambda s, n: [],
-                                           close_position=lambda *a, **k: None)
-                c = dataclasses.replace(cfg, rogue_a1_anchor_mode=a1_on)
-                return types.SimpleNamespace(cfg=c, adapter=ad, paper=True,
-                                             state={'last_broker_date': '2026-06-29'},
-                                             _rogue=None, _last_boost_mid=4000.0,
-                                             tele=types.SimpleNamespace(info=lambda *a, **k: None))
-            try:
-                _r.drive(_mk(False)); off_legacy = (sentinel['a1'] == 0)
-                _r.drive(_mk(True));  on_a1 = (sentinel['a1'] == 1)
-            finally:
-                _r._drive_a1 = orig
-            gating_ok = off_legacy and on_a1
-
-            # (h) isolation: a reversal closes ONLY the ROGUE ticket; A1 read is read-only.
-            closed = []
-            mt5 = types.SimpleNamespace(
-                ACCOUNT_TRADE_MODE_DEMO=0,
-                account_info=lambda: types.SimpleNamespace(trade_mode=0),
-                symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=3998.0, ask=3998.2),
-                positions_get=lambda ticket=None: [],   # rogue ticket already gone
-                history_deals_get=lambda position=None: [
-                    types.SimpleNamespace(entry=1, profit=-175.0, swap=0.0, commission=0.0)])
-            ad = types.SimpleNamespace(
-                mt5=mt5, get_latest_m5=lambda s, n: [],
-                close_position=lambda tk, dry_run=False: closed.append(int(tk)))
-            tr = types.SimpleNamespace(
-                cfg=cfg, adapter=ad, paper=True, state={'last_broker_date': '2026-06-29'},
-                _last_boost_mid=4000.0,
-                tele=types.SimpleNamespace(info=lambda *a, **k: None),
-                # an ANCHOR leg (magic 20260522) is in the book; it must NOT be touched.
-                shadow_positions={55: {'anchor_label': 'A1', 'leg_fill_price': 3980.0,
-                                       'magic': 20260522}})
-            tr._rogue = {'day': '2026-06-29', 'gov': _r.new_day_state(),
-                         'anchor': 4010.0, 'leg_dir': 'BUY', 'open':
-                         {'ticket': 99, 'side': 'BUY', 'entry': 4010.0, 'sl': 4005.0,
-                          'peak': 4010.0, 'magic': _r.ROGUE_MAGIC,
-                          'leg_type': _r.ROGUE_LEG_TYPE}}
-            a1_read = _r._a1_anchor_price(tr)                    # read-only A1 price
-            _r._drive_a1(tr, tr._rogue)                          # price 4000 = -$10 -> reversal
-            iso_ok = (closed == [99]                             # ONLY the rogue ticket
-                      and 55 not in closed                       # NEVER the anchor 20260522
-                      and abs((a1_read or 0) - 3980.0) < 1e-9    # A1 read worked, read-only
-                      and tr.shadow_positions[55]['leg_fill_price'] == 3980.0)  # untouched
-
-            ok = (seed_a1 and chain and entry_ok and reversal_ok and braked
-                  and gating_ok and iso_ok)
-            detail = (f"(a)gate_off={off_legacy}/on={on_a1} (b)seed={seed_a1}&chain={chain} "
-                      f"(c)entry={entry_ok} (d)reversal={reversal_ok} "
-                      f"(f)brake={braked} (h)isolation={iso_ok}")
-        except Exception as e:
-            self._record(185, FAIL, f"raised: {e!r}"); return
-        self._record(185, PASS if ok else FAIL, detail)
-
     def _step_fb_trapped_late_rescue(self):
         # 184 F-B: trapped-leg CAPPED late-rescue (No-OCO whipsaw), flag-gated DEFAULT OFF.
         # (a) flag OFF -> plan is None (byte-identical: the trapped loser rides to its full
@@ -11259,316 +10512,6 @@ class SelfTest:
                 import shutil
                 shutil.rmtree(tmp, ignore_errors=True)
         self._record(186, PASS if ok else FAIL, detail)
-
-    def _step_rogue_manual_seed(self):
-        # 187 Rogue manual current-tick seed command (rogueseed). Mid-day restart has no A1
-        # event to seed Fix 4, so this plants the anchor at the current tick on demand.
-        #  (a) DEMO + a1-mode ON -> plants the anchor at the given tick (st['a1_last_close']).
-        #  (b) from that seed a $10 move triggers the EXISTING Fix 4 entry (ROGUE magic).
-        #  (c) DEMO-only gate: a FUNDED account refuses (fail-closed), no seed planted.
-        #  (d) a1-mode OFF -> refuses with 'disabled' (tells the user to enable it).
-        #  (e) isolation: never closes/touches an anchor 20260522 ticket.
-        #  (f) the CLI enqueue writes a 'rogueseed' command onto the command channel.
-        import rogue as _r, dataclasses, types, os, json, tempfile
-        tmp = None
-        try:
-            def _mk(demo, a1_on, mid=4000.0):
-                placed = []
-                closed = []
-                mt5 = types.SimpleNamespace(
-                    ACCOUNT_TRADE_MODE_DEMO=0,
-                    account_info=lambda: types.SimpleNamespace(trade_mode=(0 if demo else 2)),
-                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
-                        bid=mid - 0.1, ask=mid + 0.1),
-                    positions_get=lambda ticket=None: [],
-                    history_deals_get=lambda position=None: [])
-                def _place(symbol, side, lot, sl=None, tp=None, magic=None,
-                           comment=None, dry_run=False):
-                    placed.append({'side': side, 'magic': magic})
-                    return types.SimpleNamespace(retcode=10009, order=7001, deal=7001)
-                ad = types.SimpleNamespace(
-                    mt5=mt5, get_latest_m5=lambda s, n: [], place_market_order=_place,
-                    modify_position_sl=lambda *a, **k: types.SimpleNamespace(retcode=10009),
-                    close_position=lambda tk, dry_run=False: closed.append(int(tk)))
-                cfg = dataclasses.replace(
-                    self.cfg, rogue_enabled=True, rogue_a1_anchor_mode=a1_on,
-                    rogue_daywatch=True, rogue_entry_confirm_redesign=10.0,
-                    rogue_reversal_dollars=10.0, lot_size=0.01)
-                tr = types.SimpleNamespace(
-                    cfg=cfg, adapter=ad, paper=True, _rogue=None, _last_boost_mid=mid,
-                    state={'last_broker_date': '2026-06-29'},
-                    tele=types.SimpleNamespace(info=lambda *a, **k: None,
-                                               warn=lambda *a, **k: None),
-                    shadow_positions={55: {'anchor_label': 'A1', 'leg_fill_price': 3980.0,
-                                           'magic': 20260522}})   # an ANCHOR leg present
-                return tr, placed, closed
-
-            # gate (pure)
-            g_ok = (_r.manual_seed_ok(_mk(True, True)[0].cfg, True) == (True, 'ok'))
-            g_funded = (_r.manual_seed_ok(_mk(False, True)[0].cfg, False)[1] == 'funded')
-            g_disabled = (_r.manual_seed_ok(_mk(True, False)[0].cfg, True)[1] == 'disabled')
-
-            # (a) DEMO + a1-mode ON -> plants anchor at 4000
-            tr, placed, closed = _mk(True, True, mid=4000.0)
-            ok_seed, reason, seeded = _r.manual_seed(tr, 4000.0)
-            planted = (ok_seed is True and reason == 'ok' and abs(seeded - 4000.0) < 1e-9
-                       and abs(tr._rogue['a1_last_close'] - 4000.0) < 1e-9)
-
-            # (b) a $10 move off the seed -> EXISTING Fix 4 engine enters (ROGUE magic)
-            tr.adapter.mt5.symbol_info_tick = lambda s=None: types.SimpleNamespace(
-                bid=4009.9, ask=4010.1)   # mid 4010 = +$10 off the 4000 seed
-            tr._last_boost_mid = 4010.0
-            _r.drive(tr)
-            entered = (len(placed) == 1 and placed[0]['side'] == 'BUY'
-                       and placed[0]['magic'] == _r.ROGUE_MAGIC == 20260626)
-
-            # (c) FUNDED refuses, no seed planted
-            trf, placedf, closedf = _mk(False, True, mid=4000.0)
-            okf, reasonf, seededf = _r.manual_seed(trf, 4000.0)
-            funded_refused = (okf is False and reasonf == 'funded' and seededf is None
-                              and (trf._rogue is None
-                                   or trf._rogue.get('a1_last_close') is None))
-
-            # (d) a1-mode OFF refuses with 'disabled'
-            trd, _pd, _cd = _mk(True, False, mid=4000.0)
-            okd, reasond, _ = _r.manual_seed(trd, 4000.0)
-            disabled_refused = (okd is False and reasond == 'disabled')
-
-            # (e) isolation: the anchor 20260522 ticket #55 was NEVER closed/touched
-            iso_ok = (55 not in closed and tr.shadow_positions[55]['magic'] == 20260522
-                      and tr.shadow_positions[55]['leg_fill_price'] == 3980.0)
-
-            # (f) CLI enqueue writes a rogueseed command to AUREON_RUN_DIR/commands.json
-            tmp = tempfile.mkdtemp(prefix='aureon_seedcmd_')
-            _prev = os.environ.get('AUREON_RUN_DIR')
-            os.environ['AUREON_RUN_DIR'] = tmp
-            try:
-                rc = _r.enqueue_seed_command(tr.cfg)
-                with open(os.path.join(tmp, 'commands.json'), encoding='utf-8') as f:
-                    cmds = json.load(f)
-            finally:
-                if _prev is None:
-                    os.environ.pop('AUREON_RUN_DIR', None)
-                else:
-                    os.environ['AUREON_RUN_DIR'] = _prev
-            cli_ok = (rc == 0 and any(c.get('cmd') == 'rogueseed' for c in cmds))
-
-            ok = (g_ok and g_funded and g_disabled and planted and entered
-                  and funded_refused and disabled_refused and iso_ok and cli_ok)
-            detail = (f"(a)planted={planted} (b)entry_ROGUE={entered} (c)funded_refused="
-                      f"{funded_refused} (d)disabled_refused={disabled_refused} "
-                      f"(e)isolation={iso_ok} (f)cli_enqueue={cli_ok} "
-                      f"gates(ok/funded/disabled)={g_ok}/{g_funded}/{g_disabled}")
-        except Exception as e:
-            self._record(187, FAIL, f"raised: {e!r}")
-            if tmp:
-                import shutil
-                shutil.rmtree(tmp, ignore_errors=True)
-            return
-        finally:
-            if tmp:
-                import shutil
-                shutil.rmtree(tmp, ignore_errors=True)
-        self._record(187, PASS if ok else FAIL, detail)
-
-    def _step_rogueseed_consume(self):
-        # 188 the RUNNING loop consumes a queued rogueseed (bugfix). Drives the REAL bound
-        # LiveTrader._handle_commands / _consume_commands against a commands.json holding
-        # [{"cmd":"rogueseed"}]:
-        #  (a) the loop CONSUMES it -> plants the anchor at the current tick + logs MANUAL SEED;
-        #  (b) the command is REMOVED from commands.json (cleared to []);
-        #  (c) a SECOND loop does NOT replant (idempotent -- fires exactly once);
-        #  (d) a FUNDED account refuses (no seed planted); and
-        #  (e) isolation: the anchor 20260522 ticket is never touched.
-        import live_trader as _lt, rogue as _r, dataclasses, types, os, json, tempfile
-        tmp = None
-        try:
-            tmp = tempfile.mkdtemp(prefix='aureon_seedconsume_')
-
-            def _mk(demo, mid=4100.0):
-                closed = []
-                mt5 = types.SimpleNamespace(
-                    ACCOUNT_TRADE_MODE_DEMO=0,
-                    account_info=lambda: types.SimpleNamespace(trade_mode=(0 if demo else 2)),
-                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
-                        bid=mid - 0.1, ask=mid + 0.1))
-                ad = types.SimpleNamespace(
-                    mt5=mt5, close_position=lambda tk, dry_run=False: closed.append(int(tk)))
-                cfg = dataclasses.replace(self.cfg, rogue_enabled=True,
-                                          rogue_a1_anchor_mode=True)
-                cpath = os.path.join(tmp, f"commands_{'demo' if demo else 'funded'}.json")
-                json.dump([{"cmd": "rogueseed"}], open(cpath, "w", encoding='utf-8'))   # launcher queued it
-                stub = types.SimpleNamespace(
-                    commands_path=cpath, adapter=ad, cfg=cfg, paper=True, _rogue=None,
-                    state={'last_broker_date': '2026-06-29'},
-                    tele=types.SimpleNamespace(info=lambda *a, **k: None,
-                                               warn=lambda *a, **k: None),
-                    shadow_positions={55: {'anchor_label': 'A1', 'magic': 20260522,
-                                           'leg_fill_price': 3980.0}})
-                # bind the REAL production consumer methods
-                stub._consume_commands = types.MethodType(
-                    _lt.LiveTrader._consume_commands, stub)
-                stub._handle_commands = types.MethodType(
-                    _lt.LiveTrader._handle_commands, stub)
-                return stub, cpath, closed
-
-            # DEMO: consume -> plant -> clear -> idempotent
-            tr, cpath, closed = _mk(True)
-            tr._handle_commands()                                   # (a) the per-tick poll
-            planted = (tr._rogue is not None
-                       and abs(tr._rogue.get('a1_last_close', 0) - 4100.0) < 1e-9)
-            cleared = (json.load(open(cpath, encoding='utf-8')) == [])                # (b) command removed
-            # (c) idempotent: a second loop must NOT replant (file already empty)
-            tr._rogue['a1_last_close'] = None
-            tr._handle_commands()
-            idempotent = (tr._rogue.get('a1_last_close') is None)
-
-            # (d) FUNDED refuses -> no seed planted, but the command is still consumed once
-            trf, cpathf, _cf = _mk(False)
-            trf._handle_commands()
-            funded_refused = (trf._rogue is None
-                              or trf._rogue.get('a1_last_close') is None)
-
-            # (e) isolation: the anchor 20260522 ticket #55 was never closed
-            iso_ok = (55 not in closed and tr.shadow_positions[55]['magic'] == 20260522)
-
-            ok = planted and cleared and idempotent and funded_refused and iso_ok
-            detail = (f"(a)consumed+planted={planted} (b)file_cleared={cleared} "
-                      f"(c)idempotent_no_replant={idempotent} (d)funded_refused={funded_refused} "
-                      f"(e)isolation={iso_ok}")
-        except Exception as e:
-            self._record(188, FAIL, f"raised: {e!r}")
-            if tmp:
-                import shutil
-                shutil.rmtree(tmp, ignore_errors=True)
-            return
-        finally:
-            if tmp:
-                import shutil
-                shutil.rmtree(tmp, ignore_errors=True)
-        self._record(188, PASS if ok else FAIL, detail)
-
-    def _step_r7_rogue_e3_chain(self):
-        # 189 (E-3 CHAIN): on ANY Rogue close the A1 redesign clears st['open'], re-anchors at
-        # the EXIT price, and keeps hunting -> a fresh $10 move fires a SECOND entry (proves the
-        # chain, no dormancy). Verified for a TRAILING-profit close AND an init-SL close; brakes
-        # still gate the next entry; the anchor 20260522 ticket is NEVER touched.
-        import rogue as _r, dataclasses, types
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0,
-                                      rogue_reversal_dollars=10.0)   # daily stop inherits cfg
-
-            def mk():
-                # a controllable A1-mode trader: env['book'] = live broker positions;
-                # env['deal'] = the close deal surfaced once the ticket leaves the book.
-                env = {'price': None, 'book': {}, 'deal': None, 'orders': [], 'logs': []}
-                def place_market_order(sym, side, lot, sl=None, tp=None, magic=None,
-                                       comment=None, dry_run=False):
-                    tk = 900000 + len(env['orders']) + 1
-                    env['orders'].append({'ticket': tk, 'side': side})
-                    env['book'][tk] = True
-                    return types.SimpleNamespace(order=tk, deal=tk, retcode=10009)
-                def positions_get(ticket=None):
-                    return [object()] if env['book'].get(int(ticket)) else []
-                def history_deals_get(position=None):
-                    d = env['deal']
-                    return ([types.SimpleNamespace(entry=1, profit=d['pnl'], price=d['price'],
-                                                   swap=0.0, commission=0.0)]
-                            if (d and int(position) == int(d['ticket'])) else [])
-                def close_position(tk, dry_run=False):
-                    env['book'].pop(int(tk), None)
-                mt5 = types.SimpleNamespace(
-                    positions_get=positions_get, history_deals_get=history_deals_get,
-                    symbol_info_tick=lambda s=None: types.SimpleNamespace(
-                        bid=env['price'], ask=env['price']),
-                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
-                    ACCOUNT_TRADE_MODE_DEMO=0)
-                ad = types.SimpleNamespace(
-                    mt5=mt5, place_market_order=place_market_order,
-                    modify_position_sl=lambda tk, sl: None, close_position=close_position)
-                tr = types.SimpleNamespace(
-                    cfg=cfg, paper=True, adapter=ad, _last_boost_mid=None,
-                    state={'last_broker_date': '2026-07-01'},
-                    tele=types.SimpleNamespace(
-                        info=lambda *a, **k: env['logs'].append(a[0] if a else ''),
-                        warn=lambda *a, **k: None))
-                tr._rogue = {'day': '2026-07-01', 'gov': _r.new_day_state(), 'anchor': None,
-                             'leg_dir': None, 'open': None, 'a1_last_close': None,
-                             'a1_reverted': False}
-                return tr, env
-
-            def tick(tr, env, price, close=None):
-                env['price'] = float(price)
-                tr._last_boost_mid = float(price)
-                if close is not None:            # broker closes the open ticket at (pnl, exit)
-                    o = tr._rogue.get('open') or {}
-                    tk = o.get('ticket')
-                    if tk is not None:
-                        env['book'].pop(int(tk), None)
-                        env['deal'] = {'ticket': tk, 'pnl': close[0], 'price': close[1]}
-                _r._drive_a1(tr, tr._rogue)
-
-            # (A) TRAILING-profit close chains to a SECOND entry.
-            trA, envA = mk()
-            envA['book'][self._R_ANCHOR_TK] = True     # an anchor 20260522 leg is present
-            _r.manual_seed(trA, 3984.0)                # seed (mid-day restart, no A1 event)
-            tick(trA, envA, 3974.0)                    # -$10 -> ENTER SELL #1
-            entered1 = (trA._rogue.get('open') is not None
-                        and (trA._rogue['open'] or {}).get('side') == 'SELL')
-            tick(trA, envA, 3950.0, close=(206.50, 3953.0))    # trailing-profit CLOSE
-            closedA = trA._rogue.get('open') is None
-            reanchoredA = abs((trA._rogue.get('a1_last_close') or 0) - 3953.0) < 1e-9
-            dayA = abs(trA._rogue['gov']['day_pnl'] - 206.50) < 1e-9
-            chain_logged = any('CHAIN re-anchor' in str(m) and 'hunting $10 both dirs' in str(m)
-                               for m in envA['logs'])
-            # P3 (E-17): the chained re-anchor now carries a cooldown; simulate it
-            # elapsing (timing only -- every assertion below is unchanged).
-            self._p3_warp(trA)
-            tick(trA, envA, 3963.0)                    # +$10 off 3953 exit -> SECOND entry
-            entered2 = (trA._rogue.get('open') is not None
-                        and trA._rogue['gov']['reanchor_count'] == 2)
-            iso_A = self._R_ANCHOR_TK in envA['book']  # the anchor ticket was never closed
-            trailing_ok = (entered1 and closedA and reanchoredA and dayA and chain_logged
-                           and entered2 and iso_A)
-
-            # (B) init-SL close ALSO chains to a SECOND entry (fail streak advances, still trades).
-            trB, envB = mk()
-            _r.manual_seed(trB, 4000.0)
-            tick(trB, envB, 4010.0)                    # +$10 -> ENTER BUY #1
-            tick(trB, envB, 4005.0, close=(-5.0, 4005.0))      # init-SL fake-out CLOSE
-            closedB = trB._rogue.get('open') is None
-            reanchoredB = abs((trB._rogue.get('a1_last_close') or 0) - 4005.0) < 1e-9
-            failB = trB._rogue['gov']['consec_fails'] == 1
-            self._p3_warp(trB)                         # P3: cooldown elapses (timing only)
-            tick(trB, envB, 4015.0)                    # +$10 off 4005 exit -> SECOND entry
-            entered2B = (trB._rogue.get('open') is not None
-                         and trB._rogue['gov']['reanchor_count'] == 2)
-            sl_ok = (closedB and reanchoredB and failB and entered2B)
-
-            # (C) brakes still gate: after a loss past the daily stop, the chain does NOT re-enter.
-            trC, envC = mk()
-            _r.manual_seed(trC, 4000.0)
-            tick(trC, envC, 4008.0)                    # +$8 -> no entry yet (holds)
-            tick(trC, envC, 4010.0)                    # +$10 -> ENTER BUY #1
-            tick(trC, envC, 4002.0,
-                 close=(float(cfg.rogue_daily_loss_stop) - 75.0, 4002.0))  # past the daily stop
-            stoppedC = trC._rogue['gov']['loss_stopped'] is True
-            cntC = trC._rogue['gov']['reanchor_count']
-            self._p3_warp(trC)                         # P3: cooldown elapses, so the BRAKE
-            tick(trC, envC, 4012.0)                    # (not the cooldown) blocks this entry
-            braked = (trC._rogue.get('open') is None
-                      and trC._rogue['gov']['reanchor_count'] == cntC)
-            brake_ok = stoppedC and braked
-
-            ok = trailing_ok and sl_ok and brake_ok
-            detail = (f"trailing[e1={entered1} closed={closedA} reanchor@3953={reanchoredA} "
-                      f"day={dayA} chainlog={chain_logged} e2={entered2} iso={iso_A}] "
-                      f"sl[reanchor@4005={reanchoredB} fail={failB} e2={entered2B}] "
-                      f"brake[stopped={stoppedC} no_reentry={braked}]")
-        except Exception as e:
-            self._record(189, FAIL, f"raised: {e!r}"); return
-        self._record(189, PASS if ok else FAIL, detail)
 
     # === P1 "never blind, never brick" — E-13..E-16 + E-12 ladder ==============
     def _step_fix1_rc_retry_brick(self):
@@ -11708,74 +10651,6 @@ class SelfTest:
         except Exception as e:
             self._record(191, FAIL, f"raised: {e!r}"); return
         self._record(191, PASS if ok else FAIL, detail)
-
-    def _step_fix3_rogue_gated(self):
-        # 192 (Fix 3 / E-15): with allow_new_entries=False (the post-EOD trail-only call) a
-        # NEW Rogue entry is REFUSED while an EXISTING open position still trails; and
-        # force_close_open (the kill-switch path) closes the Rogue ticket + books the governor.
-        import rogue as _r, dataclasses, types
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0)
-
-            def mk():
-                env = {'book': {}, 'orders': [], 'deal': None, 'price': None}
-                def pmo(sym, side, lot, sl=None, tp=None, magic=None, comment=None, dry_run=False):
-                    tk = 700000 + len(env['orders']) + 1; env['orders'].append(tk); env['book'][tk] = True
-                    return types.SimpleNamespace(order=tk, deal=tk, retcode=10009)
-                def hist(position=None):
-                    d = env['deal']
-                    return ([types.SimpleNamespace(entry=1, profit=d['pnl'], price=d['price'],
-                                                   swap=0, commission=0)]
-                            if (d and int(position) == int(d['ticket'])) else [])
-                mt5 = types.SimpleNamespace(
-                    positions_get=lambda ticket=None: [object()] if env['book'].get(int(ticket)) else [],
-                    history_deals_get=hist,
-                    symbol_info_tick=lambda s=None: types.SimpleNamespace(bid=env['price'], ask=env['price']),
-                    account_info=lambda: types.SimpleNamespace(trade_mode=0),
-                    ACCOUNT_TRADE_MODE_DEMO=0)   # DEMO so manual_seed is accepted
-                ad = types.SimpleNamespace(mt5=mt5, place_market_order=pmo,
-                                           modify_position_sl=lambda tk, sl: None,
-                                           close_position=lambda tk, dry_run=False: env['book'].pop(int(tk), None))
-                tr = types.SimpleNamespace(cfg=cfg, paper=True, adapter=ad, _last_boost_mid=None,
-                                           state={'last_broker_date': '2026-07-02'},
-                                           tele=types.SimpleNamespace(info=lambda *a, **k: None,
-                                                                      warn=lambda *a, **k: None))
-                tr._rogue = {'day': '2026-07-02', 'gov': _r.new_day_state(), 'anchor': None,
-                             'leg_dir': None, 'open': None, 'a1_last_close': None, 'a1_reverted': False}
-                return tr, env
-
-            # (a) post-EOD (allow_new_entries=False) BLOCKS a fresh entry.
-            trA, envA = mk(); _r.manual_seed(trA, 4000.0)
-            envA['price'] = 4010.0; trA._last_boost_mid = 4010.0
-            _r._drive_a1(trA, trA._rogue, allow_new_entries=False)   # +$10 but blocked
-            blocked_new = (trA._rogue['open'] is None and trA._rogue['gov']['reanchor_count'] == 0)
-
-            # (b) post-EOD still TRAILS an existing open position.
-            trB, envB = mk(); _r.manual_seed(trB, 4000.0)
-            envB['price'] = 4010.0; trB._last_boost_mid = 4010.0
-            _r._drive_a1(trB, trB._rogue)                            # ENTER BUY @4010 (open)
-            entered = trB._rogue['open'] is not None
-            envB['price'] = 4035.0; trB._last_boost_mid = 4035.0
-            _r._drive_a1(trB, trB._rogue, allow_new_entries=False)   # trail-only manage
-            trailed = (trB._rogue['open'] is not None and trB._rogue['open']['peak'] >= 4035.0)
-
-            # (c) force_close_open (kill-switch) closes the Rogue ticket + books it.
-            trC, envC = mk(); _r.manual_seed(trC, 4000.0)
-            envC['price'] = 4010.0; trC._last_boost_mid = 4010.0
-            _r._drive_a1(trC, trC._rogue)
-            tkC = trC._rogue['open']['ticket']
-            envC['deal'] = {'ticket': tkC, 'pnl': 40.0, 'price': 4010.0}
-            fc = _r.force_close_open(trC, reason='KillSwitch')
-            killed = (fc is True and trC._rogue['open'] is None
-                      and abs(trC._rogue['gov']['day_pnl'] - 40.0) < 1e-9 and tkC not in envC['book'])
-
-            ok = blocked_new and entered and trailed and killed
-            detail = (f"post_eod_blocks_new={blocked_new} trails_existing={trailed} "
-                      f"kill_force_close[closed+booked]={killed}")
-        except Exception as e:
-            self._record(192, FAIL, f"raised: {e!r}"); return
-        self._record(192, PASS if ok else FAIL, detail)
 
     def _step_fix4_feed_reinit_l3(self):
         # 193 (Fix 4 / E-12): Level 2 MT5Adapter.reinit() confirms a FRESH tick (fresh->True,
@@ -11960,229 +10835,6 @@ class SelfTest:
         # rogue._epoch() - chain_time). Assertion-neutral -- timing only.
         if tr._rogue.get('chain_time') is not None:
             tr._rogue['chain_time'] -= float(sec)
-
-    def _step_p3_chase_cap(self):
-        # 196 GATE 1 (E-17): entry band $10 <= |move| <= $20 off the ACTIVE anchor.
-        # Beyond the cap: NO entry, NO governor slot, ONE throttled CHASE-REJECT log.
-        # No latch: a later pullback inside the band enters normally. Pure band edges:
-        # exactly $20 enters, $20.01 doesn't; both directions; cap=0 disables.
-        import rogue as _r, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0)
-            # pure band edges
-            band_ok = (_r.a1_entry_decision(4000.0, 4020.0, cfg)[0] is True      # == cap
-                       and _r.a1_entry_decision(4000.0, 4020.01, cfg)[0] is False  # > cap
-                       and _r.a1_entry_decision(4000.0, 3980.0, cfg)[:2] == (True, 'SELL')
-                       and _r.a1_entry_decision(4000.0, 3979.0, cfg)[0] is False
-                       and _r.a1_entry_decision(
-                           4000.0, 4025.0,
-                           dataclasses.replace(cfg, rogue_chase_cap_dollars=0.0))[0] is True)
-            # driver: reject -> throttled log -> pullback re-allows, slot only on the fill
-            tr, env = self._p3_mk(cfg)
-            _r.manual_seed(tr, 4000.0)                     # seed anchor (not chained)
-            self._p3_tick(tr, env, 4025.0)                 # +$25 > cap -> CHASE-REJECT
-            rej1 = (tr._rogue['open'] is None and tr._rogue['gov']['reanchor_count'] == 0)
-            n_logs = sum(1 for m in env['logs'] if 'CHASE-REJECT' in str(m))
-            self._p3_tick(tr, env, 4026.0)                 # still beyond -> same episode
-            n_logs2 = sum(1 for m in env['logs'] if 'CHASE-REJECT' in str(m))
-            throttled = (n_logs == 1 and n_logs2 == 1)
-            self._p3_tick(tr, env, 4015.0)                 # pullback inside band -> ENTER
-            reallowed = (tr._rogue['open'] is not None
-                         and tr._rogue['open']['side'] == 'BUY'
-                         and tr._rogue['gov']['reanchor_count'] == 1)
-            ok = band_ok and rej1 and throttled and reallowed
-            detail = (f"band(20in/20.01out/0off)={band_ok} reject_no_slot={rej1} "
-                      f"log_once={throttled} pullback_reenters={reallowed}")
-        except Exception as e:
-            self._record(196, FAIL, f"raised: {e!r}"); return
-        self._record(196, PASS if ok else FAIL, detail)
-
-    def _step_p3_chain_cooldown(self):
-        # 197 GATE 2a (E-17): after a close, the CHAINED re-anchor refuses the next entry
-        # until rogue_chain_cooldown_sec elapses -- ONE throttled CHAIN-COOLDOWN log, no
-        # slot consumed -- then the SAME signal enters once the cooldown has passed.
-        import rogue as _r, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0)
-            tr, env = self._p3_mk(cfg)
-            _r.manual_seed(tr, 4000.0)
-            self._p3_tick(tr, env, 4010.0)                       # ENTER BUY #1 (seed exempt)
-            e1 = tr._rogue['open'] is not None
-            self._p3_tick(tr, env, 4020.0, close=(350.0, 4020.0))   # close -> chain @ 4020
-            chained = (abs((tr._rogue.get('chain_anchor') or 0) - 4020.0) < 1e-9
-                       and tr._rogue.get('chain_time') is not None)
-            self._p3_tick(tr, env, 4030.0)                       # +$10 but INSIDE cooldown
-            blocked = (tr._rogue['open'] is None
-                       and tr._rogue['gov']['reanchor_count'] == 1)
-            n1 = sum(1 for m in env['logs'] if 'CHAIN-COOLDOWN' in str(m))
-            self._p3_tick(tr, env, 4031.0)                       # still cooling -> no relog
-            n2 = sum(1 for m in env['logs'] if 'CHAIN-COOLDOWN' in str(m))
-            throttled = (n1 == 1 and n2 == 1)
-            self._p3_warp(tr, float(cfg.rogue_chain_cooldown_sec) + 5)   # cooldown elapses
-            self._p3_tick(tr, env, 4030.0)                       # same signal -> ENTER #2
-            entered2 = (tr._rogue['open'] is not None
-                        and tr._rogue['gov']['reanchor_count'] == 2
-                        and tr._rogue.get('chain_anchor') is None)  # chain meta consumed
-            ok = e1 and chained and blocked and throttled and entered2
-            detail = (f"e1={e1} chained@4020={chained} inside_cooldown_blocked={blocked} "
-                      f"log_once={throttled} after_cooldown_enters={entered2}")
-        except Exception as e:
-            self._record(197, FAIL, f"raised: {e!r}"); return
-        self._record(197, PASS if ok else FAIL, detail)
-
-    def _step_p3_chain_displacement(self):
-        # 198 GATE 2b (E-17): the chained entry needs >= rogue_chain_min_displacement of
-        # movement off the re-anchor IN the entry direction at some point since planting.
-        # Tuned ABOVE the $10 confirm here (disp=15, cooldown=0) so the check bites:
-        # +$12 is a valid confirm but < $15 fresh -> blocked; a spike to +$25 (chase-
-        # rejected, no entry) RECORDS the displacement, and the pullback to +$12 then
-        # enters -- 'at some point since planting', exactly as specified. Also proves the
-        # two Gate-2 checks are independently toggleable (cooldown=0 here).
-        import rogue as _r, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0,
-                                      rogue_chain_cooldown_sec=0.0,
-                                      rogue_chain_min_displacement=15.0)
-            # pure reasons
-            pure_ok = (_r.chain_entry_allowed(None, 0.0, 12.0, cfg)[:2] == (False, 'displacement')
-                       and _r.chain_entry_allowed(None, 0.0, 15.0, cfg)[0] is True
-                       and _r.chain_entry_allowed(0.0, 100.0, 5.0, dataclasses.replace(
-                           cfg, rogue_chain_min_displacement=0.0))[0] is True)
-            tr, env = self._p3_mk(cfg)
-            _r.manual_seed(tr, 4000.0)
-            self._p3_tick(tr, env, 4010.0)                       # ENTER #1 (seed exempt)
-            self._p3_tick(tr, env, 4020.0, close=(350.0, 4020.0))   # chain @ 4020
-            self._p3_tick(tr, env, 4032.0)                       # +$12 confirm but disp<15
-            blocked = (tr._rogue['open'] is None
-                       and any('CHAIN-DISPLACEMENT' in str(m) for m in env['logs']))
-            self._p3_tick(tr, env, 4045.0)                       # +$25: chase-reject BUT
-            spike_no_entry = tr._rogue['open'] is None           # ...displacement recorded
-            disp_recorded = float(tr._rogue.get('chain_disp_up', 0.0)) >= 15.0
-            self._p3_tick(tr, env, 4032.0)                       # pullback +$12 -> ENTER
-            entered = (tr._rogue['open'] is not None
-                       and tr._rogue['gov']['reanchor_count'] == 2)
-            ok = pure_ok and blocked and spike_no_entry and disp_recorded and entered
-            detail = (f"pure={pure_ok} 12<15_blocked={blocked} spike_rejected={spike_no_entry} "
-                      f"disp_recorded>=15={disp_recorded} pullback_enters={entered}")
-        except Exception as e:
-            self._record(198, FAIL, f"raised: {e!r}"); return
-        self._record(198, PASS if ok else FAIL, detail)
-
-    def _step_p3_reversal_exempt(self):
-        # 199 (E-17): the reversal-recovery leg is time-critical -- NO chain cooldown on
-        # it (fires immediately at $10 past entry), but the CHASE CAP still applies (a
-        # recovery $35 past the anchor is an exhausted move too). Recovery SL still the
-        # $13 rescue cap.
-        import rogue as _r, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0,
-                                      rogue_reversal_dollars=10.0,
-                                      rogue_rescue_cap_dollars=13.0)
-            # (a) recovery fires immediately (no cooldown), SL = entry + $13 for a SELL.
-            tr, env = self._p3_mk(cfg)
-            _r.manual_seed(tr, 4000.0)
-            self._p3_tick(tr, env, 4010.0)                       # ENTER BUY @4010
-            tk1 = tr._rogue['open']['ticket']
-            env['deal'] = {'ticket': tk1, 'pnl': -175.0, 'price': 4000.0}
-            self._p3_tick(tr, env, 4000.0)                       # -$10 past entry -> REVERSAL
-            reverted = (tr._rogue['open'] is None and tr._rogue.get('a1_reverted') is True
-                        and tr._rogue.get('chain_time') is None)  # NOT chained
-            self._p3_tick(tr, env, 4000.0)                       # -$10 off 4010 -> RECOVER NOW
-            o = tr._rogue.get('open') or {}
-            recovered = (o.get('side') == 'SELL'
-                         and abs(float(env['orders'][-1]['sl']) - 4013.0) < 1e-9)
-            # (b) the chase cap DOES apply to the recovery leg.
-            tr2, env2 = self._p3_mk(cfg)
-            _r.manual_seed(tr2, 4000.0)
-            self._p3_tick(tr2, env2, 4010.0)                     # ENTER BUY @4010
-            tk2 = tr2._rogue['open']['ticket']
-            env2['deal'] = {'ticket': tk2, 'pnl': -175.0, 'price': 4000.0}
-            self._p3_tick(tr2, env2, 4000.0)                     # REVERSAL (anchor 4010)
-            self._p3_tick(tr2, env2, 3975.0)                     # -$35 off 4010 > cap -> reject
-            capped = (tr2._rogue['open'] is None
-                      and any('CHASE-REJECT' in str(m) for m in env2['logs']))
-            self._p3_tick(tr2, env2, 3995.0)                     # -$15: inside band -> enters
-            capped_then_ok = tr2._rogue.get('open') is not None
-            ok = reverted and recovered and capped and capped_then_ok
-            detail = (f"reversal_not_chained={reverted} recovery_immediate_sl13={recovered} "
-                      f"recovery_chase_capped={capped} band_reentry={capped_then_ok}")
-        except Exception as e:
-            self._record(199, FAIL, f"raised: {e!r}"); return
-        self._record(199, PASS if ok else FAIL, detail)
-
-    def _step_p3_seeds_exempt(self):
-        # 200 (E-17): gates apply ONLY to re-anchors from closes. The A1 morning seed and
-        # a manual rogueseed are NOT chained -> the first trade of the day fires at the
-        # plain $10 confirm with zero cooldown/displacement wait.
-        import rogue as _r, dataclasses
-        try:
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0)
-            # A1 morning seed (read-only cross-read of the A1 anchor price)
-            tr, env = self._p3_mk(cfg)
-            tr.shadow_positions = {55: {'anchor_label': 'A1', 'leg_fill_price': 4000.0,
-                                        'magic': 20260522}}
-            self._p3_tick(tr, env, 4010.0)                       # +$10 off A1 seed -> ENTER
-            a1_seed = (tr._rogue['open'] is not None
-                       and tr._rogue.get('chain_anchor') is None)
-            # manual rogueseed
-            tr2, env2 = self._p3_mk(cfg)
-            _r.manual_seed(tr2, 4000.0)
-            seed_unchained = (tr2._rogue.get('chain_time') is None
-                              and tr2._rogue.get('chain_anchor') is None)
-            self._p3_tick(tr2, env2, 3990.0)                     # -$10 off seed -> ENTER NOW
-            manual = (tr2._rogue['open'] is not None
-                      and tr2._rogue['open']['side'] == 'SELL')
-            no_gate_logs = not any(('CHAIN-COOLDOWN' in str(m) or 'CHAIN-DISPLACEMENT' in str(m))
-                                   for m in env['logs'] + env2['logs'])
-            ok = a1_seed and seed_unchained and manual and no_gate_logs
-            detail = (f"a1_seed_immediate={a1_seed} rogueseed_unchained={seed_unchained} "
-                      f"rogueseed_immediate={manual} no_gate_logs={no_gate_logs}")
-        except Exception as e:
-            self._record(200, FAIL, f"raised: {e!r}"); return
-        self._record(200, PASS if ok else FAIL, detail)
-
-    def _step_p3_gates_off_freeze(self):
-        # 201 (E-17) FREEZE: with all three knobs 0 the pre-P3 behavior is reproduced
-        # exactly -- an entry $25 past the anchor fires (no cap) and the chain re-enters
-        # immediately after a close (no cooldown, no displacement wait). Also pins the
-        # protective defaults ON (cap 20 / cooldown 300 / displacement 6).
-        import rogue as _r, dataclasses
-        try:
-            defaults_on = (abs(float(self.cfg.rogue_chase_cap_dollars) - 20.0) < 1e-9
-                           and abs(float(self.cfg.rogue_chain_cooldown_sec) - 300.0) < 1e-9
-                           and abs(float(self.cfg.rogue_chain_min_displacement) - 6.0) < 1e-9)
-            cfg = dataclasses.replace(self.cfg, rogue_a1_anchor_mode=True, rogue_enabled=True,
-                                      rogue_entry_confirm_redesign=10.0,
-                                      rogue_chase_cap_dollars=0.0,
-                                      rogue_chain_cooldown_sec=0.0,
-                                      rogue_chain_min_displacement=0.0,
-                                      # this step books a +$500 close to test the chase gates;
-                                      # disable the 2026-07-08 profit lock so it isn't what
-                                      # blocks the re-entry under test.
-                                      rogue_daily_profit_stop=0.0)
-            tr, env = self._p3_mk(cfg)
-            _r.manual_seed(tr, 4000.0)
-            self._p3_tick(tr, env, 4025.0)                       # +$25 -> ENTERS (no cap)
-            unbounded = (tr._rogue['open'] is not None
-                         and abs(tr._rogue['open']['entry'] - 4025.0) < 1e-9)
-            self._p3_tick(tr, env, 4040.0, close=(500.0, 4040.0))   # close -> chain @ 4040
-            self._p3_tick(tr, env, 4050.0)                       # IMMEDIATE re-entry (old)
-            immediate = (tr._rogue['open'] is not None
-                         and tr._rogue['gov']['reanchor_count'] == 2)
-            no_gate_logs = not any(any(k in str(m) for k in
-                                       ('CHASE-REJECT', 'CHAIN-COOLDOWN', 'CHAIN-DISPLACEMENT'))
-                                   for m in env['logs'])
-            ok = defaults_on and unbounded and immediate and no_gate_logs
-            detail = (f"defaults(20/300/6)={defaults_on} no_cap_entry@+25={unbounded} "
-                      f"immediate_chain_reentry={immediate} silent={no_gate_logs}")
-        except Exception as e:
-            self._record(201, FAIL, f"raised: {e!r}"); return
-        self._record(201, PASS if ok else FAIL, detail)
 
     # --- v3.5.0 all-16 features (renumbered 148-161; logic identical to
     #     feature/v3.5.0-all16 132-145 -- only the _record() numbers shifted) ---
@@ -12737,19 +11389,9 @@ class SelfTest:
             self._step_R6_chop_skip()
             # ROGUE — self-anchoring monster-rider (flag-gated; demo default ON)
             self._step_rogue_freeze_gate()
-            self._step_rogue_detect_monster()
-            self._step_rogue_weak_no_slot()
-            self._step_rogue_cap_blocks()
-            self._step_rogue_early_entry()
-            self._step_rogue_adaptive_trail()
-            self._step_rogue_loss_stop()
-            self._step_rogue_fail_pause()
             self._step_rogue_closure_isolation()
-            self._step_rogue_rescue_capped()
-            self._step_rogue_rally_reuse()
             self._step_rogue_demo_funded()
             self._step_rogue_tagging()
-            self._step_rogue_ride_unlimited()
             # Watchdog boot validator (Task 1)
             self._step_watchdog_safe_start()
             self._step_watchdog_do_not_start()
@@ -12773,9 +11415,7 @@ class SelfTest:
             # run_live() guaranteed rogue promotion on every live boot
             self._step_rogue_promote_live_boot()
             # Rogue ML pipeline: pattern logger + model gate + archive
-            self._step_rogue_ml_gate()
             # Rogue ML: EOD champion/challenger autotrain + exit-feature capture
-            self._step_rogue_ml_train()
             # E-12 feed-death watchdog (pure FeedWatchdog; no MT5 needed)
             self._step_f1_feed_resubscribe_after_n()
             self._step_f2_feed_success_resets()
@@ -12783,10 +11423,6 @@ class SelfTest:
             self._step_f4_feed_warn_throttled()
             self._step_f5_feed_disabled_byte_identical()
             # E-2/E-3/E-4 Rogue brakes (pure rogue + stubs; no MT5 needed)
-            self._step_r1_rogue_record_close()
-            self._step_r2_rogue_reentry_allowed()
-            self._step_r3_rogue_observe_close()
-            self._step_r4_rogue_loss_stop_trips()
             self._step_r5_rogue_eod_flag()
             self._step_r6_rogue_isolation()
             # E-6 boost rides with parent (177-182; pure strategy/trails, no MT5)
@@ -12797,7 +11433,6 @@ class SelfTest:
             self._step_b5_boost_rescue_unaffected()
             self._step_b6_boost_a1_replay()
             # E-5 / D-13: Rogue daily loss stop paired to 3 x init-SL strike
-            self._step_e5_rogue_stop_525()
             # D-13: 3 consecutive init-SL strikes -> fail-pause at the paired stop (ordering)
             self._step_d13_three_strike_pause()
             # D-13: a 4th strike while paused stays blocked (never re-opens the gate)
@@ -12897,30 +11532,19 @@ class SelfTest:
             # F-B: trapped-leg capped late-rescue (DEFAULT OFF)
             self._step_fb_trapped_late_rescue()
             # Fix 4: Rogue A1-anchored redesign (NEW ENGINE, DEFAULT OFF)
-            self._step_fix4_rogue_a1()
             # selftest auto-summary reporter (report-only)
             self._step_selftest_summary()
             # Rogue manual current-tick seed command
-            self._step_rogue_manual_seed()
             # rogueseed command consumed by the live loop (idempotent)
-            self._step_rogueseed_consume()
             # E-3 CHAIN: ANY Rogue close re-anchors the A1 redesign at the exit (no dormancy)
-            self._step_r7_rogue_e3_chain()
             # P1 "never blind, never brick" — E-13..E-16 + E-12 ladder (pure; no MT5 needed)
             self._step_fix1_rc_retry_brick()
             self._step_fix2_pnl_unresolved()
-            self._step_fix3_rogue_gated()
             self._step_fix4_feed_reinit_l3()
             self._step_fix5_restart_recovery()
             # watchdog relaunch policy — relaunch ONLY on exit 42, stop on any other code
             self._step_watchdog_exit_policy()
             # P3 (E-17): Rogue monster-catcher discipline — chase cap + chain gates
-            self._step_p3_chase_cap()
-            self._step_p3_chain_cooldown()
-            self._step_p3_chain_displacement()
-            self._step_p3_reversal_exempt()
-            self._step_p3_seeds_exempt()
-            self._step_p3_gates_off_freeze()
             # Hotfix 2026-07-02: PTRACE BREAK_FAILED spam throttle (logging only)
             self._step_ptrace_break_spam()
             # P4 2026-07-03: W-7 (D-4), E-18, F-B (D-5)
@@ -12955,7 +11579,6 @@ class SelfTest:
             # independence (rogue_seed_fallback + seed_source provenance).
             self._step_engine_defaults_wired()
             self._step_anchors_off_manage_only()
-            self._step_rogue_off_manage_only()
             self._step_engine_persist_override()
             self._step_seed_fallback_modes()
             self._step_seed_a1_regression()

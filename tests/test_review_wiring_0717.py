@@ -31,25 +31,8 @@ def _lines(rv):
 
 
 # --- rogue stop-mode lifecycle ----------------------------------------------------
-def test_rogue_stop_lifecycle_review_lines(tmp_path):
-    from test_rogue_stop import FakeBroker, _mgr
-    rv = _fresh_logger(tmp_path)
-    br = FakeBroker()
-    mgr, gov = _mgr(br)
-
-    mgr.on_tick(4030.0, 1000.0)                          # seed OCO
-    br.set_price(4013.0); mgr.on_tick(4013.0, 1001.0)    # SELL fills -> chain C1 placed
-    br.set_price(4023.0); mgr.on_tick(4023.0, 1002.0)    # reverses up -> SELL hits SL (close)
-
-    body = _lines(rv)
-    # seed / re-seed OCO placement
-    assert "PENDING" in body and "engine=ROGUE" in body and "action=seed" in body and "tag=OCO" in body
-    # the fill
-    assert "FILL" in body and "engine=ROGUE" in body and "side=SELL" in body
-    # the next chain stop placed (action=placed carries the chain tag)
-    assert "action=placed" in body and "tag=C1" in body
-    # the close, reason SL (loss)
-    assert "CLOSE" in body and "reason=SL" in body
+# (legacy rogue_stop lifecycle review-line test removed with the stop engine;
+#  the monster engine's review-log wiring is covered by tests/test_rogue_monster_log.py)
 
 
 # --- rescue-boost (RB) v2 place + cancel ------------------------------------------
