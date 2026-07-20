@@ -384,8 +384,13 @@ def promote_on_boot(trader):
             if stored and float(stored.get('extra_atr', 0.0)):
                 guards.append('RED-DAY')
             cfg_hash = _rml_cfg_hash(trader.cfg)
+            try:
+                import version as _ver
+                _vstr = getattr(_ver, '__version__', None)
+            except Exception:
+                _vstr = None
             card = _dc.card_monster_boot(anchor, 'armed' if anchor else 'dark',
-                                         ','.join(guards) or 'none', cfg_hash)
+                                         ','.join(guards) or 'none', cfg_hash, version=_vstr)
             tele = getattr(trader, 'tele', None)
             if tele is not None:
                 try:

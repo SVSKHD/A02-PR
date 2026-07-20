@@ -21,6 +21,7 @@ re-snapshot). Fully guarded — never raises onto the live tick.
 from __future__ import annotations
 
 import logging
+import time as _time
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,10 @@ import rogue_monster as rm
 import rogue_monster_state as rms
 
 log = logging.getLogger("AUREON")
+
+# retry backoff seam (tests monkeypatch this to a no-op)
+_sleep = _time.sleep
+_RETRY_BACKOFFS = (0.5, 1.0, 2.0)
 
 # imported lazily to avoid a hard cycle with rogue.py at module load
 ROGUE_MAGIC = 20260626
@@ -236,21 +241,74 @@ def _card(trader, which, **kw):
 
 # ── order placement ──────────────────────────────────────────────────────────
 def _place_stop(trader, side, price, sl, kind):
-    """Place ONE ROGUE_MAGIC pending stop; return the ticket (int) or None."""
+    """Place ONE ROGUE_MAGIC pending stop, with pre-flight + bounded retry. Returns
+    (outcome, ref):
+      ('PENDING', ticket) - resting stop placed;
+      ('MARKET',  ticket) - price was already through the level by <= the chase cap,
+                            so it was converted to a market order (same direction);
+      ('STALE',   through)- price through by > cap (or not placeable) -> caller drops;
+      ('FAIL',    None)   - 3 off-quote rejections -> abandoned.
+    Kills the 10015 flood: an invalid stop is never re-sent unbounded — it is chased,
+    dropped, or abandoned, and the caller clears the arm for the bar."""
     try:
+        cfg = trader.cfg
+        sym = cfg.symbol
+        paper = bool(getattr(trader, "paper", False))
         broker_side = "BUY" if side == "LONG" else "SELL"
+        cap = float(getattr(cfg, "pending_chase_cap_pts", 3.0))
+        price = round(price, 2)
+        sl = round(sl, 2)
         tp = round(price + (200.0 if side == "LONG" else -200.0), 2)
-        res = trader.adapter.place_stop_order(
-            trader.cfg.symbol, broker_side, round(price, 2), _lot(trader),
-            round(sl, 2), tp, comment=f"AUR_ROGUE_{kind[0]}",
-            dry_run=bool(getattr(trader, "paper", False)), magic=ROGUE_MAGIC)
-        rc = getattr(res, "retcode", None) if res is not None else None
-        tk = getattr(res, "order", None) if res is not None else None
-        if rc == 10009 and tk:
-            return int(tk)
+        for attempt in range(3):
+            ok, through, _detail = trader.adapter.stop_preflight(sym, broker_side, price)
+            if not ok:
+                if 0.0 < through <= cap:
+                    mres = trader.adapter.place_market_order(
+                        sym, broker_side, _lot(trader), sl=sl, tp=tp,
+                        magic=ROGUE_MAGIC, comment=f"AUR_ROGUE_{kind[0]}", dry_run=paper)
+                    mtk = ((getattr(mres, "order", None) or getattr(mres, "deal", None))
+                           if mres is not None else None)
+                    if getattr(mres, "retcode", None) == 10009 and mtk:
+                        _log(trader, "CHASE", side=side, kind=kind, through=through)
+                        return ("MARKET", int(mtk))
+                    break   # market chase failed -> abandon
+                return ("STALE", round(through, 2))   # beyond cap / not placeable -> drop
+            res = trader.adapter.place_stop_order(
+                sym, broker_side, price, _lot(trader), sl, tp,
+                comment=f"AUR_ROGUE_{kind[0]}", dry_run=paper, magic=ROGUE_MAGIC)
+            rc = getattr(res, "retcode", None) if res is not None else None
+            tk = getattr(res, "order", None) if res is not None else None
+            if rc == 10009 and tk:
+                return ("PENDING", int(tk))
+            # off-quote / preflight-stale-shim rejection -> backoff, re-preflight, retry
+            if attempt < 2 and not paper:
+                try:
+                    _sleep(_RETRY_BACKOFFS[attempt])
+                except Exception:
+                    pass
+        return ("FAIL", None)
     except Exception as e:
         log.warning(f"{_GLYPH} place stop non-fatal: {e!r}")
-    return None
+        return ("FAIL", None)
+
+
+def _order_error_card(trader, m, side, level, kind):
+    """One ERROR line + one ⚠️ Discord card per DISTINCT failed order intent (dedup)."""
+    try:
+        tk = trader.adapter.mt5.symbol_info_tick(trader.cfg.symbol)
+        tick = f"bid {float(tk.bid):.2f}/ask {float(tk.ask):.2f}"
+    except Exception:
+        tick = "tick n/a"
+    log.error(f"{_GLYPH} ROGUE {kind} {side} @ {float(level):.2f} ABANDONED after 3 rejects ({tick})")
+    _log(trader, "ABANDON", side=side, kind=kind, level=round(float(level), 2))
+    key = f"{kind}:{side}:{round(float(level), 1)}"
+    seen = m.setdefault("err_cards", [])
+    if key in seen:
+        return
+    seen.append(key)
+    if len(seen) > 20:
+        del seen[0]
+    _card(trader, "guard", name="ORDER-ABANDON", detail=f"{kind} {side} @ {float(level):.2f} — {tick}")
 
 
 def _closed_pnl(trader, ticket):
@@ -348,10 +406,21 @@ def _reconcile(trader, m, mcfg, positions, px, t):
         if m["chains_in_seq"] < mcfg.max_chains:
             lvl = rm.chain_level(side, entry, mcfg)
             sl = rm.init_sl(side, lvl, mcfg)
-            tk = _place_stop(trader, side, lvl, sl, "CHAIN")
-            if tk:
-                m["pend"] = {"ticket": tk, "side": side, "level": lvl, "sl": sl, "kind": "CHAIN"}
+            outcome, ref = _place_stop(trader, side, lvl, sl, "CHAIN")
+            if outcome == "PENDING":
+                m["pend"] = {"ticket": ref, "side": side, "level": lvl, "sl": sl, "kind": "CHAIN"}
                 _log(trader, "CHAIN", side=side, level=lvl)
+            elif outcome == "MARKET":
+                m["pend"] = None
+                _log(trader, "CHAIN", side=side, level=lvl, detail="MARKET chase")
+            elif outcome == "STALE":
+                m["pend"] = None
+                _log(trader, "CHAIN", side=side, level=lvl, detail=f"STALE through {ref}")
+            else:  # FAIL
+                m["pend"] = None
+                _order_error_card(trader, m, side, lvl, "CHAIN")
+            # A dropped/abandoned chain never orphans the sequence: existing legs keep
+            # trailing and sequence-close bookkeeping enumerates positions, not m["pend"].
 
     closed_any = False
     last_reason = None
@@ -510,15 +579,31 @@ def _maybe_arm(trader, m, mcfg, m1, t, px, positions, pendings, new_bar):
             return
     if not side:
         return
+    if m.get("arm_blocked_bar") == str(t):   # already dropped/abandoned this bar -> wait
+        return
     lvl = rm.entry_level(side, box, m["anchor"], mcfg)
     sl = rm.init_sl(side, lvl, mcfg)
-    tk = _place_stop(trader, side, lvl, sl, "ENTRY")
-    if tk:
-        m["pend"] = {"ticket": tk, "side": side, "level": lvl, "sl": sl, "kind": "ENTRY"}
+    reason = f"{gate_hit} | bias {b}"
+    outcome, ref = _place_stop(trader, side, lvl, sl, "ENTRY")
+    if outcome == "PENDING":
+        m["pend"] = {"ticket": ref, "side": side, "level": lvl, "sl": sl, "kind": "ENTRY"}
         m["quiet_bars"] = 0
-        reason = f"{gate_hit} | bias {b}"
         _log(trader, "ARM", side=side, level=lvl, reason=reason)
         _card(trader, "armed", side=side, level=lvl, reason=reason, anchor=m["anchor"])
+    elif outcome == "MARKET":
+        # chased at market -> a position opens; _reconcile books it as the ENTRY fill.
+        m["pend"] = None
+        m["quiet_bars"] = 0
+        _log(trader, "ARM", side=side, level=lvl, reason=f"{reason} | MARKET chase")
+    elif outcome == "STALE":
+        # price ran through the level beyond the chase cap -> drop the arm, re-eval next bar
+        _log(trader, "ARM", side=side, level=lvl, detail=f"STALE (price through level by {ref})")
+        m["pend"] = None
+        m["arm_blocked_bar"] = str(t)
+    else:  # FAIL — 3 off-quote rejects
+        _order_error_card(trader, m, side, lvl, "ENTRY")
+        m["pend"] = None
+        m["arm_blocked_bar"] = str(t)
 
 
 def _governor(trader, m, mcfg, day_pnl):

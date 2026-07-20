@@ -149,6 +149,10 @@ class Config:
     rogue_be_lock_floor: float = 0.0       # breakeven (entry) lock
     # Fix C Asia block: no arming before this server hour (0 = disabled). A+C validated at 7.
     rogue_asia_start_hour: int = 7
+    # Pending-stop chase cap (order-path, v3.10.1): when a Rogue ENTRY/CHAIN stop is
+    # already through the market by <= this many points, convert to a market order in
+    # the same direction; beyond it, drop the arm (never chase anchor/RB legs).
+    pending_chase_cap_pts: float = 3.0
     account_profile: str = "STANDARD_5PCT"
     fp_standard_pct: float = 0.05
     fp_zero_pct: float = 0.01

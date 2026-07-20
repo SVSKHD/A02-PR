@@ -18,6 +18,8 @@ sys.path.insert(0, _ROOT)
 import rogue_monster_live as rml  # noqa: E402
 import rogue_monster_state as rms  # noqa: E402
 
+rml._sleep = lambda *a, **k: None   # no real backoff sleeps in tests (default)
+
 _spec = importlib.util.spec_from_file_location(
     "sim_broker", os.path.join(_ROOT, "backtest", "sim_broker.py"))
 sb = importlib.util.module_from_spec(_spec)
@@ -75,6 +77,24 @@ class TestAdapter:
 
     def cancel_order(self, ticket, dry_run=False):
         return self.broker.order_send({"action": sb.TRADE_ACTION_REMOVE, "order": int(ticket)})
+
+    def place_market_order(self, symbol, side, lot, sl=0.0, tp=0.0, comment="",
+                           dry_run=False, magic=20260522):
+        otype = sb.ORDER_TYPE_BUY if side == "BUY" else sb.ORDER_TYPE_SELL
+        return self.broker.order_send({"action": sb.TRADE_ACTION_DEAL, "symbol": symbol,
+                                       "volume": lot, "type": otype, "sl": sl, "tp": tp,
+                                       "magic": int(magic), "comment": comment})
+
+    def stop_preflight(self, symbol, side, price, cushion_pts=0.0):
+        tk = self.mt5.symbol_info_tick(symbol)
+        info = self.mt5.symbol_info(symbol)
+        bid, ask = float(tk.bid), float(tk.ask)
+        point = float(getattr(info, "point", 0.01) or 0.01)
+        stops = max(float(getattr(info, "trade_stops_level", 0) or 0),
+                    float(getattr(info, "trade_freeze_level", 0) or 0)) * point + max(0.0, cushion_pts)
+        if side == "BUY":
+            return (price >= ask + stops), round(max(0.0, ask - price), 2), "test"
+        return (price <= bid - stops), round(max(0.0, price - bid), 2), "test"
 
 
 class Trader:
@@ -255,6 +275,119 @@ def test_asia_block_live(tmp_path):
     assert m["anchor"] is not None, "anchor still seeds at 02:30"
     assert m.get("pend") is None, "Asia block: no arm before 07:00"
     assert len(adapter.mt5.orders_get(symbol="XAUUSD")) == 0, "no resting order placed"
+
+
+def test_stop_preflight_side_and_through(tmp_path=None):
+    trader, broker, adapter = _mk_trader(tmp_path or ".")
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    ok, through, _ = adapter.stop_preflight("XAUUSD", "BUY", 3005.0)   # above market -> valid
+    assert ok and through == 0.0
+    ok, through, _ = adapter.stop_preflight("XAUUSD", "BUY", 2998.0)   # through by 2
+    assert (not ok) and through == 2.0
+    ok, through, _ = adapter.stop_preflight("XAUUSD", "SELL", 2995.0)  # below market -> valid
+    assert ok and through == 0.0
+
+
+def test_rogue_entry_market_chase_within_cap(tmp_path):
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path)          # A+C off, chase cap 3.0
+    adapter.feed_m1(_arm_bars())
+    # ask already 2 pts THROUGH the 3001.6 entry level (<= 3.0 cap) -> chase market
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3003.6, 3003.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    m = trader._rogue["monster"]
+    assert m.get("pend") is None, "market chase does not leave a pending"
+    assert len(rml._rogue_positions(trader)) == 1, "entry chased to a market position"
+    assert len(adapter.mt5.orders_get(symbol="XAUUSD")) == 0, "no resting stop left"
+
+
+def test_rogue_entry_drop_beyond_cap(tmp_path):
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path)
+    adapter.feed_m1(_arm_bars())
+    # ask 5 pts through the level (> 3.0 cap) -> drop the arm, no order, block re-arm
+    t = pd.Timestamp("2026-06-10 03:06")
+    broker.cur = _Tick(t, 3006.6, 3006.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    m = trader._rogue["monster"]
+    assert m.get("pend") is None
+    assert len(rml._rogue_positions(trader)) == 0, "no market chase beyond cap"
+    assert len(adapter.mt5.orders_get(symbol="XAUUSD")) == 0, "no stale stop placed"
+    assert m.get("arm_blocked_bar") == str(pd.Timestamp(m["last_m1_ts"])), "re-arm blocked this bar"
+
+
+class _RejectAdapter(TestAdapter):
+    """preflight passes but the broker keeps rejecting the stop (10015)."""
+    def stop_preflight(self, symbol, side, price, cushion_pts=0.0):
+        return True, 0.0, "ok"
+
+    def place_stop_order(self, symbol, side, price, lot, sl, tp, comment="",
+                         dry_run=False, magic=20260522):
+        class _R:
+            retcode = 10015
+            order = 0
+            comment = "INVALID_PRICE"
+        return _R()
+
+
+def test_rogue_3strike_abandon_with_backoff(tmp_path):
+    rms._last_blob["v"] = None
+    cfg = Config()
+    cfg.rogue_be_lock_arm = 0.0; cfg.rogue_asia_start_hour = 0
+    broker = sb.FakeBroker("XAUUSD", cfg, starting_balance=50000.0, spread=0.0)
+    adapter = _RejectAdapter(broker, "XAUUSD")
+    trader = Trader(cfg, adapter, str(tmp_path))
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    calls = []
+    saved = rml._sleep
+    rml._sleep = lambda s, *a, **k: calls.append(s)
+    try:
+        rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    finally:
+        rml._sleep = saved
+    m = trader._rogue["monster"]
+    assert m.get("pend") is None, "arm abandoned after 3 rejects"
+    assert m.get("arm_blocked_bar") is not None, "arm cleared / blocked this bar"
+    assert calls == [0.5, 1.0], "backoff between the 3 attempts (0.5, 1.0)"
+    assert m.get("err_cards"), "one error-card intent recorded (dedup)"
+
+
+def test_anchor_leg_no_market_chase(tmp_path):
+    # the SHARED place_stop_order preflight returns a stale shim and NEVER converts to
+    # market (anchor/RB legs must not chase — market fill breaks straddle geometry).
+    from mt5_adapter import MT5Adapter
+    cfg = Config()
+    broker = sb.FakeBroker("XAUUSD", cfg, starting_balance=50000.0, spread=0.0)
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 10:00"), 4012.0, 4012.0)
+    adapter = MT5Adapter.__new__(MT5Adapter)
+    adapter.mt5 = sb.FakeMT5(broker)
+    # BUY stop @ 4010.1 with ask 4012 -> through by 1.9 -> preflight SKIP (the 10015 case)
+    res = adapter.place_stop_order("XAUUSD", "BUY", 4010.1, 0.35, 4000.0, 4200.0,
+                                   comment="A1", magic=20260522)
+    assert getattr(res, "retcode", None) == 10015
+    assert getattr(res, "comment", "") == "PREFLIGHT_STALE"
+    assert len(broker.positions) == 0 and len(broker.pendings) == 0, "no order/position created"
+
+
+def test_chain_rejection_does_not_orphan_sequence(tmp_path):
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path)
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)   # arm
+    _tick(broker, 3001.6)                                              # fill entry
+    # chain would rest at 3013.6; make the tick already through it (>cap) so the chain
+    # is dropped as STALE — but the entry must remain and the sequence must still close.
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:07"), 3020.0, 3020.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)   # fill detect + chain STALE
+    m = trader._rogue["monster"]
+    assert len(m["positions"]) == 1, "entry still tracked (chain drop did not orphan it)"
+    # entry runs to SL -> sequence closes cleanly (re-anchor bookkeeping intact)
+    adapter.feed_m1(_bars_ending(2991.0))
+    _tick(broker, 2991.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    assert len(m["positions"]) == 0 and abs(m["anchor"] - 2991.0) < 1e-6, "sequence closed + re-anchored"
 
 
 def _run_all():

@@ -385,6 +385,41 @@ class MT5Adapter:
         matches.sort(key=lambda o: int(o.ticket), reverse=True)
         return matches[0]
 
+    def stop_preflight(self, symbol: str, side: str, price: float,
+                       cushion_pts: float = 0.0):
+        """Validate a pending STOP against the live tick + broker stops/freeze level
+        BEFORE sending (root-cause guard for the 10015 INVALID_PRICE flood).
+
+        Returns (ok, through_pts, detail):
+          ok          - True if the stop is placeable (correct side AND at least the
+                        stops-level distance away from the market).
+          through_pts - how far price has moved BEYOND the level in the fill direction
+                        (>0 means the stop is on the wrong side / would fill at once);
+                        0 when the stop is on the right side (valid, or merely too close).
+          detail      - human string for logs.
+        FAIL-OPEN: any read error returns ok=True so a telemetry glitch never blocks a
+        placement — the broker stays the final arbiter."""
+        try:
+            tk = self.mt5.symbol_info_tick(symbol)
+            info = self.mt5.symbol_info(symbol)
+            bid, ask = float(tk.bid), float(tk.ask)
+            point = float(getattr(info, "point", 0.01) or 0.01)
+            stops = max(float(getattr(info, "trade_stops_level", 0) or 0),
+                        float(getattr(info, "trade_freeze_level", 0) or 0)) * point
+            stops += max(0.0, float(cushion_pts))
+            if side == "BUY":
+                ok = price >= ask + stops
+                through = max(0.0, ask - price)
+                detail = f"BUY stop {price:.2f} vs ask {ask:.2f} + stops {stops:.2f}"
+            else:
+                ok = price <= bid - stops
+                through = max(0.0, price - bid)
+                detail = f"SELL stop {price:.2f} vs bid {bid:.2f} - stops {stops:.2f}"
+            return bool(ok), round(through, 2), detail
+        except Exception as e:
+            log.debug(f"stop_preflight non-fatal: {e!r}")
+            return True, 0.0, "preflight-unavailable"
+
     def place_stop_order(self, symbol: str, side: str, price: float,
                          lot: float, sl: float, tp: float,
                          comment: str = "AUREON_v2", dry_run: bool = False,
@@ -415,6 +450,23 @@ class MT5Adapter:
         if dry_run:
             log.info(f"[PAPER] Would place {side} stop {symbol} @ {price} lot={lot} SL={sl} TP={tp}")
             return {'paper': True, 'request': req}
+        # Pre-flight: never SEND a stop that is on the wrong side of / inside the
+        # broker stops-level (the 2026 10015 flood came from re-sending exactly this).
+        # Returns a stale shim (retcode 10015, .stale) so callers skip/chase without a
+        # wasted broker round-trip; place_with_retry then bounds anchor/RB legs cleanly.
+        pf_ok, pf_through, pf_detail = self.stop_preflight(symbol, side, price)
+        if not pf_ok:
+            log.warning(f"⚠ stop preflight SKIP: {pf_detail} (through {pf_through:.2f}) — not sent")
+
+            class _StaleResult:
+                retcode = 10015
+                order = 0
+                deal = 0
+                comment = "PREFLIGHT_STALE"
+                stale = True
+                through_pts = pf_through
+
+            return _StaleResult()
         result = mt5.order_send(req)
         # Decode retcode for human-readable logging
         rc = result.retcode if result else -1
