@@ -198,16 +198,19 @@ def card_rogue_reseed(anchor_price, buy, sell, footer=None):
 # ── ROGUE "monster" engine cards (magic 20260626) ───────────────────────────
 # Absolute prices come straight from the actual order payloads / engine state —
 # never recomputed here. 🗡️ glyph, ORANGE neutral / GREEN win / RED loss+halt.
-def card_monster_boot(anchor, armed, guards, config_hash, footer=None):
-    """Boot card: which impl is live, current anchor, armed/dark, guard states."""
-    return build_embed(
-        "🗡️ ROGUE IMPL: monster", BLUE, author=_author("ROGUE"),
-        fields=[
-            ("anchor", _price(anchor) if anchor is not None else "unseeded"),
-            ("state", armed),
-            ("guards", guards or "none"),
-            ("config", str(config_hash)),
-        ], footer=footer)
+def card_monster_boot(anchor, armed, guards, config_hash, version=None, footer=None):
+    """Boot card: build version, which impl is live, current anchor, armed/dark, guards."""
+    fields = []
+    if version:
+        fields.append(("version", f"v{version}"))
+    fields += [
+        ("anchor", _price(anchor) if anchor is not None else "unseeded"),
+        ("state", armed),
+        ("guards", guards or "none"),
+        ("config", str(config_hash)),
+    ]
+    return build_embed("🗡️ ROGUE IMPL: monster", BLUE, author=_author("ROGUE"),
+                       fields=fields, footer=footer)
 
 
 def card_monster_armed(side, level, reason, anchor=None, footer=None):
