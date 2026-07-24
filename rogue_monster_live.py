@@ -320,13 +320,67 @@ def _closed_pnl(trader, ticket):
         return 0.0
 
 
+def _closed_price(trader, ticket):
+    """Actual exit PRICE of a closed ROGUE ticket from its broker close deal. None if
+    the deal isn't in history yet (caller falls back to the stored stop)."""
+    try:
+        import rogue as _r
+        v = _r._rogue_close_price(trader, ticket)
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _emit_trade_row(trader, pos, reason, pnl, exit_px, ticket):
+    """Append ONE authoritative rogue_trades.csv row for a closed monster leg — every
+    exit path (SL / BE / TRAIL / GOV / MANUAL / EOD), every leg (entry + chains).
+
+    `pnl` is the REAL signed account $ from the MT5 close deal (never recomputed);
+    `points` is derived from that same $ so the two never disagree; `peak` is the
+    leg's max favourable excursion (pts); `lot` and `exit_reason` are recorded so the
+    row is self-describing. Guarded — telemetry never reaches the trading path."""
+    try:
+        import rogue_patternlog as _rpl
+        side = pos.get("side", "")
+        lot = _lot(trader)
+        try:
+            pts = round(float(pnl) / (rm.POINT_VALUE * lot), 2) if lot else ""
+        except Exception:
+            pts = ""
+        seed = str((getattr(trader, "_rogue", {}) or {}).get("seed_source", "") or "")
+        _rpl.log_trade(
+            _run_dir(trader), ts=_now(trader), event="close", direction=side,
+            entry=round(float(pos.get("entry", 0.0)), 2),
+            exit_px=round(float(exit_px), 2),
+            sl=round(float(pos.get("sl", 0.0) or 0.0), 2),
+            outcome_dollars=round(float(pnl), 2), ticket=int(ticket),
+            points=pts, peak=round(float(pos.get("peak", 0.0)), 2),
+            exit_reason=reason, lot=lot, seed_source=seed)
+    except Exception as e:
+        log.debug(f"{_GLYPH} trade-row non-fatal: {e!r}")
+
+
 def _flatten_all(trader, m, reason):
-    """Close EVERY open ROGUE position + cancel EVERY ROGUE pending."""
+    """Close EVERY open ROGUE position + cancel EVERY ROGUE pending. Emits one
+    rogue_trades.csv row per closed leg so governor/manual/EOD flattens are logged
+    too (the exit_reason maps the flatten cause)."""
+    row_reason = ("GOV" if str(reason).startswith("GOV")
+                  else "EOD" if str(reason).upper().startswith("EOD")
+                  else "MANUAL")
+    known = dict(m.get("positions") or {})
     for tk in list(_rogue_positions(trader).keys()):
+        pos = known.get(str(tk))
         try:
             trader.adapter.close_position(int(tk), dry_run=bool(getattr(trader, "paper", False)))
         except Exception as e:
             log.warning(f"{_GLYPH} flatten close {tk} non-fatal: {e!r}")
+            continue
+        if pos is not None:
+            pnl = _closed_pnl(trader, int(tk))
+            exit_px = _closed_price(trader, int(tk))
+            if exit_px is None:
+                exit_px = pos.get("sl", 0.0)
+            _emit_trade_row(trader, pos, row_reason, pnl, exit_px, tk)
     try:
         import rogue as _r
         _r.cancel_pendings(trader, reason=reason)
@@ -438,9 +492,13 @@ def _reconcile(trader, m, mcfg, positions, px, t):
             reason = "SL"
         _apply_close_guards(trader, m, mcfg, pos, reason, t)
         pnl = _closed_pnl(trader, int(tks))
+        exit_px = _closed_price(trader, int(tks))
+        if exit_px is None:
+            exit_px = pos.get("sl", px)
         m["seq_pnl"] = float(m.get("seq_pnl", 0.0)) + pnl
         last_reason = reason
         _log(trader, "CLOSE", side=pos["side"], kind=pos["kind"], price=px, pnl=pnl, reason=reason)
+        _emit_trade_row(trader, pos, reason, pnl, exit_px, tks)   # one CSV row per close
         closed_any = True
 
     if closed_any and not known:
@@ -466,8 +524,11 @@ def _reconcile(trader, m, mcfg, positions, px, t):
         if known:
             pk = sorted(known.keys(), key=lambda x: int(x))[0]
             pi = known[pk]
+            # peak mirrored as a PRICE (entry +/- favourable pts) so the patternlog
+            # exit-feature backfill reads a real max-fav, not a flat entry (T4 fix).
+            peak_px = pi["entry"] + (pi["peak"] if pi["side"] == "LONG" else -pi["peak"])
             trader._rogue["open"] = {"ticket": int(pk), "side": pi["side"], "entry": pi["entry"],
-                                     "sl": pi["sl"], "peak": pi["entry"], "magic": ROGUE_MAGIC,
+                                     "sl": pi["sl"], "peak": peak_px, "magic": ROGUE_MAGIC,
                                      "leg_type": ROGUE_LEG_TYPE}
         else:
             trader._rogue["open"] = None
@@ -492,8 +553,78 @@ def _apply_close_guards(trader, m, mcfg, pos, reason, t):
     # left untouched; a BE exit is neither a full SL nor a caution-resetting winner.
 
 
+_MODIFY_OK_RC = (10009,)   # MT5 TRADE_RETCODE_DONE (sim + live)
+
+
+def _modify_sl_checked(trader, ticket, new_sl, paper):
+    """Modify a position SL with RETCODE verification + bounded retry. Returns True
+    only when the broker actually acknowledges the move (rc DONE / dry-run).
+
+    E1 fix: the previous path wrapped modify_position_sl in a bare try/except and
+    treated ANY non-raising return as success — but the adapter RETURNS a result
+    object on a rejection (it never raises), so a rejected modify advanced the local
+    SL while the broker kept the old one. Here a non-DONE retcode is a failure the
+    caller must handle (surface / fallback), never a silent success."""
+    for attempt in range(3):
+        try:
+            res = trader.adapter.modify_position_sl(int(ticket), round(new_sl, 2), dry_run=paper)
+        except Exception as e:
+            log.warning(f"{_GLYPH} modify raise {ticket} non-fatal: {e!r}")
+            res = None
+        if paper or (isinstance(res, dict) and res.get("paper")):
+            return True
+        if getattr(res, "retcode", None) in _MODIFY_OK_RC:
+            return True
+        if attempt < 2 and not paper:
+            try:
+                _sleep(_RETRY_BACKOFFS[attempt])
+            except Exception:
+                pass
+    return False
+
+
+def _surface_modify_fail(trader, m, ticket, target, kind):
+    """A trail SL-modify the broker rejected: loud ERROR + one deduped ⚠️ card, and
+    leave p["sl"] UNCHANGED so the next bar re-attempts (never a phantom advance)."""
+    log.error(f"{_GLYPH} ROGUE {kind} SL-modify REJECTED ticket={ticket} -> {float(target):.2f} "
+              f"(broker SL unchanged, will retry next bar)")
+    _log(trader, "SLMOD", ticket=int(ticket), new_sl=round(float(target), 2), reason=f"{kind}_REJECT")
+    key = f"SLMODFAIL:{kind}:{int(ticket)}"
+    seen = m.setdefault("err_cards", [])
+    if key in seen:
+        return
+    seen.append(key)
+    if len(seen) > 20:
+        del seen[0]
+    _card(trader, "guard", name="SL-MODIFY-REJECT",
+          detail=f"{kind} ticket {ticket} -> {float(target):.2f} (broker unchanged)")
+
+
+def _lock_fallback_close(trader, m, ticket, be_target, p):
+    """LOCK_FALLBACK_CLOSE (Fix A): the BE-lock modify was rejected by the broker, so
+    the SL is still the initial (losing) stop. Rather than risk a full-SL reversal,
+    market-close the position NOW to bank the peak. _reconcile books it BE next tick."""
+    log.error(f"{_GLYPH} ROGUE BE-lock modify REJECTED ticket={ticket} -> LOCK_FALLBACK_CLOSE "
+              f"@ market (peak +{float(p.get('peak', 0.0)):.1f})")
+    _log(trader, "BELOCK", ticket=int(ticket), price=round(float(be_target), 2),
+         detail="LOCK_FALLBACK_CLOSE")
+    try:
+        trader.adapter.close_position(int(ticket), dry_run=bool(getattr(trader, "paper", False)))
+    except Exception as e:
+        log.warning(f"{_GLYPH} lock-fallback close {ticket} non-fatal: {e!r}")
+    key = f"LOCKFB:{int(ticket)}"
+    seen = m.setdefault("err_cards", [])
+    if key not in seen:
+        seen.append(key)
+        if len(seen) > 20:
+            del seen[0]
+        _card(trader, "guard", name="LOCK_FALLBACK_CLOSE",
+              detail=f"BE reject ticket {ticket} — closed @market to hold +{float(p.get('peak', 0.0)):.1f}")
+
+
 def _manage_trails(trader, m, mcfg, positions, px):
     known = m["positions"]
+    paper = bool(getattr(trader, "paper", False))
     for tks, info in positions.items():
         k = str(tks)
         if k not in known:
@@ -505,27 +636,23 @@ def _manage_trails(trader, m, mcfg, positions, px):
             tr = rm.trail_target(p["side"], p["entry"], p["peak"], mcfg)
             better = (tr > p["sl"]) if p["side"] == "LONG" else (tr < p["sl"])
             if better:
-                try:
-                    trader.adapter.modify_position_sl(int(tks), round(tr, 2),
-                                                      dry_run=bool(getattr(trader, "paper", False)))
+                if _modify_sl_checked(trader, tks, tr, paper):
                     _log(trader, "SLMOD", ticket=int(tks), new_sl=round(tr, 2), reason="TRAIL")
                     p["sl"] = tr
-                except Exception as e:
-                    log.warning(f"{_GLYPH} trail modify {tks} non-fatal: {e!r}")
+                else:
+                    _surface_modify_fail(trader, m, tks, tr, "TRAIL")
         elif mcfg.be_lock_arm > 0 and p["peak"] >= mcfg.be_lock_arm:
-            # Fix A: ratchet SL to breakeven+floor before the trail arms (same SL-modify
-            # path as a trail move -> retry -> LOCK_FALLBACK_CLOSE). Ratchet only.
+            # Fix A: ratchet SL to breakeven+floor before the trail arms. Retry-checked
+            # modify -> on repeated broker rejection, LOCK_FALLBACK_CLOSE. Ratchet only.
             be = rm.be_lock_target(p["side"], p["entry"], mcfg)
             better = (be > p["sl"]) if p["side"] == "LONG" else (be < p["sl"])
             if better:
-                try:
-                    trader.adapter.modify_position_sl(int(tks), round(be, 2),
-                                                      dry_run=bool(getattr(trader, "paper", False)))
+                if _modify_sl_checked(trader, tks, be, paper):
                     _log(trader, "BELOCK", ticket=int(tks), price=round(be, 2))  # "BE lock set @<price>"
                     p["sl"] = be
                     p["be_set"] = True
-                except Exception as e:
-                    log.warning(f"{_GLYPH} BE lock modify {tks} non-fatal: {e!r}")
+                else:
+                    _lock_fallback_close(trader, m, tks, be, p)
 
 
 def _maybe_arm(trader, m, mcfg, m1, t, px, positions, pendings, new_bar):

@@ -42,11 +42,15 @@ PATTERN_COLUMNS = ['ts', 'direction', 'range_dollars', 'body_ratio', 'candle_cou
                    'entry_price', 'max_fav', 'trail_path_summary', 'exit_price',
                    'held_minutes', 'outcome_dollars', 'magic', 'seed_source']
 # rogue_trades.csv is a DECISION LOG (entry/exit reasoning + provenance), NOT a P&L source.
-# Realized day P&L comes ONLY from MT5 deal history by magic (pnl_source.magic_day_net) --
-# NEVER sum outcome_dollars over these rows to produce a reported number (that path is the
-# R-8 corruption source: a stale header mis-indexes the columns).
+# Realized day P&L is still reported ONLY from MT5 deal history by magic (pnl_source.magic_day_net)
+# -- NEVER sum outcome_dollars over these rows to produce a REPORTED number (that path is the R-8
+# corruption source: a stale header mis-indexes the columns).
+# v3.10.2: outcome_dollars now carries the REAL signed close-deal $ (was a raw price delta in
+# POINTS with LONG inverted); points/peak/exit_reason/lot appended LAST so an existing file's
+# positional columns stay valid (the R-8 self-heal migrates the header on the next append).
 TRADE_COLUMNS = ['ts', 'event', 'direction', 'entry', 'exit', 'sl',
-                 'outcome_dollars', 'ticket', 'magic', 'seed_source']
+                 'outcome_dollars', 'ticket', 'magic', 'seed_source',
+                 'points', 'peak', 'exit_reason', 'lot']
 
 EXIT_COLUMNS = ['max_fav', 'trail_path_summary', 'exit_price', 'held_minutes',
                 'outcome_dollars']
@@ -164,13 +168,17 @@ def log_eval(run_dir, *, ts, direction, features, decision, model_score,
 
 
 def log_trade(run_dir, *, ts, event, direction, entry, exit_px, sl,
-              outcome_dollars='', ticket='', magic=ROGUE_MAGIC, seed_source=''):
+              outcome_dollars='', ticket='', magic=ROGUE_MAGIC, seed_source='',
+              points='', peak='', exit_reason='', lot=''):
     """Append one ACTUAL Rogue fill/close row to rogue_trades.csv. Guarded.
-    v3.6.0: seed_source tags the row with the day's seed provenance (D-8)."""
+    v3.6.0: seed_source tags the row with the day's seed provenance (D-8).
+    v3.10.2: points/peak/exit_reason/lot make a close row self-describing; the caller
+    passes REAL signed close-deal $ in outcome_dollars (never a recomputed delta)."""
     try:
         row = {'ts': ts, 'event': event, 'direction': direction, 'entry': entry,
                'exit': exit_px, 'sl': sl, 'outcome_dollars': outcome_dollars,
-               'ticket': ticket, 'magic': int(magic), 'seed_source': seed_source or ''}
+               'ticket': ticket, 'magic': int(magic), 'seed_source': seed_source or '',
+               'points': points, 'peak': peak, 'exit_reason': exit_reason, 'lot': lot}
         _append_row(os.path.join(run_dir, TRADES_CSV), TRADE_COLUMNS, row)
         return row
     except Exception as e:
@@ -259,24 +267,37 @@ def observe(trader):
         if not _ticket_closed(trader, tk):
             return
         side = snap.get('side')
-        sgn = 1.0 if side == 'BUY' else -1.0
+        # T1 sign fix: the monster mirror stores side as LONG/SHORT (not BUY/SELL); the
+        # old `== 'BUY'` test made every LONG sgn=-1, inverting long outcomes.
+        sgn = 1.0 if side in ('BUY', 'LONG') else -1.0
         try:
             entry = float(snap.get('entry'))
-            peak = float(snap.get('peak', entry))
-            exit_px = float(snap.get('sl'))   # closed on the trailing/init stop
-            outcome = round(sgn * (exit_px - entry), 2)
+            peak = float(snap.get('peak', entry))   # mirror peak is now a PRICE (T4 fix)
+            exit_px = float(snap.get('sl'))          # closed on the trailing/init stop
             max_fav = round(sgn * (peak - entry), 2)
         except Exception:
             entry = peak = exit_px = ''
-            outcome = max_fav = ''
+            max_fav = ''
+        # prefer the REAL signed close-deal $ (NON-blocking read — no retry sleep on the
+        # live tick); fall back to the sign-corrected price delta only if the deal has not
+        # landed in history yet.
+        outcome = ''
+        if exit_px != '':
+            try:
+                import rogue as _r
+                real = _r._rogue_close_pnl(trader, tk)
+            except Exception:
+                real = None
+            outcome = (round(float(real), 2) if real is not None
+                       else round(sgn * (exit_px - entry), 2))
         enter_ts = rpl.get('enter_ts')
         held = _held_minutes(enter_ts, ts) if enter_ts else ''
         trail_path = (f"{entry}->{peak}->{exit_px}"
                       if '' not in (entry, peak, exit_px) else '')
-        log_trade(run_dir, ts=ts, event='close', direction=side,
-                  entry=entry, exit_px=exit_px, sl=exit_px,
-                  outcome_dollars=outcome, ticket=tk,
-                  seed_source=str(st.get('seed_source') or ''))
+        # rogue_trades.csv close rows are written by the ENGINE close path
+        # (rogue_monster_live._emit_trade_row): one authoritative row per leg with the real
+        # deal $, points, peak and exit_reason. observe() no longer double-writes them — it
+        # only backfills the patterns.csv EXIT features for the future Phase-3 exit model.
         if enter_ts and outcome != '':
             backfill_exit(run_dir, enter_ts,
                           {'max_fav': max_fav, 'trail_path_summary': trail_path,

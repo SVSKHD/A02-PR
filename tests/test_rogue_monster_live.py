@@ -5,6 +5,7 @@ seed -> arm (resting stop) -> broker fill -> chain placed -> trail -> SL close -
 re-anchor, plus the day-loss governor flatten and TF_ isolation. Runs under
 pytest AND standalone: `python tests/test_rogue_monster_live.py`.
 """
+import csv
 import importlib.util
 import os
 import sys
@@ -388,6 +389,145 @@ def test_chain_rejection_does_not_orphan_sequence(tmp_path):
     _tick(broker, 2991.0)
     rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
     assert len(m["positions"]) == 0 and abs(m["anchor"] - 2991.0) < 1e-6, "sequence closed + re-anchored"
+
+
+def _read_trades(run_dir):
+    p = os.path.join(str(run_dir), "rogue_trades.csv")
+    if not os.path.exists(p):
+        return []
+    with open(p, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+class _RejectModifyAdapter(TestAdapter):
+    """Broker fills/closes normally but REJECTS every SL modify with a non-DONE
+    retcode (mirrors a live INVALID_STOPS / autotrading-off rejection that the old
+    path swallowed as success — the E1 defect)."""
+    def modify_position_sl(self, ticket, new_sl, dry_run=False):
+        class _R:
+            retcode = 10016   # TRADE_RETCODE_INVALID_STOPS
+            comment = "INVALID_STOPS"
+        return _R()
+
+
+# ── telemetry: one authoritative rogue_trades.csv row per close, real deal $ ──────
+def test_csv_row_on_sl_close(tmp_path):
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path)
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    _tick(broker, 3001.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)   # fill entry @3001.6
+    adapter.feed_m1(_bars_ending(2991.0))
+    _tick(broker, 2991.0)                                              # -> SL @2991.6
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    rows = _read_trades(tmp_path)
+    closes = [r for r in rows if r["event"] == "close"]
+    assert len(closes) == 1, f"exactly one close row expected, got {rows}"
+    r = closes[0]
+    assert r["direction"] == "LONG" and r["exit_reason"] == "SL"
+    assert float(r["outcome_dollars"]) < 0, "a full-SL LONG loss is negative $"
+    assert abs(float(r["outcome_dollars"]) - (-350.0)) < 1.0   # (2991.6-3001.6)*0.35*100
+    assert abs(float(r["points"]) - (-10.0)) < 0.1
+    assert abs(float(r["lot"]) - 0.35) < 1e-6
+
+
+def test_csv_row_on_trail_close_long_positive(tmp_path):
+    # end-to-end sign correctness: a winning LONG must record POSITIVE $ (T1 regression).
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path)
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    _tick(broker, 3001.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)   # fill
+    adapter.feed_m1(_bars_ending(3012.6))
+    _tick(broker, 3012.6)                                              # +11 (< chain@+12) -> trail SL to 3007.6
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    adapter.feed_m1(_bars_ending(3007.6))
+    _tick(broker, 3007.6)                                              # reverse into the trailed SL
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    closes = [r for r in _read_trades(tmp_path) if r["event"] == "close"]
+    assert len(closes) == 1, closes
+    r = closes[0]
+    assert r["direction"] == "LONG" and r["exit_reason"] == "TRAIL"
+    assert float(r["outcome_dollars"]) > 0, "a trailed LONG winner is positive $ (sign fix)"
+    assert abs(float(r["outcome_dollars"]) - 210.0) < 1.0   # (3007.6-3001.6)*35
+
+
+def test_csv_row_on_governor_flatten(tmp_path):
+    # a governor/manual flatten of an OPEN leg still emits a row, tagged GOV.
+    rms._last_blob["v"] = None
+    trader, broker, adapter = _mk_trader(tmp_path)
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    _tick(broker, 3001.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)   # fill, leg open
+    m = trader._rogue["monster"]
+    assert len(m["positions"]) == 1
+    rml._flatten_all(trader, m, "GOV-LOSS")
+    closes = [r for r in _read_trades(tmp_path) if r["event"] == "close"]
+    assert len(closes) == 1 and closes[0]["exit_reason"] == "GOV", closes
+    assert len(rml._rogue_positions(trader)) == 0
+
+
+# ── E1: silent SL-modify failure now surfaced + BE fallback close ─────────────────
+def test_modify_reject_be_lock_fallback(tmp_path):
+    rms._last_blob["v"] = None
+    cfg = Config()
+    cfg.rogue_be_lock_arm = 5.0
+    cfg.rogue_be_lock_floor = 0.0
+    cfg.rogue_asia_start_hour = 0
+    broker = sb.FakeBroker("XAUUSD", cfg, starting_balance=50000.0, spread=0.0)
+    adapter = _RejectModifyAdapter(broker, "XAUUSD")
+    trader = Trader(cfg, adapter, str(tmp_path))
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    _tick(broker, 3001.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)   # fill
+    m = trader._rogue["monster"]
+    # run to +5: BE modify is rejected 3x -> LOCK_FALLBACK_CLOSE market-closes the leg
+    adapter.feed_m1(_bars_ending(3006.6))
+    _tick(broker, 3006.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    assert len(rml._rogue_positions(trader)) == 0, "BE reject must fall back to a market close"
+    assert any(str(k).startswith("LOCKFB") for k in m.get("err_cards", [])), "fallback recorded"
+    # reconcile the fallback close -> booked BE (scratch), CSV row emitted
+    adapter.feed_m1(_bars_ending(3006.0))
+    _tick(broker, 3006.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    assert len(m["positions"]) == 0
+    assert m["consec_sl"] == 0, "a BE fallback is a scratch, not a full SL"
+    closes = [r for r in _read_trades(tmp_path) if r["event"] == "close"]
+    assert len(closes) == 1 and closes[0]["exit_reason"] == "BE", closes
+    assert float(closes[0]["outcome_dollars"]) > 0, "fallback banked the peak (positive $)"
+
+
+def test_modify_reject_trail_surfaces(tmp_path):
+    rms._last_blob["v"] = None
+    cfg = Config()
+    cfg.rogue_be_lock_arm = 0.0
+    cfg.rogue_asia_start_hour = 0
+    broker = sb.FakeBroker("XAUUSD", cfg, starting_balance=50000.0, spread=0.0)
+    adapter = _RejectModifyAdapter(broker, "XAUUSD")
+    trader = Trader(cfg, adapter, str(tmp_path))
+    adapter.feed_m1(_arm_bars())
+    broker.cur = _Tick(pd.Timestamp("2026-06-10 03:06"), 3000.0, 3000.0)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    _tick(broker, 3001.6)
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)   # fill
+    m = trader._rogue["monster"]
+    tk = int(sorted(m["positions"].keys(), key=int)[0])
+    sl0 = adapter.mt5.positions_get(ticket=tk)[0].sl
+    adapter.feed_m1(_bars_ending(3012.6))
+    _tick(broker, 3012.6)                                              # +11 (< chain@+12) -> trail modify rejected
+    rml.drive_monster(trader, trader._rogue, allow_new_entries=True)
+    assert any(str(k).startswith("SLMODFAIL:TRAIL") for k in m.get("err_cards", [])), "reject surfaced"
+    assert abs(m["positions"][str(tk)]["sl"] - sl0) < 1e-6, "local SL NOT advanced on a rejected modify"
+    assert len(rml._rogue_positions(trader)) == 1, "trail reject leaves the leg open (retries next bar)"
 
 
 def _run_all():

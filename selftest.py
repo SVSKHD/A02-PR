@@ -7540,7 +7540,7 @@ class SelfTest:
                            sl=3990, outcome_dollars=1.0, ticket=1, seed_source='A1_BREAK')
             h, r = _hdr_row(os.path.join(tmp, _rpl.TRADES_CSV))
             checks['rogue_trades'] = (len(h) == len(r) and h == _rpl.TRADE_COLUMNS
-                                      and h[-1] == 'seed_source')
+                                      and h[-1] == _rpl.TRADE_COLUMNS[-1])
             # rogue_patterns.csv
             _rpl.log_eval(tmp, ts='t', direction='BUY', features={}, decision=_rpl.ENTER,
                           model_score=0.5, seed_source='A1_BREAK')
@@ -7581,9 +7581,11 @@ class SelfTest:
         self._record(278, PASS if ok else FAIL, detail)
 
     def _step_r8_migration(self):
-        # 279 R-8 FIX: a legacy rogue_trades.csv with a 9-col header over 10-col rows migrates to
-        # a 10-col header (seed_source LAST), data rows PRESERVED, the original backed up to .bak,
-        # and the writer self-heals on the next append. Re-running the migration is a no-op.
+        # 279 R-8 FIX: a legacy rogue_trades.csv whose header is narrower than the current
+        # TRADE_COLUMNS migrates to the FULL current header (last-appended column LAST), data
+        # rows PRESERVED, the original backed up to .bak, and the writer self-heals on the next
+        # append. Re-running the migration is a no-op. (Schema-agnostic: the widths are read from
+        # _rpl.TRADE_COLUMNS so appending telemetry columns doesn't stale this test.)
         import os, csv, tempfile
         import csv_schema as _cs, rogue_patternlog as _rpl
         tmp = tempfile.mkdtemp(prefix='aureon_r8_')
@@ -7599,7 +7601,8 @@ class SelfTest:
             res = _cs.migrate(p, _rpl.TRADE_COLUMNS)
             hf, _ = _cs.inspect(p)
             rows = list(csv.DictReader(open(p, encoding='utf-8')))
-            migrated_ok = (res['migrated'] and len(hf) == 10 and hf[-1] == 'seed_source'
+            migrated_ok = (res['migrated'] and len(hf) == len(_rpl.TRADE_COLUMNS)
+                           and hf[-1] == _rpl.TRADE_COLUMNS[-1]
                            and os.path.exists(p + '.bak') and len(rows) == 2
                            and rows[0]['outcome_dollars'] == '7.0'
                            and rows[1]['seed_source'] == 'A1_BREAK' and None not in rows[0])
@@ -7612,7 +7615,7 @@ class SelfTest:
                 csv.writer(f).writerow(legacy)             # 9-col header only
             _cs.ensure(p2, _rpl.TRADE_COLUMNS)
             hf2, _ = _cs.inspect(p2)
-            heal = (len(hf2) == 10 and hf2[-1] == 'seed_source')
+            heal = (len(hf2) == len(_rpl.TRADE_COLUMNS) and hf2[-1] == _rpl.TRADE_COLUMNS[-1])
             ok = migrated_ok and idem and heal
             detail = f"migrated={migrated_ok} idempotent={idem} self_heal={heal}"
         except Exception as e:
