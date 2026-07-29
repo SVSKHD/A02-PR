@@ -57,11 +57,24 @@ def main():
     # import cycle (live_trader imports the split modules, not bot)
 
     parser = argparse.ArgumentParser(description="AUREON v2 bot — XAUUSD multi-anchor")
-    parser.add_argument('mode', choices=['backtest', 'paper', 'live', 'selftest',
-                                         'testfire', 'testorder', 'verifyfb', 'rescuestats',
-                                         'bescratchscan', 'rogueseed', 'fetchseed',
-                                         'dailyreport', 'reconcile', 'fetchticks',
-                                         'simulate', 'review'])
+    parser.add_argument('mode', nargs='?', default=None,
+                        choices=['backtest', 'paper', 'live', 'selftest',
+                                 'testfire', 'testfireimmediate', 'testorder', 'test',
+                                 'verifyfb', 'rescuestats',
+                                 'bescratchscan', 'rogueseed', 'fetchseed',
+                                 'dailyreport', 'reconcile', 'fetchticks',
+                                 'simulate', 'review'])
+    parser.add_argument('--test', dest='test_alias', action='store_true',
+                        help="alias for the `test` READ-ONLY broker preflight")
+    parser.add_argument('--daily-limit-pct', type=float, default=None,
+                        help="test: firm daily-loss limit as a fraction of starting_balance "
+                             "for the lot advisor (default config daily_loss_pct)")
+    parser.add_argument('--i-know-real-account', action='store_true',
+                        help="testfireimmediate: required (with --lot-min) to run on a "
+                             "non-demo account")
+    parser.add_argument('--lot-min', action='store_true',
+                        help="testfireimmediate: required (with --i-know-real-account) to run "
+                             "on a non-demo account; the cycle uses volume_min regardless")
     parser.add_argument('--i-know-this-is-real', action='store_true',
                         help="testorder: allow running against a non-demo account")
     parser.add_argument('--csv', help="Path to M1 CSV (backtest mode)")
@@ -106,6 +119,13 @@ def main():
                              "(--force refetches days already on disk)")
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
+
+    # `--test` is an alias for the `test` preflight subcommand (so it can run without a
+    # positional mode: `python bot.py --test`).
+    if getattr(args, 'test_alias', False) and args.mode is None:
+        args.mode = 'test'
+    if args.mode is None:
+        parser.error("a mode is required (or pass --test for the broker preflight)")
 
     global log
     log = setup_logging(args.log_level)
@@ -191,6 +211,69 @@ def main():
         finally:
             try:
                 _adapter.shutdown()
+            except Exception:
+                pass
+        sys.exit(code)
+
+    elif args.mode == 'test':
+        # READ-ONLY broker preflight (safe on demo AND real). Validates account /
+        # terminal / symbol / order viability (via mt5.order_check() ONLY — nothing is
+        # ever sent) / timing / a per-lot risk advisor, then prints aligned tables + one
+        # Discord card. Exit 0 = READY, nonzero = BLOCKED so a watchdog/script can gate
+        # on it. See broker_preflight.py.
+        from mt5_adapter import MT5Adapter
+        from broker_preflight import run_preflight
+        try:
+            from telemetry import telemetry_from_env
+            _tele = telemetry_from_env(component="AUREON-preflight")
+        except Exception:
+            _tele = None
+        _adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'),
+                              expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))
+        try:
+            code = run_preflight(cfg, _adapter, daily_limit_pct=args.daily_limit_pct,
+                                 lot_override=args.lot, notifier=_tele)
+        finally:
+            try:
+                _adapter.shutdown()
+            except Exception:
+                pass
+            try:
+                if _tele is not None:
+                    _tele.stop(timeout=6.0)
+            except Exception:
+                pass
+        sys.exit(code)
+
+    elif args.mode == 'testfireimmediate':
+        # REAL order-path test (distinct from `testorder`'s TESTORDER magic and from
+        # `testfire`'s live-managed straddle): runs the EXACT live placement code (same
+        # adapter fns + magic/comment/filling as anchors + RB + SL-modify), ONE cycle,
+        # then exits — no watchdog. TF_ isolated (magic 20260522 + TF_ comment) so its
+        # deals are excluded from day-P&L/halts like a classic testfire (#125 symmetry).
+        # Demo: runs flagless. Non-demo: requires BOTH --i-know-real-account AND --lot-min.
+        # See testfire_immediate.py.
+        from mt5_adapter import MT5Adapter
+        from testfire_immediate import run_testfireimmediate
+        try:
+            from telemetry import telemetry_from_env
+            _tele = telemetry_from_env(component="AUREON-testfireimmediate")
+        except Exception:
+            _tele = None
+        _adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'),
+                              expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))
+        try:
+            code = run_testfireimmediate(cfg, _adapter,
+                                         allow_real=args.i_know_real_account,
+                                         lot_min=args.lot_min, notifier=_tele)
+        finally:
+            try:
+                _adapter.shutdown()
+            except Exception:
+                pass
+            try:
+                if _tele is not None:
+                    _tele.stop(timeout=6.0)
             except Exception:
                 pass
         sys.exit(code)
