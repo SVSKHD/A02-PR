@@ -122,6 +122,7 @@ HELP_TEXT = """*AUREON v2 commands*
 🌱 `/rogueseed` — re-anchor Rogue at the current tick (live testing; DEMO-only)
 🌱 `/fetchseed` — re-anchor Fetcher at the current tick (live testing; DEMO-only)
 🧪 `/testfire` — fire ONE isolated TF_ straddle inside the running bot (DEMO-only; real schedule untouched)
+🧪 `/testfire now [dist] [lot]` — UNGATED real non-OCO TF_ straddle at current mid ±dist (default 3.0), lot default cfg.lot_size — no demo/rate/brake gate
 🧪 `/testfire status` — last run time, result, whether one is in flight
 🔒 `/daylock status` — per-engine day P&L vs profit/loss stops + lock state
 🔓 `/daylock anchors off` — override the anchors profit lock (loss stop stays)
@@ -672,6 +673,19 @@ class Watchdog:
                 self._write_command("testfire_status")
                 self.tele.info("🧪🔥 `/testfire status` queued — bot will report the last "
                                "run + in-flight state next tick.")
+            elif sub == "now":
+                # /testfire now [dist] [lot]: UNGATED real non-OCO straddle at the current
+                # mid with a SHORT trigger distance. The watchdog only PARSES + queues; the
+                # bot fires it on its next tick and replies with the placement table (incl.
+                # any broker retcode). No demo/rate/brake gate is applied.
+                dist = toks[1] if len(toks) >= 2 else None
+                lot = toks[2] if len(toks) >= 3 else None
+                self._write_command("testfire_now", {"dist": dist, "lot": lot})
+                self.tele.warn(
+                    "🧪🔥 `/testfire now` queued — bot fires ONE UNGATED non-OCO TF_ straddle "
+                    f"next tick at current mid ±${dist or '3'} (lot {lot or 'cfg.lot_size'}). "
+                    "No demo/rate/brake gate. Real anchor schedule UNAFFECTED. It replies "
+                    "with the placement table + any broker retcode.")
             else:
                 self._write_command("testfire")
                 self.tele.info("🧪🔥 `/testfire` queued — bot fires ONE isolated TF_ straddle "

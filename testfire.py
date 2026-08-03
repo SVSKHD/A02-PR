@@ -362,14 +362,20 @@ def testfire_preflight_inproc(trader, now_utc=None):
                   "anchors brake clear — firing an isolated TF_ straddle.")
 
 
-def arm_testfire_inproc(trader, now_utc=None):
+def arm_testfire_inproc(trader, now_utc=None, dist=None, lot=None):
     """Arm ONE isolated test straddle inside the RUNNING process. Drops a deferred
     anchor onto trader._testfire_deferred (a SEPARATE slot from the real
     _deferred_anchor) with a TF_<HHMMSS> identity; the live loop's
     _complete_testfire_anchor places it on the next tick via the SAME
     _place_orders_for_anchor path (current-mid straddle). Does NOT set
     _testfire_mode, so the real scheduler is entirely unaffected. Returns the label.
-    NO broker orders are placed here."""
+    NO broker orders are placed here.
+
+    dist / lot (v3.10.x /testfire now): optional per-call overrides threaded to
+    _place_orders_for_anchor via the deferred slot -- dist replaces cfg.trigger_dist
+    (a SHORT distance so both legs fill in minutes), lot replaces cfg.lot_size. Both
+    None (the gated /testfire) keeps the exact prior geometry (cfg.trigger_dist / SL 18
+    / TP 30 unchanged either way)."""
     now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
     label = make_testfire_label(now)
     mid = None
@@ -390,6 +396,8 @@ def arm_testfire_inproc(trader, now_utc=None):
         'gap_lot_override': None,
         'gap_sl_override': None,
         'gap_re_anchor': None,
+        'trigger_dist_override': (float(dist) if dist is not None else None),
+        'lot_override': (float(lot) if lot is not None else None),
     }
     # result record (surfaced by /testfire status + the placement/summary cards)
     try:
@@ -519,6 +527,61 @@ def handle_testfire_command(trader, now_utc=None):
             f"mid (+/-${getattr(trader.cfg, 'trigger_dist', 5.0):.0f}, $"
             f"{getattr(trader.cfg, 'sl_dist', 18.0):.0f} SL / ${getattr(trader.cfg, 'tp_dist', 30.0):.0f} "
             f"TP, No-OCO). Real anchor schedule is UNAFFECTED; results post as it runs "
+            f"(/testfire status).")
+    except Exception:
+        pass
+    return True
+
+
+def handle_testfire_now_command(trader, dist=None, lot=None, now_utc=None):
+    """Discord `/testfire now [dist] [lot]` — fire the REAL non-OCO TF_ straddle at the
+    CURRENT mid with a SHORT trigger distance, UNCONDITIONALLY.
+
+    This is the same in-process mechanism as `/testfire` (arm_testfire_inproc ->
+    _complete_testfire_anchor -> _place_completed_anchor -> _place_orders_for_anchor),
+    so it is byte-identical downstream: TF_ label + "A:<price>" origin tag, magic
+    20260522, SL cfg.sl_dist / TP cfg.tp_dist, no_oco leaving the sibling live, rescue-
+    boost adoption, freeze + trail. The ONLY differences are (a) NO gates and (b) a
+    SHORT trigger distance so both legs fill in minutes.
+
+    DELIBERATELY UNGATED (all Part-0.3 gates removed for this entry point): no rate
+    limit, no rail 1 DEMO-ONLY, no rail 2 NO-FP, no rail 5 ONE-AT-A-TIME, no rail 4
+    ACTIVE-WINDOW, no rail 6 ANCHORS-BRAKE. One message -> one straddle.
+
+    Broker realities are NOT gated but ARE surfaced verbatim: the placement path posts
+    the stale/no-tick/warmup warnings itself, and record_testfire_placement posts the
+    per-leg PASS/FAIL table with the raw retcode + ticket for any non-10009 reject
+    (market closed, insufficient margin, invalid volume, disconnect, etc.). Guarded so a
+    bad argument never breaks the tick loop.
+
+      dist  default 3.0  (the +/- distance for the two stop orders)
+      lot   default cfg.lot_size  (optional override)
+    """
+    now = now_utc if now_utc is not None else pd.Timestamp.now(tz='UTC')
+    cfg = trader.cfg
+    try:
+        d = float(dist) if dist is not None and str(dist).strip() != '' else 3.0
+    except (TypeError, ValueError):
+        d = 3.0
+    lot_ovr = None
+    if lot is not None and str(lot).strip() != '':
+        try:
+            lot_ovr = float(lot)
+        except (TypeError, ValueError):
+            lot_ovr = None
+    eff_lot = lot_ovr if lot_ovr is not None else float(getattr(cfg, 'lot_size', 0.53))
+    # record the run stamp (parity with the gated path's status surface) then arm.
+    try:
+        trader.state.setdefault('testfire', {})['last_run_epoch'] = now.timestamp()
+    except Exception:
+        pass
+    label = arm_testfire_inproc(trader, now, dist=d, lot=lot_ovr)
+    try:
+        trader.tele.warn(
+            f"🧪🔥 *TESTFIRE NOW armed* [{label}] — UNGATED non-OCO straddle at current "
+            f"mid ±${d:.2f}, lot `{eff_lot:g}`, ${getattr(cfg, 'sl_dist', 18.0):.0f} SL / "
+            f"${getattr(cfg, 'tp_dist', 30.0):.0f} TP, No-OCO. No demo/rate/brake gate. "
+            f"Real anchor schedule UNAFFECTED. Fills + retcodes post as it runs "
             f"(/testfire status).")
     except Exception:
         pass

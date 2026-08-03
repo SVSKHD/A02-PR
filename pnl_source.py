@@ -19,6 +19,7 @@ Summing their rows is exactly the R-8 corruption the reconcile audit exists to c
 from __future__ import annotations
 
 import logging
+import re
 
 log = logging.getLogger("AUREON")
 
@@ -63,6 +64,40 @@ def _is_test(d) -> bool:
         return False
 
 
+# A rescue-boost (RB v2) leg carries "RB1:<parent_ticket>" / "RB2:<parent_ticket>"
+# (rescue_boost.boost_comment) but NO "TF_" marker of its own. When its parent is a
+# TESTFIRE position, its realized P&L must inherit the test exclusion too -- otherwise a
+# testfire whose rescue fires would count toward the REAL anchors daily loss stop.
+_RB_PARENT_RE = re.compile(r"RB[12]:(\d+)")
+
+
+def _rb_parent_ticket(d):
+    """The parent position ticket an RB rescue-boost leg is tagged to
+    ("RB1:<ticket>"/"RB2:<ticket>"), else None. PURE; guarded."""
+    try:
+        mobj = _RB_PARENT_RE.search(str(getattr(d, 'comment', '') or ''))
+        return int(mobj.group(1)) if mobj else None
+    except Exception:
+        return None
+
+
+def _test_position_ids(deals):
+    """The set of position_ids belonging to a TESTFIRE (TF_) deal in `deals`. Used to
+    extend the test exclusion to an RB rescue leg whose PARENT is a TF_ position (the RB
+    comment carries the parent's position ticket, which equals its position_id). PURE;
+    guarded per-deal. Returns an empty set when nothing is a test."""
+    ids = set()
+    for d in (deals or []):
+        try:
+            if _is_test(d):
+                pid = getattr(d, 'position_id', None)
+                if pid is not None:
+                    ids.add(int(pid))
+        except Exception:
+            continue
+    return ids
+
+
 def magic_day_net(deals, magic, exclude_test=False):
     """PURE, the SINGLE TRUTH: realized net over the CLOSING deals (entry == 1) whose magic
     matches `magic`, in `deals`. Summing ALL out deals (not last-out-per-position) so a
@@ -70,13 +105,21 @@ def magic_day_net(deals, magic, exclude_test=False):
 
     exclude_test=True SYMMETRICALLY drops TESTFIRE deals (TF_ comment marker) — a test SL
     and a test win are both excluded, so the daily total can never freeze one-sided
-    (2026-07-17: a testfire -630 SL counted but its +155/+156/+346 wins did not)."""
+    (2026-07-17: a testfire -630 SL counted but its +155/+156/+346 wins did not). It ALSO
+    drops the RB rescue-boost legs of a TF_ parent position (their comment carries no TF_
+    marker of its own), so a testfire whose rescue fires can never halt the REAL anchors
+    engine. A NORMAL anchor's RB legs are UNAFFECTED: their parent is not a TF_ position,
+    so it is never in the test-position set -> they still count exactly as before."""
     m = int(magic)
     total = 0.0
+    test_ids = _test_position_ids(deals) if exclude_test else set()
     for d in (deals or []):
         try:
-            if _magic(d) == m and _is_out(d) and not (exclude_test and _is_test(d)):
-                total += deal_pnl(d)
+            if not (_magic(d) == m and _is_out(d)):
+                continue
+            if exclude_test and (_is_test(d) or _rb_parent_ticket(d) in test_ids):
+                continue
+            total += deal_pnl(d)
         except Exception:
             continue
     return round(total, 2)

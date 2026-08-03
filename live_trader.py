@@ -806,6 +806,17 @@ class LiveTrader:
                     _tf.handle_testfire_command(self)
                 except Exception as e:
                     log.warning(f"testfire command failed (non-fatal): {e!r}")
+            elif cmd == "testfire_now":
+                # Discord /testfire now [dist] [lot]: fire the REAL non-OCO TF_ straddle at
+                # the current mid with a SHORT trigger distance, UNCONDITIONALLY (no demo/
+                # rate/one-at-a-time/active-window/anchors-brake gate). Same in-process path
+                # as /testfire; broker rejects surface verbatim in the placement table.
+                try:
+                    import testfire as _tf
+                    _tf.handle_testfire_now_command(self, dist=args.get("dist"),
+                                                    lot=args.get("lot"))
+                except Exception as e:
+                    log.warning(f"testfire now command failed (non-fatal): {e!r}")
             elif cmd == "testfire_status":
                 try:
                     import testfire as _tf
