@@ -511,6 +511,11 @@ def _place_completed_anchor(self, d):
     gap_lot_override = d.get('gap_lot_override', None)
     gap_sl_override  = d.get('gap_sl_override',  None)
     gap_re_anchor    = d.get('gap_re_anchor',    None)
+    # /testfire now: per-call trigger-distance + lot overrides (None -> cfg default).
+    # Set ONLY by the in-process testfire deferred slot; a scheduled anchor's deferred
+    # dict never carries these keys, so its placement is byte-identical (both -> None).
+    trigger_dist_override = d.get('trigger_dist_override', None)
+    lot_override          = d.get('lot_override', None)
     if gap_mode_locked and gap_re_anchor is not None:
         anchor_price = gap_re_anchor
 
@@ -574,13 +579,17 @@ def _place_completed_anchor(self, d):
         gap_mode_locked=gap_mode_locked,
         gap_lot_override=gap_lot_override,
         gap_sl_override=gap_sl_override,
+        trigger_dist_override=trigger_dist_override,
+        lot_override=lot_override,
     )
 
 def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_price,
                               retry_count=0,
                               gap_mode_locked=False,
                               gap_lot_override=None,
-                              gap_sl_override=None):
+                              gap_sl_override=None,
+                              trigger_dist_override=None,
+                              lot_override=None):
     # All the original gap detection + pre-flight + placement logic.
     # v2.5.2: retry_count parameter added — used in the rc=-1 recovery block below.
     # v2.5.3: gap_mode_locked + overrides — if a previous attempt resolved
@@ -608,7 +617,7 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
         # Instead of skipping (passive), we re-anchor to current M5 close and
         # trade the breakout from there with REDUCED RISK (half-lot, tight SL).
         gap_mode = False
-        gap_lot = self.cfg.lot_size
+        gap_lot = lot_override if lot_override is not None else self.cfg.lot_size
         gap_sl_dist = self.cfg.sl_dist
         gap_tp_dist = self.cfg.tp_dist
         if current_price is not None:
@@ -646,8 +655,14 @@ def _place_orders_for_anchor(self, label, anchor_utc, anchor_price, current_pric
                 )
                 anchor_price = new_anchor
 
-    buy_stop  = round(anchor_price + self.cfg.trigger_dist, 2)
-    sell_stop = round(anchor_price - self.cfg.trigger_dist, 2)
+    # /testfire now threads a SHORT trigger distance so the straddle fills in minutes;
+    # a scheduled anchor passes None here -> cfg.trigger_dist (byte-identical). The gap-
+    # detection threshold above deliberately stays on cfg.trigger_dist (an orthogonal
+    # "is the anchor stale vs market" guard); a testfire re-anchors to the current mid so
+    # its gap is ~0 and gap-mode never triggers regardless.
+    _trig = trigger_dist_override if trigger_dist_override is not None else self.cfg.trigger_dist
+    buy_stop  = round(anchor_price + _trig, 2)
+    sell_stop = round(anchor_price - _trig, 2)
     sl_buy    = round(buy_stop  - gap_sl_dist, 2)
     sl_sell   = round(sell_stop + gap_sl_dist, 2)
     tp_buy    = round(buy_stop  + gap_tp_dist, 2)
