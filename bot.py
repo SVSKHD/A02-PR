@@ -60,10 +60,13 @@ def main():
     parser.add_argument('mode', nargs='?', default=None,
                         choices=['backtest', 'paper', 'live', 'selftest',
                                  'testfire', 'testfireimmediate', 'testorder', 'test',
+                                 'tfnow',
                                  'verifyfb', 'rescuestats',
                                  'bescratchscan', 'rogueseed', 'fetchseed',
                                  'dailyreport', 'reconcile', 'fetchticks',
                                  'simulate', 'review'])
+    parser.add_argument('tf_args', nargs='*',
+                        help="tfnow: <dist> [lot] — the +/- stop distance and optional lot")
     parser.add_argument('--test', dest='test_alias', action='store_true',
                         help="alias for the `test` READ-ONLY broker preflight")
     parser.add_argument('--daily-limit-pct', type=float, default=None,
@@ -277,6 +280,49 @@ def main():
             except Exception:
                 pass
         sys.exit(code)
+
+    elif args.mode == 'tfnow':
+        # ZERO-GATE standalone TF_ straddle: build the adapter, place BOTH stop legs
+        # SYNCHRONOUSLY through the adapter, print the retcodes, exit. Takes NO PID lock
+        # (MT5Adapter never grabs run/aureon.pid) so it runs WHILE the live bot is up.
+        # Depends on nothing else — not Discord, not the watchdog, not commands.json, not
+        # the tick loop. See tfnow.py. Broker realities (no tick / market closed / bad
+        # volume / non-10009 rc) are reported, never gated.
+        from mt5_adapter import MT5Adapter
+        import tfnow as _tfnow
+        try:
+            from telemetry import telemetry_from_env
+            _tele = telemetry_from_env(component="AUREON-tfnow")
+        except Exception:
+            _tele = None
+        try:
+            _dist = float(args.tf_args[0]) if args.tf_args else 3.0
+        except (TypeError, ValueError):
+            _dist = 3.0
+        _lot = None
+        if len(args.tf_args) > 1:
+            try:
+                _lot = float(args.tf_args[1])
+            except (TypeError, ValueError):
+                _lot = None
+        _adapter = MT5Adapter(getattr(cfg, 'symbol', 'XAUUSD'),
+                              expected_offset_hours=getattr(cfg, 'EXPECTED_BROKER_OFFSET_HOURS', None))
+        out = {}
+        try:
+            out = _tfnow.fire(_adapter, cfg, _tele, dist=_dist, lot=_lot)
+        finally:
+            try:
+                _adapter.shutdown()
+            except Exception:
+                pass
+            try:
+                if _tele is not None:
+                    _tele.stop(timeout=6.0)
+            except Exception:
+                pass
+        # exit 0 iff at least one leg was accepted (rc 10009); else 1.
+        _ok = any(r.get('rc') == 10009 for r in (out.get('rows') or []))
+        sys.exit(0 if _ok else 1)
 
     elif args.mode == 'review':
         # Post/print today's decision-grade session-review digest (fills, closes by
