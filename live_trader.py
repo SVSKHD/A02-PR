@@ -1079,6 +1079,19 @@ class LiveTrader:
                 or not self._engine_enabled('fetcher')
                 or bool(getattr(self, '_account_locked', lambda: False)()))
 
+    def _aureon_non_oco_entries_blocked(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
+        """Shared entries-blocked seam for the aureon_new_non_oco engine, mirroring
+        _rogue_entries_blocked / _fetcher_entries_blocked. effective_block =
+        master-flag-OFF OR friday_window OR account-level day lock. Feeds
+        aureon_non_oco.drive(allow_new_entries=...) -- with entries blocked, drive()
+        still trail-manages / books closes on an open AURNO position (manage-only),
+        it just arms no new session and takes no new chain entry. The master flag is
+        the outer gate so with it OFF the engine is fully inert."""
+        if not bool(getattr(self.cfg, 'aureon_new_non_oco', False)):
+            return True
+        return (self._friday_entries_blocked(broker_date, utc_now)
+                or bool(getattr(self, '_account_locked', lambda: False)()))
+
     # ------------------------------------------------------------------------
     # v3.7.3 ANCHORS-engine daily stops + the (inert) account-level lock
     # ------------------------------------------------------------------------
@@ -2547,6 +2560,16 @@ class LiveTrader:
                     _fetcher.drive(self, allow_new_entries=False)
             except Exception:
                 pass
+            # aureon_new_non_oco post-EOD manage-only: the bot's EOD (eod_broker_hour,
+            # 23:00) fires before this engine's own 23:30 flat cutoff, and the EOD block
+            # returns before the normal 6d driver runs -- so keep managing any open AURNO
+            # position here with NEW entries hard-blocked. The engine flattens itself at
+            # 23:30 (anc_flat_broker_hour) from inside drive(). No-op unless ON.
+            try:
+                import aureon_non_oco as _aurno
+                _aurno.drive(self, allow_new_entries=False)
+            except Exception:
+                pass
             # v3.0.0 commit 3: Firebase EOD journal -- ONCE per broker day, after
             # the book is flat and the day's P&L is final (never during anchor
             # capture). Guarded so it fires once and never blocks the EOD path.
@@ -2634,6 +2657,20 @@ class LiveTrader:
         try:
             import fetcher as _fetcher
             _fetcher.drive(self, allow_new_entries=not self._fetcher_entries_blocked(broker_date, utc_now))
+        except Exception:
+            pass
+
+        # 6d. aureon_new_non_oco per-tick driver: mirrors 6b/6c. A SEPARATE parallel
+        # engine (magic 20260811) that runs IN ADDITION to the blind non-OCO straddle
+        # -- it never merges with or suppresses it. Runs here AFTER the kill-switch and
+        # EOD returns, so a NEW entry only opens on a live, non-killed, pre-EOD tick.
+        # Immediate no-op unless cfg.aureon_new_non_oco is ON (DEFAULT OFF -> byte-
+        # identical). Gated on _aureon_non_oco_entries_blocked (= flag OFF OR
+        # friday_window OR account lock); with entries blocked, drive() still manages
+        # any open AURNO position (manage-only) -- it never orphans a leg.
+        try:
+            import aureon_non_oco as _aurno
+            _aurno.drive(self, allow_new_entries=not self._aureon_non_oco_entries_blocked(broker_date, utc_now))
         except Exception:
             pass
 
@@ -2785,4 +2822,5 @@ LiveTrader._firebase_weekly_reconcile = _journal_mod._firebase_weekly_reconcile
 LOADED_MODULES = ['utils', 'config', 'strategy', 'mt5_adapter', 'backtest',
                   'state', 'risk', 'anchors', 'fills', 'trails', 'journal',
                   'live_trader', 'bot', 'firebase_journal', 'position_telemetry',
-                  'offset_guard', 'soft_restart', 'break_hold', 'fp_guard']
+                  'offset_guard', 'soft_restart', 'break_hold', 'fp_guard',
+                  'aureon_non_oco']

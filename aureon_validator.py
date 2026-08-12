@@ -39,6 +39,11 @@ _EXPECTED_FLAGS = (
     # 2026-07-09 $10-break seed anchor (Rule 1) + earned trade budget (Rule 2), both engines
     'seed_break_dollars', 'engine_base_trades_per_anchor', 'engine_extend_requires_wins',
     'engine_exhausted_gap_sec',
+    # aureon_new_non_oco engine: master switch + mechanism knobs (all DEFAULT-OFF safe)
+    'aureon_new_non_oco', 'anc_threshold', 'anc_n_candles', 'anc_obs_expiry_min',
+    'anc_sl', 'anc_lock_at', 'anc_lock_to', 'anc_target', 'anc_trail_dist',
+    'anc_max_chain', 'anc_chain_stop_on_loss', 'anc_chain_trend', 'anc_ema_period',
+    'anc_lot', 'anc_daily_target_pct',
 )
 # the feature modules that MUST import cleanly for the wired behavior to exist.
 _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
@@ -46,7 +51,9 @@ _FEATURE_MODULES = ('pullback_entry', 'rally', 'rescue', 'rogue', 'boosts',
                     'seed_budget',
                     # 2026-07-09 P&L pipeline: the single source of truth + the R-8 CSV
                     # self-heal + the reconcile audit must all import cleanly.
-                    'pnl_source', 'csv_schema', 'pnl_reconcile')
+                    'pnl_source', 'csv_schema', 'pnl_reconcile',
+                    # aureon_new_non_oco engine module
+                    'aureon_non_oco')
 # the LiveTrader seams that MUST be bound for the per-tick flow to dispatch.
 _SEAMS = ('_break_and_hold_ok', '_rescue_entry_ok', '_check_boost_triggers',
           '_resolved_anchor_hm', '_process_anchor_if_due',
@@ -55,7 +62,9 @@ _SEAMS = ('_break_and_hold_ok', '_rescue_entry_ok', '_check_boost_triggers',
           # v3.7.0 FETCHER engine: its shared entries-blocked seam
           '_fetcher_entries_blocked',
           # v3.7.3 ANCHORS daily stops + account lock seams
-          '_anchors_daystop_blocked', '_account_locked')
+          '_anchors_daystop_blocked', '_account_locked',
+          # aureon_new_non_oco engine: its shared entries-blocked seam
+          '_aureon_non_oco_entries_blocked')
 
 
 def _probe(cfg):

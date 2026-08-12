@@ -411,6 +411,75 @@ helpers only; closures label-scoped). No logic changed in the merge — it's a p
 
 ---
 
+### `aureon_new_non_oco` — observation → confirmation → ladder → chain (flag-gated, **DEFAULT OFF**)
+
+A SEPARATE, self-contained entry/exit engine (own magic `20260811`), modelled on ROGUE
+and driven by the same per-tick seam. It does **not** replace or merge with the blind
+non-OCO straddle — when its flag is on it runs **in parallel**, additively, on its own
+magic and its own trade handling; the four blind anchors keep firing exactly as today.
+
+**What the flag does.** With `cfg.aureon_new_non_oco = False` (the default) the engine's
+`drive()` is an immediate no-op and the whole bot is byte-identical. With it **on**, for
+each label in `cfg.anc_anchors` (default **A2 10:00**, **A5 19:30** broker; A5 skipped
+Fridays, 45-min drift skip) it:
+
+1. captures the anchor price and forms two **observation** levels at anchor ± `anc_threshold`
+   (**15**);
+2. a **touch** of either level opens an observation window — **no order is placed**;
+3. it watches **closed M1 candles**: `anc_n_candles` (**3**) consecutive same-direction
+   closes is the signal (3 up → long, 3 down → short; a doji breaks the run; direction
+   comes from the candles, **not** the level touched). No confirm within `anc_obs_expiry_min`
+   (**60**) min → the setup is dead for that anchor;
+4. enters at market and rides the **exit ladder**: stop starts **18** from entry → floors at
+   **+2.5** at +3 (never backwards) → secures **+10** at +10, then trails **1.5** behind the
+   peak; flat everything at **23:30** broker;
+5. **chains**: after a close, observation reopens **at the exit price** (no new touch) — up to
+   `anc_max_chain` (**5**) trades/anchor/day, ending on a losing link, with a **200-EMA** M1
+   trend filter on links ≥ 1 (**link 0, the first trade off the touch, is not filtered**).
+
+All the numbers are `anc_*` fields in `config.py` (`anc_daily_target_pct` defaults to **0 =
+OFF** deliberately — a daily cap removes the small number of large runners that carry the
+edge). The engine reuses the existing broker helpers (broker-side SL at entry via
+`place_market_order`, trailing via `modify_position_sl`), the existing notifier, and the
+existing account guards (kill-switch / drawdown floor flatten it via `_flatten_all`; on MT5
+disconnect it takes no new entries and leaves open positions on their broker stops).
+
+**Turn it on.** Set `aureon_new_non_oco = True` in `config.py` (or `cfg.aureon_new_non_oco =
+True` right after `Config()` in `bot.py`, alongside the other flag overrides). It is a config
+flag, DEFAULT OFF; leave it off to keep today's behaviour.
+
+**Backtest (correctness check).**
+```bash
+python aureon_non_oco_backtest.py --csv XAUUSD_M1.csv \
+    --start 2025-08-01 --end 2026-07-31 --lot 1.0 --commission 7 --spread 0.0
+```
+Drives an M1 CSV through the *same* pure core the live engine uses. On XAUUSD M1,
+Aug 2025 – Jul 2026, 1 lot, spread + $7/lot commission, a correct implementation lands near:
+
+| metric | reference |
+|---|---|
+| trades | ~1,327 |
+| net | ~$121,700 |
+| win rate | 83.3% |
+| profit factor | 1.38 |
+| max drawdown | ~$11,500 |
+| exits (lock / target / stop / EOD) | ~907 / 180 / 163 / 77 |
+| trades reaching +10 | ~180 (they carry all the profit) |
+| worst month | ~+$171 (no losing month) |
+
+> ⚠️ **These figures are IN-SAMPLE.** The anchors and chain settings were selected on this
+> same year, so treat them as a **correctness check on the implementation, not an expected
+> live return.** Reproducing them requires that same M1 data and spread series; point `--csv`
+> at your history and set `--spread` / `--commission` to your broker's costs. If your numbers
+> are far off, the usual culprits are: the chain reopening at the wrong price (must be the
+> **exit** price, not the original level), the EMA filter being applied to link 0, or the
+> confirmation scanning open candles instead of **closed** ones.
+
+Tests: `tests/test_aureon_non_oco.py` (confirmation, ladder, chain, and the flag-off
+regression — `python -m unittest tests.test_aureon_non_oco`).
+
+---
+
 ## License
 
 This is YOUR strategy and YOUR risk. Provided as-is for educational and
