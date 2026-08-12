@@ -224,6 +224,39 @@ class Config:
     a5_skip_friday: bool = True
     a4_skip_friday: bool = True
     non_oco_enabled: bool = True
+    # ── AUREON NEW NON-OCO — observation → confirmation → ladder → chain ─────────
+    # A SEPARATE, self-contained engine (own magic 20260811), modelled on ROGUE:
+    # it never merges with the blind non-OCO straddle above and never touches an
+    # anchor/rogue/fetcher leg. Master switch `aureon_new_non_oco` DEFAULT OFF, so
+    # with it off drive() is a pure no-op and the whole bot is byte-identical.
+    # When ON it runs IN PARALLEL with the existing engines (additive): for each
+    # anc_anchors label it observes anchor ±anc_threshold, confirms on 3 closed M1
+    # candles, enters at market, rides the anc_* exit ladder, and re-enters (chains)
+    # from the exit price under the cap / stop-on-loss / EMA controls. See
+    # aureon_non_oco.py and the README section for the full mechanism + backtest
+    # reference numbers.
+    aureon_new_non_oco: bool = False
+    anc_anchors: List[str] = field(default_factory=lambda: ["A2", "A5"])
+    anc_threshold: float = 15.0        # ± observation levels from the anchor price
+    anc_n_candles: int = 3             # consecutive same-dir closed M1 candles = signal
+    anc_obs_expiry_min: float = 60.0   # no confirm within this from the touch -> dead
+    anc_sl: float = 18.0               # initial broker-side stop from entry
+    anc_lock_at: float = 3.0           # at +this favourable ...
+    anc_lock_to: float = 2.5           # ... floor the stop at +this (never backwards)
+    anc_target: float = 10.0           # at +this, secure the stop at +target ...
+    anc_trail_dist: float = 1.5        # ... then trail this far behind the peak
+    anc_max_chain: int = 5             # max trades per anchor per day (links 0..4)
+    anc_chain_stop_on_loss: bool = True  # a losing link ends the chain for the day
+    anc_chain_trend: str = "ema"       # "none" | "ema": chained links (>=1) trend filter
+    anc_ema_period: int = 200          # M1 EMA period for the chain trend filter
+    anc_lot: float = 0.10              # lot per link
+    anc_daily_target_pct: float = 0.0  # 0 = OFF (do not enable by default; see README)
+    # 45-min drift rule (mirrors the anchor scheduler convention): if the engine
+    # comes due for an anchor more than this many minutes late, skip it for the day.
+    anc_drift_min: float = 45.0
+    # Flat everything at this broker hour (23:30 = 23.5), fractional-hour like
+    # friday_flatten_broker_hour above.
+    anc_flat_broker_hour: float = 23.5
     rogue_seed_fallback: str = "a1_time_snapshot"
     # ── FETCHER — grinder engine, retired after 07-08/09 chop losses. OFF.
     fetcher_enabled: bool = False

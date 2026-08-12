@@ -243,6 +243,17 @@ def _flatten_all(self, reason: str = "Manual", scope: str = "ALL"):
             _fetcher.force_close_open(self, reason=reason)
         except Exception as e:
             log.warning(f"fetcher force_close_open during flatten failed (non-fatal): {e!r}")
+    # aureon_new_non_oco: the same kill-switch / manual flatten must ALSO close any open
+    # AURNO ticket (magic 20260811) -- it rides its own magic, untouched by the anchor
+    # loop. EOD is EXCLUDED (the engine flattens itself at its own 23:30 cutoff via its
+    # driver). An ANCHORS-scoped flatten skips it. No-op unless the engine is enabled.
+    if str(reason) != "EOD" and str(scope) != "ANCHORS":
+        try:
+            import aureon_non_oco as _aurno
+            if bool(getattr(self.cfg, "aureon_new_non_oco", False)):
+                _aurno.close_all(self, dry_run=self.paper)
+        except Exception as e:
+            log.warning(f"aureon_non_oco close_all during flatten failed (non-fatal): {e!r}")
 
     # E-22: this flatten closed anchor positions DIRECTLY via the MT5 adapter, bypassing the
     # fills.py reconcile loop that increments state['daily_pnl']. Invalidate the computed-P&L
