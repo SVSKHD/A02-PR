@@ -504,3 +504,31 @@ def card_startup(version, mode, lot, kill, hold_tstop, ladder, boost_sl, alerts,
             ("Boost SL", boost_sl),
             ("Alerts", alerts),
         ], footer=footer)
+
+
+# ============================================================================
+# aureon_new_non_oco — DISTINCT message identity (magic 20260811)
+# ============================================================================
+# These builders give the new engine its OWN look so a fill from it is
+# distinguishable at a glance from the blind straddle's ⚓ blue "AUREON INFO"
+# card, WITHOUT reading the numbers: its own emoji + title (🔷 NEW NON-OCO), its
+# own colour (teal normal / amber warn / red bad), and every body line carries
+# the greppable [NNO] prefix + the anchor label + link index. Title/emoji/colour
+# are passed in by the caller (sourced from cfg.nno_*) so discord_cards never
+# imports config; the straddle/ROGUE/FETCHER builders above are untouched.
+def card_nno(title, emoji, colour, line, fields=None, footer=None):
+    """One NEW NON-OCO event card. `title`/`emoji`/`colour` come from cfg.nno_*;
+    `line` is the single already-[NNO]-prefixed body line (see aureon_non_oco).
+    `fields` is an optional list of (name, value[, inline]) tuples. NEVER raises."""
+    return build_embed(f"{emoji} {title}".strip(), colour,
+                       fields=fields, description=line, footer=footer)
+
+
+def card_nno_batch(title, emoji, colour, lines, footer=None):
+    """A batched NEW NON-OCO card for a burst of events (rate-limit coalescing).
+    Keeps the SAME title/emoji/colour as a single event so a coalesced burst never
+    falls back to a plain straddle-looking message. `lines` is a list of
+    already-[NNO]-prefixed body lines; they are joined into the description."""
+    body = "\n".join(str(x) for x in (lines or []) if str(x).strip())
+    return build_embed(f"{emoji} {title}".strip(), colour,
+                       description=body or "—", footer=footer)

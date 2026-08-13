@@ -839,6 +839,17 @@ class LiveTrader:
                     self._daylock_override(str(args.get("which", "")).lower())
                 except Exception as e:
                     log.warning(f"daylock override failed (non-fatal): {e!r}")
+            elif cmd == "nno":
+                # aureon_new_non_oco control surface (magic 20260811 ONLY). Handlers
+                # read shared session state + do magic-scoped broker reads/writes on
+                # THIS (trading) thread; every reply is a NEW NON-OCO card. No-op when
+                # the surface is disabled or the master flag is OFF (bot-side gate).
+                try:
+                    import aureon_non_oco as _aurno
+                    _aurno.handle_command(self, str(args.get("sub", "status")).lower(),
+                                          bool(args.get("confirm", False)))
+                except Exception as e:
+                    log.warning(f"nno command failed (non-fatal): {e!r}")
 
     def _eod_reached(self, broker_date: DateType, utc_now: pd.Timestamp) -> bool:
         eod = self._eod_datetime_utc(broker_date, self.cfg)
@@ -1088,6 +1099,11 @@ class LiveTrader:
         it just arms no new session and takes no new chain entry. The master flag is
         the outer gate so with it OFF the engine is fully inert."""
         if not bool(getattr(self.cfg, 'aureon_new_non_oco', False)):
+            return True
+        # `!nno pause` (persisted in state.json, so a crash never silently resumes)
+        # blocks NEW entries + NEW chain links only; open positions keep laddering
+        # through the manage-only path above. Independent of the global `/pause`.
+        if bool((self.state or {}).get('nno_paused', False)):
             return True
         return (self._friday_entries_blocked(broker_date, utc_now)
                 or bool(getattr(self, '_account_locked', lambda: False)()))

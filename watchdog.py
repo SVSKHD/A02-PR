@@ -101,7 +101,9 @@ ALLOWED_COMMANDS = {"status","restart","stop","flatten","pause",
                     # v3.7.3 per-engine daily stops status + overrides
                     "daylock",
                     # 2026-07-18 in-process /testfire (isolated TF_ straddle; demo-only)
-                    "testfire"}
+                    "testfire",
+                    # aureon_new_non_oco control surface (magic 20260811 ONLY): !nno ...
+                    "nno"}
 
 
 HELP_TEXT = """*AUREON v2 commands*
@@ -128,6 +130,10 @@ HELP_TEXT = """*AUREON v2 commands*
 🔓 `/daylock anchors off` — override the anchors profit lock (loss stop stays)
 🔓 `/daylock off` — override the account lock (disabled by default)
 ⚙️ `/engines status` — all engines' state + open count per magic
+🔷 `!nno status|anchors|positions|today|config` — NEW NON-OCO engine (magic 20260811 only)
+🔷 `!nno pause|resume` — stop / allow NEW entries + chain links (open positions keep laddering)
+🔷 `!nno flat` → `!nno flat confirm` — close ONLY magic-20260811 positions (two-step)
+🔷 `!nno help` — the NEW NON-OCO command list
 ❓ `/help` — this message
 """
 
@@ -604,7 +610,7 @@ class Watchdog:
         return "\n".join(lines)
 
     def _handle_command(self, cmd: str, raw_text: str, source: str = "Discord"):
-        cmd = cmd.lower().lstrip("/")
+        cmd = cmd.lower().lstrip("/!")   # "/status" and "!nno" both normalise here
         if cmd not in ALLOWED_COMMANDS:
             return
         if cmd == "help" or cmd == "start":
@@ -724,6 +730,36 @@ class Watchdog:
         elif cmd == "engines":
             # v3.6.0: /engines status — both engines' state + open count per magic.
             self._write_command("engines_status", {})
+        elif cmd == "nno":
+            # aureon_new_non_oco control surface (magic 20260811 ONLY). The watchdog
+            # only PARSES + queues; the bot renders/applies next tick and replies with
+            # a NEW NON-OCO card. All broker access is magic-scoped INSIDE the bot;
+            # the whole surface no-ops when aureon_new_non_oco is off (bot-side gate).
+            toks = (raw_text or "").split()[1:]
+            sub = toks[0].lower() if toks else "status"
+            known = {"status", "anchors", "positions", "today", "pause",
+                     "resume", "flat", "config", "help"}
+            if sub not in known:
+                self.tele.info(
+                    "Usage: `!nno status|anchors|positions|today|pause|resume|"
+                    "flat [confirm]|config|help`")
+                return
+            confirm = (sub == "flat" and
+                       any(t.lower() == "confirm" for t in toks[1:]))
+            self._write_command("nno", {"sub": sub, "confirm": confirm})
+            if sub == "flat" and not confirm:
+                self.tele.warn(
+                    "🔷 `!nno flat` queued — bot replies with the count + combined "
+                    "P&L that WILL be closed (magic 20260811 only); send "
+                    "`!nno flat confirm` to execute.")
+            elif sub == "flat" and confirm:
+                self.tele.warn(
+                    "🔷🚨 `!nno flat confirm` queued — bot closes ONLY magic 20260811 "
+                    "(anchor / ROGUE / FETCHER legs untouched).")
+            elif sub in ("pause", "resume"):
+                self.tele.info(
+                    f"🔷 `!nno {sub}` queued — effective next tick (magic 20260811 "
+                    f"only; open positions keep their ladder + broker stop).")
 
     # ------------------------------------------------------------------------
     # Main supervisor loop

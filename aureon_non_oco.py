@@ -192,6 +192,12 @@ class AnchorDaySession:
         self.pending_side = None          # backtest: confirmed, enter at next bar's open
         self.open_ticket = None           # live: broker ticket of the open position
         self.trades = []                  # closed-trade records (dicts)
+        # Transient telemetry breadcrumbs for the live NOTIFIER only (touch / ema
+        # block / observation expiry). Pure annotations — the live driver drains
+        # them to post NEW NON-OCO cards. They NEVER feed a decision, so the
+        # backtest/paper/unit-test behaviour is byte-identical whether or not
+        # anyone reads them.
+        self.notices = []
 
     # ---- shared primitives -------------------------------------------------
     def _open_observation(self, now, reopen_price=None):
@@ -206,11 +212,14 @@ class AnchorDaySession:
         May flip the session to DONE on observation-window expiry."""
         if self.state == WAIT_TOUCH:
             if _bv(bar, "high") >= self.upper or _bv(bar, "low") <= self.lower:
+                touched = self.upper if _bv(bar, "high") >= self.upper else self.lower
+                self.notices.append(("touch", touched))     # telemetry only
                 self._open_observation(now)   # touch opens the window; count from next candle
             return None
 
         if self.state == OBSERVE:
             if _minutes(now, self.obs_start) > self.p.obs_expiry_min:
+                self.notices.append(("expiry", None))        # telemetry only
                 self.chain_ended = True
                 self.state = DONE
                 self.done = True
@@ -234,6 +243,9 @@ class AnchorDaySession:
                     aligned = ((side == "BUY" and close_ > ema_value)
                                or (side == "SELL" and close_ < ema_value))
                     if not aligned:
+                        self.notices.append(                # telemetry only
+                            ("ema_block", side, float(ema_value), close_,
+                             self.trades_done))
                         self.run_dir = 0      # reject against-trend; need a fresh run
                         self.run_len = 0
                         return None
@@ -392,11 +404,125 @@ class AnchorDaySession:
 # ---------------------------------------------------------------------------
 # LIVE driver — the only part that touches MT5 / telemetry
 # ---------------------------------------------------------------------------
-def _tele(trader, level, msg):
+# NEW NON-OCO message identity ------------------------------------------------
+# Every event this engine posts wears its OWN embed (🔷 NEW NON-OCO, teal/amber/
+# red), NEVER the straddle's blue "AUREON INFO", and every body line carries the
+# greppable `[NNO]` prefix + the anchor label + the chain link index. The title,
+# emoji and colours come from cfg.nno_* so the operator can retune them without a
+# code change; the straddle / ROGUE / FETCHER cards are untouched. Bursts inside a
+# single drive() tick are BATCHED into one card per tone so a fast chain can never
+# flood #bot_update — and the batched card keeps the same NEW NON-OCO title/colour.
+
+def _nno_line(cfg, label, link, text):
+    """Build one `[NNO]`-prefixed body line carrying the anchor label + link index."""
+    prefix = str(getattr(cfg, "nno_notify_prefix", "[NNO]"))
+    head = str(label) if label else ""
+    if link is not None and head:
+        head = f"{head} link {link}"
+    return " ".join(x for x in (prefix, head, str(text)) if x).strip()
+
+
+def _nno_colour(cfg, tone):
+    if tone == "warn":
+        return int(getattr(cfg, "nno_embed_colour_warn", 0xE8A33D))
+    if tone == "bad":
+        return int(getattr(cfg, "nno_embed_colour_bad", 0xE24B4A))
+    return int(getattr(cfg, "nno_embed_colour", 0x2ECC9B))
+
+
+def _nno_sev(tone):
     try:
-        getattr(trader.tele, level)(f"{ALERT} {msg}")
+        from telemetry import Severity
+        return {"warn": Severity.WARN, "bad": Severity.ERROR}.get(tone, Severity.INFO)
+    except Exception:
+        return {"warn": 30, "bad": 40}.get(tone, 20)   # INFO/WARN/ERROR ints
+
+
+def _send_nno(trader, tone, line):
+    """Post ONE NEW NON-OCO card immediately (single event, or a command reply)."""
+    cfg = trader.cfg
+    try:
+        import discord_cards as _dc
+        card = _dc.card_nno(str(getattr(cfg, "nno_embed_title", "NEW NON-OCO")),
+                            str(getattr(cfg, "nno_embed_emoji", "\U0001F537")),
+                            _nno_colour(cfg, tone), line)
+    except Exception:
+        card = None
+    try:
+        trader.tele.send(line, _nno_sev(tone), card=card, important=True)
     except Exception:
         pass
+
+
+def _emit(trader, tone, label, link, text):
+    """Emit a NEW NON-OCO event. Inside a drive() tick it is BUFFERED (flushed as a
+    batched card at the end of the tick); outside one (command replies) it posts
+    immediately. `tone` in 'normal' | 'warn' | 'bad'. Never raises."""
+    line = _nno_line(trader.cfg, label, link, text)
+    buf = getattr(trader, "_aurno_batch", None)
+    if buf is not None:
+        buf.append((tone, line))
+    else:
+        _send_nno(trader, tone, line)
+
+
+def _flush_nno(trader, buf):
+    """Flush a drive() tick's buffered events. 0/1 -> nothing / one card. A burst
+    -> ONE batched card per tone (keeping the NEW NON-OCO title + colour), so a
+    fast chain coalesces instead of flooding the channel. Never raises."""
+    try:
+        if not buf:
+            return
+        if len(buf) == 1:
+            _send_nno(trader, buf[0][0], buf[0][1])
+            return
+        cfg = trader.cfg
+        import discord_cards as _dc
+        title = str(getattr(cfg, "nno_embed_title", "NEW NON-OCO"))
+        emoji = str(getattr(cfg, "nno_embed_emoji", "\U0001F537"))
+        for tone in ("normal", "warn", "bad"):     # one card per non-empty tone
+            lines = [ln for t, ln in buf if t == tone]
+            if not lines:
+                continue
+            if len(lines) == 1:
+                _send_nno(trader, tone, lines[0])
+                continue
+            try:
+                card = _dc.card_nno_batch(title, emoji, _nno_colour(cfg, tone), lines)
+            except Exception:
+                card = None
+            try:
+                trader.tele.send("\n".join(lines), _nno_sev(tone),
+                                 card=card, important=True)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"{ALERT} notify flush non-fatal: {e!r}")
+
+
+def notify(trader, tone, label, link, text):
+    """Public one-shot NEW NON-OCO card (used by the live_trader `!nno` command
+    replies, which run outside a drive() tick). Posts immediately."""
+    _send_nno(trader, tone, _nno_line(trader.cfg, label, link, text))
+
+
+def _drain_notices(trader, sess):
+    """Turn the session's pure telemetry breadcrumbs (touch / ema block / expiry)
+    into NEW NON-OCO cards, then clear them. Decision-free."""
+    notices, sess.notices = sess.notices, []
+    for n in notices:
+        kind = n[0]
+        if kind == "touch":
+            _emit(trader, "normal", sess.label, None,
+                  f"touch {n[1]:.2f} — observing (no order)")
+        elif kind == "ema_block":
+            _side, ema_v, _close, link = n[1], n[2], n[3], n[4]
+            _emit(trader, "warn", sess.label, link,
+                  f"short blocked — ema200 {ema_v:.2f}" if _side == "SELL"
+                  else f"long blocked — ema200 {ema_v:.2f}")
+        elif kind == "expiry":
+            _emit(trader, "warn", sess.label, None,
+                  "observation expired, no confirmation")
 
 
 def _mid(trader):
@@ -496,7 +622,8 @@ def drive(trader, allow_new_entries=True):
     try:
         cfg = trader.cfg
         if not bool(getattr(cfg, "aureon_new_non_oco", False)):
-            return
+            return                       # flag OFF -> byte-identical no-op
+        trader._aurno_batch = []         # events this tick coalesce into it
         import pandas as pd
         p = AncParams.from_cfg(cfg)
         utc_now = pd.Timestamp.now(tz="UTC")
@@ -528,8 +655,8 @@ def drive(trader, allow_new_entries=True):
                 continue
             if delta > p.drift_min * 60.0:
                 st["skipped"][label] = True
-                _tele(trader, "warn",
-                      f"{label} skipped — {delta/60:.0f}m past anchor (> {p.drift_min:.0f}m drift)")
+                _emit(trader, "warn", label, None,
+                      f"skipped — {delta/60:.0f}m past anchor (> {p.drift_min:.0f}m drift)")
                 continue
             if not allow_new_entries:
                 continue
@@ -538,8 +665,8 @@ def drive(trader, allow_new_entries=True):
                 continue
             sess = AnchorDaySession(label, mid, p, flat_ts=_flat_ts(trader, bdate, p))
             st["sessions"][label] = sess
-            _tele(trader, "info",
-                  f"{label} armed @ ${mid:.2f} — levels ${sess.upper:.2f} / ${sess.lower:.2f}")
+            _emit(trader, "normal", label, None,
+                  f"anchor {mid:.2f} — levels {sess.upper:.2f} / {sess.lower:.2f}")
 
         # Manage once per newly-closed M1 bar.
         cur_min = utc_now.floor("1min")
@@ -560,6 +687,63 @@ def drive(trader, allow_new_entries=True):
                 log.warning(f"{ALERT} {label} manage non-fatal: {e!r}")
     except Exception as e:
         log.warning(f"{ALERT} drive non-fatal: {e!r}")
+    finally:
+        # Coalesce this tick's events into batched NEW NON-OCO cards, then detach
+        # the buffer (so command-reply notifies post immediately, not buffered).
+        # Only runs when the flag is ON (the buffer is created past that gate).
+        batch = getattr(trader, "_aurno_batch", None)
+        if batch is not None:
+            trader._aurno_batch = None
+            _flush_nno(trader, batch)
+
+
+def _exit_tone(rec):
+    """Losing exit -> red; profitable / break-even -> teal."""
+    return "bad" if float(rec.get("pnl_price", 0.0)) < -1e-9 else "normal"
+
+
+def _emit_ladder(trader, sess, new_sl):
+    """A stop advanced this bar — post the ladder milestone (lock / target-secured)
+    the FIRST time each threshold is crossed, so the operator sees the ratchet act.
+    Reads the pos it already ratcheted; sets one-shot flags on the (live-only) pos
+    dict so a re-touch of the same rung doesn't re-post. Decision-free."""
+    pos = sess.pos
+    if pos is None:
+        return
+    off = float(pos.get("sl_off", 0.0))
+    p = sess.p
+    if off >= p.target - 1e-9 and not pos.get("_secure_notified"):
+        pos["_secure_notified"] = True
+        pos["_lock_notified"] = True
+        _emit(trader, "normal", sess.label, pos["link"],
+              f"secured +{p.target:.0f}, trailing {p.trail_dist:.1f}")
+    elif off >= p.lock_to - 1e-9 and not pos.get("_lock_notified"):
+        pos["_lock_notified"] = True
+        _emit(trader, "normal", sess.label, pos["link"], f"locked +{p.lock_to:.1f}")
+
+
+def _emit_chain(trader, sess, rec):
+    """After an exit, report where the chain went: reopened at the exit price (next
+    link), or ended (losing link / cap). Reads the post-exit session state."""
+    _emit(trader, _exit_tone(rec), sess.label, rec["link"],
+          f"closed {_money(rec['pnl_price'])} ({rec['reason']})")
+    if sess.done:
+        if sess.chain_ended:
+            _emit(trader, "warn", sess.label, None, "chain ended (losing link)")
+        else:
+            _emit(trader, "warn", sess.label, None,
+                  f"chain ended (cap {sess.p.max_chain})")
+    elif sess.reopen_price is not None:
+        _emit(trader, "normal", sess.label, None,
+              f"observing again from {sess.reopen_price:.2f} (link {sess.trades_done})")
+
+
+def _money(v):
+    try:
+        f = float(v)
+        return f"{'+' if f >= 0 else '-'}${abs(f):,.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def _manage_session_live(trader, sess, bar, now, ema_val, allow_new_entries, p):
@@ -568,14 +752,16 @@ def _manage_session_live(trader, sess, bar, now, ema_val, allow_new_entries, p):
     # PAPER: reuse the deterministic simulate brain so the chain runs end-to-end.
     if trader.paper:
         for ev in sess.on_m1_close(bar, now, ema_val):
-            if ev.get("kind") == "ENTER":
-                _tele(trader, "info",
-                      f"{sess.label} [PAPER] {ev['side']} link{ev['link']} @ ${ev['price']:.2f} "
-                      f"SL ${ev['sl']:.2f}")
-            elif ev.get("kind") == "EXIT":
-                _tele(trader, "success",
-                      f"{sess.label} [PAPER] EXIT {ev['reason']} @ ${ev['exit']:.2f} "
-                      f"({ev['pnl_price']:+.2f})")
+            k = ev.get("kind")
+            if k == "ENTER":
+                _emit(trader, "normal", sess.label, ev["link"],
+                      f"[PAPER] {ev['side']} {p.lot:.2f} @ {ev['price']:.2f} "
+                      f"sl {ev['sl']:.2f}")
+            elif k == "MODIFY_SL":
+                _emit_ladder(trader, sess, ev["sl"])
+            elif k == "EXIT":
+                _emit_chain(trader, sess, ev)
+        _drain_notices(trader, sess)
         return
 
     # LIVE: broker owns the fill + stop.
@@ -587,23 +773,30 @@ def _manage_session_live(trader, sess, bar, now, ema_val, allow_new_entries, p):
                 exit_px = sess.pos["sl_price"]
             rec = sess.on_exit(exit_px, now, "SL")
             if rec:
-                _tele(trader, "success",
-                      f"{sess.label} EXIT {rec['reason']} @ ${rec['exit']:.2f} "
-                      f"({rec['pnl_price']:+.2f}) — link{rec['link']}")
+                _emit_chain(trader, sess, rec)
+            _drain_notices(trader, sess)
             return
         if sess.flat_ts is not None and now >= sess.flat_ts:
             trader.adapter.close_position(tk, dry_run=False)
-            sess.on_exit(_mid(trader) or sess.pos["entry"], now, "EOD")
-            _tele(trader, "info", f"{sess.label} flat @ 23:30 (EOD)")
+            rec = sess.on_exit(_mid(trader) or sess.pos["entry"], now, "EOD")
+            if rec:
+                _emit(trader, "normal", sess.label, rec["link"],
+                      f"flat @ 23:30 (EOD) {_money(rec['pnl_price'])}")
             return
         new_sl = sess.manage_live(bar, now)
         if new_sl is not None:
             trader.adapter.modify_position_sl(tk, new_sl, dry_run=False)
+            _emit_ladder(trader, sess, new_sl)
         return
 
+    # Entries blocked (paused / friday window / account lock): do NOT advance the
+    # setup state machine — leave it exactly as it was so a confirmation is never
+    # consumed-and-discarded while blocked (byte-identical to the pre-control-surface
+    # behaviour). Open positions above still ladder/exit; this gate is new-risk only.
     if not allow_new_entries:
         return
     side = sess.poll_setup(bar, now, ema_val)
+    _drain_notices(trader, sess)     # touch / ema-block / expiry surfaced on this bar
     if side is None:
         return
     mid = _mid(trader) or bar["close"]
@@ -613,13 +806,14 @@ def _manage_session_live(trader, sess, bar, now, ema_val, allow_new_entries, p):
         comment=f"AURNO_{sess.label[:2]}_{side[0]}", dry_run=False, magic=AURNO_MAGIC)
     rc = getattr(res, "retcode", None) if res is not None else None
     if rc not in (10009,) and not isinstance(res, dict):
-        _tele(trader, "error", f"{sess.label} {side} market rejected (rc={rc})")
+        _emit(trader, "bad", sess.label, sess.trades_done,
+              f"{side} market rejected (rc={rc})")
         return
     fill = _fill_price(res) or mid
     sess.enter_live(side, fill, now)
     sess.open_ticket = _ticket(res)
-    _tele(trader, "success",
-          f"{sess.label} {side} link{sess.pos['link']} @ ${fill:.2f} SL ${sl:.2f} (lot {p.lot})")
+    _emit(trader, "normal", sess.label, sess.pos["link"],
+          f"{side} {p.lot:.2f} @ {fill:.2f} sl {sl:.2f}")
 
 
 def close_all(trader, dry_run=False):
@@ -636,3 +830,285 @@ def close_all(trader, dry_run=False):
     except Exception as e:
         log.warning(f"{ALERT} close_all non-fatal: {e!r}")
     return closed
+
+
+# ===========================================================================
+# `!nno` control surface — magic 20260811 ONLY
+# ===========================================================================
+# Runs on the TRADING thread (via live_trader._handle_commands), so every broker
+# read/write here is serialised with the engine's own order lifecycle — the
+# Discord thread never calls MT5. EVERY command replies with a NEW NON-OCO card
+# so the control surface shares the engine's distinct identity. EVERY broker
+# touch is filtered by AURNO_MAGIC; no command can read, modify, or close an
+# anchor / ROGUE / FETCHER / RB / RGS / TF_ leg. With the master flag OFF (or the
+# command surface disabled) `handle_command` is an immediate no-op.
+import time as _time
+
+
+def _now_wall():
+    return _time.time()
+
+
+def _sessions(trader):
+    st = getattr(trader, "_aurno", None)
+    return (st.get("sessions", {}) or {}) if isinstance(st, dict) else {}
+
+
+def _nno_paused(trader):
+    return bool((getattr(trader, "state", None) or {}).get("nno_paused", False))
+
+
+def _open_positions(trader):
+    """Broker-truth OPEN positions owned by THIS engine (magic 20260811 ONLY).
+    Every other magic is filtered out here, so nothing downstream can act on a
+    foreign leg."""
+    out = []
+    try:
+        positions = trader.adapter.mt5.positions_get(symbol=trader.cfg.symbol) or []
+    except Exception:
+        positions = []
+    for pos in positions:
+        try:
+            if int(getattr(pos, "magic", -1)) == AURNO_MAGIC:
+                out.append(pos)
+        except Exception:
+            continue
+    return out
+
+
+def _ticket_link_map(trader):
+    """ticket -> (anchor label, link index) for open engine positions, from the
+    live session state (the broker position carries no link index)."""
+    m = {}
+    for label, sess in _sessions(trader).items():
+        tk = getattr(sess, "open_ticket", None)
+        pos = getattr(sess, "pos", None)
+        if tk is not None and pos:
+            try:
+                m[int(tk)] = (label, pos.get("link"))
+            except Exception:
+                continue
+    return m
+
+
+def _link_usd(cfg, pnl_price):
+    """Price-point P&L -> USD at the engine's fixed per-link lot (anc_lot) and the
+    account contract size. Mirrors the straddle's contract_size convention."""
+    cs = float(getattr(cfg, "contract_size", 100.0))
+    lot = float(getattr(cfg, "anc_lot", 0.10))
+    return float(pnl_price) * cs * lot
+
+
+def _realized_today(trader):
+    """(n_links, usd) realized by the engine today, from the session trade records
+    (magic 20260811 only — the sessions dict is this engine's alone)."""
+    recs = []
+    for sess in _sessions(trader).values():
+        recs.extend(getattr(sess, "trades", []) or [])
+    usd = sum(_link_usd(trader.cfg, r.get("pnl_price", 0.0)) for r in recs)
+    return len(recs), usd
+
+
+def _anchor_state_str(sess):
+    parts = [f"anc {sess.anchor_price:.2f}", f"{sess.lower:.2f}/{sess.upper:.2f}"]
+    if sess.done:
+        parts.append("dead (losing link)" if sess.chain_ended else "done")
+    elif sess.state == WAIT_TOUCH:
+        parts.append("waiting touch")
+    elif sess.state == OBSERVE:
+        parts.append(f"observing (run {sess.run_len}/{sess.p.n_candles})")
+    elif sess.state == IN_POS:
+        parts.append(f"in pos link {sess.pos['link'] if sess.pos else '?'}")
+    parts.append(f"link {sess.trades_done}")
+    return " · ".join(parts)
+
+
+def _post_nno_card(trader, tone, header, fields):
+    """Post a multi-field NEW NON-OCO card (status/anchors/positions/today/config/
+    help). Header is a plain `[NNO]`-prefixed line; fields is a list of (name,
+    value) tuples. Never raises."""
+    cfg = trader.cfg
+    line = _nno_line(cfg, None, None, header)
+    try:
+        import discord_cards as _dc
+        card = _dc.card_nno(str(getattr(cfg, "nno_embed_title", "NEW NON-OCO")),
+                            str(getattr(cfg, "nno_embed_emoji", "\U0001F537")),
+                            _nno_colour(cfg, tone), line, fields=fields)
+    except Exception:
+        card = None
+    try:
+        text = line + "\n" + "\n".join(f"{n}: {v}" for n, v, *_ in fields)
+        trader.tele.send(text, _nno_sev(tone), card=card, important=True)
+    except Exception:
+        pass
+
+
+def _cmd_status(trader):
+    cfg = trader.cfg
+    positions = _open_positions(trader)
+    open_usd = sum(float(getattr(p, "profit", 0.0) or 0.0) for p in positions)
+    n_done, realized = _realized_today(trader)
+    fields = [
+        ("Engine", "🟢 ON" if bool(getattr(cfg, "aureon_new_non_oco", False)) else "🔴 OFF"),
+        ("Paused", "⏸ yes" if _nno_paused(trader) else "▶️ no"),
+        ("Realized today", f"{_money(realized)} · {n_done} link(s)"),
+        ("Open positions", f"{len(positions)} · {_money(open_usd)} live"),
+    ]
+    for label, sess in _sessions(trader).items():
+        fields.append((label, _anchor_state_str(sess)))
+    _post_nno_card(trader, "normal", "status (magic 20260811)", fields)
+
+
+def _cmd_anchors(trader):
+    sessions = _sessions(trader)
+    if not sessions:
+        notify(trader, "normal", None, None, "anchors — none armed yet today")
+        return
+    fields = [(label, _anchor_state_str(sess)) for label, sess in sessions.items()]
+    _post_nno_card(trader, "normal", "anchors", fields)
+
+
+def _cmd_positions(trader):
+    positions = _open_positions(trader)
+    if not positions:
+        notify(trader, "normal", None, None, "positions — none open (magic 20260811)")
+        return
+    linkmap = _ticket_link_map(trader)
+    fields = []
+    for p in positions:
+        tk = int(getattr(p, "ticket", 0))
+        side = "BUY" if int(getattr(p, "type", 0)) == 0 else "SELL"
+        entry = float(getattr(p, "price_open", 0.0) or 0.0)
+        cur = float(getattr(p, "price_current", 0.0) or 0.0)
+        sl = float(getattr(p, "sl", 0.0) or 0.0)
+        prof = float(getattr(p, "profit", 0.0) or 0.0)
+        label, link = linkmap.get(tk, ("?", "?"))
+        fields.append((f"{tk} {side}",
+                       f"{label} link {link} · in {entry:.2f} now {cur:.2f} "
+                       f"sl {sl:.2f} · {_money(prof)}"))
+    _post_nno_card(trader, "normal", "positions (magic 20260811)", fields)
+
+
+def _cmd_today(trader):
+    recs = []
+    for label, sess in _sessions(trader).items():
+        for r in (getattr(sess, "trades", []) or []):
+            recs.append((label, r))
+    if not recs:
+        notify(trader, "normal", None, None, "today — no closed links yet")
+        return
+    fields, total = [], 0.0
+    for label, r in recs:
+        usd = _link_usd(trader.cfg, r.get("pnl_price", 0.0))
+        total += usd
+        t = r.get("exit_time")
+        tstr = t.strftime("%H:%M") if hasattr(t, "strftime") else str(t)
+        fields.append((f"{tstr} {label} link {r.get('link')}",
+                       f"{r.get('reason')} · {_money(usd)}"))
+    fields.append(("TOTAL", _money(total)))
+    _post_nno_card(trader, "normal" if total >= 0 else "bad", "today", fields)
+
+
+def _cmd_config(trader):
+    cfg = trader.cfg
+    keys = ["anc_anchors", "anc_threshold", "anc_n_candles", "anc_obs_expiry_min",
+            "anc_sl", "anc_lock_at", "anc_lock_to", "anc_target", "anc_trail_dist",
+            "anc_max_chain", "anc_chain_stop_on_loss", "anc_chain_trend",
+            "anc_ema_period", "anc_lot", "anc_drift_min", "anc_flat_broker_hour"]
+    fields = [(k, str(getattr(cfg, k, "?"))) for k in keys]
+    _post_nno_card(trader, "normal", "config (live anc_*)", fields)
+
+
+def _cmd_help(trader):
+    fields = [
+        ("!nno status", "on/off, paused, today P&L, open positions, per-anchor state"),
+        ("!nno anchors", "per-anchor: price, levels, touched, observing, link, dead"),
+        ("!nno positions", "open magic-20260811: ticket, side, entry, current, SL, P&L, link"),
+        ("!nno today", "today's closed links: time, link, reason, P&L, total"),
+        ("!nno pause / resume", "stop / allow NEW entries + chain links (open positions keep laddering)"),
+        ("!nno flat [confirm]", "close ONLY magic 20260811 (two-step confirm)"),
+        ("!nno config", "the live anc_* values"),
+    ]
+    _post_nno_card(trader, "normal", "commands", fields)
+
+
+def _cmd_pause(trader):
+    st = getattr(trader, "state", None)
+    if isinstance(st, dict):
+        st["nno_paused"] = True
+    try:
+        trader._save_state()
+    except Exception:
+        pass
+    notify(trader, "warn", None, None,
+           "paused — no NEW entries or chain links (open positions keep laddering)")
+
+
+def _cmd_resume(trader):
+    st = getattr(trader, "state", None)
+    if isinstance(st, dict):
+        st["nno_paused"] = False
+    try:
+        trader._save_state()
+    except Exception:
+        pass
+    notify(trader, "normal", None, None, "resumed — new entries allowed")
+
+
+def _cmd_flat(trader, confirm):
+    """Two-step, magic-20260811-only flatten. Bare `!nno flat` reports the count +
+    combined P&L that WILL close and arms a confirm window; `!nno flat confirm`
+    within `nno_discord_flat_confirm_sec` executes close_all (magic-scoped)."""
+    cfg = trader.cfg
+    win = float(getattr(cfg, "nno_discord_flat_confirm_sec", 60.0))
+    if not confirm:
+        positions = _open_positions(trader)
+        n = len(positions)
+        usd = sum(float(getattr(p, "profit", 0.0) or 0.0) for p in positions)
+        trader._nno_flat_pending_ts = _now_wall()
+        if n == 0:
+            notify(trader, "normal", None, None,
+                   "flat — no open magic-20260811 positions")
+            return
+        notify(trader, "warn", None, None,
+               f"flat WILL close {n} position(s), combined {_money(usd)} — send "
+               f"`!nno flat confirm` within {win:.0f}s (anchor/ROGUE/FETCHER untouched)")
+        return
+    ts = getattr(trader, "_nno_flat_pending_ts", None)
+    if ts is None or (_now_wall() - float(ts)) > win:
+        trader._nno_flat_pending_ts = None
+        notify(trader, "warn", None, None,
+               "flat confirm expired or none pending — send `!nno flat` first")
+        return
+    trader._nno_flat_pending_ts = None
+    closed = close_all(trader, dry_run=False)
+    notify(trader, "bad", None, None,
+           f"FLAT — closed {closed} magic-20260811 position(s) "
+           f"(anchor/ROGUE/FETCHER untouched)")
+
+
+_NNO_COMMANDS = {
+    "status": _cmd_status, "anchors": _cmd_anchors, "positions": _cmd_positions,
+    "today": _cmd_today, "config": _cmd_config, "help": _cmd_help,
+    "pause": _cmd_pause, "resume": _cmd_resume,
+}
+
+
+def handle_command(trader, sub, confirm=False):
+    """Entry point for a queued `!nno <sub>` command, called on the trading thread.
+    No-op — touching no broker, no notifier, no state — when the command surface is
+    disabled OR the master flag is OFF (so the flag-off guarantee holds). Guarded:
+    a command error never breaks the tick loop."""
+    cfg = trader.cfg
+    if not bool(getattr(cfg, "nno_discord_commands_enabled", True)):
+        return
+    if not bool(getattr(cfg, "aureon_new_non_oco", False)):
+        return
+    sub = str(sub or "").lower()
+    try:
+        if sub == "flat":
+            _cmd_flat(trader, bool(confirm))
+        else:
+            _NNO_COMMANDS.get(sub, lambda _t: None)(trader)
+    except Exception as e:
+        log.warning(f"{ALERT} !nno {sub} non-fatal: {e!r}")

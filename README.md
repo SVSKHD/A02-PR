@@ -475,8 +475,53 @@ Aug 2025 – Jul 2026, 1 lot, spread + $7/lot commission, a correct implementati
 > **exit** price, not the original level), the EMA filter being applied to link 0, or the
 > confirmation scanning open candles instead of **closed** ones.
 
-Tests: `tests/test_aureon_non_oco.py` (confirmation, ladder, chain, and the flag-off
-regression — `python -m unittest tests.test_aureon_non_oco`).
+**Discord control surface (`!nno`) — a distinct identity + runtime control, ops-only.**
+When the flag is on, this engine posts with its **own message identity** so a fill from it
+is never mistaken for a blind-straddle fill in `#bot_update`: a **`🔷 NEW NON-OCO`** title
+(never "AUREON INFO"), its **own colour** (teal normal / amber block·expiry·pause / red
+losing-exit), and a greppable **`[NNO]`** prefix carrying the **anchor label** (`A2`/`A5`)
+and **chain link index** (`link 0…4`) on every line. It emits: anchor armed, level touched
+(observe, no order), confirmed + entry, lock armed, target secured, exit, chain continues,
+chain ended (losing / cap), **EMA-block** (the control that fixed the worst month — now
+visible when it acts), and observation expired. Bursts inside one tick are batched into a
+single card per colour so a fast chain can't flood the channel. All identity strings/colours
+are `nno_*` fields in `config.py`; the straddle / ROGUE / FETCHER cards are unchanged.
+
+Commands are namespaced under **`!nno`** (the gateway accepts `!` alongside the existing
+`/`; `/nno` also works). They queue through the same watchdog→`commands.json`→bot path every
+other command uses, so **the Discord thread never calls MT5** and a Discord outage never
+touches trading:
+
+| command | behaviour |
+|---|---|
+| `!nno status` | on/off, paused?, today's realised P&L, open positions, per-anchor state |
+| `!nno anchors` | per anchor: price, both levels, touched / observing, current link, dead? |
+| `!nno positions` | open **magic-20260811** positions: ticket, side, entry, current, SL, live P&L, link |
+| `!nno today` | today's closed links: time, link, exit reason, P&L, and a total |
+| `!nno pause` | stop opening **new** entries + **new** chain links; open positions keep laddering |
+| `!nno resume` | allow entries again |
+| `!nno flat` → `!nno flat confirm` | **two-step**: previews count + combined P&L, then closes **only magic 20260811** within `nno_discord_flat_confirm_sec` (60s) |
+| `!nno config` | the live `anc_*` values |
+| `!nno help` | the list |
+
+**Magic-isolation guarantee.** Every `!nno` command operates on magic **`20260811` only**.
+No command can cancel, modify, or close an anchor (`20260522`), ROGUE (`20260626`), FETCHER
+(`20260707`), or any RB/RGS/TF_ leg — every broker call filters by magic. `!nno flat` reuses
+the engine's magic-scoped `close_all`; the section-5 test asserts a mixed book loses only the
+`20260811` ticket. `!nno pause` persists in the state file (`nno_paused`), so a crash never
+silently resumes trading, and it is **independent of `/pause`** (which only affects the
+straddle). With `aureon_new_non_oco = False` the whole surface is an immediate no-op.
+
+**Authorisation.** Mutating commands (`pause` / `resume` / `flat`) are gated by the existing
+`DISCORD_ALLOWED_USER_IDS` gateway allow-list — set it to your operator's Discord user id to
+restrict them (leave it empty to allow anyone who can post in the channel, matching the
+existing commands). `nno_discord_admin_user_id` in `config.py` documents the intended single
+operator; the effective gate is the gateway allow-list.
+
+Tests: `tests/test_aureon_non_oco.py` (confirmation, ladder, chain, the flag-off regression,
+**and** the control surface — message identity, magic-scoped `!nno flat`, pause-blocks-entries-
+while-open-positions-ladder, pause persistence, commands-noop-when-off, and other engines'
+identity unchanged — `python -m unittest tests.test_aureon_non_oco`).
 
 ---
 
