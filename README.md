@@ -448,6 +448,38 @@ disconnect it takes no new entries and leaves open positions on their broker sto
 True` right after `Config()` in `bot.py`, alongside the other flag overrides). It is a config
 flag, DEFAULT OFF; leave it off to keep today's behaviour.
 
+**v3.10.1 funded port — opt-in refinements (all DEFAULT to today's behaviour).** Three
+validated tunings sit behind config keys whose defaults keep the engine byte-identical; the
+funded profile (Fundedelite) opts in:
+
+- **`anc_confirm`** (`"candles"` default | `"closes"`). `"candles"` is today's exact rule
+  (`anc_n_candles` consecutive same-direction **closed** M1 candles). `"closes"` triggers on
+  `anc_closes_n` (**1**) consecutive M1 **closes beyond a reference price** — link 0 the
+  **touched observation level**, links ≥ 1 the **previous exit fill price** (close > ref →
+  long, close < ref → short, exactly equal → keep waiting, other-side close resets the count).
+  The EMA filter still applies to links ≥ 1 only.
+- **`anc_lock_to`** — the +3 lock floor. Default **2.5** (today); funded profile **3.0**.
+- **`anc_opposite_candles`** (**0** = off) / **`anc_opposite_action`** (`"close"` | `"flip"`).
+  SL-avoidance while a trade is in **stage 0** (before the +3 lock arms): after this many
+  **consecutive closed M1 candles against** the position (a with-position candle or a doji
+  resets the count), `"close"` scratches at market and `"flip"` scratches **and immediately
+  reverses** (same lot, fresh SL, fresh ladder, as the next chain link). `scratch` and `flip`
+  are **not** losing links — they never trip chain-stop-on-loss — and `flip` consumes a chain
+  slot (subject to the cap). Disabled entirely once the +3 lock has armed.
+- **`anc_eod_entry_cutoff_hour`** (**23.0** = the bot's `eod_broker_hour`). No new chain entry
+  opens at/after this broker hour (open positions still ladder to the 23:30 flat). It defaults
+  to the **current live** cutoff and is applied inside the engine so the backtest agrees.
+  Live/backtest EOD divergence (previously the backtest entered until the 23:30 flat while
+  live stopped new entries at 23:00) is now unified by this key.
+
+Funded profile (v3.10.1 Fundedelite) values: `anc_lock_to 3.0`, `anc_confirm closes`,
+`anc_closes_n 1`, `anc_opposite_candles 3`, `anc_opposite_action flip` (threshold 15, sl 18,
+target 10, trail 1.5, chain cap 5, chain-stop-on-loss on, EMA200, daily target off, A2+A5,
+`anc_lot 0.10` — **lot unchanged** in this port). Every live NNO entry logs a greppable
+`[NNO-TIMING]` line (signal-bar close time, order-send time, requested vs fill price, and the
+difference) — the primary live-vs-backtest slippage measurement now that the one-bar trigger
+removes the two-minute slack the 3-candle rule provided.
+
 **Backtest (correctness check).**
 ```bash
 python aureon_non_oco_backtest.py --csv XAUUSD_M1.csv \

@@ -239,12 +239,27 @@ class Config:
     anc_anchors: List[str] = field(default_factory=lambda: ["A2", "A5"])
     anc_threshold: float = 15.0        # ± observation levels from the anchor price
     anc_n_candles: int = 3             # consecutive same-dir closed M1 candles = signal
+    # ENTRY TRIGGER MODE (v3.10.1 funded port). "candles" = today's exact behaviour
+    # (anc_n_candles consecutive same-direction closed M1 candles). "closes" = one (or
+    # anc_closes_n consecutive) M1 close beyond a reference price: link 0 the touched
+    # observation level, link >= 1 the PREVIOUS exit fill price. DEFAULT "candles" so
+    # the engine is byte-identical until the funded profile opts into "closes".
+    anc_confirm: str = "candles"       # "candles" | "closes"
+    anc_closes_n: int = 1              # closes-mode: consecutive same-side closes required
     anc_obs_expiry_min: float = 60.0   # no confirm within this from the touch -> dead
     anc_sl: float = 18.0               # initial broker-side stop from entry
     anc_lock_at: float = 3.0           # at +this favourable ...
     anc_lock_to: float = 2.5           # ... floor the stop at +this (never backwards)
     anc_target: float = 10.0           # at +this, secure the stop at +target ...
     anc_trail_dist: float = 1.5        # ... then trail this far behind the peak
+    # SL-AVOIDANCE opposite-candle flip (v3.10.1 funded port). Active ONLY in stage 0
+    # (before the +anc_lock_at lock arms). Count consecutive CLOSED M1 candles against
+    # the open position (a with-position candle or a doji resets to 0); at
+    # anc_opposite_candles: "close" scratches at market, "flip" scratches AND immediately
+    # reverses (same lot, fresh SL, fresh ladder, next chain link). scratch/flip are NOT
+    # losing links. DEFAULT 0 = OFF -> byte-identical until the funded profile opts in.
+    anc_opposite_candles: int = 0      # 0 = off
+    anc_opposite_action: str = "close" # "close" | "flip"
     anc_max_chain: int = 5             # max trades per anchor per day (links 0..4)
     anc_chain_stop_on_loss: bool = True  # a losing link ends the chain for the day
     anc_chain_trend: str = "ema"       # "none" | "ema": chained links (>=1) trend filter
@@ -257,6 +272,12 @@ class Config:
     # Flat everything at this broker hour (23:30 = 23.5), fractional-hour like
     # friday_flatten_broker_hour above.
     anc_flat_broker_hour: float = 23.5
+    # Stop OPENING new chain entries at this broker hour (open positions still ladder
+    # to the 23:30 flat). Defaults to 23.0 = the CURRENT LIVE behaviour (the bot's
+    # eod_broker_hour gate already blocks new NNO entries at 23:00); applying it inside
+    # the engine unifies the backtest (which otherwise entered until the 23:30 flat)
+    # with live. See the PR note on the live/backtest EOD divergence.
+    anc_eod_entry_cutoff_hour: float = 23.0
     # ── aureon_new_non_oco — Discord CONTROL SURFACE (ops only; no strategy effect).
     # A distinct message identity + `!nno` command set for the engine above, all
     # scoped to AURNO_MAGIC (20260811) ONLY. None of these alter trading behaviour;

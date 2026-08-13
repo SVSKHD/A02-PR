@@ -115,12 +115,16 @@ def _minutes(now, start):
 class AncParams:
     threshold: float = 15.0
     n_candles: int = 3
+    confirm: str = "candles"          # "candles" | "closes"
+    closes_n: int = 1                 # closes-mode: consecutive same-side closes
     obs_expiry_min: float = 60.0
     sl: float = 18.0
     lock_at: float = 3.0
     lock_to: float = 2.5
     target: float = 10.0
     trail_dist: float = 1.5
+    opposite_candles: int = 0         # SL-avoidance: 0 = off
+    opposite_action: str = "close"    # "close" | "flip"
     max_chain: int = 5
     chain_stop_on_loss: bool = True
     chain_trend: str = "ema"          # "none" | "ema"
@@ -129,6 +133,7 @@ class AncParams:
     daily_target_pct: float = 0.0
     drift_min: float = 45.0
     flat_broker_hour: float = 23.5
+    eod_entry_cutoff_hour: float = 23.0
 
     @classmethod
     def from_cfg(cls, cfg):
@@ -136,12 +141,16 @@ class AncParams:
         return cls(
             threshold=float(g("anc_threshold", 15.0)),
             n_candles=int(g("anc_n_candles", 3)),
+            confirm=str(g("anc_confirm", "candles")).lower(),
+            closes_n=int(g("anc_closes_n", 1)),
             obs_expiry_min=float(g("anc_obs_expiry_min", 60.0)),
             sl=float(g("anc_sl", 18.0)),
             lock_at=float(g("anc_lock_at", 3.0)),
             lock_to=float(g("anc_lock_to", 2.5)),
             target=float(g("anc_target", 10.0)),
             trail_dist=float(g("anc_trail_dist", 1.5)),
+            opposite_candles=int(g("anc_opposite_candles", 0)),
+            opposite_action=str(g("anc_opposite_action", "close")).lower(),
             max_chain=int(g("anc_max_chain", 5)),
             chain_stop_on_loss=bool(g("anc_chain_stop_on_loss", True)),
             chain_trend=str(g("anc_chain_trend", "ema")),
@@ -150,6 +159,7 @@ class AncParams:
             daily_target_pct=float(g("anc_daily_target_pct", 0.0)),
             drift_min=float(g("anc_drift_min", 45.0)),
             flat_broker_hour=float(g("anc_flat_broker_hour", 23.5)),
+            eod_entry_cutoff_hour=float(g("anc_eod_entry_cutoff_hour", 23.0)),
         )
 
 
@@ -170,11 +180,16 @@ class AnchorDaySession:
         broker owns the fill/stop; the driver feeds the realised exit back in.
     """
 
-    def __init__(self, anchor_label, anchor_price, params, flat_ts=None):
+    def __init__(self, anchor_label, anchor_price, params, flat_ts=None,
+                 entry_cutoff_ts=None):
         self.label = anchor_label
         self.anchor_price = float(anchor_price)
         self.p = params
         self.flat_ts = flat_ts
+        # No NEW chain entry opens at/after this ts (open positions still ladder to
+        # flat_ts). None = no cutoff (the pure unit-test default); the live driver and
+        # backtest harness set it from anc_eod_entry_cutoff_hour so both agree.
+        self.entry_cutoff_ts = entry_cutoff_ts
         self.upper = round(self.anchor_price + params.threshold, 2)
         self.lower = round(self.anchor_price - params.threshold, 2)
 
@@ -182,6 +197,7 @@ class AnchorDaySession:
         self.obs_start = None
         self.run_dir = 0
         self.run_len = 0
+        self.touch_level = None           # closes-mode link-0 reference (the touched level)
         self.reopen_price = None          # exit price a chained window reopened at
 
         self.trades_done = 0              # entries taken so far (link index = this at entry)
@@ -207,12 +223,58 @@ class AnchorDaySession:
         self.run_len = 0
         self.reopen_price = reopen_price
 
+    def _confirm_ref(self):
+        """closes-mode reference price: the PREVIOUS exit fill price on a chained link
+        (>=1), else the observation level that was touched (link 0). None until known."""
+        return self.reopen_price if self.reopen_price is not None else self.touch_level
+
+    def _confirm_side(self, bar):
+        """Advance the confirmation run per `p.confirm` and return a raw side
+        ('BUY'/'SELL') when the required consecutive count is reached, else None. The
+        EMA and entry-cutoff gates are applied by the caller, NOT here.
+
+          "candles" (default) — `n_candles` consecutive same-direction closed M1
+                                candles (a doji breaks the run). Byte-identical.
+          "closes"            — `closes_n` consecutive M1 closes on the SAME side of the
+                                reference price (close>ref long / close<ref short;
+                                exactly equal = no signal, keep waiting; a close on the
+                                other side resets the count to 1 on that side).
+        """
+        if self.p.confirm == "closes":
+            ref = self._confirm_ref()
+            if ref is None:
+                return None
+            close_ = _bv(bar, "close")
+            if close_ > ref:
+                d = 1
+            elif close_ < ref:
+                d = -1
+            else:
+                return None               # exactly equal -> no signal, keep waiting
+            need = max(1, int(self.p.closes_n))
+        else:                             # "candles"
+            d = candle_dir(_bv(bar, "open"), _bv(bar, "close"))
+            if d == 0:                    # doji breaks the run
+                self.run_dir = 0
+                self.run_len = 0
+                return None
+            need = int(self.p.n_candles)
+        if d == self.run_dir:
+            self.run_len += 1
+        else:
+            self.run_dir = d              # other side (or first) -> reset to 1 on this side
+            self.run_len = 1
+        if self.run_len >= need:
+            return "BUY" if self.run_dir > 0 else "SELL"
+        return None
+
     def _advance_setup(self, bar, now, ema_value):
         """WAIT_TOUCH + OBSERVE. Returns a confirmed side ('BUY'/'SELL') or None.
         May flip the session to DONE on observation-window expiry."""
         if self.state == WAIT_TOUCH:
             if _bv(bar, "high") >= self.upper or _bv(bar, "low") <= self.lower:
                 touched = self.upper if _bv(bar, "high") >= self.upper else self.lower
+                self.touch_level = touched                  # closes-mode link-0 reference
                 self.notices.append(("touch", touched))     # telemetry only
                 self._open_observation(now)   # touch opens the window; count from next candle
             return None
@@ -224,34 +286,29 @@ class AnchorDaySession:
                 self.state = DONE
                 self.done = True
                 return None
-            d = candle_dir(_bv(bar, "open"), _bv(bar, "close"))
-            if d == 0:                        # doji breaks the run
-                self.run_dir = 0
-                self.run_len = 0
+            side = self._confirm_side(bar)
+            if side is None:
                 return None
-            if d == self.run_dir:
-                self.run_len += 1
-            else:
-                self.run_dir = d
-                self.run_len = 1
-            if self.run_len >= self.p.n_candles:
-                side = "BUY" if self.run_dir > 0 else "SELL"
-                # EMA trend filter — chained links (>=1) only; link 0 is NEVER filtered.
-                if (self.trades_done >= 1 and self.p.chain_trend == "ema"
-                        and ema_value is not None):
-                    close_ = _bv(bar, "close")
-                    aligned = ((side == "BUY" and close_ > ema_value)
-                               or (side == "SELL" and close_ < ema_value))
-                    if not aligned:
-                        self.notices.append(                # telemetry only
-                            ("ema_block", side, float(ema_value), close_,
-                             self.trades_done))
-                        self.run_dir = 0      # reject against-trend; need a fresh run
-                        self.run_len = 0
-                        return None
-                self.run_dir = 0
-                self.run_len = 0
-                return side
+            # EOD entry cutoff: no NEW chain entry opens at/after the cutoff (an open
+            # position still ladders to the 23:30 flat). None -> no cutoff.
+            if self.entry_cutoff_ts is not None and now >= self.entry_cutoff_ts:
+                return None
+            # EMA trend filter — chained links (>=1) only; link 0 is NEVER filtered.
+            if (self.trades_done >= 1 and self.p.chain_trend == "ema"
+                    and ema_value is not None):
+                close_ = _bv(bar, "close")
+                aligned = ((side == "BUY" and close_ > ema_value)
+                           or (side == "SELL" and close_ < ema_value))
+                if not aligned:
+                    self.notices.append(                # telemetry only
+                        ("ema_block", side, float(ema_value), close_,
+                         self.trades_done))
+                    self.run_dir = 0      # reject against-trend; need a fresh run
+                    self.run_len = 0
+                    return None
+            self.run_dir = 0
+            self.run_len = 0
+            return side
         return None
 
     def _start_position(self, side, entry, now):
@@ -261,11 +318,31 @@ class AnchorDaySession:
         self.pos = {
             "side": side, "entry": entry, "entry_time": now,
             "peak_fav": 0.0, "sl_off": sl_off, "sl_price": round(sl_price, 2),
-            "link": self.trades_done,
+            "link": self.trades_done, "opp_count": 0,
         }
         self.trades_done += 1
         self.state = IN_POS
         return self.pos
+
+    def _locked(self):
+        """True once the +lock_at ratchet has moved the stop off its initial -sl —
+        i.e. the trade has left stage 0. The opposite-candle flip is disabled here."""
+        return self.pos is not None and self.pos["sl_off"] > -self.p.sl + 1e-9
+
+    def _note_opposite(self, bar):
+        """Stage-0 SL-avoidance. Count consecutive CLOSED M1 candles AGAINST the open
+        position (a with-position candle or a doji resets to 0); return 'flip' or
+        'scratch' when anc_opposite_candles is reached, else None. Disabled once the
+        +lock_at lock has armed (stage >= 1) or when anc_opposite_candles <= 0."""
+        pos = self.pos
+        if pos is None or self.p.opposite_candles <= 0 or self._locked():
+            return None
+        d = candle_dir(_bv(bar, "open"), _bv(bar, "close"))
+        against = (d == -1) if pos["side"] == "BUY" else (d == 1)
+        pos["opp_count"] = (pos.get("opp_count", 0) + 1) if against else 0
+        if pos["opp_count"] >= self.p.opposite_candles:
+            return "flip" if self.p.opposite_action == "flip" else "scratch"
+        return None
 
     def _sl_hit(self, bar):
         if self.pos["side"] == "BUY":
@@ -291,9 +368,10 @@ class AnchorDaySession:
         return None
 
     def _classify(self, reason):
-        """Map an exit to one of the four report buckets: stop / lock / target / EOD."""
-        if reason == "EOD":
-            return "EOD"
+        """Map an exit to a report bucket. `scratch` / `flip` (SL-avoidance) are their
+        own buckets; otherwise stop / lock / target / EOD off the stop position."""
+        if reason in ("EOD", "scratch", "flip"):
+            return reason
         off = self.pos["sl_off"]
         if off >= self.p.target - 1e-9:
             return "target"
@@ -301,12 +379,13 @@ class AnchorDaySession:
             return "lock"
         return "stop"
 
-    def _close_and_chain(self, exit_price, now, reason, force_done=False):
+    def _make_exit_rec(self, exit_price, now, reason):
+        """Build the closed-trade record for the CURRENT position (does not clear it).
+        Returns (rec, pnl_price)."""
         pos = self.pos
         entry = pos["entry"]
         exit_price = round(float(exit_price), 2)
         pnl = (exit_price - entry) if pos["side"] == "BUY" else (entry - exit_price)
-        loss = pnl < -1e-9
         rec = {
             "kind": "EXIT",
             "label": self.label, "side": pos["side"], "link": pos["link"],
@@ -314,6 +393,14 @@ class AnchorDaySession:
             "peak_fav": round(pos["peak_fav"], 4), "reason": self._classify(reason),
             "entry_time": pos["entry_time"], "exit_time": now,
         }
+        return rec, pnl
+
+    def _close_and_chain(self, exit_price, now, reason, force_done=False, neutral=False):
+        """Close the position, record it, and advance the chain (reopen at the exit
+        price, or end on a losing link / cap). `neutral=True` (scratch) exempts the
+        link from chain-stop-on-loss whatever its P&L."""
+        rec, pnl = self._make_exit_rec(exit_price, now, reason)
+        loss = (pnl < -1e-9) and not neutral
         self.trades.append(rec)
         self.pos = None
         self.open_ticket = None
@@ -325,8 +412,29 @@ class AnchorDaySession:
             self.state = DONE
             self.done = True
         else:
-            self._open_observation(now, reopen_price=exit_price)  # chain: reopen at exit price
+            self._open_observation(now, reopen_price=rec["exit"])  # chain: reopen at exit
         return rec
+
+    def _flip_close(self, exit_price, now):
+        """SL-avoidance FLIP: close the position at market (exit reason 'flip', a
+        NON-losing link) and report whether an immediate reverse should open. Returns
+        (rec, opp_side): opp_side is the side to open next (same lot, fresh SL, fresh
+        ladder — the next chain link) when a slot is free and the entry cutoff has not
+        passed; otherwise opp_side is None and the chain simply reopens / ends (cap).
+        The CALLER opens the reverse (so live uses the real broker fill)."""
+        rec, _pnl = self._make_exit_rec(exit_price, now, "flip")
+        opp = "SELL" if self.pos["side"] == "BUY" else "BUY"
+        self.trades.append(rec)
+        self.pos = None
+        self.open_ticket = None
+        if self.trades_done >= self.p.max_chain:      # cap: no slot for the reverse
+            self.state = DONE
+            self.done = True
+            return rec, None
+        if self.entry_cutoff_ts is not None and now >= self.entry_cutoff_ts:
+            self._open_observation(now, reopen_price=rec["exit"])  # past cutoff -> just chain
+            return rec, None
+        return rec, opp                               # caller opens the reverse now
 
     # ---- BACKTEST / PAPER driver ------------------------------------------
     def on_m1_close(self, bar, now, ema_value=None):
@@ -370,6 +478,20 @@ class AnchorDaySession:
             new_sl = self._ladder(bar)
             if new_sl is not None:
                 events.append({"kind": "MODIFY_SL", "sl": new_sl, "label": self.label})
+            # SL-avoidance opposite-candle flip/scratch — stage 0 only, evaluated AFTER
+            # the ladder so a bar that arms the +lock_at lock disables it from here on.
+            action = self._note_opposite(bar)
+            if action == "scratch":
+                events.append(self._close_and_chain(_bv(bar, "close"), now, "scratch",
+                                                    neutral=True))
+            elif action == "flip":
+                rec, opp = self._flip_close(_bv(bar, "close"), now)
+                events.append(rec)
+                if opp is not None:
+                    self._start_position(opp, _bv(bar, "close"), now)
+                    events.append({"kind": "ENTER", "side": opp, "flip": True,
+                                   "price": self.pos["entry"], "sl": self.pos["sl_price"],
+                                   "link": self.pos["link"], "label": self.label})
         return events
 
     # ---- LIVE driver primitives -------------------------------------------
@@ -543,6 +665,22 @@ def _flat_ts(trader, bdate, p):
         return None
 
 
+def _entry_cutoff_ts(trader, bdate, p):
+    """UTC ts after which NO new chain entry opens (open positions still ladder to the
+    23:30 flat). Mirrors _flat_ts geometry at anc_eod_entry_cutoff_hour (default 23:00
+    = the bot's eod_broker_hour), so the engine's new-entry cutoff matches live and the
+    backtest agrees. None disables (no cutoff)."""
+    fh = float(getattr(p, "eod_entry_cutoff_hour", 23.0))
+    if fh <= 0:
+        return None
+    hh = int(fh)
+    mm = int(round((fh - hh) * 60))
+    try:
+        return trader._anchor_datetime_utc(bdate, hh, trader.cfg.broker_tz_offset_hours, mm)
+    except Exception:
+        return None
+
+
 def _live_ema(trader, p):
     if p.chain_trend != "ema":
         return None
@@ -663,7 +801,8 @@ def drive(trader, allow_new_entries=True):
             mid = _mid(trader)
             if mid is None:
                 continue
-            sess = AnchorDaySession(label, mid, p, flat_ts=_flat_ts(trader, bdate, p))
+            sess = AnchorDaySession(label, mid, p, flat_ts=_flat_ts(trader, bdate, p),
+                                    entry_cutoff_ts=_entry_cutoff_ts(trader, bdate, p))
             st["sessions"][label] = sess
             _emit(trader, "normal", label, None,
                   f"anchor {mid:.2f} — levels {sess.upper:.2f} / {sess.lower:.2f}")
@@ -754,13 +893,20 @@ def _manage_session_live(trader, sess, bar, now, ema_val, allow_new_entries, p):
         for ev in sess.on_m1_close(bar, now, ema_val):
             k = ev.get("kind")
             if k == "ENTER":
+                tag = "⇄ flip " if ev.get("flip") else ""
                 _emit(trader, "normal", sess.label, ev["link"],
-                      f"[PAPER] {ev['side']} {p.lot:.2f} @ {ev['price']:.2f} "
+                      f"[PAPER] {tag}{ev['side']} {p.lot:.2f} @ {ev['price']:.2f} "
                       f"sl {ev['sl']:.2f}")
             elif k == "MODIFY_SL":
                 _emit_ladder(trader, sess, ev["sl"])
             elif k == "EXIT":
-                _emit_chain(trader, sess, ev)
+                # A flip re-entered on the SAME bar, so the post-exit session state is the
+                # NEW position — don't run _emit_chain's continuation branch on it.
+                if ev.get("reason") == "flip":
+                    _emit(trader, _exit_tone(ev), sess.label, ev["link"],
+                          f"⇄ flip — closed {_money(ev['pnl_price'])} (flip)")
+                else:
+                    _emit_chain(trader, sess, ev)
         _drain_notices(trader, sess)
         return
 
@@ -787,6 +933,11 @@ def _manage_session_live(trader, sess, bar, now, ema_val, allow_new_entries, p):
         if new_sl is not None:
             trader.adapter.modify_position_sl(tk, new_sl, dry_run=False)
             _emit_ladder(trader, sess, new_sl)
+        # SL-avoidance opposite-candle flip/scratch — stage 0 only (disabled once the
+        # +lock_at lock arms), evaluated after the ladder like the backtest brain.
+        action = sess._note_opposite(bar)
+        if action:
+            _do_opposite_live(trader, sess, action, now, p)
         return
 
     # Entries blocked (paused / friday window / account lock): do NOT advance the
@@ -799,21 +950,90 @@ def _manage_session_live(trader, sess, bar, now, ema_val, allow_new_entries, p):
     _drain_notices(trader, sess)     # touch / ema-block / expiry surfaced on this bar
     if side is None:
         return
-    mid = _mid(trader) or bar["close"]
+    _place_entry_live(trader, sess, side, now, p, signal_ts=now,
+                      fallback_px=bar["close"])
+
+
+def _place_entry_live(trader, sess, side, now, p, signal_ts, fallback_px, flip=False):
+    """Place ONE magic-20260811 market entry (the confirmed link, or a flip reverse) and
+    fold the real fill back into the session. Logs the entry-timing gap. Returns True on
+    a placed fill, False on rejection (the caller decides how to continue the chain)."""
+    cfg = trader.cfg
+    mid = _mid(trader) or fallback_px
+    requested = mid
     sl = round(mid - p.sl, 2) if side == "BUY" else round(mid + p.sl, 2)
+    from datetime import datetime as _dt, timezone as _tz
+    send_ts = _dt.now(_tz.utc)         # stdlib clock (no pandas dependency on the send)
     res = trader.adapter.place_market_order(
         cfg.symbol, side, p.lot, sl=sl, tp=0.0,
         comment=f"AURNO_{sess.label[:2]}_{side[0]}", dry_run=False, magic=AURNO_MAGIC)
     rc = getattr(res, "retcode", None) if res is not None else None
     if rc not in (10009,) and not isinstance(res, dict):
         _emit(trader, "bad", sess.label, sess.trades_done,
-              f"{side} market rejected (rc={rc})")
-        return
+              f"{'⇄ flip ' if flip else ''}{side} market rejected (rc={rc})")
+        return False
     fill = _fill_price(res) or mid
     sess.enter_live(side, fill, now)
     sess.open_ticket = _ticket(res)
+    _log_entry_timing(trader, sess, side, signal_ts, send_ts, requested, fill, flip)
     _emit(trader, "normal", sess.label, sess.pos["link"],
-          f"{side} {p.lot:.2f} @ {fill:.2f} sl {sl:.2f}")
+          f"{'⇄ flip ' if flip else ''}{side} {p.lot:.2f} @ {fill:.2f} sl {sl:.2f}")
+    return True
+
+
+def _log_entry_timing(trader, sess, side, signal_ts, send_ts, requested, fill, flip):
+    """Log the entry-timing gap for EVERY NNO entry — signal bar close time, order send
+    time, requested price, fill price, and the difference. This is the primary
+    live-vs-backtest slippage measurement (the one-bar trigger removed the 2-minute
+    slack the 3-candle rule used to provide). Greppable `[NNO-TIMING]`; never raises."""
+    try:
+        diff = float(fill) - float(requested)
+        sig = (signal_ts.strftime("%Y-%m-%d %H:%M:%S")
+               if hasattr(signal_ts, "strftime") else str(signal_ts))
+        snd = (send_ts.strftime("%H:%M:%S.%f")[:-3]
+               if hasattr(send_ts, "strftime") else str(send_ts))
+        link = sess.pos["link"] if sess.pos else "?"
+        log.info(f"{ALERT} [NNO-TIMING] {sess.label} link {link} "
+                 f"{'FLIP ' if flip else ''}{side} signal_close={sig} send={snd} "
+                 f"req={float(requested):.2f} fill={float(fill):.2f} diff={diff:+.2f}")
+    except Exception:
+        pass
+
+
+def _do_opposite_live(trader, sess, action, now, p):
+    """LIVE SL-avoidance: close the stage-0 position at market and, for a flip, open the
+    opposite side immediately as the next chain link. scratch/flip are non-losing and
+    surface as distinct exit reasons."""
+    tk = sess.open_ticket
+    exit_px = sess.pos["entry"] if sess.pos else 0.0
+    try:
+        trader.adapter.close_position(tk, dry_run=False)
+        exit_px = _last_exit_price(trader, tk) or _mid(trader) or exit_px
+    except Exception as e:
+        log.warning(f"{ALERT} {sess.label} opposite close non-fatal: {e!r}")
+        return
+    if action == "scratch":
+        rec = sess._close_and_chain(exit_px, now, "scratch", neutral=True)
+        _emit_chain(trader, sess, rec)
+        _drain_notices(trader, sess)
+        return
+    # flip: close + immediate reverse (same lot, fresh SL, fresh ladder, next link).
+    rec, opp = sess._flip_close(exit_px, now)
+    _emit(trader, _exit_tone(rec), sess.label, rec["link"],
+          f"⇄ flip — closed {_money(rec['pnl_price'])} (flip)")
+    if opp is None:                       # cap or past the entry cutoff -> just chain
+        if sess.done:
+            _emit(trader, "warn", sess.label, None, f"chain ended (cap {sess.p.max_chain})")
+        elif sess.reopen_price is not None:
+            _emit(trader, "normal", sess.label, None,
+                  f"observing again from {sess.reopen_price:.2f} (link {sess.trades_done})")
+        _drain_notices(trader, sess)
+        return
+    ok = _place_entry_live(trader, sess, opp, now, p, signal_ts=now, fallback_px=exit_px,
+                           flip=True)
+    if not ok:                            # reverse rejected -> continue the chain
+        sess._open_observation(now, reopen_price=rec["exit"])
+    _drain_notices(trader, sess)
 
 
 def close_all(trader, dry_run=False):
@@ -1011,10 +1231,13 @@ def _cmd_today(trader):
 
 def _cmd_config(trader):
     cfg = trader.cfg
-    keys = ["anc_anchors", "anc_threshold", "anc_n_candles", "anc_obs_expiry_min",
+    keys = ["anc_anchors", "anc_threshold", "anc_n_candles", "anc_confirm",
+            "anc_closes_n", "anc_obs_expiry_min",
             "anc_sl", "anc_lock_at", "anc_lock_to", "anc_target", "anc_trail_dist",
+            "anc_opposite_candles", "anc_opposite_action",
             "anc_max_chain", "anc_chain_stop_on_loss", "anc_chain_trend",
-            "anc_ema_period", "anc_lot", "anc_drift_min", "anc_flat_broker_hour"]
+            "anc_ema_period", "anc_lot", "anc_drift_min", "anc_flat_broker_hour",
+            "anc_eod_entry_cutoff_hour"]
     fields = [(k, str(getattr(cfg, k, "?"))) for k in keys]
     _post_nno_card(trader, "normal", "config (live anc_*)", fields)
 
