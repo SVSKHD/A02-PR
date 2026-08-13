@@ -73,6 +73,19 @@ def _flat_utc_minute(cfg):
     return ((hh * 60 + mm) - off * 60) % 1440
 
 
+def _entry_cutoff_utc_minute(cfg):
+    """UTC minute-of-day for anc_eod_entry_cutoff_hour (default 23:00 broker). None
+    disables. Mirrors _flat_utc_minute so the backtest applies the SAME new-entry
+    cutoff the live engine does (removing the old live/backtest EOD divergence)."""
+    fh = float(getattr(cfg, "anc_eod_entry_cutoff_hour", 23.0))
+    if fh <= 0:
+        return None
+    off = int(getattr(cfg, "broker_tz_offset_hours", 3))
+    hh = int(fh)
+    mm = int(round((fh - hh) * 60))
+    return ((hh * 60 + mm) - off * 60) % 1440
+
+
 def run(df, cfg, lot=1.0, commission=7.0, spread=0.0):
     """Replay `df` (UTC-indexed M1 OHLC) and return (trades, stats).
 
@@ -84,6 +97,7 @@ def run(df, cfg, lot=1.0, commission=7.0, spread=0.0):
     want = set(str(x) for x in getattr(cfg, "anc_anchors", ["A2", "A5"]))
     anchor_min = _anchor_utc_minutes(cfg, want)
     flat_min = _flat_utc_minute(cfg)
+    cutoff_min = _entry_cutoff_utc_minute(cfg)
     off = int(getattr(cfg, "broker_tz_offset_hours", 3))
     a5_skip_fri = bool(getattr(cfg, "a5_skip_friday", True))
 
@@ -120,7 +134,13 @@ def run(df, cfg, lot=1.0, commission=7.0, spread=0.0):
             flat_ts = ts.floor("D") + pd.Timedelta(minutes=flat_min)
             if flat_ts <= ts:
                 flat_ts += pd.Timedelta(days=1)
-            sess = AnchorDaySession(label, float(o[i]), p, flat_ts=flat_ts)
+            cutoff_ts = None
+            if cutoff_min is not None:
+                cutoff_ts = ts.floor("D") + pd.Timedelta(minutes=cutoff_min)
+                if cutoff_ts <= ts:
+                    cutoff_ts += pd.Timedelta(days=1)
+            sess = AnchorDaySession(label, float(o[i]), p, flat_ts=flat_ts,
+                                    entry_cutoff_ts=cutoff_ts)
             sessions[label] = sess
             armed_today[label] = broker_day
 

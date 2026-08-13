@@ -570,6 +570,208 @@ class TestNnoCommandsNoopWhenOff(unittest.TestCase):
         self.assertEqual(tr.tele.sent, [])
 
 
+# ======================================================================================
+# 6 — v3.10.1 funded port: anc_confirm ("candles" | "closes")
+# ======================================================================================
+class TestConfirmModes(unittest.TestCase):
+    def _feed(self, s, candles, ema_value=None):
+        for i, (o, c) in enumerate(candles, start=1):
+            s.on_m1_close(cbar(o, c), T0 + timedelta(minutes=i), ema_value)
+        return s.pending_side
+
+    # -- REGRESSION GUARD (the important one): "candles" == today's exact behaviour --
+    def test_candles_default_in_config(self):
+        self.assertEqual(Config().anc_confirm, "candles")
+        self.assertEqual(Config().anc_closes_n, 1)
+        self.assertEqual(AncParams.from_cfg(Config()).confirm, "candles")
+
+    def test_candles_reproduces_three_green_long(self):
+        s = observing(params=AncParams(confirm="candles"))
+        self.assertEqual(self._feed(s, [(4000, 4001), (4001, 4002), (4002, 4003)]), "BUY")
+
+    def test_candles_reproduces_three_red_short(self):
+        s = observing(params=AncParams(confirm="candles"))
+        self.assertEqual(self._feed(s, [(4000, 3999), (3999, 3998), (3998, 3997)]), "SELL")
+
+    def test_candles_doji_still_resets(self):
+        s = observing(params=AncParams(confirm="candles"))
+        self._feed(s, [(4000, 4001), (4001, 4002), (4002, 4002), (4002, 4003)])
+        self.assertIsNone(s.pending_side)      # doji broke the run -> no confirm yet
+
+    # -- "closes" link 0: one close beyond the TOUCHED level, in the close's direction --
+    def test_closes_link0_long_above_upper(self):
+        p = AncParams(confirm="closes", closes_n=1)
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)          # upper 4015
+        s.on_m1_close(bar(4013, 4016, 4012, 4014), T0, None)         # touch upper
+        self.assertEqual(s.state, "OBSERVE")
+        self.assertEqual(s.touch_level, 4015.0)
+        s.on_m1_close(bar(4014, 4018, 4013, 4017), T0 + timedelta(minutes=1), None)
+        self.assertEqual(s.pending_side, "BUY")                      # close 4017 > 4015
+
+    def test_closes_link0_short_off_upper_level(self):
+        # Upper level touched but the close is BELOW it -> SHORT off the upper level.
+        p = AncParams(confirm="closes", closes_n=1)
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s.on_m1_close(bar(4013, 4016, 4012, 4014), T0, None)         # touch upper 4015
+        s.on_m1_close(bar(4014, 4014, 4010, 4011), T0 + timedelta(minutes=1), None)
+        self.assertEqual(s.pending_side, "SELL")                     # close 4011 < 4015
+
+    def test_closes_exactly_equal_is_no_signal(self):
+        p = AncParams(confirm="closes", closes_n=1)
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s._open_observation(T0)
+        s.touch_level = 4015.0
+        s.on_m1_close(bar(4014, 4016, 4013, 4015), T0 + timedelta(minutes=1), None)
+        self.assertIsNone(s.pending_side)                            # close == ref -> wait
+
+    def test_closes_link1_ref_is_prev_exit_not_level(self):
+        # Chained link (>=1) measures off the PREVIOUS exit fill price, not the level.
+        p = AncParams(confirm="closes", closes_n=1)
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)          # upper 4015
+        s._open_observation(T0, reopen_price=4050.0)                 # chain reopened at 4050
+        s.trades_done = 1
+        # close 4020 is ABOVE the level (4015) but BELOW the exit (4050): ref=exit -> SELL.
+        s.on_m1_close(bar(4019, 4021, 4018, 4020), T0 + timedelta(minutes=1), None)
+        self.assertEqual(s.pending_side, "SELL")
+
+    def test_closes_n2_needs_two_consecutive_other_side_resets(self):
+        p = AncParams(confirm="closes", closes_n=2)
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s._open_observation(T0)
+        s.touch_level = 4015.0
+        s.on_m1_close(bar(4014, 4018, 4013, 4017), T0 + timedelta(minutes=1), None)  # >ref: 1 up
+        self.assertIsNone(s.pending_side)                            # need 2
+        s.on_m1_close(bar(4017, 4017, 4010, 4011), T0 + timedelta(minutes=2), None)  # <ref: reset
+        self.assertIsNone(s.pending_side)
+        s.on_m1_close(bar(4011, 4011, 4008, 4009), T0 + timedelta(minutes=3), None)  # <ref: 2 down
+        self.assertEqual(s.pending_side, "SELL")
+
+
+# ======================================================================================
+# 7 — v3.10.1 funded port: SL-avoidance opposite-candle flip / scratch (stage 0 only)
+# ======================================================================================
+class TestOppositeFlip(unittest.TestCase):
+    def _down(self, e):
+        """A down (against-a-BUY) candle near price e that neither SLs nor locks."""
+        return bar(e, e, e - 1.0, e - 0.5)
+
+    def test_flip_reverses_same_stage0_sl18(self):
+        p = AncParams(opposite_candles=3, opposite_action="flip")
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s._start_position("BUY", 4000.0, T0)                         # link 0, sl 3982
+        for i in range(3):
+            s.on_m1_close(self._down(4000.0), T0 + timedelta(minutes=i + 1), None)
+        # closed the BUY as a flip and immediately reversed to a fresh SELL link 1
+        self.assertEqual(len(s.trades), 1)
+        self.assertEqual(s.trades[0]["reason"], "flip")
+        self.assertIsNotNone(s.pos)
+        self.assertEqual(s.pos["side"], "SELL")
+        self.assertEqual(s.pos["link"], 1)
+        self.assertEqual(s.pos["sl_off"], -18.0)                     # fresh SL, back to stage 0
+        self.assertEqual(s.pos["sl_price"], round(s.pos["entry"] + 18.0, 2))
+        self.assertEqual(s.trades_done, 2)                           # flip consumed a slot
+
+    def test_flip_disabled_once_locked(self):
+        p = AncParams(opposite_candles=3, opposite_action="flip")
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s._start_position("BUY", 4000.0, T0)
+        s._ladder(bar(4000, 4003, 3999, 4002))                      # +3 -> lock (stage >= 1)
+        self.assertTrue(s._locked())
+        # down-body candles that stay ABOVE the +2.5 lock (no SL): must NOT flip
+        for i in range(3):
+            s.on_m1_close(bar(4004, 4004, 4003, 4003.5), T0 + timedelta(minutes=i + 1), None)
+        self.assertIsNotNone(s.pos)
+        self.assertEqual(s.pos["side"], "BUY")                       # unchanged, never flipped
+        self.assertFalse(any(t["reason"] == "flip" for t in s.trades))
+
+    def test_scratch_loss_does_not_end_chain(self):
+        p = AncParams(opposite_candles=1, opposite_action="close")
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s._start_position("BUY", 4000.0, T0)
+        s.on_m1_close(bar(4000, 4000, 3999, 3999), T0 + timedelta(minutes=1), None)
+        self.assertEqual(s.trades[0]["reason"], "scratch")
+        self.assertLess(s.trades[0]["pnl_price"], 0)                 # a losing-P&L scratch ...
+        self.assertFalse(s.done)                                    # ... but the chain lives
+        self.assertFalse(s.chain_ended)
+        self.assertEqual(s.state, "OBSERVE")
+        self.assertEqual(s.reopen_price, 3999.0)
+
+    def test_flip_loss_does_not_end_chain(self):
+        p = AncParams(opposite_candles=1, opposite_action="flip")
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s._start_position("BUY", 4000.0, T0)
+        s.on_m1_close(bar(4000, 4000, 3999, 3999), T0 + timedelta(minutes=1), None)
+        self.assertEqual(s.trades[0]["reason"], "flip")
+        self.assertLess(s.trades[0]["pnl_price"], 0)
+        self.assertFalse(s.done)
+        self.assertFalse(s.chain_ended)
+        self.assertEqual(s.pos["side"], "SELL")
+
+    def test_flip_respects_chain_cap_5(self):
+        p = AncParams(opposite_candles=1, opposite_action="flip", max_chain=5)
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None)
+        s._start_position("BUY", 4000.0, T0)                        # link 0
+        m = 0
+        while not s.done and m < 30:
+            m += 1
+            if s.pos and s.pos["side"] == "BUY":
+                b = bar(4000, 4000, 3999, 3999)                     # against BUY (down)
+            else:
+                e = s.pos["entry"]
+                b = bar(e, e + 1.0, e, e + 0.5)                     # against SELL (up)
+            s.on_m1_close(b, T0 + timedelta(minutes=m), None)
+        self.assertTrue(s.done)
+        self.assertEqual(s.trades_done, 5)                          # capped at 5 links
+        self.assertEqual(len(s.trades), 5)
+
+    def test_flip_live_closes_and_reverses_same_lot(self):
+        # LIVE path: original ticket closed, opposite market order placed at anc_lot,
+        # fresh SL 18, session flipped to the reverse side as the next link.
+        p = AncParams(opposite_candles=3, opposite_action="flip")
+        sess = AnchorDaySession("A2", 4400.0, p, flat_ts=None)
+        sess.enter_live("BUY", 4400.0, T0)                          # sl 4382, link 0
+        sess.open_ticket = 111
+        tr = _CmdTrader([_Pos(_a.AURNO_MAGIC, 111)], paper=False)
+        for i in range(3):
+            down = bar(4400.0, 4400.0, 4399.0, 4399.5)              # against BUY, no SL/lock
+            _a._manage_session_live(tr, sess, down, T0 + timedelta(minutes=i + 1),
+                                    None, allow_new_entries=True, p=p)
+        self.assertEqual(tr.adapter.closed, [111])                  # original closed
+        self.assertEqual(len(tr.adapter.placed), 1)                 # one reverse order
+        args, kw = tr.adapter.placed[0]
+        self.assertEqual(args[1], "SELL")                           # opposite side
+        self.assertAlmostEqual(float(args[2]), 0.10)                # same lot (anc_lot)
+        self.assertEqual(sess.pos["side"], "SELL")
+        self.assertEqual(sess.pos["link"], 1)
+        self.assertEqual(sess.pos["sl_off"], -18.0)                 # fresh SL, stage 0
+        self.assertEqual(sess.trades[-1]["reason"], "flip")
+
+
+# ======================================================================================
+# 8 — v3.10.1 funded port: EOD new-entry cutoff (open positions still ladder)
+# ======================================================================================
+class TestEodEntryCutoff(unittest.TestCase):
+    def test_no_new_entry_at_or_after_cutoff(self):
+        cutoff = T0 + timedelta(minutes=2)
+        p = AncParams(confirm="candles")
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None, entry_cutoff_ts=cutoff)
+        s._open_observation(T0)
+        # a full 3-up confirmation lands AT/AFTER the cutoff -> no entry taken
+        s.on_m1_close(cbar(4000, 4001), T0 + timedelta(minutes=1), None)
+        s.on_m1_close(cbar(4001, 4002), T0 + timedelta(minutes=2), None)
+        s.on_m1_close(cbar(4002, 4003), T0 + timedelta(minutes=3), None)
+        self.assertIsNone(s.pending_side)
+        self.assertIsNone(s.pos)
+
+    def test_cutoff_none_keeps_todays_behaviour(self):
+        p = AncParams(confirm="candles")
+        s = AnchorDaySession("A2", 4000.0, p, flat_ts=None, entry_cutoff_ts=None)
+        s._open_observation(T0)
+        for i, (o, c) in enumerate([(4000, 4001), (4001, 4002), (4002, 4003)], start=1):
+            s.on_m1_close(cbar(o, c), T0 + timedelta(minutes=i), None)
+        self.assertEqual(s.pending_side, "BUY")
+
+
 def _run_all():
     unittest.main(verbosity=2)
 
