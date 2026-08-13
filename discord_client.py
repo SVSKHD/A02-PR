@@ -323,7 +323,10 @@ class DiscordClient:
                     # Empty content => Message Content Intent almost certainly OFF.
                     self._warn_intent_off()
                     return
-                if content.startswith("/"):
+                # Commands use "/" (all existing) or "!" (the `!nno` control
+                # surface). Both prefixes route to the same handler, which strips
+                # the leading marker before matching.
+                if content.startswith(("/", "!")):
                     command_handler(content.split()[0], content)
             except Exception as e:
                 self._log.warning(f"Discord command error: {e!r}")

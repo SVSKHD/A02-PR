@@ -257,6 +257,23 @@ class Config:
     # Flat everything at this broker hour (23:30 = 23.5), fractional-hour like
     # friday_flatten_broker_hour above.
     anc_flat_broker_hour: float = 23.5
+    # ── aureon_new_non_oco — Discord CONTROL SURFACE (ops only; no strategy effect).
+    # A distinct message identity + `!nno` command set for the engine above, all
+    # scoped to AURNO_MAGIC (20260811) ONLY. None of these alter trading behaviour;
+    # with aureon_new_non_oco = False the whole surface is inert.
+    nno_discord_commands_enabled: bool = True
+    # Reserved admin id for the mutating commands. Effective gate is the existing
+    # DISCORD_ALLOWED_USER_IDS gateway allow-list (see README); when non-zero this
+    # documents the single operator who owns pause/resume/flat. 0 = anyone allowed
+    # by the gateway.
+    nno_discord_admin_user_id: int = 0
+    nno_discord_flat_confirm_sec: float = 60.0   # !nno flat confirm window (seconds)
+    nno_notify_prefix: str = "[NNO]"             # greppable line prefix on every event
+    nno_embed_title: str = "NEW NON-OCO"         # embed title — NEVER "AUREON INFO"
+    nno_embed_emoji: str = "\U0001F537"          # 🔷 title marker (straddle uses ⚓)
+    nno_embed_colour: int = 0x2ECC9B             # teal — normal events
+    nno_embed_colour_warn: int = 0xE8A33D        # amber — ema block / expiry / pause
+    nno_embed_colour_bad: int = 0xE24B4A         # red — losing exit / guard trip
     rogue_seed_fallback: str = "a1_time_snapshot"
     # ── FETCHER — grinder engine, retired after 07-08/09 chop losses. OFF.
     fetcher_enabled: bool = False

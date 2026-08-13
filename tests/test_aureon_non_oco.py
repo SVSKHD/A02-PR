@@ -305,6 +305,271 @@ class TestFlagOffRegression(unittest.TestCase):
             self.fail(f"drive() raised with flag on: {e!r}")
 
 
+# ======================================================================================
+# Section-5 tests for the Discord CONTROL SURFACE (message identity + `!nno`).
+# These cover the ops layer only; the strategy tests above are unchanged.
+# ======================================================================================
+import json as _json
+
+import aureon_non_oco as _a
+import discord_cards as _dc
+from config import Config
+
+
+class _Pos:
+    """Minimal MT5-position stand-in (fields the command surface reads)."""
+    def __init__(self, magic, ticket, typ=1, profit=0.0, price_open=4400.0,
+                 price_current=4410.0, sl=4382.0, volume=0.10):
+        self.magic = magic
+        self.ticket = ticket
+        self.type = typ            # 0 = buy, 1 = sell
+        self.profit = profit
+        self.price_open = price_open
+        self.price_current = price_current
+        self.sl = sl
+        self.volume = volume
+
+
+class _MT5:
+    def __init__(self, positions):
+        self._positions = positions
+
+    def positions_get(self, **kw):
+        # ticket=... queries (for _position_open) return truthy => "still open".
+        if "ticket" in kw:
+            return [object()]
+        return list(self._positions)
+
+
+class _RecAdapter:
+    """Records the magic-scoped broker calls the surface makes."""
+    def __init__(self, positions):
+        self.mt5 = _MT5(positions)
+        self.closed = []
+        self.modified = []
+        self.placed = []
+
+    def close_position(self, ticket, dry_run=False):
+        self.closed.append(int(ticket))
+
+    def modify_position_sl(self, ticket, sl, dry_run=False):
+        self.modified.append((ticket, sl))
+
+    def place_market_order(self, *a, **k):
+        self.placed.append((a, k))
+        return {"ticket": 4242, "price": k.get("sl")}
+
+
+class _CapTele:
+    def __init__(self):
+        self.sent = []      # (msg, card) tuples
+
+    def send(self, msg, severity=None, card=None, **kw):
+        self.sent.append((msg, card))
+
+    # convenience wrappers, in case anything routes through them
+    def _rec(self, msg, *a, **k):
+        self.sent.append((msg, None))
+    info = warn = success = error = critical = debug = _rec
+
+
+class _CmdTrader:
+    def __init__(self, positions, paper=False):
+        self.cfg = Config()
+        self.cfg.aureon_new_non_oco = True
+        self.adapter = _RecAdapter(positions)
+        self.tele = _CapTele()
+        self.paper = paper
+        self.state = {}
+        self.save_count = 0
+
+    def _save_state(self):
+        self.save_count += 1
+
+
+class TestNnoMessageIdentity(unittest.TestCase):
+    """Section 5: notification embeds carry the NEW NON-OCO title, the configured
+    colour, the [NNO] prefix, the anchor label, and the link index."""
+
+    def _capture(self, tone, label, link, text):
+        tr = _CmdTrader([])
+        _a._emit(tr, tone, label, link, text)   # no drive() buffer => posts now
+        self.assertEqual(len(tr.tele.sent), 1)
+        msg, card = tr.tele.sent[0]
+        return msg, card
+
+    def test_title_emoji_and_prefix(self):
+        cfg = Config()
+        msg, card = self._capture("normal", "A2", 0, "SELL 0.10 @ 4416.20 sl 4434.20")
+        self.assertEqual(card["title"], f"{cfg.nno_embed_emoji} {cfg.nno_embed_title}")
+        self.assertNotIn("AUREON INFO", card["title"])
+        self.assertTrue(msg.startswith(cfg.nno_notify_prefix))
+        self.assertIn("A2", msg)
+        self.assertIn("link 0", msg)
+
+    def test_tone_colours(self):
+        cfg = Config()
+        _, c_norm = self._capture("normal", "A2", 0, "x")
+        _, c_warn = self._capture("warn", "A2", 1, "x")
+        _, c_bad = self._capture("bad", "A2", 2, "x")
+        self.assertEqual(c_norm["color"], cfg.nno_embed_colour)
+        self.assertEqual(c_warn["color"], cfg.nno_embed_colour_warn)
+        self.assertEqual(c_bad["color"], cfg.nno_embed_colour_bad)
+
+    def test_batch_keeps_identity(self):
+        cfg = Config()
+        tr = _CmdTrader([])
+        tr._aurno_batch = []
+        _a._emit(tr, "normal", "A2", 0, "locked +2.5")
+        _a._emit(tr, "normal", "A2", 0, "secured +10, trailing 1.5")
+        buf = tr._aurno_batch
+        tr._aurno_batch = None
+        _a._flush_nno(tr, buf)
+        # one coalesced card, still NEW NON-OCO title + teal colour (never a plain msg)
+        self.assertEqual(len(tr.tele.sent), 1)
+        _, card = tr.tele.sent[0]
+        self.assertEqual(card["title"], f"{cfg.nno_embed_emoji} {cfg.nno_embed_title}")
+        self.assertEqual(card["color"], cfg.nno_embed_colour)
+        self.assertIn("locked", card["description"])
+        self.assertIn("secured", card["description"])
+
+
+class TestOtherEnginesUnchanged(unittest.TestCase):
+    """Section 5: the straddle's / ROGUE's / FETCHER's identity is untouched — same
+    generic title + colour map as before, and DISTINCT from NEW NON-OCO."""
+
+    def test_severity_colour_map_intact(self):
+        self.assertEqual(_dc.SEVERITY_COLOR["INFO"], _dc.BLUE)
+        self.assertEqual(_dc.SEVERITY_COLOR["SUCCESS"], _dc.GREEN)
+        self.assertEqual(_dc.SEVERITY_COLOR["WARN"], _dc.AMBER)
+
+    def test_generic_card_still_aureon_info(self):
+        card = _dc.card_generic("AUREON INFO", "a fill", _dc.BLUE)
+        self.assertEqual(card["title"], "AUREON INFO")
+        self.assertEqual(card["color"], _dc.BLUE)
+
+    def test_nno_is_distinct_from_straddle(self):
+        cfg = Config()
+        # different title AND different colour from the straddle's blue AUREON INFO
+        self.assertNotEqual(cfg.nno_embed_title, "AUREON INFO")
+        self.assertNotEqual(cfg.nno_embed_colour, _dc.BLUE)
+        self.assertNotIn(cfg.nno_embed_colour,
+                         (_dc.BLUE, _dc.GREEN, _dc.GREY))
+
+
+class TestNnoFlatMagicIsolation(unittest.TestCase):
+    """Section 5 (most important): `!nno flat` closes ONLY magic 20260811."""
+
+    def test_flat_confirm_closes_only_aurno_magic(self):
+        ours = _Pos(_a.AURNO_MAGIC, 111, profit=132.5)
+        anchor = _Pos(20260522, 999, profit=-50.0)     # anchor leg — must survive
+        rogue = _Pos(20260626, 888, profit=10.0)       # ROGUE leg — must survive
+        fetch = _Pos(20260707, 777, profit=1.0)        # FETCHER leg — must survive
+        tr = _CmdTrader([ours, anchor, rogue, fetch])
+        # step 1: preview arms the confirm window, closes nothing
+        _a.handle_command(tr, "flat", confirm=False)
+        self.assertEqual(tr.adapter.closed, [])
+        # step 2: confirm closes ONLY 111
+        _a.handle_command(tr, "flat", confirm=True)
+        self.assertEqual(tr.adapter.closed, [111])
+        for foreign in (999, 888, 777):
+            self.assertNotIn(foreign, tr.adapter.closed)
+
+    def test_flat_confirm_without_preview_is_refused(self):
+        ours = _Pos(_a.AURNO_MAGIC, 111, profit=1.0)
+        tr = _CmdTrader([ours])
+        # a confirm with no prior preview (no armed window) must NOT close anything
+        _a.handle_command(tr, "flat", confirm=True)
+        self.assertEqual(tr.adapter.closed, [])
+
+    def test_flat_confirm_expired_is_refused(self):
+        ours = _Pos(_a.AURNO_MAGIC, 111, profit=1.0)
+        tr = _CmdTrader([ours])
+        _a.handle_command(tr, "flat", confirm=False)      # arm
+        tr._nno_flat_pending_ts -= (tr.cfg.nno_discord_flat_confirm_sec + 5)
+        _a.handle_command(tr, "flat", confirm=True)        # too late
+        self.assertEqual(tr.adapter.closed, [])
+
+
+class TestNnoPauseBlocksEntriesButLadders(unittest.TestCase):
+    """Section 5: `!nno pause` blocks NEW entries + NEW chain links, while an
+    already-open position still ratchets its SL through the ladder."""
+
+    def _params(self):
+        return AncParams()
+
+    def test_open_position_still_ladders_while_blocked(self):
+        p = self._params()
+        sess = AnchorDaySession("A2", 4400.0, p, flat_ts=None)
+        sess.enter_live("BUY", 4400.0, T0)     # open a position, sl at 4382
+        sess.open_ticket = 111
+        tr = _CmdTrader([_Pos(_a.AURNO_MAGIC, 111)], paper=False)
+        # a bar whose high reaches +4 favourable => ladder locks to +2.5 (sl 4402.5)
+        fav_bar = bar(4400.0, 4404.0, 4399.9, 4403.0)
+        _a._manage_session_live(tr, sess, fav_bar, T0, None,
+                                allow_new_entries=False, p=p)
+        # SL ratcheted despite entries being blocked
+        self.assertTrue(tr.adapter.modified, "ladder must run while paused")
+        self.assertEqual(tr.adapter.modified[-1][1], 4402.5)
+        # and NO new order was placed
+        self.assertEqual(tr.adapter.placed, [])
+
+    def test_no_new_entry_and_confirmation_not_consumed_while_blocked(self):
+        p = self._params()
+        sess = AnchorDaySession("A2", 4400.0, p, flat_ts=None)
+        # prime OBSERVE one candle short of a 3-up confirmation
+        sess._open_observation(T0)
+        sess.run_dir, sess.run_len = 1, 2
+        tr = _CmdTrader([], paper=False)
+        up = cbar(4400.0, 4401.0)              # would be the 3rd up candle => confirm
+        _a._manage_session_live(tr, sess, up, T0, None,
+                                allow_new_entries=False, p=p)
+        # blocked path returns before poll_setup: no order, run not consumed
+        self.assertEqual(tr.adapter.placed, [])
+        self.assertEqual(sess.run_len, 2)
+        self.assertEqual(sess.state, "OBSERVE")
+
+
+class TestNnoPausePersistence(unittest.TestCase):
+    """Section 5: pause state round-trips through the state file."""
+
+    def test_pause_sets_and_persists_flag(self):
+        tr = _CmdTrader([])
+        _a.handle_command(tr, "pause")
+        self.assertTrue(tr.state.get("nno_paused"))
+        self.assertGreaterEqual(tr.save_count, 1)      # _save_state was called
+        # the flag survives a state-file round-trip (json is what _save_state writes)
+        reloaded = _json.loads(_json.dumps(tr.state))
+        self.assertTrue(reloaded.get("nno_paused"))
+        # resume clears it and persists again
+        _a.handle_command(tr, "resume")
+        self.assertFalse(tr.state.get("nno_paused"))
+        self.assertFalse(_json.loads(_json.dumps(tr.state)).get("nno_paused"))
+
+
+class TestNnoCommandsNoopWhenOff(unittest.TestCase):
+    """Section 5: command handlers are no-ops when aureon_new_non_oco = False."""
+
+    def test_all_subcommands_noop_when_flag_off(self):
+        ours = _Pos(_a.AURNO_MAGIC, 111, profit=5.0)
+        tr = _CmdTrader([ours])
+        tr.cfg.aureon_new_non_oco = False           # master flag OFF
+        # even a flat confirm must touch nothing
+        tr._nno_flat_pending_ts = _a._now_wall()
+        for sub in ("status", "anchors", "positions", "today", "config", "help",
+                    "pause", "resume", "flat"):
+            _a.handle_command(tr, sub, confirm=True)
+        self.assertEqual(tr.tele.sent, [])          # no notifier interaction
+        self.assertEqual(tr.adapter.closed, [])     # no broker interaction
+        self.assertEqual(tr.state, {})              # no state mutation
+
+    def test_commands_noop_when_surface_disabled(self):
+        tr = _CmdTrader([])
+        tr.cfg.nno_discord_commands_enabled = False
+        _a.handle_command(tr, "status")
+        self.assertEqual(tr.tele.sent, [])
+
+
 def _run_all():
     unittest.main(verbosity=2)
 
